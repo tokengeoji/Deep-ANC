@@ -34,6 +34,31 @@ class RecordedQASettings:
     required_splits: tuple[str, ...] = VALID_SPLITS
     allow_incomplete_family_coverage: bool = False
 
+    # ---- 채널 간 관계 게이트 (결함 2) -------------------------------------------
+    # 2026-08-04: 실측 80 세션이 **전부** QA 를 통과했는데 학습 데이터의 시간축이
+    # 붕괴해 있었다. 통과한 이유는 QA 가 무엇을 봤는가가 아니라 **안 봤는가**다 —
+    # RMS·클리핑·길이·샘플레이트·메타데이터 일치. 전부 파일 **하나하나**의 통계다.
+    # 학습이 실제로 배워야 하는 것은 채널 **사이**의 관계(source→ERR)인데 그것을
+    # 한 번도 보지 않았다. 아래 값들이 그 관계를 판정에 넣는다.
+    check_alignment: bool = True
+    alignment_band_hz: tuple[float, float] = (150.0, 600.0)
+    alignment_nperseg: int = 8192
+    alignment_window_seconds: float = 1.0
+    alignment_max_seconds: float = 30.0
+    """정렬 검사에 읽어 들일 최대 길이(초). 스트리밍 QA 의 메모리 규약을 깨지 않기
+    위한 상한이다. 30 초 = 채널당 5.7 MB 이고, 실측 세션 70 초 중 30 초면 창 30개라
+    지연 궤적 통계가 충분히 안정된다."""
+
+    min_source_err_coherence: float = 0.60
+    """실측 정상 0.96~0.99 / 붕괴 0.02~0.13 사이의 넓은 골짜기에서 고른 값."""
+
+    min_ref_err_coherence: float = 0.60
+    """음향 대조군. 이 값이 살아 있는데 source→ERR 만 죽으면 원인은 음향이 아니라
+    녹음 소프트웨어의 타임베이스다 — 진단이 자동으로 갈린다."""
+
+    max_source_err_delay_std_samples: float = 64.0
+    max_source_err_delay_range_samples: float = 256.0
+
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
             raise ValueError("sample_rate는 양수여야 합니다")
@@ -60,6 +85,40 @@ class RecordedQASettings:
         invalid = [split for split in self.required_splits if split not in VALID_SPLITS]
         if invalid:
             raise ValueError(f"지원하지 않는 required split: {invalid}")
+        # 정렬 게이트 값도 생성 시점에 검증한다. 물리적으로 불가능한 임계로 게이트를
+        # 무력화하는 것(예: 음수 코히런스 하한)은 값이 만들어지기 전에 막아야 한다.
+        lo, hi = (float(value) for value in self.alignment_band_hz)
+        if not (0.0 < lo < hi <= float(self.sample_rate) / 2.0):
+            raise ValueError(
+                f"alignment_band_hz가 유효하지 않습니다: {self.alignment_band_hz!r} "
+                f"(0 < lo < hi ≤ {self.sample_rate / 2:.0f}Hz)"
+            )
+        if self.alignment_nperseg < 64 or self.alignment_nperseg & (self.alignment_nperseg - 1):
+            raise ValueError(
+                f"alignment_nperseg는 64 이상의 2의 거듭제곱이어야 합니다: "
+                f"{self.alignment_nperseg}"
+            )
+        if not 0.0 < float(self.alignment_window_seconds) <= 10.0:
+            raise ValueError(
+                f"alignment_window_seconds는 (0, 10] 이어야 합니다: "
+                f"{self.alignment_window_seconds!r}"
+            )
+        if not 0.0 < float(self.alignment_max_seconds):
+            raise ValueError(
+                f"alignment_max_seconds는 양수여야 합니다: {self.alignment_max_seconds!r}"
+            )
+        for value, name in (
+            (self.min_source_err_coherence, "min_source_err_coherence"),
+            (self.min_ref_err_coherence, "min_ref_err_coherence"),
+        ):
+            if not 0.0 < float(value) <= 1.0:
+                raise ValueError(f"{name}는 (0, 1] 이어야 합니다: {value!r}")
+        for value, name in (
+            (self.max_source_err_delay_std_samples, "max_source_err_delay_std_samples"),
+            (self.max_source_err_delay_range_samples, "max_source_err_delay_range_samples"),
+        ):
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name}는 유한한 양수여야 합니다: {value!r}")
 
     @property
     def effective_lead_samples(self) -> int:
@@ -76,6 +135,21 @@ class RecordedQASettings:
         return self.segment_samples + self.effective_lead_samples + 1
 
 
+_ALIGNMENT_OVERRIDE_KEYS = frozenset(
+    {
+        "check_alignment",
+        "alignment_band_hz",
+        "alignment_nperseg",
+        "alignment_window_seconds",
+        "alignment_max_seconds",
+        "min_source_err_coherence",
+        "min_ref_err_coherence",
+        "max_source_err_delay_std_samples",
+        "max_source_err_delay_range_samples",
+    }
+)
+
+
 def settings_from_data_config(
     data_cfg: dict,
     *,
@@ -86,13 +160,24 @@ def settings_from_data_config(
     min_source_rms_dbfs: float = -80.0,
     required_splits: Iterable[str] = VALID_SPLITS,
     allow_incomplete_family_coverage: bool = False,
+    alignment_overrides: dict | None = None,
 ) -> RecordedQASettings:
-    """학습 데이터 설정과 동일한 세그먼트/lead 최소 길이를 해석한다."""
+    """학습 데이터 설정과 동일한 세그먼트/lead 최소 길이를 해석한다.
+
+    ``alignment_overrides`` 는 ``readiness`` 블록이 선언한 정렬 임계를 받는 통로다.
+    QA 와 게이트가 **같은 임계**로 판정해야 한다 — 두 곳이 각자 기본값을 들고 있으면
+    "QA 는 통과했는데 게이트는 실패" 같은 해석 불가능한 상태가 생긴다.
+    """
 
     sample_rate = int(data_cfg["sample_rate"])
     raw_segment = int(round(float(data_cfg["segment_seconds"]) * sample_rate))
     segment_samples = max(256, (raw_segment // 256) * 256)
+    overrides = dict(alignment_overrides or {})
+    unknown = sorted(set(overrides).difference(_ALIGNMENT_OVERRIDE_KEYS))
+    if unknown:
+        raise ValueError(f"알 수 없는 정렬 설정 키: {unknown}")
     return RecordedQASettings(
+        **overrides,
         sample_rate=sample_rate,
         segment_samples=segment_samples,
         digital_reference_lead_samples=int(
@@ -274,6 +359,156 @@ def _validate_session_metadata(
                 )
 
 
+CHANNEL_ERR_MIC = 0
+CHANNEL_REF_MIC = 1
+"""``session.json`` 채널 규약: ``err_mic: 0, ref_mic: 1``. 두 곳에서 따로 0/1 을
+쓰지 않도록 상수로 올린다 — 채널을 뒤바꿔 읽으면 정렬 게이트가 대조군과 피검사군을
+맞바꾸고, 붕괴한 세션이 통과한다."""
+
+
+def _read_alignment_excerpt(
+    path: Path, settings: RecordedQASettings
+) -> tuple[np.ndarray, int]:
+    """정렬 검사용 앞부분 발췌를 읽는다. 길이는 ``alignment_max_seconds`` 로 묶인다."""
+
+    max_frames = int(round(float(settings.alignment_max_seconds) * settings.sample_rate))
+    with sf.SoundFile(str(path)) as handle:
+        data = handle.read(frames=max_frames, dtype="float64", always_2d=True)
+    return np.asarray(data, dtype=np.float64), int(data.shape[0])
+
+
+def _validate_alignment(
+    session_path: Path,
+    result: dict,
+    settings: RecordedQASettings,
+) -> None:
+    """학습이 배워야 하는 **관계 자체**를 검사한다 (결함 2).
+
+    파일별 통계(RMS/clip/길이)는 채널 사이의 시간 관계에 대해 아무것도 말하지 않는다.
+    실측 80 세션이 전부 통과한 이유가 정확히 그것이다.
+
+    세 값을 함께 본다 — 셋을 따로 보면 진단이 서지 않는다.
+
+    ============================  ==============  ==============  ================
+    지표                          붕괴 세션 실측  음향 대조군      임계
+    ============================  ==============  ==============  ================
+    coh²(source→ERR)              0.021~0.126     —               ≥ 0.60
+    coh²(REF→ERR)                 —               0.959~0.991     ≥ 0.60
+    source→ERR τ std (1초창)      1019~2216       17.7~20.1       ≤ 64
+    source→ERR τ range            8869~13532      106~215         ≤ 256
+    ============================  ==============  ==============  ================
+
+    REF→ERR 이 살아 있는데 source→ERR 만 죽었다는 조합이 **진단 그 자체**다: 마이크도
+    스피커도 배치도 멀쩡하고, 재생(USB)과 캡처(I²S)가 서로 다른 클록 도메인인데
+    콜백이 인덱스로만 정렬했다는 뜻이다. 그래서 대조군을 함께 잰다.
+
+    검사는 :mod:`deep_anc.dsp.invariants` 의 공용 검사기를 부른다. 여기서 코히런스를
+    다시 구현하면 그것이 두 번째 정의가 되고, 언젠가 측정·QA·게이트가 서로 다른 답을
+    내놓는다 — 이 저장소에서 이미 여러 번 일어난 일이다.
+    """
+
+    from ..dsp.invariants import check_stream_coherence, check_stream_delay_stability
+
+    mics_path = session_path / "mics.wav"
+    # **학습이 실제로 읽는 파일**을 잰다. RecordedANCDataset 은 source_aligned.wav 가
+    # 있으면 그것을 x_ref 로 쓰므로, QA 가 source.wav 만 보면 "QA 가 잰 신호"와
+    # "학습이 쓴 신호"가 갈린다 — 같은 물리량을 두 곳에서 따로 보는 발생기 A 그 자체다.
+    # source.wav 는 원본 provenance 로 남아 있고 재정렬 전에는 영원히 붕괴 상태이므로,
+    # 재정렬본이 있어도 source.wav 를 재면 복구된 세션까지 전부 FAIL 이 된다.
+    aligned_path = session_path / "source_aligned.wav"
+    source_path = aligned_path if aligned_path.is_file() else session_path / "source.wav"
+    result.setdefault("alignment_reference", source_path.name)
+    try:
+        mics_data, _ = _read_alignment_excerpt(mics_path, settings)
+        source_data, _ = _read_alignment_excerpt(source_path, settings)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _append_error(result, f"정렬 검사용 오디오를 읽지 못했습니다: {exc}")
+        return
+    if mics_data.shape[1] < 2 or source_data.shape[1] < 1:
+        return  # 채널 수 오류는 _validate_audio 가 이미 보고했다
+    frames = int(min(mics_data.shape[0], source_data.shape[0]))
+    if frames < 2:
+        _append_error(result, "정렬 검사를 할 만큼의 오디오가 없습니다")
+        return
+
+    err = mics_data[:frames, CHANNEL_ERR_MIC]
+    ref = mics_data[:frames, CHANNEL_REF_MIC]
+    src = source_data[:frames, 0]
+    if not (
+        np.all(np.isfinite(err)) and np.all(np.isfinite(ref)) and np.all(np.isfinite(src))
+    ):
+        # NaN/Inf 는 코히런스를 조용히 NaN 으로 만들고 `NaN < 임계` 는 False 라
+        # **통과처럼 보인다**. 비유한 샘플 자체는 _validate_audio 가 이미 오류로
+        # 보고했으므로 여기서는 판정을 흉내내지 않고 측정하지 않았음을 남긴다.
+        result["alignment"] = {"ok": False, "skipped": "비유한 샘플이 있어 측정 불가"}
+        return
+    band = (float(settings.alignment_band_hz[0]), float(settings.alignment_band_hz[1]))
+
+    alignment: dict[str, Any] = {
+        "band_hz": [band[0], band[1]],
+        "nperseg": int(settings.alignment_nperseg),
+        "analysed_seconds": frames / float(settings.sample_rate),
+        "reference_file": source_path.name,
+    }
+    try:
+        coherence_check = check_stream_coherence(
+            src,
+            err,
+            sample_rate=settings.sample_rate,
+            band_hz=band,
+            min_coherence=float(settings.min_source_err_coherence),
+            nperseg=int(settings.alignment_nperseg),
+            control=ref,
+            name="source_err_coherence",
+        )
+        delay_check = check_stream_delay_stability(
+            src,
+            err,
+            sample_rate=settings.sample_rate,
+            window_seconds=float(settings.alignment_window_seconds),
+            max_std_samples=float(settings.max_source_err_delay_std_samples),
+            max_range_samples=float(settings.max_source_err_delay_range_samples),
+            name="source_err_delay_stability",
+        )
+    except (ValueError, RuntimeError) as exc:
+        _append_error(result, f"정렬 검사 실패: {exc}")
+        return
+
+    control_coherence = coherence_check.measured.get("control_coherence")
+    alignment.update(
+        {
+            "source_err_coherence": float(coherence_check.measured["coherence"]),
+            "ref_err_coherence": (
+                float(control_coherence) if control_coherence is not None else float("nan")
+            ),
+            "source_err_delay_median_samples": float(
+                delay_check.measured["delay_median_samples"]
+            ),
+            "source_err_delay_std_samples": float(delay_check.measured["delay_std_samples"]),
+            "source_err_delay_range_samples": float(
+                delay_check.measured["delay_range_samples"]
+            ),
+            "delay_windows": int(delay_check.measured["n_windows"]),
+            "ok": bool(coherence_check.ok and delay_check.ok),
+        }
+    )
+    result["alignment"] = alignment
+
+    if not coherence_check.ok:
+        _append_error(result, coherence_check.detail)
+    if control_coherence is not None and float(control_coherence) < float(
+        settings.min_ref_err_coherence
+    ):
+        _append_error(
+            result,
+            f"REF→ERR {band[0]:.0f}-{band[1]:.0f}Hz 결맞음 {float(control_coherence):.3f} < "
+            f"{float(settings.min_ref_err_coherence):.2f} — 마이크/배치 문제입니다 "
+            "(소프트웨어 타임베이스가 아니라 음향 쪽)",
+        )
+    if not delay_check.ok:
+        _append_error(result, delay_check.detail)
+
+
 def _validate_audio(
     entry: dict,
     metadata: dict | None,
@@ -422,6 +657,9 @@ def _validate_one_session(entry: dict, settings: RecordedQASettings) -> dict:
         "errors": [],
         "warnings": [],
         "audio": {},
+        # 정렬 결과는 **항상** 자리를 갖는다. 키가 없으면 소비자가 `.get("alignment", {})`
+        # 로 조용히 넘어가고, "검사하지 않았다"와 "검사해서 통과했다"가 구분되지 않는다.
+        "alignment": {},
     }
     _validate_manifest_metadata(entry, session_path, result)
 
@@ -468,6 +706,16 @@ def _validate_one_session(entry: dict, settings: RecordedQASettings) -> dict:
         _validate_audio(
             entry, metadata, stats["mics"], stats.get("source"), result, settings
         )
+        # 채널 간 관계 게이트. digital reference 일 때만 source.wav 가 존재하며,
+        # 그때가 바로 "학습이 source→ERR 관계를 배운다"고 주장하는 경우다.
+        if (
+            settings.check_alignment
+            and settings.reference_mode == "digital"
+            and "source" in stats
+            and stats["mics"]["channels"] == 2
+            and stats["source"]["channels"] == 1
+        ):
+            _validate_alignment(session_path, result, settings)
         result["duration_s"] = float(stats["mics"]["duration_s"])
     else:
         result["duration_s"] = 0.0
@@ -585,6 +833,14 @@ def validate_recorded_sessions(
             "min_source_rms_dbfs": settings.min_source_rms_dbfs,
             "required_splits": list(settings.required_splits),
             "allow_incomplete_family_coverage": settings.allow_incomplete_family_coverage,
+            "check_alignment": settings.check_alignment,
+            "alignment_band_hz": list(settings.alignment_band_hz),
+            "min_source_err_coherence": settings.min_source_err_coherence,
+            "min_ref_err_coherence": settings.min_ref_err_coherence,
+            "max_source_err_delay_std_samples": settings.max_source_err_delay_std_samples,
+            "max_source_err_delay_range_samples": (
+                settings.max_source_err_delay_range_samples
+            ),
         },
         "summary": {
             "sessions": len(results),

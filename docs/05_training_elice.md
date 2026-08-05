@@ -112,11 +112,13 @@ mpg123 decode 경고는 데이터 로더가 다른 항목으로 재시도하는 
 ### 학습 목적과 정상 판정
 
 - `digital_primary_path_mode=secondary_surrogate`: P에 S의 FIR/gain을 재사용하고
-  `D_noise=1489` 적용
-- `digital_reference_lead_samples=109`: 학습의 연속 source 정렬과 실제 playback FIFO가 동일
-- S 총지연 `1342+256=1598`, delay/gain/tilt jitter 0, all-pass off
+  `D_noise=1602` 적용
+- `digital_reference_lead_samples=116`: 학습의 연속 source 정렬과 실제 playback FIFO가 동일
+  (2026-08-05 플랜트 복구 전 사전학습된 checkpoint 는 109 다)
+- S 총지연 `1462+256=1718`, delay/gain/tilt jitter 0, all-pass off
 - η=10, drive=1, hardclip off의 공칭 선형 커리큘럼
-- best 기준은 trusted NMSE **150–600Hz**; fullband NMSE도 매 log/eval에 함께 기록
+- best 기준은 trusted NMSE **150–1600Hz**(CVaR 집계); fullband NMSE와 **대역 밖 최악값**도
+  매 log/eval에 함께 기록
 
 로그는 `nmse_t`(trusted)와 `nmse_f`(fullband)를 분리해 표시한다. corrected Stage-1에서도
 trusted NMSE가 과적합 게이트와 초기 검증 구간 내에서 계속 0dB에 고정되면 정상으로 기다리지
@@ -171,8 +173,10 @@ Jetson 에서 수집한 `data/recorded/` + manifest 를 git/zip 으로 올린 �
 
 파이프라인과 직접 `train.py` 실행은 모두 GPU 초기화 전에 같은 readiness 게이트를 강제한다.
 `duct.digital_reference.primary_path_npz`가 실제 측정 파일을 가리키는지만 보는 것이 아니라,
-P/S 각각의 official ESS 출력 채널·80–1600Hz·3회 이상·일관성 0.9·xrun 0과 동일
-amplitude/block/latency, P/S 지연에서 계산한 lead까지 검사한다.
+P/S 각각의 official 출력 채널·요구 대역(**150–1600Hz**) **모든 부대역** 일관성
+`≥0.9406`·유지 반복 `≥8`·xrun 0, 동일 amplitude/block/latency,
+**P−S 상대 τ 궤적의 상수성**(편차 `≤3샘플`), 그리고 P/S 지연에서 계산한 lead 까지 검사한다.
+(궤적 검사가 없던 시절 게이트가 오염된 `S(z)` 를 통과시켰다 — docs/12 §2.3)
 `require_measured_primary_path: true`가 surrogate 파인튜닝을,
 `require_init_checkpoint: true`가 누락된 사전학습 checkpoint를,
 `require_recorded_manifest: true`가 녹음 없이 합성-only로 진행되는 실수를 fail-fast한다.
@@ -186,7 +190,7 @@ P/S와 recorded 세션이 없으므로 현재 검사는 의도대로 FAIL이며,
 ## 4. 결과 회수 → Jetson
 
 ```bash
-.venv/bin/python scripts/train/export_onnx.py --ckpt runs/pretrain_base_corrected/ckpt/best.pt --out runs/export/model.onnx
+.venv/bin/python scripts/train/export_onnx.py --ckpt runs/pretrain_base_corrected/ckpt/best.pt --out runs/export/base_corrected.onnx
 # runs/export/{model.onnx, model.json} + ckpt/best.pt 를 zip 으로 다운로드
 # (수십 MB — VS Code 탐색기 우클릭 Download, 또는 GitHub Release 자산으로 업로드)
 ```

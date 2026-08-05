@@ -13,10 +13,12 @@ import torch
 from deep_anc.config import REPO_ROOT, load_yaml
 from deep_anc.data.manifest import write_manifest
 from deep_anc.train.finetune_readiness import (
+    achievable_cancellation_ceiling_db,
     audit_finetune_completion,
     audit_finetune_readiness,
     audit_official_path_model,
     require_finetune_readiness,
+    required_consistency_for,
     sha256_file,
 )
 
@@ -64,7 +66,10 @@ def _official_path(
         "calibration_latency": np.asarray("high"),
         "output_channel": np.asarray(channel),
         "method": np.asarray(method),
-        "repeats": np.asarray(3, dtype=np.int64),
+        # 유지 반복 수. MIN_KEPT_REPEATS=8 이 하한이다 — 기각을 많이 한 것은 문제가
+        # 아니지만(복구 캡처는 48 중 30 을 기각했다) 남은 것이 적으면 한 번의
+        # 이상치가 플랜트 형상을 지배한다.
+        "repeats": np.asarray(12, dtype=np.int64),
         "amplitude": np.asarray(amplitude),
         "xrun_count": np.asarray(0, dtype=np.int64),
         "delay_spread_samples": np.asarray(1, dtype=np.int64),
@@ -98,58 +103,174 @@ def _checkpoint(
     )
 
 
-def _recorded_manifest(root: Path, *, frames: int = 512) -> Path:
+GROUPS_PER_FAMILY_PER_SPLIT = 4
+"""계열·split 당 그룹 수. ``readiness.min_groups_per_family_per_split`` 과 같아야 한다.
+
+3 으로 내리면 ``recorded_statistical_power`` 가 FAIL 한다 — 즉 이 상수 하나로 검정력
+게이트가 살아 있는지 확인할 수 있다.
+"""
+
+# P(z) 픽스처의 FIR 은 ``[0.5, -0.1, 0.02]`` 라 최대 tap 이 0 이다. 따라서 유도되는
+# 재생→ERR 지연은 ``벌크지연 + 0`` 이고, 실측 세션도 같은 지연을 갖도록 만들어야
+# D2 교차검증이 성립한다. 두 값을 **같은 곳에서 유도**하는 것이 이 상수의 목적이다.
+PRIMARY_DELAY_SAMPLES = 4
+ERR_MIC_DELAY_SAMPLES = PRIMARY_DELAY_SAMPLES
+REF_MIC_DELAY_SAMPLES = 2
+
+
+def _recorded_band_noise(frames: int, seed: int) -> np.ndarray:
+    """정렬 검사가 통하는 광대역 소스.
+
+    옛 픽스처는 순음이었다. 순음은 상호상관 최대점이 주기마다 반복돼 지연이 다중값이
+    되고, 무엇보다 ERR/REF 두 채널을 **같은 신호의 상수배**로 만들어 시간 관계를
+    시험하지 않는다. 실측 프로그램 소재는 광대역이므로 픽스처도 광대역이어야 한다.
+    """
+
+    from scipy.signal import butter, lfilter
+
+    rng = np.random.default_rng(seed)
+    b, a = butter(4, [120.0 / (FS / 2), 1_200.0 / (FS / 2)], btype="band")
+    filtered = lfilter(b, a, rng.standard_normal(frames + 2048))[2048:]
+    peak = float(np.max(np.abs(filtered))) or 1.0
+    return 0.3 * filtered / peak
+
+
+def _recorded_manifest(
+    root: Path,
+    *,
+    frames: int = 4_096,
+    groups_per_family: int = GROUPS_PER_FAMILY_PER_SPLIT,
+    collapse_alignment: bool = False,
+    source_delay_samples: int = ERR_MIC_DELAY_SAMPLES,
+) -> Path:
+    """실측 manifest 픽스처.
+
+    ``collapse_alignment`` 는 2026-08-04 사고(재생/캡처 타임베이스 붕괴)를 주입한다.
+    ``source_delay_samples`` 는 D2(실측 지연 vs P(z) 유도값) 교차검증을 흔들 때 쓴다.
+    """
+
     manifest = root / "manifests" / "recorded.jsonl"
     entries = []
-    t = np.arange(frames, dtype=np.float64) / FS
     for family_index, family in enumerate(FAMILIES):
         for split_index, split in enumerate(("train", "val", "test")):
-            session_id = f"{family}-{split}"
-            session = root / "recorded" / session_id
-            session.mkdir(parents=True)
-            source = (0.05 * np.sin(2 * np.pi * (250 + family_index * 40) * t)).astype(
-                np.float32
-            )
-            mics = np.stack([0.7 * source, 0.4 * source], axis=1)
-            sf.write(session / "mics.wav", mics, FS, subtype="FLOAT")
-            sf.write(session / "source.wav", source, FS, subtype="FLOAT")
-            group = f"group-{family}-{split_index}"
-            (session / "session.json").write_text(
-                json.dumps(
+            for group_index in range(groups_per_family):
+                session_id = f"{family}-{split}-{group_index}"
+                session = root / "recorded" / session_id
+                session.mkdir(parents=True)
+                source = _recorded_band_noise(
+                    frames, 1_000 * family_index + 10 * split_index + group_index
+                )
+                err = 0.7 * np.roll(source, int(source_delay_samples))
+                ref = 0.4 * np.roll(source, REF_MIC_DELAY_SAMPLES)
+                if collapse_alignment:
+                    # ERR/REF 마이크는 그대로 두고 source 만 시간축을 깬다 —
+                    # 실측에서 무너진 것이 음향이 아니라 소프트웨어였기 때문이다.
+                    rng = np.random.default_rng(7 + group_index)
+                    block = max(64, frames // 8)
+                    broken = np.zeros(frames, dtype=np.float64)
+                    for start in range(0, frames, block):
+                        stop = min(frames, start + block)
+                        jump = int(rng.integers(-1_000, 1_000))
+                        broken[start:stop] = np.roll(source, jump)[start:stop]
+                    source = broken
+                mics = np.stack([err, ref], axis=1).astype(np.float32)
+                sf.write(session / "mics.wav", mics, FS, subtype="FLOAT")
+                sf.write(
+                    session / "source.wav", source.astype(np.float32), FS, subtype="FLOAT"
+                )
+                group = f"group-{family}-{split}-{group_index}"
+                (session / "session.json").write_text(
+                    json.dumps(
+                        {
+                            "session_id": session_id,
+                            "group_id": group,
+                            "source_family": family,
+                            "sample_rate": FS,
+                            "seconds": frames / FS,
+                            "program": {"type": "file"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                entries.append(
                     {
+                        "path": str(session),
+                        "duration_s": frames / FS,
+                        "sample_rate": FS,
+                        "channels": 2,
+                        "tag": "recorded",
                         "session_id": session_id,
                         "group_id": group,
                         "source_family": family,
-                        "sample_rate": FS,
-                        "seconds": frames / FS,
-                        "program": {"type": "file"},
+                        "split": split,
                     }
-                ),
-                encoding="utf-8",
-            )
-            entries.append(
-                {
-                    "path": str(session),
-                    "duration_s": frames / FS,
-                    "sample_rate": FS,
-                    "channels": 2,
-                    "tag": "recorded",
-                    "session_id": session_id,
-                    "group_id": group,
-                    "source_family": family,
-                    "split": split,
-                }
-            )
+                )
     write_manifest(entries, manifest)
     return manifest
 
 
-def _ready_config(tmp_path: Path) -> dict:
+def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
+    """실측 소스 목록(``sources.csv``)과 합성 소음 manifest 를 만든다.
+
+    ``leak=True`` 면 실측 music 이 쓴 원본이 합성 train 에도 들어간다 — 2026-08-05
+    감사가 실측에서 찾은 상태(music 60/60 겹침, 그중 55개가 합성 train)의 축소판이다.
+    """
+
+    pool_dir = root / "source_pool"
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = pool_dir / "sources.csv"
+    recorded_clips = {
+        "speech": ["spk1-a.flac", "spk1-b.flac"],
+        "music": ["music-0001.mp3", "music-0002.mp3"],
+        "environment": ["env-1.wav", "env-2.wav"],
+        "machine": ["mach-1.wav", "mach-2.wav"],
+    }
+    rows = ["source_family,session_index,group_id,path,seconds,clips"]
+    for family, clips in recorded_clips.items():
+        payload = json.dumps(clips).replace('"', '""')
+        rows.append(f'{family},0,grp-{family},{family}_000.wav,70.0,"{payload}"')
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    manifest_dir = root / "synth_manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    speech_entries = [
+        {
+            "path": str(root / "raw" / "speech" / "other-1.flac"),
+            "duration_s": 5.0,
+            "sample_rate": FS,
+            "channels": 1,
+            "tag": "speech",
+            "split": "train",
+        }
+    ]
+    music_paths = ["fresh-a.mp3", "fresh-b.mp3"]
+    if leak:
+        # 실측이 재생한 바로 그 원본이 합성 train 에도 있다.
+        music_paths = ["music-0001.mp3", "fresh-b.mp3"]
+    music_entries = [
+        {
+            "path": str(root / "raw" / "music" / "000" / name),
+            "duration_s": 30.0,
+            "sample_rate": FS,
+            "channels": 2,
+            "tag": "music",
+            "split": "train",
+        }
+        for name in music_paths
+    ]
+    write_manifest(speech_entries, manifest_dir / "speech.jsonl")
+    write_manifest(music_entries, manifest_dir / "music.jsonl")
+    return csv_path, manifest_dir
+
+
+def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = False) -> dict:
     primary = tmp_path / "primary.npz"
     secondary = tmp_path / "secondary.npz"
-    _official_path(primary, channel="noise", delay=4)
+    _official_path(primary, channel="noise", delay=PRIMARY_DELAY_SAMPLES)
     _official_path(secondary, channel="cancel", delay=5)
-    manifest = _recorded_manifest(tmp_path / "data")
+    if manifest is None:
+        manifest = _recorded_manifest(tmp_path / "data")
+    source_csv, synth_dir = _corpus_fixture(tmp_path / "data", leak=leak)
     model_cfg = {"name": "test-model", "hop": 4}
     pretrain_cfg = {
         "model": model_cfg,
@@ -175,6 +296,9 @@ def _ready_config(tmp_path: Path) -> dict:
                 "feedback_delay_samples": [4, 8],
                 "warmup_seconds": 0.0,
             },
+            # 코퍼스 누수 게이트(D1)가 읽는 합성 스트림 구성.
+            "noise_manifest_dir": str(synth_dir),
+            "source_mix_ratio": {"speech": 0.5, "music": 0.5},
         },
         "duct": {
             "secondary_path": {
@@ -203,8 +327,36 @@ def _ready_config(tmp_path: Path) -> dict:
             "required_source_families": list(FAMILIES),
             "require_completed_init_checkpoint": True,
             "max_init_best_metric_db": 0.0,
+            # --- 신규 게이트가 소비하는 선언 ---
+            # 픽스처 일관성 0.97 두 경로 → 상한 12.1 dB. 목표 3 + 여유 3 = 6 이므로 통과.
+            "target_cancellation_db": 3.0,
+            "cancellation_ceiling_margin_db": 3.0,
+            "min_groups_per_family_per_split": GROUPS_PER_FAMILY_PER_SPLIT,
+            "recorded_source_pool_csv": str(source_csv),
+            "min_delay_crosscheck_sessions": 8,
+            "max_measured_delay_mismatch_samples": 8.0,
         },
     }
+
+
+def _plant_fingerprint_payload(**overrides) -> str:
+    """metrics.npz 에 박히는 플랜트 지문. 기본값은 val/test 가 같은 플랜트다."""
+
+    payload = {
+        "primary_delay_samples": 4,
+        "secondary_delay_samples": 5,
+        "handoff_samples": 2,
+        "lead_samples": 3,
+        "sample_rate": FS,
+        "physics_status": "measured_primary_path",
+        "optimize_band_hz": [100.0, 1_000.0],
+        "secondary_sha256": None,
+        "primary_sha256": None,
+        "capture_id": None,
+        "configured_lead_samples": 3,
+    }
+    payload.update(overrides)
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
 def _g4_metrics(
@@ -216,6 +368,14 @@ def _g4_metrics(
     source_pass: bool = True,
     worst_source_db: float = -4.0,
     include_source_fields: bool = True,
+    include_modern_fields: bool = True,
+    verdict: str = "PASS",
+    do_no_harm_pass: bool = True,
+    power_pass: bool = True,
+    ci_pass: bool = True,
+    worst_octave_center_hz: float = 500.0,
+    worst_octave_worst10_db: float = 3.0,
+    fingerprint: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -239,6 +399,20 @@ def _g4_metrics(
             g4_worst_source_trusted_mean_db=np.asarray(float(worst_source_db)),
             g4_worst_source_trusted_worst10_db=np.asarray(float(worst_source_db) + 1.0),
             g4_worst_source_family=np.asarray("speech"),
+        )
+    if include_modern_fields:
+        # 2026-08-05 신설 판정. 이 필드들이 없는 산출물은 게이트가 거부해야 한다
+        # (include_modern_fields=False 로 그 회귀를 검사한다).
+        payload.update(
+            g4_verdict=np.asarray(verdict),
+            g4_do_no_harm_pass=np.asarray(bool(do_no_harm_pass)),
+            g4_power_pass=np.asarray(bool(power_pass)),
+            g4_ci_pass=np.asarray(bool(ci_pass)),
+            g4_worst_octave_center_hz=np.asarray(float(worst_octave_center_hz)),
+            g4_worst_octave_worst10_db=np.asarray(float(worst_octave_worst10_db)),
+            plant_fingerprint_json=np.asarray(
+                fingerprint if fingerprint is not None else _plant_fingerprint_payload()
+            ),
         )
     np.savez_compressed(path, **payload)
 
@@ -280,6 +454,14 @@ def test_readiness_passes_only_with_official_paths_completed_init_and_full_recor
         "path_delay_and_lead",
         "completed_init_checkpoint",
         "recorded_dataset_qa",
+        # --- 2026-08-05 신설 ---
+        # 각각 실측으로 확인된 결함 하나씩에 대응한다. 이 집합에서 항목을 빼면
+        # 그 결함을 다시 통과시키는 것이므로 테스트가 즉시 깨진다.
+        "recorded_alignment_integrity",   # 결함 2: source→ERR 관계가 존재하는가
+        "recorded_statistical_power",     # 결함 4 / D3: 계열당 그룹 ≥ 하한
+        "corpus_disjoint",                # D1: 합성 ∩ 실측 원본 = ∅
+        "measured_source_delay_agreement",  # D2: 실측 지연 == P(z) 유도값
+        "plant_confidence_ceiling",       # G1c: 목표가 달성 가능 상한 안인가
     }
     assert require_finetune_readiness(cfg)["ok"]
 
@@ -777,3 +959,536 @@ def test_trainer_and_gate_share_one_lead_tolerance():
     assert "max_init_lead_mismatch_samples" in source, (
         "trainer 가 readiness 와 다른 기준으로 init lead 를 검사하고 있다"
     )
+
+
+# ======================================================================================
+# 신설 게이트 5종의 negative fixture
+#
+# 규칙: **게이트마다 그것을 FAIL 시키는 테스트가 짝으로 있어야 한다.** 이것이 없어서
+# 게이트 9개가 전부 PASS 인 채로 무용지물이라는 것을 아무도 몰랐다.
+# ======================================================================================
+def _gate(report: dict, gate_id: str) -> dict:
+    for item in report["checks"]:
+        if item["id"] == gate_id:
+            return item
+    raise AssertionError(f"게이트를 찾을 수 없습니다: {gate_id} ({[c['id'] for c in report['checks']]})")
+
+
+# ---- G2b 학습 데이터 정렬 (결함 2) ---------------------------------------------------
+def test_readiness_rejects_collapsed_source_err_timebase(tmp_path):
+    """재생/캡처 타임베이스가 깨진 실측 데이터로는 학습을 시작할 수 없다.
+
+    2026-08-04 실측: coh²(source→ERR) 0.021~0.126 인데 QA 는 80/80 PASS 였다.
+    """
+
+    manifest = _recorded_manifest(tmp_path / "data", collapse_alignment=True)
+    cfg = _ready_config(tmp_path, manifest=manifest)
+
+    report = audit_finetune_readiness(cfg)
+
+    assert not report["ok"]
+    gate = _gate(report, "recorded_alignment_integrity")
+    assert not gate["ok"]
+    assert "결맞음" in gate["message"] or "재녹음" in gate["message"]
+
+
+def test_readiness_does_not_count_a_skipped_qa_as_alignment_evidence(tmp_path):
+    """QA 를 건너뛴 실행은 정렬 게이트를 **통과하지 못한다**.
+
+    "측정하지 않았다"를 "측정해서 통과했다"와 같게 취급하는 것이 이 저장소에서
+    반복된 실패다.
+    """
+
+    cfg = _ready_config(tmp_path)
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+
+    gate = _gate(report, "recorded_alignment_integrity")
+    assert not gate["ok"]
+    assert "측정하지 않은" in gate["message"]
+
+
+# ---- G2c 통계적 검정력 (결함 4 / D3) -------------------------------------------------
+def test_readiness_rejects_underpowered_val_and_test_groups(tmp_path):
+    """계열당 그룹이 1–2개면 G4 판정이 성립하지 않으므로 진입을 막는다.
+
+    실측 상태: val machine 1그룹, test environment 1그룹, test machine 1그룹.
+    """
+
+    manifest = _recorded_manifest(tmp_path / "data", groups_per_family=2)
+    cfg = _ready_config(tmp_path, manifest=manifest)
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "recorded_statistical_power")
+    assert not gate["ok"]
+    assert "cluster bootstrap" in gate["message"]
+    # 어느 split/계열이 부족한지 기계 판독 가능해야 한다.
+    weak = {(item[0], item[1]) for item in gate["details"]["weak"]}
+    assert ("val", "machine") in weak and ("test", "speech") in weak
+
+
+# ---- D1 코퍼스 누수 -------------------------------------------------------------------
+def test_readiness_rejects_corpus_leak_between_synthetic_and_recorded(tmp_path):
+    """합성 학습 스트림과 실측이 같은 원본 오디오를 쓰면 FAIL 한다.
+
+    2026-08-05 실측: music 60/60(100%)이 겹치고 55개가 합성 train 에 있었다.
+    같은 곡에서 두 브랜치가 반대 방향 gradient 를 주고, **music 만 개선되지 않았다.**
+    """
+
+    cfg = _ready_config(tmp_path, leak=True)
+
+    report = audit_finetune_readiness(cfg)
+
+    assert not report["ok"]
+    gate = _gate(report, "corpus_disjoint")
+    assert not gate["ok"]
+    assert "music" in gate["message"]
+    families = gate["details"]["families"]
+    assert families["music"]["overlap_clips"] == 1
+    assert families["speech"]["overlap_clips"] == 0
+    # 겹친 원본이 합성의 어느 split 에 있었는지까지 나와야 한다.
+    assert families["music"]["overlap_by_synthetic_split"] == {"train": 1}
+
+
+def test_readiness_refuses_to_claim_disjoint_corpora_it_cannot_see(tmp_path):
+    """합성 manifest 가 없으면 "겹치지 않는다"고 주장하지 않는다 (실패 폐쇄)."""
+
+    cfg = _ready_config(tmp_path)
+    cfg["data"]["noise_manifest_dir"] = str(tmp_path / "nonexistent")
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "corpus_disjoint")
+    assert not gate["ok"]
+    assert "판정할 수 없습니다" in gate["message"]
+
+
+def test_readiness_refuses_when_only_some_declared_tags_have_a_manifest(tmp_path):
+    """태그 **일부만** manifest 가 있으면 "서로소" 라고 말하지 않는다.
+
+    2026-08-06 통합 검증에서 실제로 재현된 fail-open 이다. data/manifests 에
+    esc50.jsonl 하나만 있는 상태에서 이 게이트가 "실측 691개와 합성 1587개가 서로소"
+    로 PASS 했는데, D1 이 실제로 찾은 누수는 music 60/60(100%)이고 music.jsonl 이
+    없어 비교 대상에 아예 들어가지 않았다. 없는 태그는 조용히 사라지지 않고
+    synth_dataset 이 합성원으로 폴백하므로, 선언한 혼합비와 다른 데이터로 돌기까지 한다.
+    """
+
+    cfg = _ready_config(tmp_path)
+    manifest_dir = Path(cfg["data"]["noise_manifest_dir"])
+    # speech 만 남기고 music manifest 를 지운다 — 선언은 그대로 speech/music 이다.
+    (manifest_dir / "music.jsonl").unlink()
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "corpus_disjoint")
+    assert not gate["ok"]
+    assert "music" in gate["message"]
+    assert "manifest 가 없는" in gate["message"]
+
+
+# ---- D2 실측-측정 지연 교차검증 --------------------------------------------------------
+def test_readiness_rejects_recorded_delay_disagreeing_with_the_primary_path(tmp_path):
+    """실측 세션의 source→ERR 지연이 P(z) 유도값과 다르면 FAIL 한다.
+
+    2026-08-05 감사: 독립 세 방법이 ~1670 으로 일치하는데 유도값은 ~1850~1950 이었다.
+    차이 180~280 샘플(4~6 ms), 비용은 계열별 +0.71 ~ +2.39 dB. 검사하는 게이트가 없었다.
+    """
+
+    # P(z) 는 지연 4 를 신고하는데 실측 세션은 60 샘플 지연으로 녹음됐다.
+    manifest = _recorded_manifest(tmp_path / "data", source_delay_samples=60)
+    cfg = _ready_config(tmp_path, manifest=manifest)
+
+    report = audit_finetune_readiness(cfg)
+
+    assert not report["ok"]
+    gate = _gate(report, "measured_source_delay_agreement")
+    assert not gate["ok"]
+    assert "두 방법으로 잰 값이 다릅니다" in gate["message"]
+    assert gate["details"]["mismatch_samples"] > 8.0
+
+
+def test_readiness_refuses_a_delay_crosscheck_with_too_few_sessions(tmp_path):
+    """표본 하나짜리 중앙값으로 지연 부기를 승인하지 않는다."""
+
+    cfg = _ready_config(tmp_path)
+    cfg["readiness"]["min_delay_crosscheck_sessions"] = 10_000
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "measured_source_delay_agreement")
+    assert not gate["ok"]
+    assert "자기증명" in gate["message"]
+
+
+# ---- G1c 달성 가능 상한 ---------------------------------------------------------------
+def test_readiness_rejects_a_target_above_the_achievable_ceiling(tmp_path):
+    """플랜트가 허용하는 상한을 넘는 목표는 **학습 시작 전에** 막는다."""
+
+    cfg = _ready_config(tmp_path)
+    cfg["readiness"]["target_cancellation_db"] = 20.0
+
+    report = audit_finetune_readiness(cfg)
+
+    assert not report["ok"]
+    gate = _gate(report, "plant_confidence_ceiling")
+    assert not gate["ok"]
+    assert "재측정" in gate["message"]
+    assert gate["details"]["binding_constraint"] == "플랜트 일관성"
+
+
+def test_readiness_uses_the_tighter_of_the_two_ceilings(tmp_path):
+    """γ 상한이 낙관적일 때 **정규방정식 설계 상한**이 구속해야 한다.
+
+    복구된 플랜트에서 γ 상한은 약 28 dB 인데 직접 계산한 설계 상한은 6.53 dB 다.
+    낙관적인 상한 하나만 믿는 것이 이 저장소에서 반복된 사고의 형태이므로, 두 값 중
+    **작은 쪽**으로 판정하는지 못 박아 둔다.
+    """
+
+    cfg = _ready_config(tmp_path)
+    cfg["readiness"]["target_cancellation_db"] = 3.0
+    cfg["readiness"]["measured_design_ceiling_db"] = 4.0  # γ 상한(12.1)보다 훨씬 작다
+    # 상한은 대역이 붙어야 숫자다. 요구 대역 [100, 1000] 을 덮게 선언한다.
+    cfg["readiness"]["measured_design_ceiling_band_hz"] = [100, 1_000]
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "plant_confidence_ceiling")
+    assert not gate["ok"]
+    assert gate["details"]["binding_constraint"] == "정규방정식 설계 상한"
+    assert gate["details"]["binding_ceiling_db"] == 4.0
+    assert gate["details"]["gamma_ceiling_db"] > 10.0
+
+
+def test_readiness_rejects_a_design_ceiling_measured_on_a_narrower_band(tmp_path):
+    """좁은 대역에서 푼 상한으로 넓은 대역 요구를 통과시키지 못한다.
+
+    실제로 있었던 오판정이다: 설정이 6.53 dB 를 선언했고 그것은 150-600Hz 값인데
+    required_path_band_hz 는 [150, 1600] 이었다. 같은 플랜트를 요구 대역 전체에서
+    다시 풀면 4.6 dB 라 목표 3.0 + 여유 3.0 을 통과할 수 없었는데, 대역 표시가 없는
+    float 하나여서 아무도 대조하지 않았다. 상한이 낙관적인 방향으로 틀리면 그 오판정은
+    항상 "어려운 대역을 방치한다" 쪽으로 나온다 — 절대목표 1 과 정면으로 충돌한다.
+    """
+
+    cfg = _ready_config(tmp_path)
+    cfg["readiness"]["required_path_band_hz"] = [100, 1_000]
+    cfg["readiness"]["target_cancellation_db"] = 3.0
+    # 상한 자체는 넉넉하다. 그런데 그것을 잰 대역이 요구 대역의 절반뿐이다.
+    cfg["readiness"]["measured_design_ceiling_db"] = 30.0
+    cfg["readiness"]["measured_design_ceiling_band_hz"] = [100, 500]
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "plant_confidence_ceiling")
+    assert not gate["ok"]
+    assert "덮지 못합니다" in gate["message"]
+    assert gate["details"]["design_ceiling_band_hz"] == [100.0, 500.0]
+    assert gate["details"]["required_path_band_hz"] == [100.0, 1_000.0]
+
+
+def test_readiness_rejects_a_design_ceiling_declared_without_its_band(tmp_path):
+    """대역 없는 상한 선언은 그 자체로 거부한다 (짝 fixture)."""
+
+    cfg = _ready_config(tmp_path)
+    cfg["readiness"]["target_cancellation_db"] = 3.0
+    cfg["readiness"]["measured_design_ceiling_db"] = 30.0
+    cfg["readiness"].pop("measured_design_ceiling_band_hz", None)
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "plant_confidence_ceiling")
+    assert not gate["ok"]
+    assert "measured_design_ceiling_band_hz" in gate["message"]
+
+
+def test_readiness_requires_the_target_to_be_declared_at_all(tmp_path):
+    """목표를 선언하지 않으면 min_path_consistency 가 근거를 잃는다 — 그것도 FAIL 이다."""
+
+    cfg = _ready_config(tmp_path)
+    del cfg["readiness"]["target_cancellation_db"]
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "plant_confidence_ceiling")
+    assert not gate["ok"]
+    assert "target_cancellation_db" in gate["message"]
+
+
+# ---- 상한 계산기 자체의 검증 -------------------------------------------------------------
+def test_achievable_ceiling_matches_the_measured_plants():
+    """유도식이 실측값을 재현하는지 확인한다. 주석의 숫자가 곧 회귀 기준이다."""
+
+    # 출하본(오염된 S(z)) — 150-600Hz 와 전대역
+    assert round(achievable_cancellation_ceiling_db(0.9556, 0.9730), 2) == 11.30
+    assert round(achievable_cancellation_ceiling_db(0.7812, 0.9200), 2) == 4.35
+    # 클린 재분석본
+    assert round(achievable_cancellation_ceiling_db(0.993, 0.993), 2) == 18.51
+    assert round(achievable_cancellation_ceiling_db(0.968, 0.979), 2) == 12.64
+    # 단일 경로 기준 역함수
+    assert round(required_consistency_for(12.0), 4) == 0.9406
+    # 게이트 임계 0.90 이 암묵적으로 뜻하던 상한
+    assert round(achievable_cancellation_ceiling_db(0.90), 2) == 9.54
+
+
+def test_achievable_ceiling_is_monotonic_and_rejects_impossible_gamma():
+    """γ 가 좋아지면 상한도 좋아지고, 물리적으로 불가능한 γ 는 거부된다."""
+
+    values = [achievable_cancellation_ceiling_db(g) for g in (0.6, 0.8, 0.95, 0.999)]
+    assert values == sorted(values)
+    for bad in (0.0, -0.1, 1.5, float("nan")):
+        with pytest.raises(ValueError):
+            achievable_cancellation_ceiling_db(bad)
+
+
+def test_required_consistency_round_trips_through_the_ceiling():
+    """``required_consistency_for`` 는 단일 경로 상한의 역함수여야 한다."""
+
+    for target in (3.0, 6.0, 12.0, 20.0):
+        gamma = required_consistency_for(target)
+        assert abs(achievable_cancellation_ceiling_db(gamma) - target) < 1e-9
+
+
+# ======================================================================================
+# 완료 게이트 — G4 강화(결함 3·4) 와 G5 플랜트 동일성(결함 5)의 negative fixture
+# ======================================================================================
+def _g4_completion_setup(tmp_path: Path, **metrics_kwargs):
+    """완료 판정에 필요한 checkpoint/metrics 한 벌을 만든다."""
+
+    cfg = _ready_config(tmp_path)
+    run = tmp_path / "finetune"
+    best = run / "ckpt" / "best.pt"
+    saved_cfg = {
+        **cfg,
+        "physics_status": "measured_primary_path",
+        "digital_reference_lead_samples": 3,
+    }
+    _checkpoint(best, cfg=saved_cfg, step=4)
+    _checkpoint(best.parent / "last.pt", cfg=saved_cfg, step=6)
+    manifest = Path(cfg["recorded_manifest"])
+    val_metrics = run / "eval_recorded_val" / "metrics.npz"
+    test_metrics = run / "eval_recorded_test" / "metrics.npz"
+    val_kwargs = dict(metrics_kwargs)
+    test_kwargs = dict(metrics_kwargs)
+    test_kwargs.pop("val_only", None)
+    for key in list(val_kwargs):
+        if key.startswith("test_"):
+            test_kwargs[key[len("test_"):]] = val_kwargs.pop(key)
+    test_kwargs = {k: v for k, v in test_kwargs.items() if not k.startswith("test_")}
+    _g4_metrics(val_metrics, split="val", checkpoint=best, manifest=manifest, **val_kwargs)
+    _g4_metrics(
+        test_metrics, split="test", checkpoint=best, manifest=manifest, **test_kwargs
+    )
+    return cfg, best, val_metrics, test_metrics
+
+
+def test_completion_rejects_metrics_from_an_evaluator_without_do_no_harm(tmp_path):
+    """대역 밖 do-no-harm·검정력·지문을 판정하지 않는 구버전 산출물은 거부된다.
+
+    이 관례는 ``g4_source_pass`` 에서 이미 쓰였고 옳았다 — 옛 형식을 통과시키면
+    새 게이트가 있으나 마나다.
+    """
+
+    cfg, best, val_metrics, test_metrics = _g4_completion_setup(
+        tmp_path, include_modern_fields=False
+    )
+
+    report = audit_finetune_completion(
+        cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
+    )
+
+    assert not report["ok"]
+    gate = _gate(report, "recorded_val_g4")
+    assert not gate["ok"]
+    assert "구버전" in gate["message"]
+    assert "g4_do_no_harm_pass" in gate["message"]
+
+
+def test_completion_rejects_out_of_band_amplification(tmp_path):
+    """신뢰 대역이 좋아도 대역 밖을 키웠다면 완료가 아니다 (절대목표 1).
+
+    실측 반증: tone300 이 fullband +5.95 dB 로 기준을 만족하면서 8 kHz 를
+    −21.56 dB 증폭했다.
+    """
+
+    cfg, best, val_metrics, test_metrics = _g4_completion_setup(
+        tmp_path,
+        verdict="FAIL",
+        do_no_harm_pass=False,
+        worst_octave_center_hz=8_000.0,
+        worst_octave_worst10_db=-21.56,
+    )
+
+    report = audit_finetune_completion(
+        cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
+    )
+
+    assert not report["ok"]
+    gate = _gate(report, "recorded_val_g4")
+    assert "do-no-harm 실패" in gate["message"]
+    assert "8000Hz" in gate["message"].replace(" ", "")
+
+
+def test_completion_does_not_accept_an_inconclusive_g4(tmp_path):
+    """판정 불가는 완료가 아니다. 표본 부족을 PASS 로 흘려보내지 않는다."""
+
+    cfg, best, val_metrics, test_metrics = _g4_completion_setup(
+        tmp_path, verdict="INCONCLUSIVE", power_pass=False, ci_pass=False
+    )
+
+    report = audit_finetune_completion(
+        cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
+    )
+
+    assert not report["ok"]
+    gate = _gate(report, "recorded_val_g4")
+    assert "INCONCLUSIVE" in gate["message"]
+    assert "통계적으로 성립하지 않습니다" in gate["message"]
+
+
+def test_completion_rejects_val_and_test_from_different_plants(tmp_path):
+    """val 과 test 가 서로 다른 플랜트에서 평가됐다면 나란히 놓을 수 없다 (G5).
+
+    2026-08-04 사고: 전 = S 지연 1342 / lead 109 / surrogate, 후 = 1465 / 113 /
+    measured 를 비교해 "1.30 dB 개선" 이라고 적었다.
+    """
+
+    cfg, best, val_metrics, test_metrics = _g4_completion_setup(
+        tmp_path,
+        test_fingerprint=_plant_fingerprint_payload(
+            secondary_delay_samples=1_465, lead_samples=113, configured_lead_samples=113
+        ),
+    )
+
+    report = audit_finetune_completion(
+        cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
+    )
+
+    assert not report["ok"]
+    gate = _gate(report, "plant_identity_for_comparison")
+    assert not gate["ok"]
+    assert "서로 다른 플랜트" in gate["message"]
+    assert "secondary_delay_samples" in gate["message"]
+
+
+def test_completion_accepts_val_and_test_from_the_same_plant(tmp_path):
+    """같은 플랜트끼리는 통과해야 한다 — 게이트가 무조건 거부하는 게 아님을 증명."""
+
+    cfg, best, val_metrics, test_metrics = _g4_completion_setup(tmp_path)
+
+    report = audit_finetune_completion(
+        cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
+    )
+
+    assert report["ok"], report
+    gate = _gate(report, "plant_identity_for_comparison")
+    assert gate["ok"]
+    assert gate["details"]["digest"]
+
+
+# ---- 플랜트 아티팩트 강화: 유지 반복 수와 P−S 상대 τ 궤적 ------------------------------
+def test_official_path_gate_rejects_too_few_kept_repeats(tmp_path):
+    """반복을 적게 남긴 플랜트는 official 이 될 수 없다.
+
+    기각을 많이 한 것은 문제가 아니다 — 2026-08-05 복구 캡처는 48 중 30 을 기각했고
+    그것이 옳은 조치였다. 문제는 **남은 것이 적을 때**다. 이전 하한 3 은 한 번의
+    이상치가 플랜트 형상을 지배하는 것을 허용했다.
+    """
+
+    thin = tmp_path / "thin.npz"
+    _official_path(thin, channel="cancel", delay=5)
+    with np.load(thin, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+    arrays["repeats"] = np.asarray(3, dtype=np.int64)
+    np.savez(thin, **arrays)
+
+    with pytest.raises(ValueError, match="유지된 반복"):
+        audit_official_path_model(
+            thin,
+            expected_output_channel="cancel",
+            sample_rate=FS,
+            required_band_hz=(100, 1_000),
+        )
+
+
+def test_matched_conditions_reads_the_stored_relative_tau_trajectory(tmp_path):
+    """게이트가 **저장돼 있던 궤적을 실제로 읽는지** 확인한다.
+
+    2026-08-04 사고의 핵심은 증거가 없었던 게 아니라 게이트가 파일 안의 증거를 한 번도
+    열어보지 않았다는 것이다. 여기서는 그 궤적에 실제 사고 값을 넣고 거부되는지 본다.
+
+    실측 P−S 상대 τ (출하 아티팩트): 반복 0–10 은 ~1.2, 반복 11–15 는 ~32.
+    스칼라 delay_spread_samples 는 range 라 이 이봉 구조를 32 라는 한 숫자로 뭉갠다.
+    """
+
+    shipped_relative = np.asarray(
+        [0.0, 1.20, 1.13, 1.09, 1.09, 1.29, 1.41, 1.47, 1.14, 1.48, 1.36,
+         32.11, 32.18, 31.75, 30.26, 29.06]
+    )
+    tau_secondary = np.zeros_like(shipped_relative)
+
+    cfg = _ready_config(tmp_path)
+    for key, tau in (
+        ("digital_reference", shipped_relative),
+        ("secondary_path", tau_secondary),
+    ):
+        path = (
+            cfg["duct"]["digital_reference"]["primary_path_npz"]
+            if key == "digital_reference"
+            else cfg["duct"]["secondary_path"]["npz"]
+        )
+        with np.load(path, allow_pickle=False) as data:
+            arrays = {name: data[name] for name in data.files}
+        arrays["repeat_tau_samples"] = tau
+        # 스칼라 요약은 **정상값으로 남겨 둔다** — 궤적을 읽지 않으면 통과해야 한다.
+        arrays["delay_spread_samples"] = np.asarray(1, dtype=np.int64)
+        np.savez(path, **arrays)
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "matched_path_measurement_conditions")
+    assert not gate["ok"], "스칼라 요약만 보면 통과하지만 궤적을 보면 프레임 슬립이다"
+    assert "프레임 슬립" in gate["message"]
+    assert "[11, 12, 13, 14, 15]" in gate["message"]
+
+
+def test_matched_conditions_accepts_a_constant_relative_tau(tmp_path):
+    """상수 궤적은 통과해야 한다 — 무조건 거부하는 검사가 아님을 증명."""
+
+    cfg = _ready_config(tmp_path)
+    drift = np.linspace(0.0, 40.0, 12)  # 두 채널에 **공통**으로 실린 드리프트
+    for path, offset in (
+        (cfg["duct"]["digital_reference"]["primary_path_npz"], 1.4),
+        (cfg["duct"]["secondary_path"]["npz"], 0.0),
+    ):
+        with np.load(path, allow_pickle=False) as data:
+            arrays = {name: data[name] for name in data.files}
+        arrays["repeat_tau_samples"] = drift + offset
+        np.savez(path, **arrays)
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "matched_path_measurement_conditions")
+    assert gate["ok"], gate
+    # 공통 드리프트는 상대 τ 에서 상쇄된다 — 그것이 동시 측정의 요점이다.
+    assert gate["details"]["relative_tau"]["max_deviation_samples"] < 3.0
+
+
+def test_group_floor_has_a_single_source():
+    """계열당 그룹 하한이 **한 곳에서만** 정의되는지 강제한다 (발생기 A).
+
+    진입 게이트와 G4 평가기가 각자 숫자를 들고 있으면 언젠가 한쪽만 바뀌고, 그러면
+    "진입은 통과했는데 완료는 판정 불가" 라는 해석 불가능한 상태가 된다. 이 저장소의
+    사고는 대부분 그 모양이었다(lead 109 vs 113 등).
+    """
+
+    from deep_anc.eval.recorded import MIN_GROUPS_PER_FAMILY
+    from deep_anc.train.finetune_readiness import (
+        MIN_GROUPS_PER_FAMILY_PER_SPLIT,
+        _min_groups_per_family_default,
+    )
+
+    assert _min_groups_per_family_default() == MIN_GROUPS_PER_FAMILY
+    assert MIN_GROUPS_PER_FAMILY_PER_SPLIT == MIN_GROUPS_PER_FAMILY
+    # 설정이 값을 주지 않아도 게이트가 같은 하한을 쓴다.
+    assert load_yaml(REPO_ROOT / "configs/train_finetune.yaml")["readiness"][
+        "min_groups_per_family_per_split"
+    ] == MIN_GROUPS_PER_FAMILY

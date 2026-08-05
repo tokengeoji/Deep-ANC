@@ -48,7 +48,8 @@ import calibrate_wideband as cw  # noqa: E402
 import measure_paths_interleaved as mpi  # noqa: E402
 
 from deep_anc.audio_io import pcm_int32_to_float32  # noqa: E402
-from deep_anc.config import REPO_ROOT  # noqa: E402
+from deep_anc.config import DEFAULT_HANDOFF_SAMPLES, REPO_ROOT  # noqa: E402
+from deep_anc.dsp.timing import PlantDelays  # noqa: E402 — lead 유도의 단일 출처
 from deep_anc.dsp.interleaved_probe import (  # noqa: E402
     build_interleaved_probe,
     dewarp_recording,
@@ -268,8 +269,18 @@ def main(argv: list[str] | None = None) -> int:
     keep, anchor = report["keep"], int(report["anchor"])
     p_delay = int(results["noise"]["model"]["delay_samples"])
     s_delay = int(results["cancel"]["model"]["delay_samples"])
-    handoff = 256
-    lead = s_delay + handoff - p_delay
+    # handoff 상수와 lead 관계식을 손으로 다시 쓰지 않는다 (발생기 A).
+    handoff = DEFAULT_HANDOFF_SAMPLES
+    lead = int(
+        PlantDelays(
+            primary_delay_samples=p_delay,
+            secondary_delay_samples=s_delay,
+            handoff_samples=handoff,
+            sample_rate=int(fs),
+        )
+        .lead()
+        .samples
+    )
     dropped = [int(v) for v in np.flatnonzero(~keep)]
 
     print(

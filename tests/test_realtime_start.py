@@ -95,3 +95,101 @@ def test_runtime_input_preflight_rejects_stuck_error_channel(monkeypatch):
     monkeypatch.setattr(run_realtime, "capture_input_probe", fake_probe)
     cfg = {"reference": "digital", "hardware": {"audio": {}}}
     assert run_realtime.input_preflight(cfg, seconds=0.1) is False
+
+
+# ======================================================================================
+# 엔진 아티팩트 preflight — 조용히 썩은 경로를 시작 전에 잡는다
+# ======================================================================================
+def test_engine_preflight_rejects_a_missing_artifact_even_when_unused(tmp_path):
+    """**지금 읽히지 않는** 키의 경로가 없어도 거부한다.
+
+    2026-08-05 실측: configs/runtime_tiny.yaml 의 `plan: runs/export/tiny_fp16.plan`
+    은 존재하지 않는 파일이었는데 engine.type=ort 라 한 번도 읽히지 않아 조용히
+    썩어 있었다. "지금 안 쓰니까 괜찮다"가 이 결함이 살아남은 이유다.
+    """
+
+    onnx = tmp_path / "model.onnx"
+    onnx.write_bytes(b"x")
+    cfg = {
+        "engine": {
+            "type": "ort",
+            "onnx": str(onnx),
+            "plan": str(tmp_path / "does_not_exist.plan"),
+        }
+    }
+
+    problems = run_realtime.engine_artifact_preflight(cfg)
+
+    assert len(problems) == 1
+    assert "does_not_exist.plan" in problems[0]
+    assert "미사용" in problems[0]
+    with pytest.raises(FileNotFoundError, match="preflight 실패"):
+        run_realtime.require_engine_artifacts(cfg)
+
+
+def test_engine_preflight_rejects_a_missing_active_artifact(tmp_path):
+    """활성 엔진의 아티팩트가 없으면 당연히 거부한다."""
+
+    cfg = {"engine": {"type": "trt", "plan": str(tmp_path / "absent.plan")}}
+
+    problems = run_realtime.engine_artifact_preflight(cfg)
+
+    assert len(problems) == 1
+    assert "활성" in problems[0]
+
+
+def test_engine_preflight_rejects_an_empty_active_key(tmp_path):
+    """활성 키가 비어 있으면 로드할 것이 없다 — 실패 폐쇄."""
+
+    problems = run_realtime.engine_artifact_preflight({"engine": {"type": "ort"}})
+
+    assert any("engine.onnx 가 비었습니다" in item for item in problems)
+
+
+def test_engine_preflight_rejects_an_unknown_engine_type():
+    problems = run_realtime.engine_artifact_preflight({"engine": {"type": "quantum"}})
+
+    assert any("알 수 없는 engine.type" in item for item in problems)
+
+
+_SHIPPED_RUNTIME_CONFIGS = ("configs/runtime.yaml", "configs/runtime_tiny.yaml")
+
+
+def test_shipped_runtime_configs_declare_a_loadable_engine():
+    """설정 자체의 결함(빈 키·알 수 없는 type)은 **어느 환경에서나** 잡힌다.
+
+    아티팩트 파일의 존재와 달리 이것은 저장소에 커밋된 텍스트만으로 판정할 수 있으므로
+    호스트에 무엇이 받아져 있든 항상 돈다.
+    """
+
+    from deep_anc.config import load_runtime_config
+
+    for name in _SHIPPED_RUNTIME_CONFIGS:
+        problems = run_realtime.engine_artifact_preflight(load_runtime_config(name))
+        structural = [p for p in problems if "아티팩트가 없습니다" not in p]
+        assert structural == [], f"{name}: {structural}"
+
+
+def test_engine_preflight_accepts_the_shipped_runtime_configs():
+    """저장소의 runtime 설정이 실제로 존재하는 파일만 가리키는지 못 박는다.
+
+    이 테스트가 깨지면 누군가 설정에 없는 경로를 다시 적었거나 아티팩트를 지운 것이다.
+
+    ⚠ 2026-08-06: ``runs/`` 는 ``.gitignore`` 대상이고 모델은 GitHub Release 로 배포된다
+    (``git ls-files runs/`` = 0). 따라서 **아티팩트를 받지 않은 트리**(새 클론, CI,
+    원격 학습 환경)에서 이 단언은 저장소 결함이 아니라 "아직 안 받았다"를 뜻한다.
+    그 트리에서 스위트를 빨간불로 만들면 "pytest 전부 통과" 규칙이 이 기기 전용이 되고,
+    규칙이 무의미해지면 다음 사람이 진짜 실패도 무시하게 된다. 그래서 아티팩트 트리에
+    한해 검사하고, 설정 자체의 결함은 위 테스트가 항상 잡는다.
+    """
+
+    from deep_anc.config import load_runtime_config
+
+    if not (run_realtime.REPO_ROOT / "runs").is_dir():
+        pytest.skip(
+            "runs/ 가 없는 트리 — 엔진 아티팩트는 .gitignore 대상이라 존재 검사는 "
+            "받아 놓은 환경에서만 의미가 있다"
+        )
+
+    for name in _SHIPPED_RUNTIME_CONFIGS:
+        assert run_realtime.engine_artifact_preflight(load_runtime_config(name)) == [], name

@@ -18,8 +18,12 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
-from ..config import DEFAULT_HANDOFF_SAMPLES, REPO_ROOT
+from ..config import REPO_ROOT
 from ..data.manifest import read_manifest
+# 지연·lead 부기의 단일 출처. 게이트가 lead 를 **스스로 유도하면** 그것이 두 번째
+# 유도가 되고, trainer 와 갈라진 채로 양쪽 다 "통과" 한다 (발생기 A, 커밋 aaeef41).
+from ..dsp.invariants import check_lead_agreement
+from ..dsp.timing import PlantDelays
 from ..data.recorded_qa import (
     settings_from_data_config,
     validate_recorded_sessions,
@@ -67,6 +71,19 @@ MAX_RELATIVE_DELAY_SPREAD_SAMPLES = 3
 파인튜닝 50,000 step 이 낭비됐다. 정상 캡처의 실측 spread 는 0.11~0.26 샘플이다.
 """
 
+MIN_KEPT_REPEATS = 8
+"""플랜트 아티팩트가 **유지한** 반복 수의 하한.
+
+기각을 많이 한 것은 문제가 아니다 — 오히려 좋은 신호다. 2026-08-05 복구에서 채택
+캡처는 48 반복 중 30 을 기각하고 18 을 남겼고, 그 기각이 정확히 옳은 조치였다.
+문제가 되는 것은 **남은 것이 적을 때**다. 반복 3개로 평균한 플랜트는 한 번의 이상치가
+형상을 지배한다. 그래서 기각 비율이 아니라 유지 개수에 하한을 둔다.
+
+값 8 은 재분석 파라미터 봉투의 ``min_kept_repeats`` 와 같다 — 두 곳이 다르면
+"재분석은 통과하는데 게이트는 실패" 같은 해석 불가능한 상태가 생긴다.
+이전 값은 3 이었다.
+"""
+
 MIN_BAND_CONSISTENCY = 0.90
 """필수 대역 안 **모든** 부대역이 넘어야 하는 값.
 
@@ -83,6 +100,117 @@ ALLOWED_REANALYSIS_ENVELOPE: dict[str, tuple[float | None, float | None]] = {
     "max_drift_deviation_samples": (None, 2.0),
     "min_kept_repeats": (8, None),
 }
+
+
+def _min_groups_per_family_default() -> int:
+    """G4 평가기가 쓰는 그룹 하한을 **그쪽에서 읽어온다** (단일 출처).
+
+    진입 게이트와 G4 평가기가 각자 4 를 들고 있으면 언젠가 한쪽만 바뀐다. 그러면
+    "진입은 통과했는데 완료에서 판정 불가" 같은 해석 불가능한 상태가 생기고, 그 상태를
+    푸는 가장 쉬운 방법은 언제나 낮은 쪽에 맞추는 것이다 — 이 저장소에서 반복된
+    발생기 A(같은 값을 두 곳에서 따로 정하고 대조하지 않는다)와 정확히 같은 모양이라
+    여기서 미리 끊는다.
+
+    지연 import 인 이유: ``eval.recorded`` 가 ``train.trainer`` 를 부르므로 모듈 최상단
+    에서 가져오면 순환이 된다.
+    """
+
+    from ..eval.recorded import MIN_GROUPS_PER_FAMILY
+
+    return int(MIN_GROUPS_PER_FAMILY)
+
+
+MIN_GROUPS_PER_FAMILY_PER_SPLIT = 4
+"""val/test 의 계열당 **독립 그룹** 하한.
+
+⚠ 이 값의 단일 출처는 :data:`deep_anc.eval.recorded.MIN_GROUPS_PER_FAMILY` 다.
+설정이 값을 주지 않으면 :func:`_min_groups_per_family_default` 로 그쪽을 읽는다.
+아래 문서 문자열은 근거를 남기기 위한 것이고, 두 값이 갈라지면
+``test_group_floor_has_a_single_source`` 가 실패한다.
+
+왜 4 인가. G4 는 계열별 평균으로 "최악 계열"을 고르는데, 그 평균의 오차는 세그먼트
+수가 아니라 **그룹 수**로 정해진다(같은 그룹 안 세그먼트는 독립이 아니다). 2026-08-05
+실측: 계열 내 그룹 간 잔차 SD 1.46 dB → 그룹 2개일 때 평균의 SE 는 1.03 dB 인데
+파인튜닝 후 계열 간 전체 폭은 0.92 dB 였다. **폭이 1 SE 보다 작다** — 최악 계열
+선택이 동전 던지기라는 뜻이다. 그룹 4개면 SE 가 0.73 dB 로 내려가고 cluster
+bootstrap 의 클러스터 수도 CI 를 정의할 수 있는 최소치를 넘는다. 그룹이 1개면
+(실측: val machine, test environment, test machine) 오차 추정 자체가 불가능하다.
+"""
+
+# ---------------------------------------------------------------------------------
+# 달성 가능 상한
+# ---------------------------------------------------------------------------------
+def achievable_cancellation_ceiling_db(
+    gamma_secondary: float, gamma_primary: float | None = None
+) -> float:
+    """반복 일관성 γ 가 허용하는 **플랜트 불확실성 상한**(dB).
+
+    유도
+    ----
+    γ 는 반복 전달함수 쌍의 정규화 복소 내적 평균이다. 반복별 추정을
+    ``H_i = H + N_i`` (N 은 평균 0, 반복 간 독립) 로 두고 상대 오차 전력을
+    ``ρ = E‖N‖²/‖H‖²`` 라 하면::
+
+        ⟨H_i, H_j⟩ ≈ ‖H‖²              (교차항 소거)
+        ‖H_i‖·‖H_j‖ ≈ ‖H‖²(1 + ρ)
+        ∴ γ ≈ 1/(1+ρ)   →   ρ = (1 − γ)/γ
+
+    모델은 K 반복의 평균으로 학습하지만 **실행 시 마주치는 플랜트는 하나의 실현**이므로
+    유효 불일치는 ρ 로 본다(보수적). 최적 제어기는 ``W = −P/Ŝ`` 이고 실제 플랜트가
+    ``S = Ŝ(1+δ)`` 이면 잔차는 ``e = P·x·δ`` 이므로 ``|δ|² = ε_S²`` 다. P 도 실측이면
+    오차가 독립이므로 ``ε² = ε_S² + ε_P²``::
+
+        상한(dB) = −10·log10( (1−γ_S)/γ_S + (1−γ_P)/γ_P )
+
+    ⚠ 이 값을 "달성 가능한 상쇄량"으로 읽으면 안 된다
+    ------------------------------------------------
+    이것은 **플랜트를 몰라서 잃는 몫**의 상한일 뿐이다. 실제 달성치는 인과성(lead),
+    FIR 길이, 신호 예측 가능성에 의해 훨씬 낮게 묶인다. 복구된 플랜트 실측이 그 증거다::
+
+        γ 기반 상한 (γ_S=0.9990, γ_P=0.9993)   ≈ 28 dB
+        주파수영역 정규방정식 직접 계산(M=2048, lead=116, 150-600Hz)  =  6.53 dB
+
+    즉 γ 상한은 4배 이상 낙관적이다. 그래서 이 프로젝트의 게이트는 이 값을 단독으로
+    쓰지 않고 ``readiness.measured_design_ceiling_db`` (정규방정식으로 직접 계산한
+    설계 상한)와 **작은 쪽**을 취한다. 낙관적인 상한 하나만 믿는 것이 이 저장소에서
+    반복된 사고의 형태다.
+
+    또 하나의 한계: γ→ε 사상은 "반복 간 오차가 독립·평균 0" 가정 위에 있다. 프레임
+    슬립처럼 계통적 오염이면 γ 가 낮아져 상한이 보수적으로(작게) 나오므로 안전하지만,
+    오염이 **모든 반복에 동일하게** 실리면 γ 는 높게 나오고 상한이 낙관적이 된다.
+    그 경우는 γ 로 못 잡으므로 P−S 상대 τ 검사와 독립 캡처 재측정이 따로 필요하다.
+    """
+
+    for label, value in (("gamma_secondary", gamma_secondary), ("gamma_primary", gamma_primary)):
+        if value is None:
+            continue
+        if not math.isfinite(float(value)) or not 0.0 < float(value) <= 1.0:
+            raise ValueError(f"{label} 는 (0, 1] 안의 유한값이어야 합니다: {value!r}")
+    eps2 = (1.0 - float(gamma_secondary)) / float(gamma_secondary)
+    if gamma_primary is not None:
+        eps2 += (1.0 - float(gamma_primary)) / float(gamma_primary)
+    if eps2 <= 0.0:
+        # γ 가 정확히 1 이면 상한이 무한대다. 측정으로 그런 값이 나올 수 없으므로
+        # 무한대를 돌려주는 대신 "측정 불가"로 다룬다.
+        return float("inf")
+    return -10.0 * math.log10(eps2)
+
+
+def required_consistency_for(target_db: float) -> float:
+    """목표 상쇄량을 내려면 **경로당** 최소 얼마의 γ 가 필요한가 (단일 경로 기준).
+
+    ``achievable_cancellation_ceiling_db`` 의 단일 경로 역함수다::
+
+        target = −10·log10((1−γ)/γ)  →  γ = 1 / (1 + 10^(−target/10))
+
+    임계를 이 함수로 적어 두면 되돌리기가 눈에 띈다. ``min_path_consistency: 0.9``
+    같은 맨숫자는 근거가 없어 보여 조정 압력을 받지만, ``required_consistency_for(12.0)``
+    은 "목표를 12 dB 에서 내리겠다"는 선언이 되어 숨길 수 없다.
+    """
+
+    if not math.isfinite(float(target_db)):
+        raise ValueError(f"target_db 는 유한값이어야 합니다: {target_db!r}")
+    return 1.0 / (1.0 + 10.0 ** (-float(target_db) / 10.0))
 
 
 def _repo_path(value: str | Path) -> Path:
@@ -307,8 +435,11 @@ def audit_official_path_model(
                 elif hi_ok is not None and float(value) > hi_ok:
                     errors.append(f"재분석 {key}={value} > {hi_ok}")
             interleaved["reanalysis_params"] = reanalysis_params
-    if repeats < 3:
-        errors.append(f"ESS 반복 {repeats}회 < 3회")
+    if repeats < MIN_KEPT_REPEATS:
+        errors.append(
+            f"유지된 반복 {repeats}회 < {MIN_KEPT_REPEATS}회 — 평균화가 부족해 "
+            "한 번의 이상치가 플랜트 형상을 지배합니다"
+        )
     if not math.isfinite(consistency) or consistency < float(min_consistency):
         errors.append(
             f"반복 일관성 {consistency!r} < {float(min_consistency):.3f}"
@@ -564,6 +695,509 @@ def _required_families(readiness_cfg: dict) -> tuple[str, ...]:
     return families
 
 
+def _relative_tau_check(primary: dict, secondary: dict):
+    """두 아티팩트에 저장된 ``repeat_tau_samples`` 로 P−S 상대 τ 상수성을 본다.
+
+    두 채널은 같은 DAC·같은 출력 스트림의 인터리브이므로 τ_P − τ_S 는 설계 원리상
+    상수다. 튀면 출력 버퍼가 한쪽 채널에서만 미끄러진 것이다.
+
+    검사는 :func:`deep_anc.dsp.invariants.check_relative_tau_constancy` 가 한다 —
+    측정·재분석·게이트가 **같은 코드**로 같은 판정을 내려야 한다. 궤적을 저장하지
+    않는 옛 아티팩트(ESS 등)는 ``None`` 을 돌려주고, 그 경우 기존 스칼라 검사가
+    유일한 방어선으로 남는다.
+    """
+
+    from ..dsp.invariants import check_relative_tau_constancy
+
+    try:
+        with np.load(_repo_path(primary["path"]), allow_pickle=False) as p_data:
+            if "repeat_tau_samples" not in p_data.files:
+                return None
+            tau_primary = np.asarray(p_data["repeat_tau_samples"], dtype=np.float64)
+        with np.load(_repo_path(secondary["path"]), allow_pickle=False) as s_data:
+            if "repeat_tau_samples" not in s_data.files:
+                return None
+            tau_secondary = np.asarray(s_data["repeat_tau_samples"], dtype=np.float64)
+    except (FileNotFoundError, OSError, KeyError, ValueError):
+        return None
+    if tau_primary.shape != tau_secondary.shape or tau_primary.size < 2:
+        raise ValueError(
+            f"P/S repeat_tau_samples 길이가 다릅니다: {tau_primary.shape} != "
+            f"{tau_secondary.shape} — 같은 캡처의 두 채널이 아닙니다"
+        )
+    return check_relative_tau_constancy(
+        tau_primary,
+        tau_secondary,
+        tolerance_samples=float(MAX_RELATIVE_DELAY_SPREAD_SAMPLES),
+    )
+
+
+_ALIGNMENT_CFG_KEYS = (
+    "min_source_err_coherence",
+    "min_ref_err_coherence",
+    "max_source_err_delay_std_samples",
+    "max_source_err_delay_range_samples",
+)
+
+
+def _alignment_overrides(readiness_cfg: dict) -> dict:
+    """readiness 가 선언한 정렬 임계를 QA 로 넘긴다.
+
+    QA 와 게이트가 **같은 임계**를 써야 한다. 두 곳이 각자 기본값을 들고 있으면
+    "QA 는 통과했는데 게이트는 실패" 같은 해석 불가능한 상태가 만들어지고, 그 상태를
+    푸는 가장 쉬운 방법은 언제나 게이트를 낮추는 것이다.
+    """
+
+    return {
+        key: float(readiness_cfg[key])
+        for key in _ALIGNMENT_CFG_KEYS
+        if readiness_cfg.get(key) is not None
+    }
+
+
+def _audit_recorded_alignment(
+    audit: "_Audit",
+    readiness_cfg: dict,
+    recorded_report: dict | None,
+    full_recorded_qa: bool,
+) -> None:
+    """G2b — 학습 데이터에 **source→ERR 관계가 실제로 존재하는가**.
+
+    결함 2. recorded QA 가 80/80 PASS 였던 이유는 무엇을 봤는가가 아니라 무엇을
+    **안 봤는가**다. 이 게이트는 QA 가 새로 측정한 정렬 지표를 판정에 쓴다.
+
+    QA 를 건너뛴 실행(``--skip-recorded-qa``)에서는 통과시키지 않는다. "측정하지
+    않았다"와 "측정해서 통과했다"를 같게 취급하는 것이 이 저장소의 반복된 실패다.
+    """
+
+    if not full_recorded_qa:
+        audit.fail(
+            "recorded_alignment_integrity",
+            "전수 QA 를 건너뛰면 source→ERR 정렬을 검증할 수 없습니다 — "
+            "측정하지 않은 것을 통과로 세지 않습니다",
+        )
+        return
+    if not recorded_report or not recorded_report.get("sessions"):
+        audit.fail(
+            "recorded_alignment_integrity",
+            "recorded QA 리포트가 없어 source→ERR 정렬을 검증할 수 없습니다",
+        )
+        return
+
+    threshold = float(readiness_cfg.get("min_source_err_coherence", 0.60))
+    unmeasured: list[str] = []
+    failing: list[tuple[str, float]] = []
+    coherences: list[float] = []
+    for session in recorded_report["sessions"]:
+        alignment = session.get("alignment") or {}
+        session_id = str(session.get("session_id", "?"))
+        if "source_err_coherence" not in alignment:
+            unmeasured.append(session_id)
+            continue
+        value = float(alignment["source_err_coherence"])
+        coherences.append(value)
+        if not alignment.get("ok", False) or value < threshold:
+            failing.append((session_id, value))
+
+    if unmeasured:
+        audit.fail(
+            "recorded_alignment_integrity",
+            f"정렬을 측정하지 못한 세션 {len(unmeasured)}개 (예: {unmeasured[:5]}) — "
+            "측정 불가는 통과가 아닙니다",
+            unmeasured_sessions=unmeasured[:20],
+        )
+        return
+    if failing:
+        audit.fail(
+            "recorded_alignment_integrity",
+            f"source→ERR 결맞음/지연 안정성 미달 세션 {len(failing)}개 "
+            f"(예: {[f'{sid} coh²={value:.3f}' for sid, value in failing[:5]]}) — "
+            "후처리로 구제되지 않습니다. 재녹음이 필요합니다",
+            failing_sessions=[sid for sid, _ in failing][:20],
+            min_source_err_coherence=threshold,
+        )
+        return
+    audit.pass_(
+        "recorded_alignment_integrity",
+        f"전 {len(coherences)}개 세션의 source→ERR 시간축이 유효합니다 "
+        f"(최소 coh² {min(coherences):.3f} ≥ {threshold:.2f})",
+        min_observed_coherence=min(coherences),
+        sessions=len(coherences),
+    )
+
+
+def _groups_per_family_per_split(entries: Iterable[dict]) -> list[tuple[str, str, int]]:
+    """``(split, source_family, 그룹 수)`` 를 센다. **세션 수가 아니라 그룹 수다.**"""
+
+    buckets: dict[tuple[str, str], set[str]] = {}
+    for entry in entries:
+        key = (str(entry.get("split", "")), str(entry.get("source_family", "")))
+        buckets.setdefault(key, set()).add(str(entry.get("group_id", "")))
+    return sorted(
+        (split, family, len(groups)) for (split, family), groups in buckets.items()
+    )
+
+
+def _audit_statistical_power(
+    audit: "_Audit", readiness_cfg: dict, entries: list[dict]
+) -> None:
+    """G2c — val/test 의 계열당 그룹이 통계 판정을 지탱하는가 (결함 4 / D3).
+
+    G4 는 계열별 평균으로 최악 계열을 고르는데, 그 평균의 불확도는 세그먼트 수가
+    아니라 **그룹 수**가 정한다. 실측: 계열 간 폭 0.92 dB < 그룹 SE 1.03 dB 였다.
+    표본을 늘리지 않고는 어떤 통계 처리로도 구제되지 않는 문제이므로, 학습을 시작하기
+    전에 데이터 수집 요구사항으로 못 박는다.
+    """
+
+    if not entries:
+        audit.fail("recorded_statistical_power", "manifest 항목이 없어 검정력을 판정할 수 없습니다")
+        return
+    minimum = int(
+        readiness_cfg.get(
+            "min_groups_per_family_per_split", _min_groups_per_family_default()
+        )
+    )
+    weak = [
+        (split, family, count)
+        for split, family, count in _groups_per_family_per_split(entries)
+        if split in ("val", "test") and count < minimum
+    ]
+    if weak:
+        audit.fail(
+            "recorded_statistical_power",
+            f"val/test 의 계열당 그룹이 부족합니다 (최소 {minimum}): "
+            + ", ".join(f"{split}/{family}={count}" for split, family, count in weak)
+            + " — 그룹이 1–2개면 cluster bootstrap 의 클러스터 수가 CI 를 정의하지 "
+            "못해 G4 판정 자체가 성립하지 않습니다. 같은 그룹 안의 세션을 늘려도 "
+            "클러스터 수는 늘지 않습니다",
+            weak=[list(item) for item in weak],
+            min_groups_per_family_per_split=minimum,
+        )
+        return
+    audit.pass_(
+        "recorded_statistical_power",
+        f"val/test 의 모든 계열이 그룹 {minimum}개 이상을 갖습니다",
+        min_groups_per_family_per_split=minimum,
+    )
+
+
+def _recorded_source_clips(csv_path: Path) -> dict[str, list[str]]:
+    """``sources.csv`` 의 ``clips`` 열에서 계열별 원본 클립 목록을 읽는다."""
+
+    import csv
+
+    families: dict[str, list[str]] = {}
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            family = str(row.get("source_family", "")).strip()
+            if not family:
+                continue
+            raw = row.get("clips") or "[]"
+            try:
+                clips = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{csv_path}: clips 열을 읽을 수 없습니다: {exc}") from exc
+            families.setdefault(family, []).extend(str(item) for item in clips)
+    return families
+
+
+def _synthetic_clip_index(
+    manifest_dir: Path, tags: Iterable[str]
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """합성 학습 스트림이 쓰는 원본 파일과 각 파일의 split 을 모은다."""
+
+    by_tag: dict[str, list[str]] = {}
+    splits: dict[str, str] = {}
+    for tag in tags:
+        path = manifest_dir / f"{tag}.jsonl"
+        if not path.is_file():
+            continue
+        rows: list[str] = []
+        for entry in read_manifest(path):
+            value = str(entry.get("path", ""))
+            if not value:
+                continue
+            rows.append(value)
+            splits[value] = str(entry.get("split", ""))
+        by_tag[str(tag)] = rows
+    return by_tag, splits
+
+
+def _audit_corpus_leak(audit: "_Audit", readiness_cfg: dict, data_cfg: dict) -> None:
+    """D1 — 합성 학습 스트림과 실측이 **같은 원본 오디오**를 쓰지 않는가.
+
+    2026-08-05 감사: 실측 music 60 트랙이 **100%** 합성 풀과 겹치고 그중 55개(92%)가
+    합성 *train* split 에 있었다. 같은 곡에서 두 브랜치가 반대 방향 gradient 를 주고,
+    실제로 **music 만 개선되지 않았다**(+0.09 dB vs 나머지 −0.85 ~ −2.05 dB).
+
+    검사 자체는 :func:`deep_anc.dsp.invariants.check_corpus_disjoint` 가 한다. 여기서
+    다시 구현하면 그것이 두 번째 정의가 된다.
+    """
+
+    from ..dsp.invariants import check_corpus_disjoint
+
+    csv_value = readiness_cfg.get(
+        "recorded_source_pool_csv", "data/source_pool/sources.csv"
+    )
+    manifest_dir_value = data_cfg.get("noise_manifest_dir", "data/manifests")
+    tags = sorted((data_cfg.get("source_mix_ratio") or {}).keys())
+    try:
+        csv_path = _repo_path(csv_value)
+        if not csv_path.is_file():
+            raise FileNotFoundError(
+                f"실측 소스 목록이 없습니다: {csv_path} — 겹침을 검사할 수 없으면 "
+                "겹치지 않는다고 주장할 수 없습니다"
+            )
+        recorded = _recorded_source_clips(csv_path)
+        if not recorded:
+            raise ValueError(f"{csv_path}: 실측 클립 목록이 비었습니다")
+        synthetic, splits = _synthetic_clip_index(_repo_path(manifest_dir_value), tags)
+        if not synthetic:
+            raise FileNotFoundError(
+                f"합성 소음 manifest 를 찾지 못했습니다 (dir={manifest_dir_value}, "
+                f"tags={tags}) — 합성 풀을 알 수 없으면 누수 여부를 판정할 수 없습니다. "
+                "scripts/data/prepare_noise_pool.py 로 manifest 를 만드세요"
+            )
+        # 태그 **하나라도** manifest 가 없으면 판정 불가다. 2026-08-06 통합 검증에서
+        # 실제로 재현된 fail-open: data/manifests 에 esc50.jsonl 하나만 있는 상태에서
+        # 이 게이트가 "실측 691개와 합성 1587개가 서로소" 로 PASS 했다. 그런데 D1 이
+        # 실제로 찾은 누수는 **music 60/60(100%)** 이고 music.jsonl 이 없어 비교 대상에
+        # 아예 들어가지 않았다. 즉 누수가 있는 태그를 못 보고 통과한 것이다.
+        #
+        # 게다가 없는 태그는 조용히 사라지지 않는다 — synth_dataset 은 manifest 없는
+        # 태그를 **합성원으로 자동 폴백**한다(data/manifests/<tag>.jsonl 부재 시).
+        # 위 상태로 학습하면 선언한 7종 혼합(esc50 5%)이 실제로는
+        # synthetic 95% + esc50 5% 가 되는데 아무 로그도 남지 않는다.
+        # 'synthetic' 은 파일 풀이 아니라 생성기이므로 제외한다.
+        missing = [
+            str(tag)
+            for tag in tags
+            if str(tag) != "synthetic" and str(tag) not in synthetic
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"source_mix_ratio 가 선언한 태그 중 manifest 가 없는 것이 있습니다: "
+                f"{missing} (dir={manifest_dir_value}). 풀을 모르는 태그의 누수는 판정할 "
+                "수 없고, 학습기는 그 태그를 조용히 합성원으로 대체해 선언한 혼합비와 "
+                "다른 데이터로 돕니다. scripts/data/prepare_noise_pool.py 로 해당 태그의 "
+                "manifest 를 만들거나, 쓰지 않는 태그라면 source_mix_ratio 에서 지우세요"
+            )
+        result = check_corpus_disjoint(recorded, synthetic, synthetic_splits=splits)
+    except (FileNotFoundError, OSError, ValueError, KeyError, TypeError) as exc:
+        audit.fail("corpus_disjoint", str(exc))
+        return
+    if result.ok:
+        audit.pass_("corpus_disjoint", result.detail, **result.measured)
+    else:
+        audit.fail("corpus_disjoint", result.detail, **result.measured)
+
+
+def _audit_measured_source_delay(
+    audit: "_Audit",
+    readiness_cfg: dict,
+    primary: dict | None,
+    recorded_report: dict | None,
+) -> None:
+    """D2 — 실측 세션에서 **직접 잰** source→ERR 지연이 P(z) 유도값과 맞는가.
+
+    전형적인 군집 A 결함이다: 같은 물리량을 두 곳에서 따로 유도하고 아무도 대조하지
+    않았다. 실측 관측(포락선 상관 80세션 중앙값 1672 / 반송파 상관 40세션 1663±73 /
+    제어기 시작지연 스윕 ~1670)이 서로 일치하는데 유도값만 어긋나 있었다.
+    """
+
+    from ..dsp.invariants import (
+        check_measured_delay_agreement,
+        derive_playback_to_error_delay_samples,
+    )
+
+    if primary is None:
+        audit.fail(
+            "measured_source_delay_agreement",
+            "유효한 official P(z)가 없어 실측 지연과 대조할 수 없습니다",
+        )
+        return
+    if not recorded_report or not recorded_report.get("sessions"):
+        audit.fail(
+            "measured_source_delay_agreement",
+            "recorded QA 리포트가 없어 실측 source→ERR 지연을 알 수 없습니다",
+        )
+        return
+
+    observations = [
+        float(session["alignment"]["source_err_delay_median_samples"])
+        for session in recorded_report["sessions"]
+        if "source_err_delay_median_samples" in (session.get("alignment") or {})
+        and math.isfinite(
+            float(session["alignment"]["source_err_delay_median_samples"])
+        )
+    ]
+    minimum_sessions = int(readiness_cfg.get("min_delay_crosscheck_sessions", 8))
+    if len(observations) < minimum_sessions:
+        audit.fail(
+            "measured_source_delay_agreement",
+            f"지연 교차검증 표본이 {len(observations)}개로 최소 {minimum_sessions}개에 "
+            "미달합니다 — 표본 하나짜리 중앙값으로 지연 부기를 승인하면 이 게이트도 "
+            "자기증명이 됩니다",
+            observations=len(observations),
+        )
+        return
+
+    try:
+        with np.load(_repo_path(primary["path"]), allow_pickle=False) as data:
+            derived = derive_playback_to_error_delay_samples(
+                int(primary["delay_samples"]), data["fir"]
+            )
+    except (FileNotFoundError, OSError, KeyError, ValueError) as exc:
+        audit.fail("measured_source_delay_agreement", f"P(z) 유도 실패: {exc}")
+        return
+
+    observed = float(np.median(np.asarray(observations, dtype=np.float64)))
+    result = check_measured_delay_agreement(
+        observed,
+        derived,
+        tolerance_samples=float(
+            readiness_cfg.get("max_measured_delay_mismatch_samples", 64.0)
+        ),
+        observation_count=len(observations),
+    )
+    if result.ok:
+        audit.pass_("measured_source_delay_agreement", result.detail, **result.measured)
+    else:
+        audit.fail("measured_source_delay_agreement", result.detail, **result.measured)
+
+
+def _audit_plant_confidence_ceiling(
+    audit: "_Audit", readiness_cfg: dict, secondary: dict | None, primary: dict | None
+) -> None:
+    """G1c — 이 플랜트로 **목표를 낼 수 있기는 한가**를 학습 시작 전에 판정한다.
+
+    지금까지 ``min_path_consistency: 0.9`` 는 근거 없는 숫자로 보였지만, 실제로는
+    "상쇄 상한 9.54 dB" 를 뜻했다 — 아무도 그렇게 읽지 않았다. 목표를 dB 로 적고
+    필요한 γ 를 역산하면 임계가 임의의 숫자가 아니라 **물리로부터 유도된 값**이 된다.
+
+    두 상한 중 **작은 쪽**으로 판정한다
+    ----------------------------------
+    γ 기반 상한은 플랜트를 몰라서 잃는 몫만 센다. 복구된 플랜트에서 그 값은 약 28 dB
+    인데, 정규방정식으로 직접 계산한 설계 상한은 **6.53 dB** (M=2048, lead=116,
+    150-600Hz)다. 4배 이상 낙관적이다 — 인과성과 FIR 길이가 진짜 병목이기 때문이다.
+    낙관적인 상한 하나만 믿는 것이 이 저장소에서 반복된 사고의 형태이므로, 설정이
+    ``measured_design_ceiling_db`` 로 직접 계산한 값을 선언하면 그쪽도 함께 본다.
+    """
+
+    target_value = readiness_cfg.get("target_cancellation_db")
+    if target_value is None:
+        audit.fail(
+            "plant_confidence_ceiling",
+            "readiness.target_cancellation_db 가 없습니다 — 목표를 선언하지 않으면 "
+            "달성 가능 여부를 판정할 수 없고, min_path_consistency 도 근거를 잃습니다",
+        )
+        return
+    if secondary is None or primary is None:
+        audit.fail(
+            "plant_confidence_ceiling",
+            "유효한 official P/S 가 없어 달성 가능 상한을 계산할 수 없습니다",
+        )
+        return
+
+    target = float(target_value)
+    margin = float(readiness_cfg.get("cancellation_ceiling_margin_db", 3.0))
+    gamma_s = float(secondary["consistency"])
+    gamma_p = float(primary["consistency"])
+    try:
+        gamma_ceiling = achievable_cancellation_ceiling_db(gamma_s, gamma_p)
+    except ValueError as exc:
+        audit.fail("plant_confidence_ceiling", f"상한 계산 실패: {exc}")
+        return
+
+    design_value = readiness_cfg.get("measured_design_ceiling_db")
+    if design_value is not None:
+        # 상한은 **대역이 붙어야 숫자다.** 2026-08-06 통합 검증에서 잡힌 실제 오판정:
+        # 설정이 6.53 dB 를 선언했는데 그것은 150-600Hz 에서 푼 값이었고,
+        # required_path_band_hz 는 [150, 1600] 이었다. 같은 플랜트를 150-1600Hz 에서
+        # 다시 풀면 상한은 4.4~4.7 dB 다(독립 재현 2회). 즉 게이트가 2 dB 낙관적인
+        # 숫자로 통과하고 있었고, 그 오판정 방향이 정확히 "고역 방치"(절대목표 1)와
+        # 같다. 대역 없는 float 하나에 상한 전체를 거는 것이 발생기 A 그 자체이므로,
+        # 이제 선언에 대역을 함께 요구하고 요구 대역을 덮는지 검사한다.
+        declared_band = readiness_cfg.get("measured_design_ceiling_band_hz")
+        required_band = readiness_cfg.get("required_path_band_hz")
+        if declared_band is None:
+            audit.fail(
+                "plant_confidence_ceiling",
+                "readiness.measured_design_ceiling_db 가 선언됐는데 "
+                "measured_design_ceiling_band_hz 가 없습니다 — 설계 상한은 대역마다 다르므로"
+                "(같은 플랜트: 150-600Hz 6.53 dB vs 150-1600Hz 4.6 dB) 대역 없는 값은 "
+                "어느 요구에 대한 상한인지 알 수 없고, 넓은 대역을 좁은 대역의 값으로 "
+                "통과시키는 사고가 실제로 있었습니다",
+                design_ceiling_db=float(design_value),
+            )
+            return
+        try:
+            band_lo, band_hi = (float(v) for v in tuple(declared_band)[:2])
+        except (TypeError, ValueError):
+            audit.fail(
+                "plant_confidence_ceiling",
+                "readiness.measured_design_ceiling_band_hz 를 [lo, hi] 로 읽을 수 "
+                f"없습니다: {declared_band!r}",
+            )
+            return
+        if required_band is not None:
+            req_lo, req_hi = (float(v) for v in tuple(required_band)[:2])
+            if band_lo > req_lo + 1e-6 or band_hi < req_hi - 1e-6:
+                audit.fail(
+                    "plant_confidence_ceiling",
+                    f"설계 상한 {float(design_value):.2f} dB 를 잰 대역 "
+                    f"[{band_lo:.0f}, {band_hi:.0f}]Hz 가 요구 대역 "
+                    f"[{req_lo:.0f}, {req_hi:.0f}]Hz 를 덮지 못합니다 — 좁은 대역에서 푼 "
+                    "상한은 넓은 대역에서 반드시 낙관적입니다(상쇄가 어려운 구간이 빠져 "
+                    "있다). 요구 대역 전체에서 정규방정식을 다시 풀어 선언하세요",
+                    design_ceiling_db=float(design_value),
+                    design_ceiling_band_hz=[band_lo, band_hi],
+                    required_path_band_hz=[req_lo, req_hi],
+                )
+                return
+    design_ceiling = float(design_value) if design_value is not None else float("inf")
+    ceiling = min(gamma_ceiling, design_ceiling)
+    binding = "정규방정식 설계 상한" if design_ceiling <= gamma_ceiling else "플랜트 일관성"
+    details = {
+        "gamma_ceiling_db": gamma_ceiling,
+        "design_ceiling_db": design_ceiling if math.isfinite(design_ceiling) else None,
+        "design_ceiling_band_hz": (
+            [float(v) for v in tuple(readiness_cfg["measured_design_ceiling_band_hz"])[:2]]
+            if design_value is not None
+            else None
+        ),
+        "binding_ceiling_db": ceiling,
+        "binding_constraint": binding,
+        "target_db": target,
+        "margin_db": margin,
+        "gamma_secondary": gamma_s,
+        "gamma_primary": gamma_p,
+    }
+    if ceiling < target + margin:
+        audit.fail(
+            "plant_confidence_ceiling",
+            f"달성 가능 상한이 {ceiling:.2f} dB 인데 목표는 {target:.2f} dB 입니다 "
+            f"(여유 {margin:.1f} dB 필요; 구속 조건 = {binding}). "
+            f"플랜트 일관성 상한 {gamma_ceiling:.2f} dB, 설계 상한 "
+            + (
+                f"{design_ceiling:.2f} dB. "
+                if math.isfinite(design_ceiling)
+                else "미선언. "
+            )
+            + f"필요 γ ≥ {required_consistency_for(target + margin):.4f} "
+            f"(실측 S={gamma_s:.4f} P={gamma_p:.4f}). "
+            "학습이 아니라 재측정 또는 목표 재설정이 필요합니다",
+            **details,
+        )
+        return
+    audit.pass_(
+        "plant_confidence_ceiling",
+        f"플랜트가 목표 {target:.1f} dB 를 여유 {margin:.1f} dB 로 허용합니다 "
+        f"(구속 상한 {ceiling:.2f} dB = {binding})",
+        **details,
+    )
+
+
 def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dict:
     """resolved train config의 G1–G3 진입 조건을 한 번에 검사한다."""
 
@@ -693,11 +1327,23 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
                 raise ValueError(
                     f"P/S 측정 조건 불일치: {key}: P={left!r}, S={right!r}"
                 )
+        # P−S 상대 τ 를 **저장된 궤적에서 직접** 본다.
+        #
+        # 결함 1 의 결정적 증거(repeat_tau_samples)는 2026-08-04 당시에도 두 NPZ 안에
+        # 전부 들어 있었다. 게이트는 그중 하나도 열어보지 않고, 측정 스크립트가 요약해
+        # 써 넣은 스칼라 ``delay_spread_samples`` 만 봤다. 그 스칼라는 range(max−min)
+        # 이라 "11개가 1.2, 5개가 32" 라는 이봉 구조를 32 라는 한 숫자로 뭉갠다.
+        # 궤적을 직접 보면 계단이 계단으로 보인다.
+        tau_check = _relative_tau_check(primary, secondary)
+        if tau_check is not None and not tau_check.ok:
+            raise ValueError(tau_check.detail)
         audit.pass_(
             "matched_path_measurement_conditions",
-            "P/S official ESS 디지털 gain·block·latency 조건이 정합합니다",
+            "P/S official ESS 디지털 gain·block·latency 조건이 정합하고 "
+            "P−S 상대 τ 궤적이 상수입니다",
             primary=primary,
             secondary=secondary,
+            relative_tau=None if tau_check is None else tau_check.measured,
         )
     except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         audit.fail("matched_path_measurement_conditions", str(exc))
@@ -707,22 +1353,23 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
         "d_noise_delay_samples"
     )
     if primary is not None and secondary is not None:
-        handoff = int(
-            duct_cfg.get("secondary_path", {}).get(
-                "handoff_extra_samples", DEFAULT_HANDOFF_SAMPLES
-            )
+        # handoff 도 lead 도 여기서 다시 유도하지 않는다 — trainer / eval 과 **같은
+        # 함수**를 부른다. 두 곳이 각자 유도해 109 와 113 으로 갈라졌던 것이
+        # 커밋 aaeef41 의 사고이고, 그때 양쪽 다 자기 기준으로는 "통과" 였다.
+        delays = PlantDelays.from_config(
+            duct_cfg=duct_cfg,
+            secondary_delay_samples=int(secondary["delay_samples"]),
+            primary_delay_samples=int(primary["delay_samples"]),
+            sample_rate=int(sample_rate),
         )
-        expected_lead = max(
-            0,
-            int(secondary["delay_samples"])
-            + handoff
-            - int(primary["delay_samples"]),
-        )
+        handoff = int(delays.handoff_samples)
+        lead_check = check_lead_agreement(configured_lead, delays)
+        expected_lead = int(lead_check.measured["derived_lead_samples"])
         delay_matches = (
             configured_primary_delay is not None
             and int(configured_primary_delay) == int(primary["delay_samples"])
         )
-        if configured_lead != expected_lead or not delay_matches:
+        if not lead_check.ok or not delay_matches:
             audit.fail(
                 "path_delay_and_lead",
                 "P/S 순수지연과 fine-tune lead 설정이 다릅니다",
@@ -780,6 +1427,8 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
         audit.fail("completed_init_checkpoint", str(exc))
 
     manifest_value = cfg.get("recorded_manifest")
+    entries: list[dict] = []
+    recorded_report: dict | None = None
     try:
         if not manifest_value:
             raise ValueError("recorded_manifest가 비었습니다")
@@ -790,6 +1439,7 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
                 data_cfg,
                 required_splits=("train", "val", "test"),
                 allow_incomplete_family_coverage=False,
+                alignment_overrides=_alignment_overrides(readiness_cfg),
             )
             recorded_report = validate_recorded_sessions(
                 entries, settings, manifest_path=str(manifest_path)
@@ -843,6 +1493,12 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
         )
     except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         audit.fail("recorded_dataset_qa", str(exc))
+
+    _audit_recorded_alignment(audit, readiness_cfg, recorded_report, full_recorded_qa)
+    _audit_statistical_power(audit, readiness_cfg, entries)
+    _audit_corpus_leak(audit, readiness_cfg, data_cfg)
+    _audit_measured_source_delay(audit, readiness_cfg, primary, recorded_report)
+    _audit_plant_confidence_ceiling(audit, readiness_cfg, secondary, primary)
 
     return audit.report(
         stage=str(cfg.get("stage", "")),
@@ -906,6 +1562,29 @@ def _audit_g4_metrics(
                 "하지 않는 구버전 평가기의 산출물입니다. evaluate_recorded.py 로 재평가하세요."
             )
         source_pass = bool(_npz_scalar(data, "g4_source_pass"))
+        # 2026-08-05 신설 판정. 없는 것은 구버전 산출물이므로 통과시키지 않는다 —
+        # 이미 g4_source_pass 에 같은 관례를 쓰고 있고, 그 관례가 옳았다.
+        modern = {
+            "g4_verdict",
+            "g4_do_no_harm_pass",
+            "g4_power_pass",
+            "g4_ci_pass",
+            "plant_fingerprint_json",
+        }
+        missing_modern = sorted(modern.difference(data.files))
+        if missing_modern:
+            raise ValueError(
+                f"G4 metrics.npz 에 {missing_modern} 가 없습니다 — 대역 밖 do-no-harm"
+                "(절대목표 1), 통계적 검정력, 플랜트 지문을 판정하지 않는 구버전 "
+                "평가기의 산출물입니다. evaluate_recorded.py 로 재평가하세요."
+            )
+        verdict = str(_npz_scalar(data, "g4_verdict"))
+        do_no_harm_pass = bool(_npz_scalar(data, "g4_do_no_harm_pass"))
+        power_pass = bool(_npz_scalar(data, "g4_power_pass"))
+        ci_pass = bool(_npz_scalar(data, "g4_ci_pass"))
+        fingerprint_json = str(_npz_scalar(data, "plant_fingerprint_json"))
+        worst_octave_hz = float(_npz_scalar(data, "g4_worst_octave_center_hz"))
+        worst_octave_db = float(_npz_scalar(data, "g4_worst_octave_worst10_db"))
         worst_source_db = float(_npz_scalar(data, "g4_worst_source_trusted_mean_db"))
         worst_source_family = str(_npz_scalar(data, "g4_worst_source_family"))
         families = {str(value) for value in np.asarray(data["source_family"]).tolist()}
@@ -929,6 +1608,28 @@ def _audit_g4_metrics(
             f"source(기능2 최악값)={source_pass} "
             f"[최악 {worst_source_family or 'n/a'} {worst_source_db:+.2f} dB], g4={g4_pass}"
         )
+    # ``INCONCLUSIVE`` 는 PASS 가 아니다. 표본 부족으로 아무 말도 할 수 없는 상태를
+    # 완료로 기록하면 게이트가 있는 것이 없는 것보다 나쁘다.
+    if verdict != "PASS":
+        errors.append(
+            f"G4 판정이 {verdict} 입니다 (PASS 아님) — "
+            f"do_no_harm={do_no_harm_pass}, power={power_pass}, ci={ci_pass}"
+        )
+    if not do_no_harm_pass:
+        errors.append(
+            "대역 밖 do-no-harm 실패 (절대목표 1): 최악 옥타브 "
+            f"{worst_octave_hz:.0f}Hz {worst_octave_db:+.2f} dB — fullband 평균 NMSE 는 "
+            "d 에 에너지가 없는 대역의 증폭을 원리적으로 잡지 못한다"
+        )
+    if not power_pass:
+        errors.append(
+            "계열당 그룹 수가 부족해 G4 판정이 통계적으로 성립하지 않습니다"
+        )
+    if not ci_pass:
+        errors.append(
+            "계열별 cluster bootstrap CI 상단이 0 아래가 아닙니다 — 점추정만으로 "
+            "개선을 주장할 수 없습니다"
+        )
     missing_families = sorted(set(required_source_families).difference(families))
     if missing_families:
         errors.append(f"G4 source_family 결과 누락: {missing_families}")
@@ -944,7 +1645,51 @@ def _audit_g4_metrics(
         "n_segments": n_segments,
         "source_families": sorted(families),
         "g4_pass": True,
+        "g4_verdict": verdict,
+        "plant_fingerprint_json": fingerprint_json,
     }
+
+
+def _audit_plant_identity(audit: "_Audit", fingerprints: dict[str, str]) -> None:
+    """G5 — 완료 판정에 쓰인 val/test 결과가 **같은 플랜트**에서 나왔는가.
+
+    2026-08-04 사고: 파인튜닝 전 기준선은 S 지연 1342 / lead 109 / surrogate 물리였고
+    후는 1465 / 113 / measured 였다. 서로 다른 물리인데 "1.30 dB 개선"이라고 적혔다.
+    비교를 막는 장치가 아무 데도 없었다.
+
+    val 과 test 는 같은 checkpoint·같은 플랜트로 평가돼야 한다. 둘의 지문이 다르면
+    두 수치를 나란히 놓는 것 자체가 성립하지 않는다.
+    """
+
+    from ..dsp.invariants import check_plant_fingerprint_match
+    from ..dsp.timing import PlantFingerprint
+
+    if len(fingerprints) < 2:
+        audit.fail(
+            "plant_identity_for_comparison",
+            "val/test 두 평가의 플랜트 지문을 모두 얻지 못해 비교 가능성을 "
+            "판정할 수 없습니다",
+            available=sorted(fingerprints),
+        )
+        return
+    try:
+        models = {
+            split: PlantFingerprint(**json.loads(payload))
+            for split, payload in fingerprints.items()
+        }
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        audit.fail("plant_identity_for_comparison", f"플랜트 지문을 읽을 수 없습니다: {exc}")
+        return
+    result = check_plant_fingerprint_match(models["val"], models["test"])
+    if result.ok:
+        audit.pass_(
+            "plant_identity_for_comparison",
+            f"val/test 평가가 같은 플랜트에서 나왔습니다 (digest "
+            f"{models['val'].digest()[:12]})",
+            digest=models["val"].digest(),
+        )
+    else:
+        audit.fail("plant_identity_for_comparison", result.detail, **result.measured)
 
 
 def audit_finetune_completion(
@@ -1030,6 +1775,7 @@ def audit_finetune_completion(
         )
 
     required_families = _required_families(cfg.get("readiness", {}) or {})
+    fingerprints: dict[str, str] = {}
     for split, path in (("val", val_metrics), ("test", test_metrics)):
         check_id = f"recorded_{split}_g4"
         if candidate_sha is None or not manifest_sha:
@@ -1043,9 +1789,12 @@ def audit_finetune_completion(
                 manifest_sha256=manifest_sha,
                 required_source_families=required_families,
             )
+            fingerprints[split] = str(details.pop("plant_fingerprint_json"))
             audit.pass_(check_id, f"독립 recorded {split} G4가 통과했습니다", **details)
         except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             audit.fail(check_id, str(exc))
+
+    _audit_plant_identity(audit, fingerprints)
 
     return audit.report(
         readiness=readiness,

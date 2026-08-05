@@ -31,10 +31,10 @@ dB를 실제 덕트 감쇠 성능으로 해석해서는 안 된다.
 ```
 [학습 — Elice Cloud 2×A100, 서로 독립된 base/tiny 프로세스]
   공개 노이즈·음성·음악 + 합성원 → 연속 source n
-                    ├→ ref를 실제 playback보다 109샘플 먼저 공급
-                    └→ P_surrogate=S의 FIR/gain, D_noise=1489 → d
-  HybridANCNet → y → 공칭 선형 S(z), 총지연 1342+256=1598 → e=d+S·y
-                    └→ trusted NMSE(150–600Hz) 최적화 + fullband NMSE 감시
+                    ├→ ref를 실제 playback보다 116샘플 먼저 공급
+                    └→ P_surrogate=S의 FIR/gain, D_noise=1602(실측) → d
+  HybridANCNet → y → 공칭 선형 S(z), 총지연 1462+256=1718 → e=d+S·y
+                    └→ trusted NMSE(150–1600Hz) 최적화 + fullband NMSE 감시
   결과: physics_status=secondary_surrogate_representation_pretrain 체크포인트
 [배포 — Jetson AGX Orin]
   실측 파인튜닝을 통과한 best.pt → ONNX(정적 스트리밍 그래프) → [ORT CPU | TensorRT FP16]
@@ -83,7 +83,9 @@ Deep_ANC/
 - 학습 스모크: open/closed-loop 각각 Jetson GPU에서 정상 (bf16 AMP, 손실은 FP32)
 - ONNX export → ORT 등가성 max err 2.4e-8
 - 추론 지연: tiny+ORT CPU P99 **1.50ms** (블록 예산 5.33ms 통과), base+ORT 6.8ms
-- 현재 Stage-1 설정: 공칭 선형 plant, `D_noise=1489`, `S_total=1598`, 실제 playback
-  FIFO lead 109, trusted NMSE 150–600Hz + fullband 모니터
+- 현재 Stage-1 설정: 공칭 선형 plant, `D_noise=1602`, `S_total=1718`, 실제 playback
+  FIFO **lead 116**, trusted NMSE **150–1600Hz** + fullband 모니터.
+  ⚠ 배포 중인 ONNX 는 실측 이전 값(`lead=109`, trusted 150–600Hz)으로 사전학습된 것이라
+  런타임 설정도 109 다. 두 값이 섞이지 않게 런타임이 시작 전에 거부한다 (docs/06)
 - 과거 `rir_surrogate` + 미관측 plant 위상 랜덤화 + fullband NMSE로 수행한 0dB 정체
   체크포인트는 학습 목적이 잘못된 실행으로 판정했다. 새 Stage-1에 resume하지 않는다.

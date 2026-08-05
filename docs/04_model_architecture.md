@@ -63,9 +63,9 @@ tiny batch 128을 각각 100k step 학습한다. GPU0/base와 GPU1/tiny는 서�
 - 인코더는 과거 384샘플만 참조(좌측 패딩), 디코더 OLA 는 과거 프레임의 꼬리만 합산
   → **알고리즘 지연 0**. 테스트: 미래 입력을 바꿔도 현재 출력 불변(비트 단위 동일).
 - 모델 자체는 입력에서 미래 샘플을 참조하지 않는다. 현재 digital-ref는 모델 예측에
-  109샘플 차이를 맡기지 않고, 자기생성 ref를 먼저 주고 실제 noise playback을
-  109샘플 FIFO로 지연한다. `reference[t]=playback[t+109]`이므로
-  `109 + D_noise(1489) = S_total(1598)`로 도착 시각이 정렬된다.
+  116샘플 차이를 맡기지 않고, 자기생성 ref를 먼저 주고 실제 noise playback을
+  116샘플 FIFO로 지연한다. `reference[t]=playback[t+116]`이므로
+  `116 + D_noise(1602) = S_total(1462+256=1718)`로 도착 시각이 정렬된다.
 - acoustic-ref에서는 이 확정적 선행 공급을 쓸 수 없다. 약 30ms 예측 부담은 손실 정렬과
   LSTM/MHSA의 주기 기억으로 학습하되, 광대역 랜덤음은 물리적으로 예측할 수 없다.
 
@@ -87,17 +87,19 @@ tiny batch 128을 각각 100k step 학습한다. GPU0/base와 GPU1/tiny는 서�
 
 ```
 source n ─→ x_ref=n(t+109) ─→ HybridANCNet ─→ y
-       └→ P_surrogate=S FIR/gain, delay 1489 ───────────────→ d
-y → G_nl(η=10, drive=1) → S(z)(1342+256 지연, 공칭 고정) → e=d+S·y
+       └→ P_surrogate=S FIR/gain, delay 1602 ───────────────→ d
+y → G_nl(η=10, drive=1) → S(z)(1462+256 지연, 공칭 고정) → e=d+S·y
 
-L = NMSE_150–600Hz(dB)
+L = NMSE_150–1600Hz(dB)
     + 1.0·MR-STFT{256,512,1024,2048}×W(f)
     + 1e-3·L_pow + 1.0·L_clip(마진 0.18)
 ```
 
 - `P_surrogate`는 측정 S의 장치 gain/FIR을 P에 재사용해 P/S 단위를 맞춘다.
-  `D_noise=1489`만 별도로 적용한다. 실제 P가 아니므로 이 단계의 dB는 실제 감쇠가 아니다.
-- NMSE 목적함수는 S 실측 excitation band 150–600Hz와 duct 목표 80–800Hz의 교집합이다.
+  `D_noise=1602`만 별도로 적용한다. 실제 P가 아니므로 이 단계의 dB는 실제 감쇠가 아니다.
+- NMSE 목적함수는 S 실측 `consistency_band_hz` 150–1600Hz 와 duct 목표
+  `realistic_target_band_hz` 80–1600Hz 의 교집합 = **150–1600Hz** 다
+  (2026-08-05 플랜트 복구 전에는 150–600Hz).
   로그의 `nmse_t`/`nmse_trusted_db`가 최적화·best 선택 기준이고,
   `nmse_f`/`nmse_fullband_db`는 전대역 증폭 여부를 감시하는 별도 지표다.
 - **W(f) 커리큘럼 A**: `duct.yaml` 목표대역 80–800Hz ×3,

@@ -35,9 +35,10 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from deep_anc.config import DEFAULT_HANDOFF_SAMPLES, load_yaml  # noqa: E402
+from deep_anc.config import load_yaml  # noqa: E402
 from deep_anc.data.primary_path import resolve_digital_primary_path  # noqa: E402
 from deep_anc.data.synth_dataset import _delay_np, fft_filter  # noqa: E402
+from deep_anc.dsp.timing import BandPlan, handoff_samples_from_config  # noqa: E402
 from deep_anc.dsp.secondary_path import (  # noqa: E402
     DifferentiableSecondaryPath,
     load_secondary_path,
@@ -151,14 +152,14 @@ def main(argv: list[str] | None = None) -> int:
     sp = load_secondary_path(REPO_ROOT / duct_cfg["secondary_path"]["npz"])
     plant = DifferentiableSecondaryPath(
         sp,
-        handoff_extra_samples=int(
-            duct_cfg["secondary_path"].get("handoff_extra_samples", DEFAULT_HANDOFF_SAMPLES)
-        ),
+        handoff_extra_samples=handoff_samples_from_config(duct_cfg),
     ).to(device)
     primary, _total = resolve_digital_primary_path(data_cfg, duct_cfg, fs, sp)
-    trusted = intersect_frequency_bands(
-        sp.trusted_band_hz(), duct_cfg["acoustics"]["realistic_target_band_hz"], fs / 2.0
-    )
+    trusted = BandPlan.resolve(
+        plant_trusted_band_hz=sp.trusted_band_hz(),
+        duct_cfg=duct_cfg,
+        sample_rate=fs,
+    ).optimize.as_tuple()
     bands = eval_cfg.get("octave_bands_hz", [125, 250, 500, 1000, 2000, 4000, 8000])
 
     out_dir = Path(args.out) if args.out else ckpt.parent.parent / "demo_audio"

@@ -117,17 +117,39 @@ probe는 raw code 다양성, float 변환 RMS, peak, clipping을 함께 검사�
 
 ### 현재 자산 (assets/measured/)
 
-| 파일 | delay | 일관성 (150–600Hz) | 전대역 | 방식 | 비고 |
-|---|---|---|---|---|---|
-| `primary_path_il.npz` | 1608 | **0.973** | 0.920 | interleaved | **채택 P(z)** |
-| `secondary_path_il.npz` | 1465 | **0.956** | 0.781 | interleaved | **채택 S(z)** — P 와 같은 capture |
-| `secondary_path_4s.npz` | 1342 | 0.40 | — | 순차 ESS | 폐기 (2026-08-05) |
-| `secondary_path_legacy_512high.npz` | 2613 | 0.27 | — | 순차 ESS | 구버전 기록용 (block 512/high) |
+| 파일 | delay | 검증 대역 | 그 대역 일관성 | 전대역 | 유지/전체 | 방식 | 비고 |
+|---|---:|---|---:|---:|---:|---|---|
+| `primary_path_il.npz` | **1602** | 150–1600Hz | **0.9993** | **0.9988** | 18/48 | interleaved | **채택 P(z)** (재발행 2026-08-05) |
+| `secondary_path_il.npz` | **1462** | 150–1600Hz | **0.9990** | **0.9984** | 18/48 | interleaved | **채택 S(z)** — P 와 같은 capture·앵커 |
+| `*_il.npz.orig` | 1608 / 1465 | 150–600Hz | 0.973 / 0.956 | 0.920 / **0.781** | 16/16 | interleaved | **오염본 백업** (아래 경고) |
+| `secondary_path_4s.npz` | 1342 | 150–600Hz | 0.40 | — | — | 순차 ESS | 폐기 (2026-08-05) |
+| `secondary_path_legacy_512high.npz` | 2613 | — | 0.27 | — | — | 순차 ESS | 구버전 기록용 (block 512/high) |
 
+`P − S = 140`, `lead = 116`, 앵커 반복 13, `capture_id = f7b0fecd…`.
 채택본 두 개는 **한 번의 재생으로 동시에** 측정했고 `capture_id` 가 일치한다. 순차 ESS 는
-두 측정 사이의 클록 wander 가 P/S 상대 지연에 실려 lead 를 틀리게 만든다.
+두 측정 사이에 일어난 **출력 버퍼 프레임 슬립**이 P/S 상대 지연에 실려 lead 를 틀리게
+만든다 — **클록 드리프트가 아니다.** 두 클록의 상대 드리프트는 **+0.4 ppm**(10분에 12샘플)
+으로 lead(116샘플)를 틀리게 만들 크기가 아니며, 둘 다 +17 ppm 으로 같은 Tegra 발진기를
+공유한다(USB 싱크 ADAPTIVE).
 
-`excitation_band_hz`(구동 64–1648Hz)와 `consistency_band_hz`(검증 150–600Hz)는 다른 값이다.
+> [!CAUTION]
+> **`.orig` 백업본(전대역 S 0.781 / P 0.920)은 오염된 반복 5개를 포함한 값이다.**
+> `alignment_scores` 반복 11–15 가 0.750–0.758 로 별도 무리인데 기각 임계 0.5 때문에
+> `rejected_repeats: 0` 이었다. 결정적 증거는 **P−S 상대 τ** — 두 채널은 같은 DAC·같은
+> 출력 스트림의 인터리브라 설계 원리상 상수여야 하는데 반복 11 에서 **1.4 → 32 샘플
+> 점프**한다(출력 버퍼 프레임 슬립). 게이트는 요약 스칼라 `delay_spread_samples 32` 를
+> 허용치 48 과 비교해 **통과시켰다.**
+> 오염 반복을 버린 재계산에서 600–1000Hz 는 S 0.837 → **0.999**, 1000–1600Hz 는
+> S 0.737 → **0.999**, 전대역 0.782 → **0.999** 로 회복한다.
+> **→ "600 Hz 위는 스피커 물리 한계" 는 틀렸다. 진짜 한계는 64–150Hz 뿐이다**
+> (클린 후에도 S 0.706~0.758). 상세: [docs/12 §2.3](12_system_summary.md#23-실측-경로-자산).
+>
+> 스피커를 울리지 않고 저장된 캡처를 재분석하려면:
+> `.venv/bin/python scripts/data/reanalyse_paths_interleaved.py <세션 디렉터리> --dry-run`
+
+`excitation_band_hz` 는 **두 경로가 다르다** — 인터리브라 두 채널이 인접 FFT 빈을 번갈아
+쓰기 때문이다: **P(noise) 64–1648Hz / S(cancel) 72–1640Hz.**
+`consistency_band_hz`(검증 **150–1600Hz**, P/S 동일)와도 다른 값이다.
 학습 손실과 평가는 **검증 대역**을 쓴다 — 재현되지 않는 대역까지 최적화하면 그 잘못된 위상이
 gradient 를 지배해 신뢰 구간 성능까지 잃는다.
 

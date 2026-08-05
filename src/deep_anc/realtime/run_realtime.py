@@ -9,6 +9,9 @@
   [추론]   in_ring 에서 hop 단위 소비 → engine.step → out_ring  (콜백은 절대 대기 안 함)
   [제어]   키보드, 1초 통계, 워치독 메시지
 파이프라인 핸드오프 지연 = 1 hop — 학습 플랜트의 handoff_extra_samples 와 정합 [C1].
+이 1 hop 은 이제 주석이 아니라 **강제**다: 입출력 링버퍼의 백로그 허용치를
+safety.PipelineHandoffBudget 이 단 한 곳에서 유도하고, 비대칭이면 생성 자체가
+거부된다 (예전에는 입력만 8 hop = 42.7 ms 여서 추론이 뒤처지면 상쇄가 증폭이 됐다).
 시작은 항상 ANC OFF. 시스템(전원모드/RT우선순위 등)은 건드리지 않는다 — 프로젝트 정책.
 """
 
@@ -30,12 +33,18 @@ from ..audio_io import (
     pcm_int32_to_float32,
     resolve_alsa_portaudio_device,
 )
-from ..config import DEFAULT_HANDOFF_SAMPLES, load_runtime_config
+from ..config import REPO_ROOT, load_runtime_config
 from ..dsp.filters import DCBlocker
 from .engines import build_engine, secondary_path_npz
 from .noise_gen import DigitalReferenceBuffer, NoiseProgram
 from .ring_buffer import SPSCRing
-from .safety import FadeGate, PowerEMA, SafetySupervisor
+from .safety import (
+    BlockObservation,
+    FadeGate,
+    PipelineHandoffBudget,
+    PowerEMA,
+    SafetySupervisor,
+)
 from .ui import KeyboardController, RuntimeState
 
 
@@ -97,6 +106,78 @@ def input_preflight(cfg: dict, seconds: float = 2.0) -> bool:
             file=sys.stderr,
         )
     return True
+
+
+_ENGINE_ARTIFACT_KEYS = {
+    "torch": ("ckpt",),
+    "ort": ("onnx",),
+    "trt": ("plan",),
+}
+"""엔진 종류별로 **실제 로드에 쓰이는** 키. 나머지 키는 읽히지 않는다."""
+
+
+def engine_artifact_preflight(cfg: dict, *, require_all: bool = True) -> list[str]:
+    """``engine`` 블록이 가리키는 파일이 실제로 존재하는지 오디오를 열기 전에 본다.
+
+    왜 활성 엔진만 보면 안 되는가
+    ----------------------------
+    2026-08-05 실측: ``configs/runtime_tiny.yaml`` 의 ``plan:
+    runs/export/tiny_fp16.plan`` 은 **존재하지 않는 파일**이었다. 실제 파일 이름은
+    ``tiny_corrected_fp16.plan`` 이다. 그런데 ``engine.type`` 이 ``ort`` 라 이 키는
+    한 번도 읽히지 않았고, 따라서 **조용히 썩어 있었다** — ``trt`` 로 바꾸는 순간
+    터졌을 것이고, 그 시점은 대개 실기 앞이다.
+
+    같은 종류의 부패가 ``configs/runtime.yaml`` 에도 있었다(``model.onnx`` /
+    ``model_fp16.plan`` 둘 다 없음).
+
+    그래서 기본값 ``require_all=True`` 는 **선언된 모든 아티팩트**를 검사한다.
+    "지금 안 쓰니까 괜찮다"는 것이 바로 이 결함이 4개월 살아남은 이유다. 설정에
+    적혀 있으면 존재해야 하고, 없으면 그 줄을 지워야 한다.
+
+    반환은 사람이 읽을 문제 목록이다. 비어 있으면 통과다.
+    """
+
+    engine = (cfg or {}).get("engine", {}) or {}
+    kind = str(engine.get("type", "torch"))
+    if kind not in _ENGINE_ARTIFACT_KEYS:
+        return [f"알 수 없는 engine.type={kind!r}; 허용={sorted(_ENGINE_ARTIFACT_KEYS)}"]
+
+    active_keys = _ENGINE_ARTIFACT_KEYS[kind]
+    checked = (
+        tuple(key for key in ("ckpt", "onnx", "plan") if engine.get(key))
+        if require_all
+        else active_keys
+    )
+    problems: list[str] = []
+    for key in active_keys:
+        if not engine.get(key):
+            problems.append(
+                f"engine.type={kind} 인데 engine.{key} 가 비었습니다 — 로드할 것이 없습니다"
+            )
+    for key in checked:
+        value = str(engine.get(key, ""))
+        if not value:
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        if not path.is_file():
+            role = "활성" if key in active_keys else "미사용(지금은 읽히지 않음)"
+            problems.append(
+                f"engine.{key} 아티팩트가 없습니다 [{role}]: {value} — "
+                "설정에 적혀 있으면 존재해야 합니다. 쓰지 않는다면 그 줄을 지우세요"
+            )
+    return problems
+
+
+def require_engine_artifacts(cfg: dict, *, require_all: bool = True) -> None:
+    """:func:`engine_artifact_preflight` 를 실패 폐쇄로 감싼다."""
+
+    problems = engine_artifact_preflight(cfg, require_all=require_all)
+    if problems:
+        raise FileNotFoundError(
+            "런타임 엔진 아티팩트 preflight 실패:\n- " + "\n- ".join(problems)
+        )
 
 
 def validate_digital_reference_lead(
@@ -169,10 +250,15 @@ class RealtimeANC:
         dc_r = float(cfg["hardware"].get("dc_blocker_r", 0.995))
         self.err_dc, self.ref_dc = DCBlocker(dc_r), DCBlocker(dc_r)
 
-        safety_cfg = cfg.get("safety", {})
-        self.safety = SafetySupervisor(safety_cfg, self.fs, self.block)
-        fade = int(float(safety_cfg.get("fade_ms", 20.0)) * self.fs / 1000.0)
+        self.safety = SafetySupervisor(cfg.get("safety", {}), self.fs, self.block)
+        # 페이드 길이도 검증된 설정에서만 읽는다 (cfg.get 재유도 금지).
+        fade = int(self.safety.limits.fade_ms * self.fs / 1000.0)
         self._fade_samples = fade
+        # 링버퍼 백로그 예산의 단일 출처. 입력 8 hop / 출력 1 hop 의 비대칭은
+        # 여기서 구조적으로 불가능하다 (safety.PipelineHandoffBudget 참조).
+        self.handoff_budget = PipelineHandoffBudget.derive(
+            duct_cfg=cfg.get("duct", {}), hop=self.hop
+        )
         self.state = RuntimeState(start_on=False)
         self.anc_gate = FadeGate(fade, initial=0.0)
         self.noise_gate = FadeGate(max(fade, int(0.1 * self.fs)), initial=0.0)
@@ -187,6 +273,7 @@ class RealtimeANC:
         self.ctrl_meter = PowerEMA(self.fs, 0.4)
         self.baseline_power = 0.0
         self.baseline_init = False
+        self._last_input_drops = 0
         self.step_times_ms: list[float] = []
         self.xruns = 0
         self._last_anc = False
@@ -231,9 +318,13 @@ class RealtimeANC:
             source, played_noise_gain = played
             ref_digital = future[0]
 
-            # 백로그가 1 hop 을 넘으면 최신으로 재동기 — 언더런에 의한 지연 누적 방지 (#9)
-            y_blk, had_data = self.out_ring.pop_latest(frames, keep_backlog=frames)
-            y_lim, clip_frac = self.safety.limit_output(y_blk[0])
+            # 백로그가 예산을 넘으면 최신으로 재동기 — 언더런에 의한 지연 누적 방지 (#9).
+            # 허용치는 handoff_budget 이 유일하게 유도한다 (입출력 대칭 강제).
+            y_blk, had_data = self.out_ring.pop_latest(
+                frames, keep_backlog=self.handoff_budget.output_keep_backlog_samples
+            )
+            out_report = self.safety.limit_output(y_blk[0])
+            y_lim, clip_frac = out_report.signal, out_report.clipped_fraction
 
             if self.state.anc_enabled != self._last_anc:
                 self.anc_gate.set_target(1.0 if self.state.anc_enabled else 0.0)
@@ -256,8 +347,13 @@ class RealtimeANC:
             err_power = self.err_meter.update(err)
             ctrl_power = self.ctrl_meter.update(control)
 
-            # 베이스라인: ANC 게이트가 닫혀 있고 소음이 켜진 구간의 에러 파워
-            if float(np.max(gain)) <= 0.001 and float(np.min(played_noise_gain)) >= 0.999:
+            # 베이스라인: ANC 게이트가 닫혀 있는 구간의 에러 파워.
+            # 소음 게이트 조건을 빼는 이유 — 외부 소음원으로 운용할 때는
+            # played_noise_gain 이 0 이라 베이스라인이 영원히 안 잡히고, 그러면
+            # 발산 워치독이 fail-closed 로 ANC 를 끈다. "ANC 없이 마이크에 들어오는
+            # 파워"가 발산 판정에 필요한 전부다. 유효성(무음 여부)은 baseline_floor_power
+            # 하한으로 판정한다 — 판정 규칙의 단일 출처는 SafetySupervisor 다.
+            if float(np.max(gain)) <= 0.001:
                 alpha = float(np.exp(-frames / (self.fs * 1.0)))
                 if not self.baseline_init:
                     self.baseline_power = err_power
@@ -265,13 +361,26 @@ class RealtimeANC:
                 else:
                     self.baseline_power = alpha * self.baseline_power + (1 - alpha) * err_power
 
-            mute = self.safety.check_block(
-                self.state.anc_enabled, clip_frac, err_power, self.baseline_power,
-                had_data or not self.state.anc_enabled,
+            input_drops = int(self.in_ring.drops)
+            stale_input = max(0, input_drops - self._last_input_drops)
+            self._last_input_drops = input_drops
+            verdict = self.safety.check_block(
+                BlockObservation(
+                    anc_on=bool(self.state.anc_enabled),
+                    output=out_report,
+                    error_power=float(err_power),
+                    baseline_power=float(self.baseline_power),
+                    baseline_valid=self.safety.baseline_is_valid(
+                        self.baseline_power, self.baseline_init
+                    ),
+                    had_output_data=bool(had_data),
+                    stale_input_samples=stale_input,
+                )
             )
+            mute = verdict.mute
             if mute:
                 self.state.anc_enabled = False
-            for msg in self.safety.drain_messages():
+            for msg in verdict.messages:
                 self.state.messages.put(msg)
 
             if self._adaptation_hold_samples > 0:
@@ -324,6 +433,12 @@ class RealtimeANC:
                 "fxlms_adapt_hold_samples": self._adaptation_hold_samples,
                 "underruns": self.out_ring.underruns,
                 "drops": self.out_ring.drops,
+                "stale_input_drops": input_drops,
+                "watchdog_trips": {
+                    item.value: count
+                    for item, count in self.safety.trip_counts.items()
+                    if count
+                },
                 "xruns": self.xruns,
                 "step_ms": float(np.mean(self.step_times_ms[-50:])) if self.step_times_ms else 0.0,
             }
@@ -351,8 +466,12 @@ class RealtimeANC:
                 self.state.reset_event.clear()
             if not self.in_ring.wait_for(self.hop, timeout=0.1):
                 continue
-            # 추론이 뒤처지면 입력 백로그를 8 hop 까지만 허용 (지연 폭주 방지)
-            blk, ok = self.in_ring.pop_latest(self.hop, keep_backlog=self.hop * 8)
+            # 입력 백로그 허용치는 출력과 **같아야 한다**. 예전에는 여기만 8 hop
+            # (42.7 ms) 이어서 추론이 뒤처지면 실효 핸드오프가 학습 가정의 8배로
+            # 조용히 늘었다 — 그 지연에서는 상쇄가 증폭이 된다.
+            blk, ok = self.in_ring.pop_latest(
+                self.hop, keep_backlog=self.handoff_budget.input_keep_backlog_samples
+            )
             if not ok:
                 continue
             err, ref_mic, ref_digital, adapt_gate = blk
@@ -426,6 +545,15 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
     print("=" * 72)
     print(f"Deep ANC 실시간 런타임 | 컨트롤러: {engine_desc} | reference: {cfg.get('reference')}")
     print(f"블록 {anc.block} ({1000*anc.block/anc.fs:.2f}ms) @ {anc.fs}Hz | 시작: ANC OFF")
+    budget = anc.handoff_budget
+    print(
+        f"실효 핸드오프 {budget.effective_handoff_samples}샘플 "
+        f"({1000*budget.effective_handoff_samples/anc.fs:.2f}ms) "
+        f"| 백로그 허용 입력={budget.input_keep_backlog_samples} "
+        f"출력={budget.output_keep_backlog_samples}"
+    )
+    for note in anc.safety.limits.legacy_notes:
+        print(f"[설정 경고] {note}")
     print(KeyboardController.help_text())
     print("주의: TPA3116D2 볼륨을 낮춘 상태에서 시작하세요.")
     print("=" * 72)
@@ -485,6 +613,7 @@ def run_calibrate(cfg: dict) -> int:
     from scipy import signal as sp_signal
 
     from ..dsp.secondary_path import load_secondary_path
+    from ..dsp.timing import handoff_samples_from_config  # handoff 의 단일 출처
 
     fs = int(cfg["hardware"]["audio"]["sample_rate"])
     seconds = 6.0
@@ -514,10 +643,11 @@ def run_calibrate(cfg: dict) -> int:
 
     cfg = dict(cfg)
     cfg["noise"] = {"type": "silence"}
-    # 측정 모드: 워치독이 처프 출력을 mute 하지 않도록 임계값 무력화 (#13)
+    # 측정 모드: 음향 성능 워치독(포화/RMS/데드라인/발산/백로그)은 자문으로 내린다.
+    # 임계값을 1e12 로 무력화하던 예전 방식과 달리 **하드웨어 보호(DC·NaN)는 그대로
+    # mute 한다** — 캘리브레이션 중이라고 보이스코일에 DC 를 흘려도 되는 것은 아니다.
     cfg["safety"] = dict(cfg.get("safety", {}))
-    cfg["safety"].update({"deadline_miss_mute": 10**9, "divergence_ratio": 1e12,
-                          "clip_streak_mute": 10**9})
+    cfg["safety"]["measurement_mode"] = True
     anc = RealtimeANC(cfg, record_seconds=seconds + 2.0)
     anc.engine = ChirpEngine(anc.hop)
     anc.state.anc_enabled = True          # 게이트를 열어 처프를 내보낸다
@@ -536,9 +666,7 @@ def run_calibrate(cfg: dict) -> int:
     corr = sp_signal.fftconvolve(err, ctrl[::-1], mode="full")
     lag = int(np.argmax(np.abs(corr))) - (ctrl.size - 1)
     sp = load_secondary_path(secondary_path_npz(cfg))
-    handoff = int(
-        cfg["duct"]["secondary_path"].get("handoff_extra_samples", DEFAULT_HANDOFF_SAMPLES)
-    )
+    handoff = handoff_samples_from_config(cfg["duct"])
     # rec['control'] 은 블록이 실제 "출력"되는 콜백 시점(핸드오프 이후)에 기록되므로,
     # 측정 lag 의 기대값은 캘리브레이션 지연(1342)뿐이다 — 핸드오프는 별도 합산 (#11)
     expected = sp.delay_samples
@@ -577,6 +705,14 @@ def main() -> int:
         return 0
 
     cfg = load_runtime_config(args.config, args.overrides)
+    # 엔진 아티팩트 확인은 **오디오 장치를 열기 전에** 한다. 마이크 프로브보다도
+    # 먼저인 이유는 이 검사가 하드웨어를 전혀 건드리지 않고 즉시 끝나기 때문이다 —
+    # 없는 파일 때문에 실패할 실행에 스피커를 울릴 이유가 없다.
+    try:
+        require_engine_artifacts(cfg)
+    except FileNotFoundError as exc:
+        print(f"[중단] {exc}", file=sys.stderr)
+        return 2
     try:
         if not input_preflight(cfg, seconds=args.input_probe_seconds):
             return 2

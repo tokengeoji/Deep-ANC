@@ -183,16 +183,20 @@ def fig_architecture(base: dict, tiny: dict) -> Path:
 
 
 def fig_tcn_block(tiny: dict) -> Path:
+    """src/deep_anc/models/tcn_blocks.py TCNBlock 을 그대로 그린다.
+
+    실제 forward:
+        y = norm(act(expand(x)))          # 1x1 -> PReLU -> ChannelLN
+        u = dw_main(pad(y)); g = sigmoid(dw_gate(pad(y)))
+        return x + project(u * g)         # residual 하나뿐. skip 분기 없음.
+    """
     stack = [
         f"1×1 conv,  {tiny['tcn_hidden']}",
         "PReLU",
         "ChannelLN",
-        f"D-Conv {tiny['kernel']},  dilation d",
-        "PReLU",
-        "ChannelLN",
     ]
     x, w, h, gap = 340, 280, 40, 18
-    c = Canvas(900, 56 + len(stack) * (h + gap) + 200)
+    c = Canvas(900, 56 + len(stack) * (h + gap) + 300)
 
     y = 46
     c.text(x + w / 2, y - 22, "x", size=15, family=MONO, weight="700")
@@ -207,30 +211,45 @@ def fig_tcn_block(tiny: dict) -> Path:
         c.line(x + w / 2, y + h, x + w / 2, y + h + gap, arrow=True)
         y += h + gap
 
+    # 두 갈래 depthwise dilated conv (주경로 / 게이트) — 곱해서 GLU
     c.circle(x + w / 2, y, 5, fill=INK, stroke=INK)
     split = y
+    bw = 210
+    left_cx, right_cx = x + w / 2 - 130, x + w / 2 + 130
 
-    c.path(f"M {x + w / 2} {split} L {x - 100} {split} L {x - 100} {split + 34}",
-           arrow=True)
-    c.rect(x - 200, split + 34, 200, h, fill="#ffffff", stroke=TCN)
-    c.text(x - 100, split + 34 + h / 2, "1×1 conv", size=13, weight="600", fill=TCN)
-    c.line(x - 100, split + 34 + h, x - 100, split + 34 + h + 28, arrow=True)
-    c.text(x - 100, split + 34 + h + 44, "skip", size=13.5, family=MONO, fill=MUTED)
+    for cx, label, sub in (
+        (left_cx, f"D-Conv {tiny['kernel']}, dil d", "dw_main → u"),
+        (right_cx, f"D-Conv {tiny['kernel']}, dil d", "dw_gate → σ(g)"),
+    ):
+        c.path(f"M {x + w / 2} {split} L {cx} {split} L {cx} {split + 30}", arrow=True)
+        c.rect(cx - bw / 2, split + 30, bw, h, fill="#ffffff", stroke=TCN)
+        c.text(cx, split + 30 + h / 2, label, size=12.5, weight="600", fill=TCN)
+        c.text(cx, split + 30 + h + 18, sub, size=11.5, family=MONO, fill=MUTED)
 
-    c.path(f"M {x + w / 2} {split} L {x + w + 100} {split} "
-           f"L {x + w + 100} {split + 34}", arrow=True)
-    c.rect(x + w, split + 34, 200, h, fill="#ffffff", stroke=TCN)
-    c.text(x + w + 100, split + 34 + h / 2, "1×1 conv", size=13, weight="600", fill=TCN)
+    mul_y = split + 30 + h + 46
+    for cx in (left_cx, right_cx):
+        c.path(f"M {cx} {split + 30 + h + 26} L {cx} {mul_y - 14} "
+               f"L {x + w / 2} {mul_y - 14}", arrow=(cx == right_cx))
+    c.circle(x + w / 2, mul_y, 15, fill="#ffffff", stroke=INK)
+    c.text(x + w / 2, mul_y, "×", size=17, weight="700", fill=INK)
 
-    add_y = split + 34 + h + 46
-    c.line(x + w + 100, split + 34 + h, x + w + 100, add_y - 16, arrow=True)
-    c.sum_node(x + w + 100, add_y)
-    c.path(f"M {x + w / 2} {identity_y} L {x + w + 100} {identity_y} "
-           f"L {x + w + 100} {add_y - 16}", dash="5 4", arrow=True)
-    c.text(x + w + 112, identity_y - 16, "identity", size=11.5,
+    proj_y = mul_y + 40
+    c.line(x + w / 2, mul_y + 15, x + w / 2, proj_y, arrow=True)
+    c.rect(x + w / 2 - bw / 2, proj_y, bw, h, fill="#ffffff", stroke=TCN)
+    c.text(x + w / 2, proj_y + h / 2, "1×1 conv (project)", size=13,
+           weight="600", fill=TCN)
+
+    add_y = proj_y + h + 46
+    c.line(x + w / 2, proj_y + h, x + w / 2, add_y - 16, arrow=True)
+    c.sum_node(x + w / 2, add_y)
+    c.path(f"M {x + w / 2} {identity_y} L {x + w + 150} {identity_y} "
+           f"L {x + w + 150} {add_y} L {x + w / 2 + 16} {add_y}",
+           dash="5 4", arrow=True)
+    c.text(x + w + 162, identity_y - 16, "residual (identity)", size=11.5,
            anchor="start", fill=MUTED)
-    c.line(x + w + 100, add_y + 16, x + w + 100, add_y + 40, arrow=True)
-    c.text(x + w + 100, add_y + 56, "out", size=13.5, family=MONO, fill=MUTED)
+    c.line(x + w / 2, add_y + 16, x + w / 2, add_y + 40, arrow=True)
+    c.text(x + w / 2, add_y + 56, "out  (skip 분기 없음)", size=13.5,
+           family=MONO, fill=MUTED)
 
     path = OUT / "fig3_tcn_block.svg"
     path.write_text(c.render(), encoding="utf-8")

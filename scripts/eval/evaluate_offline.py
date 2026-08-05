@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.config import REPO_ROOT, load_yaml                     # noqa: E402
 from deep_anc.data.synth_dataset import SynthANCDataset, make_eval_batch  # noqa: E402
+from deep_anc.dsp.timing import BandPlan, handoff_samples_from_config  # noqa: E402
 from deep_anc.dsp.secondary_path import (                            # noqa: E402
     DifferentiableSecondaryPath,
     load_secondary_path,
@@ -86,24 +87,23 @@ def main() -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
 
-    from deep_anc.config import DEFAULT_HANDOFF_SAMPLES
-
     fs = int(data_cfg["sample_rate"])
     sp = load_secondary_path(REPO_ROOT / duct_cfg["secondary_path"]["npz"])
     if sp.sample_rate != fs:
         raise ValueError(
             f"S(z) sample_rate={sp.sample_rate}Hz != data sample_rate={fs}Hz"
         )
-    trusted = intersect_frequency_bands(
-        sp.trusted_band_hz(),
-        duct_cfg["acoustics"]["realistic_target_band_hz"],
-        fs / 2.0,
+    # 대역·handoff 는 BandPlan/timing 이 단일 출처다 (발생기 A — 같은 세 줄이
+    # 다섯 파일에 복붙돼 있었고 S npz 를 넓혀도 따라오지 않는 곳이 생겼다).
+    band_plan = BandPlan.resolve(
+        plant_trusted_band_hz=sp.trusted_band_hz(),
+        duct_cfg=duct_cfg,
+        sample_rate=fs,
     )
+    trusted = band_plan.optimize.as_tuple()
     plant = DifferentiableSecondaryPath(
         sp,
-        handoff_extra_samples=int(
-            duct_cfg["secondary_path"].get("handoff_extra_samples", DEFAULT_HANDOFF_SAMPLES)
-        ),
+        handoff_extra_samples=handoff_samples_from_config(duct_cfg),
     ).to(device)
 
     ds = SynthANCDataset(data_cfg, duct_cfg, split="test", seed=999)

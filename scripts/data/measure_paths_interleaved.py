@@ -60,7 +60,8 @@ from deep_anc.audio_io import (  # noqa: E402
     pcm_int32_to_float32,
     resolve_alsa_portaudio_device,
 )
-from deep_anc.config import REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.config import DEFAULT_HANDOFF_SAMPLES, REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.dsp.timing import PlantDelays  # noqa: E402 — lead 유도의 단일 출처
 from deep_anc.dsp.interleaved_probe import (  # noqa: E402
     DEFAULT_TRACK_WINDOW,
     align_repeats,
@@ -1078,8 +1079,19 @@ def main(argv: list[str] | None = None) -> int:
 
     p_delay = int(results["noise"]["model"]["delay_samples"])
     s_delay = int(results["cancel"]["model"]["delay_samples"])
-    handoff = 256
-    lead = max(0, s_delay + handoff - p_delay)
+    # handoff 도 lead 도 여기서 다시 쓰지 않는다. 예전에는 이 자리에 ``handoff = 256``
+    # 이라는 **세 번째 사본**과 lead 관계식이 손으로 적혀 있었다 (발생기 A).
+    handoff = DEFAULT_HANDOFF_SAMPLES
+    lead = int(
+        PlantDelays(
+            primary_delay_samples=p_delay,
+            secondary_delay_samples=s_delay,
+            handoff_samples=handoff,
+            sample_rate=int(fs),
+        )
+        .lead()
+        .samples
+    )
     print(
         f"\n[성공] P {primary_out.relative_to(REPO_ROOT)}\n"
         f"       S {secondary_out.relative_to(REPO_ROOT)}\n"

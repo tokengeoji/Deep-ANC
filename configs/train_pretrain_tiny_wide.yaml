@@ -37,21 +37,61 @@ amp: bf16
 grad_clip: 5.0
 
 loss:
-  # 실측 S(z) 유효대역 ∩ duct 목표대역(현재 150–600Hz) NMSE를 최소화.
+  # 실측 S(z) 신뢰대역 ∩ duct 목표대역 NMSE를 최소화.
   # fullband NMSE는 do-no-harm 관측 지표로 별도 기록한다.
   nmse_objective: trusted_band
+
+  # --- 절대목표 2: 최악값 집계 ---
+  # dB 산술평균의 아이템별 그래디언트는 잔차 RMS 에 **반비례**한다 (실측 log-log
+  # 기울기 -0.94(synth)/-1.02(recorded), corr -0.99). 최악 4개가 그래디언트의 3.4%,
+  # 최상 4개가 16.0% 였다 — 최악값 문제에 정확히 반대 방향이다.
+  # q=0.25 근거: 평가 G4 는 worst10(=CVaR@10%)을 본다 → 학습은 그보다 약간 넓게 잡아
+  # 게이트를 독립 검증으로 남긴다. 실패 질량 실측: synth val 96개 중 하위 25% 가
+  # >= -0.03 dB, recorded 는 50% 가 >= -0.1 dB. q=0.10 은 과집중, q=0.50 은 평균 회귀.
+  nmse_cvar_q: 0.25
+  nmse_cvar_alpha: 0.7          # 순수 CVaR 은 유효 배치를 1/4 로 줄인다
+  nmse_cvar_min_k: 4            # B=16 에서도 k>=4 보장
+
+  # --- 절대목표 1: 대역 밖 악화 금지 (단측, S 위상 무관) ---
+  # 대역 목록을 여기 적지 않는다. 신뢰 대역(개선 요구 대역)을 경계에서 빼서 만든다 —
+  # S npz 의 consistency_band 가 넓어져도 따라오고, 겹침이 구조적으로 불가능하다.
+  # lambda 근거: ||∇L_dnh(CVaR25)|| 대비 0.3배 기여를 주는 값이 synth 0.110 /
+  # recorded 0.140 → 두 레짐에서 1.3배 안에 드는 0.12 를 단일값으로 채택.
+  lambda_dnh: 0.12
+  dnh_margin_db: 6.0            # |S| 측정오차 봐주기. 결함 3 의 15~22 dB 는 훌쩍 넘는다
+  dnh_weight_below: 1.0         # 신뢰대역 아래 (서브소닉 실측 최악 +30.5 dB)
+  dnh_weight_above: 2.0         # 신뢰대역 위 (결함 3 진원지, 1633-6000Hz 최악 +19.9 dB)
+
+  # --- 시간 국소성 ---
+  # 1.5초 한 FFT 로는 최악 아이템이 +0.00 dB 인데 같은 배치를 0.125초 프레임으로 보면
+  # 최악 프레임이 +10.82 dB, 증폭 프레임 12.2% 다. 8192 = 48kHz 에서 170 ms.
+  lambda_frame: 0.5
+  nmse_frame_samples: 8192
+  nmse_frame_silence_db: -40.0  # 무음 프레임이 CVaR 을 먹는 것을 막는다
+
+  # --- 스펙트럼 형상 (신뢰 대역 한정) ---
   mrstft_ffts: [256, 512, 1024, 2048]
   lambda_mrstft: 1.0
-  lambda_pow: 1.0e-3
-  lambda_clip: 1.0
-  clip_margin: 0.18
-  # 커리큘럼 A: duct.yaml 목표대역(80–800Hz) ×3 가중. [교차검증 C3]
-  # 커리큘럼 B(풀밴드 균일)는 광대역 S(z) 재보정(coherence≥0.6) 통과 후에만 사용.
-  band_weight: curriculum_a     # curriculum_a | fullband
+  # curriculum_a 는 신뢰 대역 **밖**에도 양측 가중을 준다 = "S(z) 를 못 믿는 곳에서
+  # 상쇄하라". 대역 밖 압력은 전부 단측 do-no-harm 힌지가 담당해야 한다.
+  band_weight: trusted_only     # curriculum_a | fullband | trusted_only
 
+  # --- 출력 제약 ---
+  # lambda_pow / lambda_clip 은 구조적으로 죽어 있었다: 모델이 y = L*tanh(u/L) 라
+  # relu(|y|-0.18)^2 의 상한이 4.0e-4 로 고정이고 실측 그래디언트 기여가 1.1e-8 이다.
+  # 1% 기여에 lambda_pow ~ 4.3e3 이 필요했다(설정값 1e-3 대비 6.4 오더).
+  lambda_pow: 0.0               # 지표로만 남긴다. 대역밖 억제는 힌지가 표적 수행
+  lambda_sat: 1.0               # 리미터 **이전** 활성 포화 벌점 (구 lambda_clip 대체)
+  sat_margin: 2.0               # tanh'(2)=0.071 — 여기서부터 유효 그래디언트 1/14 이하
+
+# CVaR 은 분위 추정이다. val 16개면 q=0.25 가 top-4 뿐이라 추정이 흔들린다.
+# val 배치는 그래디언트가 없으므로 batch_size 와 무관하게 키울 수 있다.
+val_items: 64
+# loss_start_sample: 미지정 시 S 벌크지연 + handoff + FIR 탭수에서 자동 유도된다
+#   (단일 출처: dsp/timing.py PlantSettle). 평가기 warmup 도 같은 값을 하한으로 쓴다.
 eval_every: 500                # 96×500 = 기존 24×2000 eval 간격
 log_every: 100
-early_stop_patience: 0          # 고정 val 16개가 약하므로 corrected pretrain은 완주
+early_stop_patience: 0          # 고정 val 이 약하므로 corrected pretrain은 완주
 ckpt_dir: runs/pretrain_tiny_wide
 resume: null                    # 재개 시 ckpt 경로
 seed: 20260802

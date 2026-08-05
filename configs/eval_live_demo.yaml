@@ -8,7 +8,7 @@
 # 소음을 지배적으로(0.65 : 0.35) 섞은 이유는 상쇄가 귀에 들려야 하기 때문이다.
 
 octave_bands_hz: [125, 250, 500, 1000, 2000, 4000, 8000]
-trusted_band_hz: [150, 600]
+# trusted_band_hz 삭제 (2026-08-06) — 읽는 코드가 없고 값도 틀렸다. configs/eval.yaml 주석 참조.
 heldout_sef_eta: 0.15
 report_dir: results
 

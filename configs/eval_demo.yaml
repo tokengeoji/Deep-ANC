@@ -2,7 +2,7 @@
 # 실제 음성 + 덕트 소음을 섞어 "소음이 섞인 실제 소리"를 만든다.
 # 기능 2(모든 소리 제거)를 귀로 확인하기 위한 구성이다.
 octave_bands_hz: [125, 250, 500, 1000, 2000, 4000, 8000]
-trusted_band_hz: [150, 600]
+# trusted_band_hz 삭제 (2026-08-06) — 읽는 코드가 없고 값도 틀렸다. configs/eval.yaml 주석 참조.
 heldout_sef_eta: 0.15
 report_dir: results
 scenarios:
