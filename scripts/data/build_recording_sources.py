@@ -151,6 +151,25 @@ def limit_crest(signal: np.ndarray, target_db: float = TARGET_CREST_DB) -> np.nd
     return (values / peak * 0.99).astype(np.float32) if peak > 0 else values.astype(np.float32)
 
 
+# 한 그룹에 넣을 서로 다른 원본 녹음(src_file) 수.
+#
+# 왜 카테고리가 아니라 src_file 인가
+# --------------------------------
+# 2026-08-06 실측: group_id 를 ESC-50 **카테고리**로 잡았더니 machine 이 8 그룹뿐이었고,
+# 그 8 그룹으로는 `min_groups_per_family_per_split=4` (val 4 + test 4 + train 1 = 9)를
+# 만족할 수 없어 manifest 생성이 실패한다. 세션을 아무리 늘려도 그룹은 안 는다.
+#
+# 그런데 `esc50.csv` 에는 `src_file`(원본 Freesound 녹음 ID)이 있고 machine 8 카테고리의
+# 고유 src_file 은 **209 개**다 (airplane 32 / chainsaw 22 / engine 34 / hand_saw 22 /
+# helicopter 15 / train 28 / vacuum_cleaner 30 / washing_machine 26).
+# 같은 카테고리라도 다른 src_file 은 다른 녹음이므로 독립 클러스터로 쓸 수 있다.
+#
+# src_file 하나당 클립이 1~2 개(5초)뿐이라 70초 세션을 채우지 못한다. 그래서 서로소인
+# src_file 을 이만큼씩 묶어 한 그룹으로 만든다 — 그룹 독립성을 지키면서 세션 안 다양성도
+# 남긴다. machine 기준 209/4 ≈ 52 그룹이 나온다.
+SRC_FILES_PER_GROUP = 4
+
+
 def collect_esc50(root: Path) -> dict[str, list[tuple[Path, str]]]:
     import csv as csv_module
 
@@ -158,7 +177,8 @@ def collect_esc50(root: Path) -> dict[str, list[tuple[Path, str]]]:
     audio = root / "ESC-50-master" / "audio"
     if not meta.exists():
         return {}
-    buckets: dict[str, list[tuple[Path, str]]] = {"machine": [], "environment": []}
+    # (family, category, src_file) → 파일들. src_file 이 그룹의 원자 단위다.
+    by_source: dict[tuple[str, str, str], list[Path]] = {}
     for row in csv_module.DictReader(meta.open(encoding="utf-8")):
         category = row["category"]
         family = (
@@ -168,8 +188,62 @@ def collect_esc50(root: Path) -> dict[str, list[tuple[Path, str]]]:
         )
         if family is None:
             continue
-        buckets[family].append((audio / row["filename"], category))
+        # src_file 이 없는 구형 메타데이터는 카테고리로 폴백한다(그룹이 거칠어질 뿐 안전).
+        src_file = str(row.get("src_file") or category)
+        by_source.setdefault((family, category, src_file), []).append(
+            audio / row["filename"]
+        )
+
+    buckets: dict[str, list[tuple[Path, str]]] = {"machine": [], "environment": []}
+    # 카테고리 안에서 src_file 을 정렬해 결정적으로 묶는다. 카테고리를 가로지르지
+    # 않는 이유: 한 세션이 여러 카테고리를 섞으면 "소스 종류별 최악값"(절대목표 2)
+    # 평가에서 그 세션이 어느 계열의 무엇인지 말할 수 없게 된다.
+    per_category: dict[tuple[str, str], list[str]] = {}
+    for family, category, src_file in by_source:
+        per_category.setdefault((family, category), []).append(src_file)
+    for (family, category), src_files in sorted(per_category.items()):
+        for index, start in enumerate(range(0, len(src_files), SRC_FILES_PER_GROUP)):
+            group = f"{category}-{index:02d}"
+            for src_file in sorted(src_files)[start : start + SRC_FILES_PER_GROUP]:
+                for path in sorted(by_source[(family, category, src_file)]):
+                    buckets[family].append((path, group))
     return buckets
+
+
+def clips_used_by_sessions(csv_paths: list[Path]) -> set[str]:
+    """이미 녹음된 세션이 쓴 클립 파일명을 모은다 (``sources.csv`` 의 ``clips`` 열).
+
+    왜 필요한가
+    ----------
+    2026-08-06: 재정렬로 47세션이 살아남고 33세션만 다시 받으면 되는데, 그 33세션의
+    소스를 새 그룹 정의로 다시 만들면 **같은 클립이 옛 그룹과 새 그룹에 동시에 들어갈
+    수 있다.** 그러면 group 단위 split 이 무의미해진다 — 같은 오디오가 train 과 test 에
+    함께 있게 된다.
+
+    ``clips`` 열은 세션당 앞 12개만 저장하므로 이 집합은 **하한**이다. 그래서 호출부는
+    이걸로 클립을 지운 뒤에도 그룹 수가 충분한지 따로 확인해야 한다.
+    """
+
+    import ast
+    import csv as csv_module
+
+    used: set[str] = set()
+    for csv_path in csv_paths:
+        path = csv_path if csv_path.is_absolute() else REPO_ROOT / csv_path
+        if not path.exists():
+            print(f"  [warn] 없는 경로: {path}")
+            continue
+        for row in csv_module.DictReader(path.open(encoding="utf-8")):
+            raw = (row.get("clips") or "").strip()
+            if not raw:
+                continue
+            try:
+                names = ast.literal_eval(raw)
+            except (SyntaxError, ValueError):
+                print(f"  [warn] clips 열을 읽지 못했습니다: {raw[:60]}")
+                continue
+            used.update(str(name) for name in names)
+    return used
 
 
 MIN_DISTINCT_GROUPS = 8
@@ -292,6 +366,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--families", nargs="+", default=["environment", "machine", "speech", "music"]
     )
+    parser.add_argument(
+        "--keep-disjoint-from",
+        nargs="+",
+        default=[],
+        metavar="SOURCES_CSV",
+        help=(
+            "이미 녹음에 쓰인 sources.csv 들. 거기 등장한 클립은 새 소스에서 제외한다. "
+            "일부 세션만 다시 녹음할 때 필수다 — 같은 클립이 옛 그룹과 새 그룹에 "
+            "동시에 들어가면 split 을 가로지른다."
+        ),
+    )
     args = parser.parse_args(argv)
 
     rng = random.Random(args.seed)
@@ -305,6 +390,29 @@ def main(argv: list[str] | None = None) -> int:
         "speech": collect_tree(REPO_ROOT / "data/raw/speech", (".flac", ".wav")),
         "music": collect_tree(REPO_ROOT / "data/raw/music", (".mp3", ".wav")),
     }
+
+    if args.keep_disjoint_from:
+        used = clips_used_by_sessions(
+            [Path(value) for value in args.keep_disjoint_from]
+        )
+        if not used:
+            print(
+                "[중단] --keep-disjoint-from 이 클립을 하나도 못 읽었습니다. "
+                "경로가 sources.csv 인지 확인하세요 — 빈 목록으로 진행하면 "
+                "누수를 막는 척만 하게 됩니다.",
+                file=sys.stderr,
+            )
+            return 2
+        before = {family: len(items) for family, items in sources.items()}
+        sources = {
+            family: [(path, group) for path, group in items if path.name not in used]
+            for family, items in sources.items()
+        }
+        print(f"[누수 차단] 이미 녹음에 쓰인 클립 {len(used)}개 제외")
+        for family in sorted(sources):
+            removed = before[family] - len(sources[family])
+            if removed:
+                print(f"  {family}: {before[family]} → {len(sources[family])} (−{removed})")
 
     rows: list[dict] = []
     for family in args.families:

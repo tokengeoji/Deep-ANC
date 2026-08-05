@@ -193,16 +193,59 @@ fuser -v /dev/snd/*                       # 장치 점유 확인 (필수)
 **47세션으로는 게이트(`≥80세션 그리고 ≥90분`)를 못 채운다. 게이트를 낮추지 않는다.**
 다만 실패 33세션만 다시 받으면 되므로 스피커 발음이 93.3분 → **약 38.5분**으로 줄었다.
 
+#### ⚠ 세션 수만 채우면 안 된다 — **그룹 수**가 진짜 제약이다 (2026-08-06 실측)
+
+`min_groups_per_family_per_split = 4` 는 계열마다 val 4 + test 4 + train 최소 1 = **9 그룹**을
+요구한다. 그런데 분할기가 비율(8:1:1)로만 나눠서 val·test 에 계열당 1~2 그룹밖에 안 갔다.
+비율로 4 를 얻으려면 계열당 40 그룹(=160 세션)이 필요하다 — 스피커 시간 2배다.
+**세션을 늘려도 그룹은 안 는다.** 같은 그룹 안의 세션은 독립이 아니기 때문이다.
+
+고친 것 둘:
+
+1. **분할기가 하한을 먼저 확보한다** (`assign_splits(min_units_per_split=...)`).
+   만족시킬 수 없으면 조용히 적게 주지 않고 EXIT=2 로 실패한다. 하한의 단일 출처는
+   `eval.recorded.MIN_GROUPS_PER_FAMILY` 이고 CLI 는 **강화 방향만** 받는다.
+2. **소스 그룹을 세분화했다** — ESC-50 `group_id` 가 카테고리(machine 8개)였는데
+   `esc50.csv` 의 `src_file`(원본 녹음 ID) 묶음으로 바꿨다. **machine 8 → 55, environment 16 → 126.**
+
+재정렬 후 현재 그룹 분포와 필요량:
+
+| 계열 | 살아남음 | 현재 그룹 | 재녹음 | 추가로 필요한 그룹 |
+|---|---|---|---|---|
+| environment | 14 | 13 | 6 | 0 |
+| machine | 13 | 8 | 7 | **1** |
+| music | 15 | 15 | 5 | 0 |
+| speech | 5 | 5 | 15 | **4** |
+
+speech 가 5/20 로 가장 낮다. **무음 희석이 아니다** — 유음 구간(RMS 상위 60%)만 골라도
+coh² 가 오히려 낮다(0.888 vs 0.941). speech 가 실제로 가장 어려운 계열이고, 절대목표 2가
+최악값 문제이므로 그 사실을 게이트 완화로 덮으면 안 된다.
+
 ```bash
-# 복구본은 아직 data/recorded_broken/ 에 있다 (source_aligned.wav 47개).
-# 되돌리기: quarantine_recorded_sessions.py --restore
-.venv/bin/python scripts/data/record_session_batch.py --confirm-speaker --amplitude 0.06
-# 계열별 분할도 가능: --families environment machine  /  --families music speech
+# ① 새 소스 — --keep-disjoint-from 이 필수다.
+#    빠뜨리면 같은 클립이 옛 그룹(살아남은 47세션의 environment-thunderstorm)과
+#    새 세분 그룹(thunderstorm-02)에 동시에 들어가 group 단위 split 이 무의미해진다.
+.venv/bin/python scripts/data/build_recording_sources.py --out data/source_pool_v2 \
+    --sessions-per-family 20 --keep-disjoint-from data/source_pool/sources.csv
+
+# ② 재녹음 — 계열별로 쪼갤 수 있다. 중단해도 batch_progress.csv 로 재개된다.
+#    speech 통과율이 25% 였으므로 speech 를 먼저 돌려 통과율을 보고 나머지를 조정하라.
+.venv/bin/python scripts/data/record_session_batch.py --confirm-speaker \
+    --amplitude 0.06 --families speech                       # 15세션, 발음 17.5분
+.venv/bin/python scripts/data/record_session_batch.py --confirm-speaker \
+    --amplitude 0.06 --families machine environment music     # 18세션, 발음 21분
+
+# ③ 매니페스트 — 계열×split 의 그룹 수를 출력한다. 하한 미달이면 EXIT=2.
 .venv/bin/python scripts/data/make_recorded_manifest.py
-.venv/bin/python scripts/data/validate_recorded_sessions.py     # 기대: 80/80 PASS
+.venv/bin/python scripts/data/validate_recorded_sessions.py
 ```
 
+복구본은 아직 `data/recorded_broken/` 에 있다(`source_aligned.wav` 47개).
+되돌리기: `quarantine_recorded_sessions.py --restore`.
+
 ⚠ 재생 전 **오디오 장치 점유 확인 필수** (`~/DeepANC_CRN_n_codex` 병행 작업 중).
+⚠ `sources.csv` 의 `clips` 열은 세션당 앞 12개만 저장하므로 제외 목록은 **하한**이다.
+  소스 생성 후 그룹 수를 눈으로 확인하라.
 
 ---
 
