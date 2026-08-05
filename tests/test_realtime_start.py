@@ -121,10 +121,45 @@ def test_engine_preflight_rejects_a_missing_artifact_even_when_unused(tmp_path):
     problems = run_realtime.engine_artifact_preflight(cfg)
 
     assert len(problems) == 1
-    assert "does_not_exist.plan" in problems[0]
-    assert "미사용" in problems[0]
+    assert "does_not_exist.plan" in problems[0].detail
+    assert "미사용" in problems[0].detail
+    assert problems[0].missing_file is True
+    # 저장소 위생 검사는 이것도 막는다 …
     with pytest.raises(FileNotFoundError, match="preflight 실패"):
         run_realtime.require_engine_artifacts(cfg)
+    # … 그러나 **시작**은 막지 않는다 (읽히지도 않는 파일이다). 경고만 남는다.
+    warnings = run_realtime.require_engine_artifacts_to_start(cfg)
+    assert len(warnings) == 1 and "does_not_exist.plan" in warnings[0]
+
+
+def test_runtime_start_is_not_blocked_by_an_unused_missing_artifact(tmp_path):
+    """**시작 fail-closed 회귀 방지.**
+
+    2026-08-06 실측 반증: ``engine.type=ort`` 인 배포가 *읽히지도 않는* ckpt/plan 이
+    없다는 이유로 ``exit 2`` 로 하드 중단됐다. 모델은 GitHub Release 로 배포되고
+    (``git ls-files runs/`` = 0) ort 배포가 onnx 하나만 받는 것은 정상이다.
+    활성 아티팩트가 없을 때만 시작을 막는다.
+    """
+
+    onnx = tmp_path / "tiny.onnx"
+    onnx.write_bytes(b"x")
+    cfg = {
+        "engine": {
+            "type": "ort",
+            "ckpt": str(tmp_path / "not_fetched.pt"),
+            "onnx": str(onnx),
+            "plan": str(tmp_path / "not_fetched.plan"),
+        }
+    }
+
+    warnings = run_realtime.require_engine_artifacts_to_start(cfg)
+    assert len(warnings) == 2
+    assert all("미사용" in item for item in warnings)
+
+    # 활성 아티팩트가 없으면 그때는 막는다.
+    cfg["engine"]["onnx"] = str(tmp_path / "absent.onnx")
+    with pytest.raises(FileNotFoundError, match="활성"):
+        run_realtime.require_engine_artifacts_to_start(cfg)
 
 
 def test_engine_preflight_rejects_a_missing_active_artifact(tmp_path):
@@ -135,7 +170,26 @@ def test_engine_preflight_rejects_a_missing_active_artifact(tmp_path):
     problems = run_realtime.engine_artifact_preflight(cfg)
 
     assert len(problems) == 1
-    assert "활성" in problems[0]
+    assert "활성" in problems[0].detail
+    assert problems[0].fatal is True
+
+
+def test_engine_preflight_rejects_a_wrong_extension_everywhere(tmp_path):
+    """확장자 오류는 '아직 안 받았다'가 아니라 **잘못 적은 것**이다 — 어디서나 치명적.
+
+    파일 시스템을 보지 않고 판정할 수 있는 부패이므로, 아티팩트를 받지 않은 새 클론
+    에서도 잡힌다. (존재 검사는 그 트리에서 의미가 없다.)
+    """
+
+    cfg = {"engine": {"type": "ort", "onnx": "runs/export/tiny_corrected.plan"}}
+
+    problems = run_realtime.engine_artifact_preflight(cfg)
+
+    assert len(problems) == 1
+    assert problems[0].fatal is True and problems[0].missing_file is False
+    assert "확장자" in problems[0].detail
+    with pytest.raises(FileNotFoundError):
+        run_realtime.require_engine_artifacts_to_start(cfg)
 
 
 def test_engine_preflight_rejects_an_empty_active_key(tmp_path):
@@ -143,20 +197,22 @@ def test_engine_preflight_rejects_an_empty_active_key(tmp_path):
 
     problems = run_realtime.engine_artifact_preflight({"engine": {"type": "ort"}})
 
-    assert any("engine.onnx 가 비었습니다" in item for item in problems)
+    assert any("engine.onnx 가 비었습니다" in item.detail for item in problems)
+    assert all(item.fatal for item in problems)
 
 
 def test_engine_preflight_rejects_an_unknown_engine_type():
     problems = run_realtime.engine_artifact_preflight({"engine": {"type": "quantum"}})
 
-    assert any("알 수 없는 engine.type" in item for item in problems)
+    assert any("알 수 없는 engine.type" in item.detail for item in problems)
+    assert all(item.fatal for item in problems)
 
 
 _SHIPPED_RUNTIME_CONFIGS = ("configs/runtime.yaml", "configs/runtime_tiny.yaml")
 
 
 def test_shipped_runtime_configs_declare_a_loadable_engine():
-    """설정 자체의 결함(빈 키·알 수 없는 type)은 **어느 환경에서나** 잡힌다.
+    """설정 자체의 결함(빈 키·알 수 없는 type·확장자 부패)은 **어느 환경에서나** 잡힌다.
 
     아티팩트 파일의 존재와 달리 이것은 저장소에 커밋된 텍스트만으로 판정할 수 있으므로
     호스트에 무엇이 받아져 있든 항상 돈다.
@@ -166,7 +222,7 @@ def test_shipped_runtime_configs_declare_a_loadable_engine():
 
     for name in _SHIPPED_RUNTIME_CONFIGS:
         problems = run_realtime.engine_artifact_preflight(load_runtime_config(name))
-        structural = [p for p in problems if "아티팩트가 없습니다" not in p]
+        structural = [item.detail for item in problems if not item.missing_file]
         assert structural == [], f"{name}: {structural}"
 
 
@@ -175,21 +231,53 @@ def test_engine_preflight_accepts_the_shipped_runtime_configs():
 
     이 테스트가 깨지면 누군가 설정에 없는 경로를 다시 적었거나 아티팩트를 지운 것이다.
 
-    ⚠ 2026-08-06: ``runs/`` 는 ``.gitignore`` 대상이고 모델은 GitHub Release 로 배포된다
-    (``git ls-files runs/`` = 0). 따라서 **아티팩트를 받지 않은 트리**(새 클론, CI,
-    원격 학습 환경)에서 이 단언은 저장소 결함이 아니라 "아직 안 받았다"를 뜻한다.
-    그 트리에서 스위트를 빨간불로 만들면 "pytest 전부 통과" 규칙이 이 기기 전용이 되고,
-    규칙이 무의미해지면 다음 사람이 진짜 실패도 무시하게 된다. 그래서 아티팩트 트리에
-    한해 검사하고, 설정 자체의 결함은 위 테스트가 항상 잡는다.
+    ⚠ 2026-08-06 반증 #12: ``runs/`` 는 ``.gitignore`` 대상이고 모델은 GitHub Release 로
+    배포된다 — ``git ls-files runs/ | wc -l`` = 0. 따라서 **아티팩트를 받지 않은
+    트리**(새 클론, CI, 원격 학습 환경)에서 파일 부재는 저장소 결함이 아니라 "아직
+    안 받았다"를 뜻한다. 그 트리에서 스위트를 빨간불로 만들면 "pytest 전부 통과"
+    규칙이 이 기기 전용이 되고, 규칙이 무의미해지면 다음 사람이 진짜 실패도 무시한다.
+
+    ⚠⚠ 2026-08-06 통합 검증에서 **이 완화 자체가 반증됐다.** 직전 판정은 "파일 부재면
+    무조건 skip" 이었는데, 그러면 ``engine.ckpt`` 를 존재하지 않는 경로로 오타 내도
+    (``sed`` 로 실제 재현: ``ckpt: ...THIS_DOES_NOT_EXIST.pt`` → ``11 passed, 1 skipped``)
+    어떤 트리에서도 빨간불이 되지 않는다. 이 게이트가 생긴 이유가 바로 ``runtime.yaml``
+    이 4개월간 존재한 적 없는 ``model.onnx`` 를 가리킨 것이었으므로, 그 결함 유형이
+    통째로 무검출로 돌아간 셈이다. docstring 첫 줄의 약속("없는 경로를 다시 적으면
+    깨진다")이 거짓이 됐다.
+
+    그래서 판정 축을 **부재냐 아니냐**가 아니라 :attr:`fatal` (= 그 파일을 실제로
+    읽는가)로 되돌린다:
+      · **활성** 아티팩트 부재 → 실패. 오타든 삭제든 여기서 잡힌다.
+      · 미사용 아티팩트 부재 → 허용. ``engine.type=ort`` 배포가 onnx 만 받는 것은
+        정상이고, "runs/ 는 있는데 일부만 있는" 트리가 실제로 존재한다.
+      · 그 밖의 부패(빈 키·확장자·알 수 없는 type) → 어디서나 실패.
+    아티팩트를 하나도 받지 않은 새 클론만 ``runs/`` 부재로 걸러 skip 한다 — 그 트리는
+    활성 파일도 없는 것이 정상이고, 이 예외는 반증 #12 이전 HEAD 에 이미 있었다.
     """
+
+    from pathlib import Path
 
     from deep_anc.config import load_runtime_config
 
-    if not (run_realtime.REPO_ROOT / "runs").is_dir():
-        pytest.skip(
-            "runs/ 가 없는 트리 — 엔진 아티팩트는 .gitignore 대상이라 존재 검사는 "
-            "받아 놓은 환경에서만 의미가 있다"
-        )
+    repo_root = Path(__file__).resolve().parents[1]
+    unfetched_tree = not (repo_root / "runs").is_dir()
 
+    unused: list[str] = []
+    active_missing: list[str] = []
     for name in _SHIPPED_RUNTIME_CONFIGS:
-        assert run_realtime.engine_artifact_preflight(load_runtime_config(name)) == [], name
+        problems = run_realtime.engine_artifact_preflight(load_runtime_config(name))
+        corrupt = [item.detail for item in problems if not item.missing_file]
+        assert corrupt == [], f"{name}: {corrupt}"
+        for item in problems:
+            bucket = active_missing if item.fatal else unused
+            bucket.append(f"{name}: {item.detail}")
+
+    if active_missing and unfetched_tree:
+        pytest.skip(
+            "엔진 아티팩트를 하나도 받지 않은 트리(runs/ 자체가 없다) — 존재 검사는 "
+            "받아 놓은 환경에서만 의미가 있다: " + "; ".join(active_missing)
+        )
+    assert active_missing == [], (
+        "출하 runtime 설정이 실제로 읽는 아티팩트가 없습니다 — 설정에 없는 경로를 "
+        "적었거나 아티팩트를 지운 것입니다: " + "; ".join(active_missing)
+    )

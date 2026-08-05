@@ -40,6 +40,9 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.config import REPO_ROOT                          # noqa: E402
+from deep_anc.dsp.invariants import (                          # noqa: E402
+    MIN_STREAM_DELAY_VALID_WINDOW_RATIO,
+)
 from deep_anc.data.timeline import (                           # noqa: E402
     TIMELINE_METHOD,
     TimelineSettings,
@@ -51,6 +54,19 @@ from deep_anc.data.timeline import (                           # noqa: E402
 # 게이트 기본값 — CLI 는 강화 방향으로만 받는다.
 DEFAULT_MIN_COHERENCE = 0.90
 DEFAULT_MIN_VALID_WINDOW_RATIO = 0.90
+
+# 같은 물리량(지연궤적 유효창 비율)에 임계가 두 곳에 선언돼 있다. 두 값이 다른 것은
+# 의도된 것이다 — 여기는 **재정렬본을 만들 때** 요구하는 값이고(0.90), invariants 쪽은
+# **이미 만들어진 세션을 학습에 들일 때** 요구하는 바닥이다(0.77). 그러나 2026-08-06
+# 통합 검증 전까지 둘 사이에 대조가 없어서 바닥 쪽이 0.50 까지 내려가 있어도 아무도
+# 몰랐고, 실제로 그 틈으로 프레임 슬립 세션이 통과했다. 순서가 뒤집히면 느슨한 쪽이
+# 학습 데이터를 지키게 되므로 import 시점에 못 박는다.
+if DEFAULT_MIN_VALID_WINDOW_RATIO < MIN_STREAM_DELAY_VALID_WINDOW_RATIO:
+    raise AssertionError(
+        "재정렬 게이트가 QA 바닥보다 느슨합니다: "
+        f"realign {DEFAULT_MIN_VALID_WINDOW_RATIO} < QA {MIN_STREAM_DELAY_VALID_WINDOW_RATIO}. "
+        "재정렬은 학습 진입보다 항상 같거나 엄격해야 합니다"
+    )
 
 
 def self_test(sample_rate: int = 48000, seconds: float = 8.0) -> int:

@@ -23,7 +23,8 @@ from ..data.manifest import read_manifest
 # 지연·lead 부기의 단일 출처. 게이트가 lead 를 **스스로 유도하면** 그것이 두 번째
 # 유도가 되고, trainer 와 갈라진 채로 양쪽 다 "통과" 한다 (발생기 A, 커밋 aaeef41).
 from ..dsp.invariants import check_lead_agreement
-from ..dsp.timing import PlantDelays
+from ..dsp.secondary_path import load_secondary_path
+from ..dsp.timing import BandPlan, FrequencyBand, PlantDelays
 from ..data.recorded_qa import (
     settings_from_data_config,
     validate_recorded_sessions,
@@ -505,6 +506,21 @@ def _checkpoint_lead(state: dict) -> int:
     return int((cfg.get("data", {}) or {}).get("digital_reference_lead_samples", 0))
 
 
+def _checkpoint_optimize_band(state: dict) -> FrequencyBand | None:
+    """checkpoint 가 **어느 대역에서 개선을 요구받았는지**. 없으면 None.
+
+    trainer 는 ``BandPlan.resolve(...).optimize`` 를 resolved cfg 의
+    ``trusted_band_hz`` 로 저장한다. 그것이 이 값의 단일 출처다 — 게이트가 여기서
+    다시 유도하지 않는다.
+    """
+
+    cfg = state.get("cfg", {}) or {}
+    raw = cfg.get("trusted_band_hz")
+    if raw is None:
+        return None
+    return FrequencyBand.parse(raw, name="checkpoint trusted")
+
+
 def _load_checkpoint_state(path: Path) -> dict:
     try:
         state = torch.load(path, map_location="cpu", weights_only=False)
@@ -556,6 +572,7 @@ def audit_init_checkpoint(
     *,
     expected_model_cfg: dict,
     expected_lead: int,
+    expected_optimize_band: FrequencyBand | None = None,
     max_lead_mismatch_samples: int = 0,
     require_completed: bool = True,
     max_best_metric_db: float = 0.0,
@@ -579,6 +596,22 @@ def audit_init_checkpoint(
     요구하고, 여기서 벗어나면 그쪽에서 걸린다. 이 허용은 오직 "어떤 checkpoint 에서
     출발할 수 있는가"에만 관여한다. 과거 사고였던 lead=0 checkpoint 는 113 과 113 샘플
     떨어져 있으므로 어떤 합리적 허용치로도 통과하지 못한다.
+
+    ``expected_optimize_band`` — **대역 축** (2026-08-06 신설, 반증 #13/#17 대응)
+    ----------------------------------------------------------------------
+    lead 와 달리 대역 차이는 파인튜닝이 흡수하는 종류가 아니다. 좁은 대역으로 학습한
+    모델은 벌점이 **없던** 구간을 적극적으로 증폭한다 — 실측: ``[150,800]`` 설정으로
+    학습한 모델이 600–1600Hz 를 **+27.01 dB** 키웠다. 그런 checkpoint 에서 출발하면
+    파인튜닝은 "고역 증폭기" 를 초기값으로 받는다.
+
+    실제 상태(2026-08-06): ``runs/pretrain_{base,tiny}_corrected/ckpt/best.pt`` 는
+    ``cfg.trusted_band_hz = [150, 600]`` / lead 109 인데 현재 설정이 유도하는 값은
+    ``[150, 1600]`` / 116 이다. lead 축만 보던 게이트는 이 checkpoint 를 통과시켰다.
+
+    그래서 요구는 하나다: **checkpoint 의 최적화 대역이 파인튜닝의 최적화 대역을
+    덮어야 한다.** 넓은 쪽에서 좁은 쪽으로 가는 것은 허용된다(벌점을 받아 본 구간이
+    더 넓다). 좁은 쪽에서 넓은 쪽으로 가는 것은 거부한다. 허용치 설정은 두지 않았다 —
+    "몇 Hz 까지 봐준다" 가 존재하는 순간 게이트를 통과시키려고 그 값을 키우게 된다.
     """
 
     checkpoint = _repo_path(path).resolve()
@@ -605,6 +638,24 @@ def audit_init_checkpoint(
             f"checkpoint={saved_lead}, fine-tune={int(expected_lead)}, "
             f"차이 {lead_mismatch} > 허용 {tolerance} samples"
         )
+    saved_band = _checkpoint_optimize_band(state)
+    if expected_optimize_band is not None:
+        if saved_band is None:
+            raise ValueError(
+                "init checkpoint 에 trusted_band_hz 가 없어 **어느 대역에서 학습됐는지** "
+                "알 수 없습니다 — 좁은 대역으로 학습된 모델은 벌점이 없던 대역을 "
+                "증폭합니다(실측 +27.01 dB). 대역을 기록하는 trainer 로 다시 학습하세요"
+            )
+        if not saved_band.covers(expected_optimize_band):
+            raise ValueError(
+                "init checkpoint 학습 대역이 파인튜닝 대역을 덮지 않습니다: "
+                f"checkpoint={saved_band.as_tuple()}, fine-tune="
+                f"{expected_optimize_band.as_tuple()} — 벌점을 받아 본 적 없는 구간이 "
+                "남습니다. 좁은 대역으로 학습한 모델은 그 구간을 적극 증폭합니다 "
+                "([150,800] 로 학습한 모델의 600-1600Hz 실측 +27.01 dB). "
+                "lead 와 달리 이 차이는 파인튜닝이 흡수하지 않습니다"
+            )
+
     best_metric = float(state.get("best_metric", float("nan")))
     if not math.isfinite(best_metric) or best_metric >= float(max_best_metric_db):
         raise ValueError(
@@ -631,6 +682,17 @@ def audit_init_checkpoint(
             raise ValueError("last.pt의 digital-reference lead가 fine-tune 설정과 다릅니다")
         if _checkpoint_lead(last_state) != saved_lead:
             raise ValueError("best.pt와 last.pt의 lead가 서로 다릅니다")
+        last_band = _checkpoint_optimize_band(last_state)
+        if (last_band is None) != (saved_band is None) or (
+            last_band is not None
+            and saved_band is not None
+            and last_band.as_tuple() != saved_band.as_tuple()
+        ):
+            raise ValueError(
+                "best.pt와 last.pt의 학습 대역이 서로 다릅니다: "
+                f"best={None if saved_band is None else saved_band.as_tuple()}, "
+                f"last={None if last_band is None else last_band.as_tuple()}"
+            )
         schedule = last_cfg.get("schedule", {}) or {}
         completion_target = int(
             last_cfg.get("run_until_step", schedule.get("total_steps", 0))
@@ -649,6 +711,12 @@ def audit_init_checkpoint(
         "best_metric_db": best_metric,
         "physics_status": physics_status,
         "digital_reference_lead_samples": saved_lead,
+        "trusted_band_hz": None if saved_band is None else list(saved_band.as_tuple()),
+        "expected_trusted_band_hz": (
+            None
+            if expected_optimize_band is None
+            else list(expected_optimize_band.as_tuple())
+        ),
         "completion_checkpoint": str(completion_path) if require_completed else None,
         "completion_step": completion_step,
         "completion_target_step": completion_target,
@@ -732,12 +800,33 @@ def _relative_tau_check(primary: dict, secondary: dict):
     )
 
 
-_ALIGNMENT_CFG_KEYS = (
-    "min_source_err_coherence",
-    "min_ref_err_coherence",
-    "max_source_err_delay_std_samples",
-    "max_source_err_delay_range_samples",
-)
+def _alignment_cfg_keys() -> frozenset[str]:
+    """QA 가 받는 정렬 키를 **QA 에서 유도한다.** 손으로 베끼지 않는다.
+
+    ⚠ 2026-08-06 통합 검증이 잡은 결함: 이 목록이 옛 4개 키
+    (``max_source_err_delay_std_samples`` 등)로 하드코딩돼 있어서, readiness 에
+    새 키(``max_source_err_delay_robust_std_samples`` 등)를 선언하면 **경고 한 줄
+    없이 버려지고** QA 는 기본값으로 돌았다. ``deprecated_threshold_notes`` 도 빈
+    튜플이 되어 "폐기 키를 쓰고 있다"는 안내문마저 사라진다 — 즉 HANDOFF 가 지시한
+    "키 이름을 새 것으로 갈아라"를 그대로 따르면 설정이 조용히 무력화된다.
+
+    목록을 복사하는 것이 원인이므로 복사를 없앤다. 폐기 키까지 함께 넘기는 이유는
+    :func:`settings_from_data_config` 가 그것을 받아 "무엇이 무시됐는지" 를
+    ``deprecated_threshold_notes`` 로 되돌려 주기 때문이다. 알 수 없는 키는 QA 가
+    ``ValueError`` 로 거절한다.
+    """
+
+    from ..data.recorded_qa import (
+        _ALIGNMENT_OVERRIDE_KEYS,
+        _DEPRECATED_ALIGNMENT_DROPPED,
+        _DEPRECATED_ALIGNMENT_KEYS,
+    )
+
+    return frozenset(
+        set(_ALIGNMENT_OVERRIDE_KEYS)
+        | set(_DEPRECATED_ALIGNMENT_KEYS)
+        | set(_DEPRECATED_ALIGNMENT_DROPPED)
+    )
 
 
 def _alignment_overrides(readiness_cfg: dict) -> dict:
@@ -748,11 +837,15 @@ def _alignment_overrides(readiness_cfg: dict) -> dict:
     푸는 가장 쉬운 방법은 언제나 게이트를 낮추는 것이다.
     """
 
-    return {
-        key: float(readiness_cfg[key])
-        for key in _ALIGNMENT_CFG_KEYS
-        if readiness_cfg.get(key) is not None
-    }
+    overrides: dict = {}
+    for key in _alignment_cfg_keys():
+        value = readiness_cfg.get(key)
+        if value is None:
+            continue
+        # 값의 형(bool/int/tuple)은 QA 의 RecordedQASettings 가 검증한다. 여기서
+        # float() 로 뭉개면 alignment_band_hz 같은 비스칼라 키가 깨진다.
+        overrides[key] = tuple(value) if isinstance(value, list) else value
+    return overrides
 
 
 def _audit_recorded_alignment(
@@ -1020,6 +1113,34 @@ def _audit_measured_source_delay(
         audit.fail(
             "measured_source_delay_agreement",
             "recorded QA 리포트가 없어 실측 source→ERR 지연을 알 수 없습니다",
+        )
+        return
+
+    # ⚠ 2026-08-06 통합 검증 — **같은 이름이 두 물리량을 오간다.**
+    # QA 는 "학습이 실제로 읽는 파일" 을 재므로 재정렬본(source_aligned.wav)이 있으면
+    # 그것을 잰다. 그 값은 재정렬 후 **잔여 음향 지연 142.5 샘플**이지, 이 게이트가
+    # P(z) 유도값(1602 + argmax tap = 1849)과 대조하려는 **원본 재생→ERR 지연**이
+    # 아니다. 대조하면 1706.5 샘플 어긋나 무조건 FAIL 하고, 그 가짜 실패가 진짜 결함
+    # (원본 관측 1672 vs 유도 1849 = 177 샘플, 허용 64 의 2.8배)을 덮는다.
+    # 숫자를 비교하기 전에 **무엇을 잰 값인지** 먼저 본다.
+    realigned = sorted(
+        {
+            str(session.get("alignment_reference"))
+            for session in recorded_report["sessions"]
+            if str(session.get("alignment_reference", "")).startswith("source_aligned")
+        }
+    )
+    if realigned:
+        audit.fail(
+            "measured_source_delay_agreement",
+            "QA 가 잰 source→ERR 지연은 **재정렬본**에서 나온 값이라 P(z) 유도값과 "
+            f"대조할 수 없습니다 (기준 파일: {', '.join(realigned)}). 재정렬본의 "
+            "지연은 정렬 후 잔여 음향 지연(약 142 샘플)이고, 이 게이트가 필요한 것은 "
+            "원본 source.wav 의 재생→ERR 총지연(관측 약 1672)입니다. 두 물리량이 같은 "
+            "이름을 쓰고 있어 그대로 비교하면 1706 샘플 어긋난 가짜 실패가 나오고, "
+            "그것이 진짜 결함(관측 1672 vs 유도 1849 = 177 샘플)을 덮습니다. "
+            "QA 가 원본 기준 지연을 별도 키로 함께 내도록 고친 뒤 다시 도세요",
+            alignment_references=realigned,
         )
         return
 
@@ -1393,14 +1514,37 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
             "유효한 official P/S가 없어 lead를 검증할 수 없습니다",
         )
 
+    # 파인튜닝이 개선을 요구할 대역. trainer 와 **같은 함수**로 유도한다 —
+    # 여기서 손으로 교집합을 쓰면 그것이 여섯 번째 복붙이다(발생기 A).
+    expected_optimize_band: FrequencyBand | None = None
+    if secondary is not None:
+        try:
+            expected_optimize_band = BandPlan.resolve(
+                # trainer 와 **같은 로더·같은 규칙**: consistency_band 가 있으면 그것,
+                # 없으면 excitation_band. 여기서 NPZ 키를 직접 읽으면 두 번째 규칙이 된다.
+                plant_trusted_band_hz=load_secondary_path(
+                    secondary["path"]
+                ).trusted_band_hz(),
+                duct_cfg=duct_cfg,
+                sample_rate=sample_rate,
+            ).optimize
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+            expected_optimize_band = None
+
     try:
         init_value = cfg.get("init_ckpt")
         if not init_value:
             raise ValueError("init_ckpt가 비었습니다")
+        if expected_optimize_band is None:
+            raise ValueError(
+                "S(z) 신뢰 대역을 알 수 없어 init checkpoint 의 학습 대역을 검증할 수 "
+                "없습니다 — official_secondary_path 를 먼저 통과시키세요"
+            )
         init = audit_init_checkpoint(
             init_value,
             expected_model_cfg=cfg.get("model", {}),
             expected_lead=configured_lead,
+            expected_optimize_band=expected_optimize_band,
             max_lead_mismatch_samples=int(
                 readiness_cfg.get("max_init_lead_mismatch_samples", 0)
             ),

@@ -15,6 +15,12 @@ from typing import Any, Iterable
 import numpy as np
 import soundfile as sf
 
+from ..dsp.invariants import (
+    MAX_STREAM_DELAY_P95_P5_SAMPLES,
+    MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+    MIN_STREAM_DELAY_VALID_WINDOW_RATIO,
+    MIN_STREAM_DELAY_VALID_WINDOWS,
+)
 from .manifest import VALID_SPLITS, validate_group_id, validate_source_family
 
 
@@ -43,7 +49,6 @@ class RecordedQASettings:
     check_alignment: bool = True
     alignment_band_hz: tuple[float, float] = (150.0, 600.0)
     alignment_nperseg: int = 8192
-    alignment_window_seconds: float = 1.0
     alignment_max_seconds: float = 30.0
     """정렬 검사에 읽어 들일 최대 길이(초). 스트리밍 QA 의 메모리 규약을 깨지 않기
     위한 상한이다. 30 초 = 채널당 5.7 MB 이고, 실측 세션 70 초 중 30 초면 창 30개라
@@ -56,8 +61,28 @@ class RecordedQASettings:
     """음향 대조군. 이 값이 살아 있는데 source→ERR 만 죽으면 원인은 음향이 아니라
     녹음 소프트웨어의 타임베이스다 — 진단이 자동으로 갈린다."""
 
-    max_source_err_delay_std_samples: float = 64.0
-    max_source_err_delay_range_samples: float = 256.0
+    max_source_err_delay_robust_std_samples: float = MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
+    """지연 궤적 산포(1.4826×MAD)의 상한. **원시 std 가 아니다.**
+
+    2026-08-06 반증 #14/#18: 원시 std/range 로 판정하던 옛 게이트는 제대로 재정렬된
+    47 세션 중 22개(47%)를 오기각했다. 창 30개 중 27개가 125~150 인데 이상치 3개가
+    std 를 1106 으로 만든 것이 원인이고, 그 이상치는 광대역 argmax 추정기가 만들었다.
+    추정기를 대역제한 PHAT 단일 출처로 바꾸고 판정량을 로버스트 통계로 바꿨다.
+    임계 근거(전수 실측)는 :data:`deep_anc.dsp.invariants.MAX_STREAM_DELAY_ROBUST_STD_SAMPLES`.
+    """
+
+    max_source_err_delay_p95_p5_samples: float = MAX_STREAM_DELAY_P95_P5_SAMPLES
+    """지연 궤적 변동폭(p95−p5)의 상한. min/max range 가 아니다 — 이유는 위와 같다."""
+
+    min_source_err_delay_windows: int = MIN_STREAM_DELAY_VALID_WINDOWS
+    """유효창이 이보다 적으면 "안정" 이 아니라 **판정 불가(FAIL)** 다."""
+
+    min_source_err_delay_window_ratio: float = MIN_STREAM_DELAY_VALID_WINDOW_RATIO
+    """추적을 놓친 창의 비율이 이보다 크면 FAIL. 로버스트 통계의 fail-open 구멍을 막는다."""
+
+    deprecated_threshold_notes: tuple[str, ...] = ()
+    """폐기된 임계 키가 들어왔을 때 남기는 안내. 조용히 무시하지 않는다 —
+    "죽은 설정이 다음 사람을 속인다"가 이 저장소에서 반복된 실패 방식이다."""
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -98,11 +123,6 @@ class RecordedQASettings:
                 f"alignment_nperseg는 64 이상의 2의 거듭제곱이어야 합니다: "
                 f"{self.alignment_nperseg}"
             )
-        if not 0.0 < float(self.alignment_window_seconds) <= 10.0:
-            raise ValueError(
-                f"alignment_window_seconds는 (0, 10] 이어야 합니다: "
-                f"{self.alignment_window_seconds!r}"
-            )
         if not 0.0 < float(self.alignment_max_seconds):
             raise ValueError(
                 f"alignment_max_seconds는 양수여야 합니다: {self.alignment_max_seconds!r}"
@@ -113,12 +133,44 @@ class RecordedQASettings:
         ):
             if not 0.0 < float(value) <= 1.0:
                 raise ValueError(f"{name}는 (0, 1] 이어야 합니다: {value!r}")
-        for value, name in (
-            (self.max_source_err_delay_std_samples, "max_source_err_delay_std_samples"),
-            (self.max_source_err_delay_range_samples, "max_source_err_delay_range_samples"),
+        for value, name, ceiling in (
+            (
+                self.max_source_err_delay_robust_std_samples,
+                "max_source_err_delay_robust_std_samples",
+                MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+            ),
+            (
+                self.max_source_err_delay_p95_p5_samples,
+                "max_source_err_delay_p95_p5_samples",
+                MAX_STREAM_DELAY_P95_P5_SAMPLES,
+            ),
         ):
             if not math.isfinite(float(value)) or float(value) <= 0.0:
                 raise ValueError(f"{name}는 유한한 양수여야 합니다: {value!r}")
+            # 게이트는 강화 방향으로만 조정할 수 있다. 통과시키려고 임계를 키우는 것을
+            # 설정 파일 한 줄로 할 수 있으면 그건 게이트가 아니다.
+            if float(value) > float(ceiling):
+                raise ValueError(
+                    f"{name}({value!r})는 실측 근거 상한 {ceiling} 보다 클 수 없습니다 — "
+                    "게이트는 강화 방향으로만 조정합니다 (정상군 최대와 오염군 최소 "
+                    "사이의 골짜기에서 고른 값입니다)"
+                )
+        if int(self.min_source_err_delay_windows) < 1:
+            raise ValueError(
+                f"min_source_err_delay_windows는 1 이상이어야 합니다: "
+                f"{self.min_source_err_delay_windows!r}"
+            )
+        ratio = float(self.min_source_err_delay_window_ratio)
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError(
+                f"min_source_err_delay_window_ratio는 (0, 1] 이어야 합니다: {ratio!r}"
+            )
+        if ratio < MIN_STREAM_DELAY_VALID_WINDOW_RATIO:
+            raise ValueError(
+                f"min_source_err_delay_window_ratio({ratio!r})는 실측 근거 하한 "
+                f"{MIN_STREAM_DELAY_VALID_WINDOW_RATIO} 보다 작을 수 없습니다 — "
+                "게이트는 강화 방향으로만 조정합니다"
+            )
 
     @property
     def effective_lead_samples(self) -> int:
@@ -140,14 +192,43 @@ _ALIGNMENT_OVERRIDE_KEYS = frozenset(
         "check_alignment",
         "alignment_band_hz",
         "alignment_nperseg",
-        "alignment_window_seconds",
         "alignment_max_seconds",
         "min_source_err_coherence",
         "min_ref_err_coherence",
-        "max_source_err_delay_std_samples",
-        "max_source_err_delay_range_samples",
+        "max_source_err_delay_robust_std_samples",
+        "max_source_err_delay_p95_p5_samples",
+        "min_source_err_delay_windows",
+        "min_source_err_delay_window_ratio",
     }
 )
+
+
+_DEPRECATED_ALIGNMENT_KEYS: dict[str, tuple[str, float]] = {
+    "max_source_err_delay_std_samples": (
+        "max_source_err_delay_robust_std_samples",
+        MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+    ),
+    "max_source_err_delay_range_samples": (
+        "max_source_err_delay_p95_p5_samples",
+        MAX_STREAM_DELAY_P95_P5_SAMPLES,
+    ),
+}
+"""옛 임계 키 → 새 키. **값은 옮겨 오지 않는다.**
+
+옛 64/256 은 광대역 argmax 추정기의 잡음 바닥(18 샘플)에 맞춰진 값이라, 대역제한
+PHAT 단일 출처로 바꾼 지금 그대로 쓰면 오염군(robust-std 최소 25.2)을 통째로
+통과시킨다. 그래서 선언값과 실측 근거 상한 중 **작은 쪽**을 쓰고, 무엇이 무시됐는지를
+``deprecated_threshold_notes`` 로 남긴다 — 조용히 무시하면 다음 사람이 설정 파일을
+읽고 게이트가 64 라고 믿는다."""
+
+
+_DEPRECATED_ALIGNMENT_DROPPED: dict[str, str] = {
+    "alignment_window_seconds": (
+        "지연 궤적의 창 길이는 이제 deep_anc.data.timeline.TimelineSettings 가 "
+        "단독으로 소유합니다 (window 0.25s / hop 0.0625s). QA 가 별도 창을 선언하면 "
+        "session.json 의 timeline.aligned_lag_* 와 QA 의 지연 통계가 다시 갈라집니다"
+    ),
+}
 
 
 def settings_from_data_config(
@@ -173,11 +254,28 @@ def settings_from_data_config(
     raw_segment = int(round(float(data_cfg["segment_seconds"]) * sample_rate))
     segment_samples = max(256, (raw_segment // 256) * 256)
     overrides = dict(alignment_overrides or {})
+    notes: list[str] = []
+    for legacy, (replacement, ceiling) in _DEPRECATED_ALIGNMENT_KEYS.items():
+        if legacy not in overrides:
+            continue
+        declared = float(overrides.pop(legacy))
+        effective = min(declared, float(ceiling))
+        notes.append(
+            f"{legacy}={declared:g} 는 폐기됐습니다 (광대역 argmax 추정기 기준 값). "
+            f"{replacement} 를 쓰고, 실측 근거 상한 {ceiling:g} 과 비교해 더 엄격한 쪽인 "
+            f"{effective:g} 을 적용합니다"
+        )
+        overrides.setdefault(replacement, effective)
+    for dropped, reason in _DEPRECATED_ALIGNMENT_DROPPED.items():
+        if dropped in overrides:
+            overrides.pop(dropped)
+            notes.append(f"{dropped} 는 더 이상 쓰이지 않습니다 — {reason}")
     unknown = sorted(set(overrides).difference(_ALIGNMENT_OVERRIDE_KEYS))
     if unknown:
         raise ValueError(f"알 수 없는 정렬 설정 키: {unknown}")
     return RecordedQASettings(
         **overrides,
+        deprecated_threshold_notes=tuple(notes),
         sample_rate=sample_rate,
         segment_samples=segment_samples,
         digital_reference_lead_samples=int(
@@ -465,9 +563,10 @@ def _validate_alignment(
             src,
             err,
             sample_rate=settings.sample_rate,
-            window_seconds=float(settings.alignment_window_seconds),
-            max_std_samples=float(settings.max_source_err_delay_std_samples),
-            max_range_samples=float(settings.max_source_err_delay_range_samples),
+            max_robust_std_samples=float(settings.max_source_err_delay_robust_std_samples),
+            max_p95_p5_samples=float(settings.max_source_err_delay_p95_p5_samples),
+            min_valid_windows=int(settings.min_source_err_delay_windows),
+            min_valid_window_ratio=float(settings.min_source_err_delay_window_ratio),
             name="source_err_delay_stability",
         )
     except (ValueError, RuntimeError) as exc:
@@ -481,14 +580,30 @@ def _validate_alignment(
             "ref_err_coherence": (
                 float(control_coherence) if control_coherence is not None else float("nan")
             ),
+            # 부기 이름이 곧 물리량이다. robust_std/p95_p5 는 판정량이고,
+            # raw_std/ptp 는 진단이다 — 이름이 섞이면 다음 사람이 다시 생 std 로
+            # 게이트를 만든다.
             "source_err_delay_median_samples": float(
-                delay_check.measured["delay_median_samples"]
+                delay_check.measured["median_samples"]
             ),
-            "source_err_delay_std_samples": float(delay_check.measured["delay_std_samples"]),
-            "source_err_delay_range_samples": float(
-                delay_check.measured["delay_range_samples"]
+            "source_err_delay_robust_std_samples": float(
+                delay_check.measured["robust_std_samples"]
             ),
-            "delay_windows": int(delay_check.measured["n_windows"]),
+            "source_err_delay_p95_p5_samples": float(
+                delay_check.measured["p95_p5_samples"]
+            ),
+            "source_err_delay_raw_std_samples": float(
+                delay_check.measured["raw_std_samples"]
+            ),
+            "source_err_delay_ptp_samples": float(delay_check.measured["ptp_samples"]),
+            "delay_windows": int(delay_check.measured["windows"]),
+            "delay_valid_windows": int(delay_check.measured["valid_windows"]),
+            "delay_valid_window_ratio": float(
+                delay_check.measured["valid_window_ratio"]
+            ),
+            "delay_track_band_hz": list(delay_check.measured["band_hz"]),
+            "delay_window_samples": int(delay_check.measured["window_samples"]),
+            "delay_estimator": "deep_anc.data.timeline.measure_delay_trajectory",
             "ok": bool(coherence_check.ok and delay_check.ok),
         }
     )
@@ -768,6 +883,9 @@ def validate_recorded_sessions(
 
     if not entries:
         global_errors.append("manifest에 실측 세션이 없습니다")
+    # 폐기된 임계 키를 조용히 무시하지 않는다 — 설정 파일만 읽은 사람이 게이트를
+    # 오해하는 것이 이 저장소에서 반복된 실패 방식이다.
+    global_warnings.extend(settings.deprecated_threshold_notes)
 
     session_ids: dict[str, list[str]] = {}
     paths: dict[str, list[str]] = {}
@@ -837,10 +955,18 @@ def validate_recorded_sessions(
             "alignment_band_hz": list(settings.alignment_band_hz),
             "min_source_err_coherence": settings.min_source_err_coherence,
             "min_ref_err_coherence": settings.min_ref_err_coherence,
-            "max_source_err_delay_std_samples": settings.max_source_err_delay_std_samples,
-            "max_source_err_delay_range_samples": (
-                settings.max_source_err_delay_range_samples
+            "max_source_err_delay_robust_std_samples": (
+                settings.max_source_err_delay_robust_std_samples
             ),
+            "max_source_err_delay_p95_p5_samples": (
+                settings.max_source_err_delay_p95_p5_samples
+            ),
+            "min_source_err_delay_windows": settings.min_source_err_delay_windows,
+            "min_source_err_delay_window_ratio": (
+                settings.min_source_err_delay_window_ratio
+            ),
+            "delay_estimator": "deep_anc.data.timeline.measure_delay_trajectory",
+            "deprecated_threshold_notes": list(settings.deprecated_threshold_notes),
         },
         "summary": {
             "sessions": len(results),

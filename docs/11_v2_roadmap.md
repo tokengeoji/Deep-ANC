@@ -48,7 +48,7 @@ THD/IMD 실측을 통과한 뒤 Stage-2 커리큘럼으로 점진 투입한다. 
   `/home/capston/anc_project/calibrate_s_path.py`는 읽기 전용 참고로만 사용하고 필요한 코드는
   이 저장소로 복사해 출처를 남긴다. THD 수% 미만이면 신경 플랜트 등 고비용 G_nl 작업을
   회피한다 — C단계 G_nl 투자 규모 결정 게이트.
-- ② ~~**광대역 S(z) 재보정 150–600Hz → 80–1600Hz**~~ → **2026-08-05 해소.** 동시 인터리브 측정 + 오염 반복 기각으로 `consistency_band_hz` 가 **150–1600Hz** 가 됐다(150–1600Hz 일관성 P 0.9993 / S 0.9990). 남은 한계는 **64–150Hz** 뿐이다(클린 후에도 S 0.706~0.758 — 진짜 물리 한계). docs/02 §4.
+- ② ~~**광대역 S(z) 재보정 150–600Hz → 80–1600Hz**~~ → **2026-08-05 해소.** 동시 인터리브 측정 + 오염 반복 기각으로 `consistency_band_hz` 가 **150–1600Hz** 가 됐다(150–1600Hz 일관성 P 0.9993 / S 0.9990). 남은 한계는 **80–150Hz** 뿐이다(클린 후에도 S 0.706~0.758 — 진짜 물리 한계). docs/02 §4.
 - ③ **digital-ref P(z) 실측**: 동일 앰프·볼륨·I/O 조건에서
   `calibrate_wideband.py --output-channel noise`로 noise→ERR compact FIR+순수지연을
   측정한다. `duct.digital_reference.primary_path_npz`와 `d_noise_delay_samples`를 함께

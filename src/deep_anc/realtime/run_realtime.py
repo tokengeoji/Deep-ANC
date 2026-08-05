@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from pydantic import BaseModel, ConfigDict
 
 from ..audio_io import (
     capture_input_probe,
@@ -115,8 +116,47 @@ _ENGINE_ARTIFACT_KEYS = {
 }
 """엔진 종류별로 **실제 로드에 쓰이는** 키. 나머지 키는 읽히지 않는다."""
 
+_ENGINE_ARTIFACT_SUFFIX = {"ckpt": (".pt", ".pth"), "onnx": (".onnx",), "plan": (".plan", ".engine")}
+"""키별로 허용되는 확장자. 파일 시스템을 보지 않고도 판정할 수 있는 부패 검사다."""
 
-def engine_artifact_preflight(cfg: dict, *, require_all: bool = True) -> list[str]:
+
+class EngineArtifactIssue(BaseModel):
+    """엔진 아티팩트 preflight 가 찾은 문제 하나.
+
+    왜 문자열이 아니라 타입인가
+    --------------------------
+    2026-08-06 실측 반증: ``main()`` 이 이 목록을 통째로 fail-closed 로 처리해서
+    ``engine.type=ort`` 인 배포가 **읽히지도 않는** ``ckpt``/``plan`` 이 없다는
+    이유로 시작을 거부했다. 모델은 GitHub Release 로 배포되므로 "필요한 것만 받은
+    트리" 가 정상 배포인데 그것이 하드 중단된 것이다.
+
+    호출부가 "무엇이 치명적인가" 를 문자열 매칭으로 다시 판정하면 그것이 두 번째
+    유도가 된다(발생기 A). 그래서 치명 여부를 **여기서 한 번** 정하고 타입에 실어
+    보낸다: :attr:`fatal` 은 "이것 때문에 오디오를 열면 안 되는가" 이고,
+    나머지는 설정 부패 경고다 — 저장소 위생 검사(pytest)는 경고까지 전부 막는다.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    key: str
+    active: bool
+    """이 키를 현재 engine.type 이 실제로 로드하는가."""
+
+    missing_file: bool
+    """파일 부재가 원인인가 (배포에서 아직 안 받았을 수 있는 종류)."""
+
+    fatal: bool
+    """시작 자체를 막아야 하는가."""
+
+    detail: str
+
+    def __str__(self) -> str:  # 로그/에러 메시지에서 그대로 쓰인다
+        return self.detail
+
+
+def engine_artifact_preflight(
+    cfg: dict, *, require_all: bool = True
+) -> list[EngineArtifactIssue]:
     """``engine`` 블록이 가리키는 파일이 실제로 존재하는지 오디오를 열기 전에 본다.
 
     왜 활성 엔진만 보면 안 되는가
@@ -127,20 +167,29 @@ def engine_artifact_preflight(cfg: dict, *, require_all: bool = True) -> list[st
     한 번도 읽히지 않았고, 따라서 **조용히 썩어 있었다** — ``trt`` 로 바꾸는 순간
     터졌을 것이고, 그 시점은 대개 실기 앞이다.
 
-    같은 종류의 부패가 ``configs/runtime.yaml`` 에도 있었다(``model.onnx`` /
-    ``model_fp16.plan`` 둘 다 없음).
-
     그래서 기본값 ``require_all=True`` 는 **선언된 모든 아티팩트**를 검사한다.
-    "지금 안 쓰니까 괜찮다"는 것이 바로 이 결함이 4개월 살아남은 이유다. 설정에
-    적혀 있으면 존재해야 하고, 없으면 그 줄을 지워야 한다.
 
-    반환은 사람이 읽을 문제 목록이다. 비어 있으면 통과다.
+    왜 그것이 시작을 막으면 안 되는가
+    --------------------------------
+    ``runs/`` 는 ``.gitignore`` 대상이고 모델은 GitHub Release 로 배포된다
+    (``git ls-files runs/`` = 0). ``engine.type=ort`` 배포가 onnx 하나만 받는 것은
+    **정상**이다. 그러므로 "선언됐는데 파일이 없다"는 활성 키에서만 치명적이고,
+    미사용 키에서는 경고다. 확장자 오류처럼 **파일 시스템과 무관한 부패**는
+    어디서나 치명적이다 — 그것은 받아 놓지 않은 것이 아니라 잘못 적은 것이다.
     """
 
     engine = (cfg or {}).get("engine", {}) or {}
     kind = str(engine.get("type", "torch"))
     if kind not in _ENGINE_ARTIFACT_KEYS:
-        return [f"알 수 없는 engine.type={kind!r}; 허용={sorted(_ENGINE_ARTIFACT_KEYS)}"]
+        return [
+            EngineArtifactIssue(
+                key="type",
+                active=True,
+                missing_file=False,
+                fatal=True,
+                detail=f"알 수 없는 engine.type={kind!r}; 허용={sorted(_ENGINE_ARTIFACT_KEYS)}",
+            )
+        ]
 
     active_keys = _ENGINE_ARTIFACT_KEYS[kind]
     checked = (
@@ -148,36 +197,88 @@ def engine_artifact_preflight(cfg: dict, *, require_all: bool = True) -> list[st
         if require_all
         else active_keys
     )
-    problems: list[str] = []
+    problems: list[EngineArtifactIssue] = []
     for key in active_keys:
         if not engine.get(key):
             problems.append(
-                f"engine.type={kind} 인데 engine.{key} 가 비었습니다 — 로드할 것이 없습니다"
+                EngineArtifactIssue(
+                    key=key,
+                    active=True,
+                    missing_file=False,
+                    fatal=True,
+                    detail=(
+                        f"engine.type={kind} 인데 engine.{key} 가 비었습니다 — "
+                        "로드할 것이 없습니다"
+                    ),
+                )
             )
     for key in checked:
         value = str(engine.get(key, ""))
         if not value:
             continue
+        active = key in active_keys
+        role = "활성" if active else "미사용(지금은 읽히지 않음)"
+        suffixes = _ENGINE_ARTIFACT_SUFFIX[key]
+        if not value.endswith(suffixes):
+            problems.append(
+                EngineArtifactIssue(
+                    key=key,
+                    active=active,
+                    missing_file=False,
+                    fatal=True,
+                    detail=(
+                        f"engine.{key} 확장자가 규약과 다릅니다 [{role}]: {value} — "
+                        f"허용 {list(suffixes)}. 이것은 아티팩트를 안 받은 것이 아니라 "
+                        "설정을 잘못 적은 것이므로 어떤 환경에서도 거부합니다"
+                    ),
+                )
+            )
+            continue
         path = Path(value)
         if not path.is_absolute():
             path = REPO_ROOT / path
         if not path.is_file():
-            role = "활성" if key in active_keys else "미사용(지금은 읽히지 않음)"
             problems.append(
-                f"engine.{key} 아티팩트가 없습니다 [{role}]: {value} — "
-                "설정에 적혀 있으면 존재해야 합니다. 쓰지 않는다면 그 줄을 지우세요"
+                EngineArtifactIssue(
+                    key=key,
+                    active=active,
+                    missing_file=True,
+                    fatal=active,
+                    detail=(
+                        f"engine.{key} 아티팩트가 없습니다 [{role}]: {value} — "
+                        "설정에 적혀 있으면 존재해야 합니다. 쓰지 않는다면 그 줄을 "
+                        "지우고, 배포라면 GitHub Release 에서 받으세요"
+                    ),
+                )
             )
     return problems
 
 
 def require_engine_artifacts(cfg: dict, *, require_all: bool = True) -> None:
-    """:func:`engine_artifact_preflight` 를 실패 폐쇄로 감싼다."""
+    """:func:`engine_artifact_preflight` 를 실패 폐쇄로 감싼다 (저장소 위생 검사용)."""
 
     problems = engine_artifact_preflight(cfg, require_all=require_all)
     if problems:
         raise FileNotFoundError(
-            "런타임 엔진 아티팩트 preflight 실패:\n- " + "\n- ".join(problems)
+            "런타임 엔진 아티팩트 preflight 실패:\n- "
+            + "\n- ".join(item.detail for item in problems)
         )
+
+
+def require_engine_artifacts_to_start(cfg: dict) -> list[str]:
+    """오디오를 열기 전 preflight — **치명적인 것만** 시작을 막는다.
+
+    반환값은 사람에게 보여 줄 경고 목록(치명적이지 않은 문제)이다.
+    """
+
+    problems = engine_artifact_preflight(cfg, require_all=True)
+    fatal = [item for item in problems if item.fatal]
+    if fatal:
+        raise FileNotFoundError(
+            "런타임 엔진 아티팩트 preflight 실패:\n- "
+            + "\n- ".join(item.detail for item in fatal)
+        )
+    return [item.detail for item in problems]
 
 
 def validate_digital_reference_lead(
@@ -271,8 +372,9 @@ class RealtimeANC:
 
         self.err_meter = PowerEMA(self.fs, 0.4)
         self.ctrl_meter = PowerEMA(self.fs, 0.4)
-        self.baseline_power = 0.0
-        self.baseline_init = False
+        # 베이스라인(=ANC 없는 에러 파워)의 수집·유효성·강제 갱신은 전부
+        # self.safety.baseline 이 소유한다. 예전에는 EMA 가 여기, 유효성 규칙이
+        # safety 에 있어서 같은 물리량의 부기가 두 파일로 갈라져 있었다(발생기 A).
         self._last_input_drops = 0
         self.step_times_ms: list[float] = []
         self.xruns = 0
@@ -326,16 +428,20 @@ class RealtimeANC:
             out_report = self.safety.limit_output(y_blk[0])
             y_lim, clip_frac = out_report.signal, out_report.clipped_fraction
 
-            if self.state.anc_enabled != self._last_anc:
-                self.anc_gate.set_target(1.0 if self.state.anc_enabled else 0.0)
-                if self.state.anc_enabled:
+            # 상쇄 출력 게이트의 목표는 매 블록 유도한다: 운용자 스위치 AND
+            # "발산 검증 프로브 중이 아님". 프로브 구간은 음향적으로 mute 와 완전히
+            # 같고(출력 0), 다른 것은 측정 결과에 따라 재개할 수 있다는 것뿐이다.
+            anc_output_wanted = bool(self.state.anc_enabled) and not self.safety.probe_active
+            if anc_output_wanted != self._last_anc:
+                self.anc_gate.set_target(1.0 if anc_output_wanted else 0.0)
+                if anc_output_wanted:
                     secondary_total = int(
                         getattr(self.engine, "secondary_total_length", 0)
                     )
                     self._adaptation_hold_samples = secondary_total + self._fade_samples
                 else:
                     self._adaptation_hold_samples = 0
-                self._last_anc = self.state.anc_enabled
+                self._last_anc = anc_output_wanted
             gain = self.anc_gate.process(frames)
             control = y_lim * gain
 
@@ -347,19 +453,11 @@ class RealtimeANC:
             err_power = self.err_meter.update(err)
             ctrl_power = self.ctrl_meter.update(control)
 
-            # 베이스라인: ANC 게이트가 닫혀 있는 구간의 에러 파워.
-            # 소음 게이트 조건을 빼는 이유 — 외부 소음원으로 운용할 때는
-            # played_noise_gain 이 0 이라 베이스라인이 영원히 안 잡히고, 그러면
-            # 발산 워치독이 fail-closed 로 ANC 를 끈다. "ANC 없이 마이크에 들어오는
-            # 파워"가 발산 판정에 필요한 전부다. 유효성(무음 여부)은 baseline_floor_power
-            # 하한으로 판정한다 — 판정 규칙의 단일 출처는 SafetySupervisor 다.
-            if float(np.max(gain)) <= 0.001:
-                alpha = float(np.exp(-frames / (self.fs * 1.0)))
-                if not self.baseline_init:
-                    self.baseline_power = err_power
-                    self.baseline_init = True
-                else:
-                    self.baseline_power = alpha * self.baseline_power + (1 - alpha) * err_power
+            # 베이스라인 수집 조건은 **"상쇄 출력이 나가지 않는다"** 하나다.
+            # (소음 재생 조건을 넣으면 외부 소음원 운용에서 영원히 안 잡히고, 빼기만
+            #  하면 정숙한 방의 플로어가 굳어 소음을 켜는 순간 발산으로 오판한다.
+            #  그래서 수집은 넓게 두고 판정을 프로브로 바꿨다 — safety.BaselineTracker.)
+            anc_output_active = bool(gain.size and float(np.max(gain)) > 0.001)
 
             input_drops = int(self.in_ring.drops)
             stale_input = max(0, input_drops - self._last_input_drops)
@@ -369,10 +467,7 @@ class RealtimeANC:
                     anc_on=bool(self.state.anc_enabled),
                     output=out_report,
                     error_power=float(err_power),
-                    baseline_power=float(self.baseline_power),
-                    baseline_valid=self.safety.baseline_is_valid(
-                        self.baseline_power, self.baseline_init
-                    ),
+                    anc_output_active=anc_output_active,
                     had_output_data=bool(had_data),
                     stale_input_samples=stale_input,
                 )
@@ -421,11 +516,14 @@ class RealtimeANC:
                 self.rec["anc_gain"][sl] = gain[:n]
                 self.rec_pos += n
 
+            baseline = self.safety.baseline
             reduction = float("nan")
-            if self.baseline_init and err_power > 0:
-                reduction = 10.0 * np.log10((self.baseline_power + 1e-30) / (err_power + 1e-30))
+            if baseline.initialized and err_power > 0:
+                reduction = 10.0 * np.log10((baseline.power + 1e-30) / (err_power + 1e-30))
             self.state.latest_stats = {
                 "anc": self.state.anc_enabled,
+                "anc_output": anc_output_active,
+                "divergence_probe": self.safety.probe_active,
                 "err_dbfs": power_to_db(err_power),
                 "ctrl_dbfs": power_to_db(ctrl_power),
                 "reduction_db": reduction,
@@ -709,7 +807,8 @@ def main() -> int:
     # 먼저인 이유는 이 검사가 하드웨어를 전혀 건드리지 않고 즉시 끝나기 때문이다 —
     # 없는 파일 때문에 실패할 실행에 스피커를 울릴 이유가 없다.
     try:
-        require_engine_artifacts(cfg)
+        for warning in require_engine_artifacts_to_start(cfg):
+            print(f"[경고] {warning}", file=sys.stderr)
     except FileNotFoundError as exc:
         print(f"[중단] {exc}", file=sys.stderr)
         return 2

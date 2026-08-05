@@ -234,3 +234,125 @@ def test_median_coherence_matches_the_shared_invariant_implementation():
     ).measured["coherence"]
     assert mine == pytest.approx(theirs)
     assert mine > 0.95
+
+
+# ======================================================================================
+# 지연 궤적 단일 출처 (반증 #14 / #18)
+# ======================================================================================
+def test_delay_trajectory_is_the_same_number_wherever_it_is_read():
+    """``invariants`` 와 ``timeline`` 이 같은 쌍에 대해 **같은 숫자**를 낸다.
+
+    반증 #14/#18 이 반증한 상태: 같은 ``(source_aligned, ERR)`` 쌍에서
+    timeline 이 robust-std 1.84, invariants 가 1106.55 — **600배**. 그 결과 제대로
+    재정렬된 47 세션 중 22 개(47%)가 오기각됐다. 지금은 두 값이 같은 함수의 결과이므로
+    비트 단위로 같아야 한다.
+    """
+
+    from deep_anc.dsp.invariants import measure_stream_delay_trajectory
+    from deep_anc.data.timeline import measure_delay_trajectory
+
+    source = _wideband(FS * 4, seed=141)
+    capture = np.concatenate([np.zeros(142), source[:-142]])
+
+    mine = measure_delay_trajectory(source, capture, sample_rate=FS)
+    theirs = measure_stream_delay_trajectory(source, capture, sample_rate=FS)
+    assert mine == theirs
+    assert abs(mine.median_samples - 142.0) <= 1.0
+
+
+def test_delay_trajectory_matches_the_residual_track_of_align_source_to_adc():
+    """``align_source_to_adc`` 가 남긴 잔여 지연 부기와 QA 가 나중에 재는 값이 같은가.
+
+    두 값이 갈리면 "수집 시점에는 통과했는데 QA 에서는 떨어진다"가 되고, 그 불일치를
+    설명하려고 세 번째 부기가 생긴다. 실측 47 세션에서 이 차이는 현재 0.0 이다.
+    """
+
+    from deep_anc.data.timeline import measure_delay_trajectory
+
+    source, witness, holdout, _ = _make_session(seconds=8.0)
+    aligned, report = align_source_to_adc(source, witness, holdout, FS)
+
+    settings = TimelineSettings(sample_rate=FS)
+    take = min(
+        len(aligned),
+        max(4 * settings.window_samples, int(round(settings.verify_seconds * FS))),
+    )
+    trajectory = measure_delay_trajectory(
+        np.asarray(aligned[:take], dtype=np.float64),
+        np.asarray(holdout[:take], dtype=np.float64),
+        sample_rate=FS,
+    )
+    assert trajectory.median_samples == report.aligned_lag_median_samples
+    assert trajectory.robust_std_samples == report.aligned_lag_robust_std_samples
+    assert trajectory.p95_p5_samples == report.aligned_lag_p95_p5_samples
+
+
+def test_delay_trajectory_type_refuses_impossible_bookkeeping():
+    """부기 타입이 **런타임에** 막는다 — 타입 힌트만 있으면 그건 문서다."""
+
+    from pydantic import ValidationError
+
+    from deep_anc.data.timeline import DelayTrajectory
+
+    good = dict(
+        windows=40,
+        valid_windows=39,
+        window_samples=12_000,
+        hop_samples=3_000,
+        band_hz=(150.0, 700.0),
+        median_samples=142.5,
+        robust_std_samples=1.8,
+        p95_p5_samples=8.4,
+        raw_std_samples=2.7,
+        ptp_samples=24.4,
+    )
+    assert DelayTrajectory(**good).valid_window_ratio == pytest.approx(39 / 40)
+
+    with pytest.raises(ValidationError):  # 유효창이 전체보다 많을 수 없다
+        DelayTrajectory(**{**good, "valid_windows": 41})
+    with pytest.raises(ValidationError):  # hop > window
+        DelayTrajectory(**{**good, "hop_samples": 20_000})
+    with pytest.raises(ValidationError):  # 음수 산포
+        DelayTrajectory(**{**good, "robust_std_samples": -1.0})
+    with pytest.raises(ValidationError):  # 뒤집힌 대역
+        DelayTrajectory(**{**good, "band_hz": (700.0, 150.0)})
+    with pytest.raises(ValidationError):  # 모르는 필드를 조용히 받지 않는다
+        DelayTrajectory(**{**good, "delay_std_samples": 1106.55})
+
+
+def test_short_signals_reuse_the_same_estimator_instead_of_a_second_one():
+    """짧은 신호도 **같은 추정기를 축소해서** 돈다 — 대역·품질 임계는 그대로."""
+
+    settings = TimelineSettings(sample_rate=FS)
+    fitted = settings.fit_to_length(FS // 2)
+
+    assert fitted.track_band_hz == settings.track_band_hz
+    assert fitted.min_coarse_quality == settings.min_coarse_quality
+    assert fitted.min_refine_quality == settings.min_refine_quality
+    assert fitted.window_samples < settings.window_samples
+    assert 0.0 < fitted.hop_seconds <= fitted.window_seconds
+    # 충분히 긴 신호에서는 설정을 건드리지 않는다 (같은 객체를 돌려준다).
+    assert settings.fit_to_length(FS * 30) is settings
+    with pytest.raises(ValueError, match="너무 짧습니다"):
+        settings.fit_to_length(128)
+
+
+def test_measurable_separates_cannot_judge_from_passed():
+    """유효창이 없으면 NaN 이고 ``NaN > 임계`` 는 False 라 조용히 통과한다 — 막는다."""
+
+    from deep_anc.data.timeline import DelayTrajectory
+
+    empty = DelayTrajectory(
+        windows=40,
+        valid_windows=0,
+        window_samples=12_000,
+        hop_samples=3_000,
+        band_hz=(150.0, 700.0),
+        median_samples=float("nan"),
+        robust_std_samples=float("nan"),
+        p95_p5_samples=float("nan"),
+        raw_std_samples=float("nan"),
+        ptp_samples=float("nan"),
+    )
+    assert not empty.measurable(8)
+    assert not (empty.robust_std_samples > 8.0)  # 이것이 조용한 통과의 정체다

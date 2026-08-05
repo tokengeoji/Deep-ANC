@@ -11,8 +11,9 @@ import soundfile as sf
 import torch
 
 from deep_anc.config import REPO_ROOT, load_yaml
-from deep_anc.data.manifest import write_manifest
+from deep_anc.data.manifest import read_manifest, write_manifest
 from deep_anc.train.finetune_readiness import (
+    MAX_RELATIVE_DELAY_SPREAD_SAMPLES,
     achievable_cancellation_ceiling_db,
     audit_finetune_completion,
     audit_finetune_readiness,
@@ -116,6 +117,15 @@ GROUPS_PER_FAMILY_PER_SPLIT = 4
 PRIMARY_DELAY_SAMPLES = 4
 ERR_MIC_DELAY_SAMPLES = PRIMARY_DELAY_SAMPLES
 REF_MIC_DELAY_SAMPLES = 2
+
+PRETRAIN_TRUSTED_BAND_HZ = (100.0, 1_000.0)
+"""픽스처 init checkpoint 가 학습된 대역.
+
+실제 사고와 같은 축이다: ``runs/pretrain_{base,tiny}_corrected`` 는 [150,600] 으로
+학습됐는데 파인튜닝이 유도하는 대역은 [150,1600] 이다. 여기서는 픽스처 S(z) 의
+신뢰대역( ``excitation_band_hz`` [100,1000] )과 기본 목표대역 [80,1000] 의 교집합이
+파인튜닝 대역이므로 checkpoint 도 같은 [100,1000] 이어야 통과한다.
+"""
 
 
 def _recorded_band_noise(frames: int, seed: int) -> np.ndarray:
@@ -278,6 +288,10 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
         "digital_reference_lead_samples": 3,
         "physics_status": "secondary_surrogate_representation_pretrain",
         "schedule": {"total_steps": 10},
+        # 어느 대역에서 벌점을 받았는가. trainer 가 resolved cfg 에 저장하는 값이고
+        # ``completed_init_checkpoint`` 게이트가 파인튜닝 대역과 대조한다.
+        # 픽스처 S(z) 의 신뢰대역 [100,1000] ∩ 기본 목표대역 [80,1000] = [100,1000].
+        "trusted_band_hz": list(PRETRAIN_TRUSTED_BAND_HZ),
     }
     init_best = tmp_path / "pretrain" / "ckpt" / "best.pt"
     _checkpoint(init_best, cfg=pretrain_cfg, step=8)
@@ -935,6 +949,7 @@ def test_gross_lead_mismatch_is_rejected_despite_tolerance(tmp_path):
         "digital_reference_lead_samples": 50,
         "physics_status": "secondary_surrogate_representation_pretrain",
         "schedule": {"total_steps": 10},
+        "trusted_band_hz": list(PRETRAIN_TRUSTED_BAND_HZ),
     }
     _checkpoint(init, cfg=pretrain_cfg, step=8)
     _checkpoint(init.parent / "last.pt", cfg=pretrain_cfg, step=10)
@@ -1492,3 +1507,391 @@ def test_group_floor_has_a_single_source():
     assert load_yaml(REPO_ROOT / "configs/train_finetune.yaml")["readiness"][
         "min_groups_per_family_per_split"
     ] == MIN_GROUPS_PER_FAMILY
+
+
+# ======================================================================================
+# 오발동 반증 — **정상 산출물을 경계까지 몰아도 게이트가 울리지 않는가** (군집 B 나머지 절반)
+#
+# 2026-08-06 반증 #13: 이 저장소의 메타 테스트는 "발동시키는 fixture 가 있는가" 만
+# 강제했다. 모든 게이트의 반응은 차단(학습 중단 / mute = 상쇄 0 dB)인데, "정상 입력에서
+# 안 울리는가" 를 운용 범위 끝까지 몰아본 게이트가 하나도 없었다. 그래서 실제로
+# 재정렬에 성공한 세션 9개 중 4개(44%)를 QA 게이트가 떨어뜨리고 있었는데도 아무도
+# 몰랐다. 아래 테스트들이 그 반쪽이다 — 전부 **한계 위의 정상값**을 넣는다.
+# ======================================================================================
+def _boundary_config(tmp_path: Path) -> dict:
+    """모든 진입 게이트를 **한계에 붙여** 통과시키는 설정.
+
+    여유를 주지 않는다. 여기서 하나라도 한 눈금 더 나빠지면 그 게이트가 FAIL 해야
+    하고(그 짝은 각 negative fixture 가 본다), 지금 이대로는 전부 PASS 해야 한다.
+    """
+
+    # D2 교차검증을 허용 오차 8.0 샘플의 **90% 지점**(7 샘플 어긋남)에서 돌린다.
+    manifest = _recorded_manifest(
+        tmp_path / "data", source_delay_samples=ERR_MIC_DELAY_SAMPLES + 7
+    )
+    cfg = _ready_config(tmp_path, manifest=manifest)
+    entries = read_manifest(Path(cfg["recorded_manifest"]))
+    sessions = len(entries)
+    duration = sum(float(item["duration_s"]) for item in entries)
+
+    # 픽스처 아티팩트의 실제 값. 게이트 임계를 여기에 **정확히** 맞춘다.
+    with np.load(tmp_path / "secondary.npz", allow_pickle=False) as data:
+        consistency = float(data["coherence_median"])
+        excitation = [float(v) for v in np.asarray(data["excitation_band_hz"]).reshape(-1)]
+
+    # 상대 τ spread 를 허용 최대값에 정확히 맞춘다 (3 = 코드 상수).
+    for name in ("primary.npz", "secondary.npz"):
+        path = tmp_path / name
+        with np.load(path, allow_pickle=False) as data:
+            arrays = {key: data[key] for key in data.files}
+        arrays["delay_spread_samples"] = np.asarray(
+            MAX_RELATIVE_DELAY_SPREAD_SAMPLES, dtype=np.int64
+        )
+        np.savez(path, **arrays)
+
+    ceiling = achievable_cancellation_ceiling_db(consistency, consistency)
+    margin = 3.0
+    cfg["readiness"].update(
+        {
+            # 대역: 아티팩트가 실제로 구동한 **양 끝**을 그대로 요구한다.
+            "required_path_band_hz": excitation,
+            "min_path_consistency": consistency,          # 여유 0
+            "required_recorded_ratio": float(cfg["recorded_ratio"]),
+            "min_recorded_sessions": sessions,            # 여유 0
+            "min_recorded_duration_seconds": duration,    # 여유 0
+            "min_groups_per_family_per_split": GROUPS_PER_FAMILY_PER_SPLIT,
+            "min_delay_crosscheck_sessions": sessions,    # 여유 0
+            "max_measured_delay_mismatch_samples": 8.0,   # 실제 어긋남 7 = 한계의 90%
+            # 목표 + 여유가 상한의 90% 지점에 오도록 잡는다.
+            "target_cancellation_db": 0.9 * ceiling - margin,
+            "cancellation_ceiling_margin_db": margin,
+        }
+    )
+    return cfg
+
+
+def test_every_entry_gate_passes_at_its_declared_boundary(tmp_path):
+    """진입 게이트 전부가 **한계에 붙은 정상 데이터**에서 PASS 한다.
+
+    몰아본 경계 (전부 여유 0 또는 한계의 90%):
+      · 세션 수 = 최소 세션 수 (48)             · 분량 = 최소 분량
+      · 반복 일관성 = min_path_consistency      · 요구 대역 = 구동 대역 양 끝 100/1000Hz
+      · P−S 상대 τ spread = 허용 최대 3 샘플    · 계열당 그룹 = 하한 4
+      · source→ERR 지연 어긋남 7 = 허용 8.0 의 90%
+      · 목표 + 여유 = 달성 가능 상한의 90%
+    """
+
+    cfg = _boundary_config(tmp_path)
+
+    report = audit_finetune_readiness(cfg)
+
+    failed = [item for item in report["checks"] if not item["ok"]]
+    assert failed == [], failed
+    assert report["ok"], report
+    # 그리고 이것이 "게이트가 없어서 통과" 가 아님을 못박는다.
+    assert len(report["checks"]) >= 14
+
+
+def test_measured_delay_agreement_is_not_a_free_pass_one_sample_further(tmp_path):
+    """한계의 90% 에서 PASS 하는 그 게이트가 한계를 넘으면 FAIL 하는가.
+
+    오기각 방지 테스트가 "게이트가 꺼져 있어서 통과" 를 증명하는 사고를 막는다.
+    """
+
+    cfg = _boundary_config(tmp_path)
+    manifest = _recorded_manifest(
+        tmp_path / "beyond", source_delay_samples=ERR_MIC_DELAY_SAMPLES + 20
+    )
+    cfg["recorded_manifest"] = str(manifest)
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "measured_source_delay_agreement")
+    assert not gate["ok"], gate
+
+
+def test_completion_gates_pass_at_the_minimum_sample_boundary(tmp_path):
+    """완료 게이트 전부가 **최소 표본**의 정상 산출물에서 PASS 한다.
+
+    몰아본 경계: 세션 1개 / 세그먼트 1개(0 이면 FAIL 하는 하한 바로 위),
+    최악 계열 −0.01 dB(개선이라 말할 수 있는 최소값), 최악 옥타브 0.01 dB.
+    """
+
+    cfg, best, val_metrics, test_metrics = _g4_completion_setup(
+        tmp_path,
+        worst_source_db=-0.01,
+        worst_octave_worst10_db=0.01,
+    )
+    for path in (val_metrics, test_metrics):
+        with np.load(path, allow_pickle=False) as data:
+            arrays = {key: data[key] for key in data.files}
+        arrays["n_sessions"] = np.asarray(1, dtype=np.int64)
+        arrays["n_segments"] = np.asarray(1, dtype=np.int64)
+        np.savez_compressed(path, **arrays)
+
+    report = audit_finetune_completion(
+        cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
+    )
+
+    failed = [item for item in report["checks"] if not item["ok"]]
+    assert failed == [], failed
+    assert report["fine_tuning_complete"]
+
+
+def test_official_path_delay_spread_passes_at_the_allowed_maximum(tmp_path):
+    """허용 최대 spread(3 샘플) 정확히 위에서는 통과한다 — 한 샘플 더 가면 FAIL."""
+
+    cfg = _ready_config(tmp_path)
+    for name in ("primary.npz", "secondary.npz"):
+        path = tmp_path / name
+        with np.load(path, allow_pickle=False) as data:
+            arrays = {key: data[key] for key in data.files}
+        arrays["delay_spread_samples"] = np.asarray(
+            MAX_RELATIVE_DELAY_SPREAD_SAMPLES, dtype=np.int64
+        )
+        np.savez(path, **arrays)
+
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+    assert _check(report, "official_secondary_path")["ok"]
+    assert _check(report, "official_primary_path")["ok"]
+
+    # 한 샘플 더: 같은 게이트가 거부한다.
+    path = tmp_path / "secondary.npz"
+    with np.load(path, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+    arrays["delay_spread_samples"] = np.asarray(
+        MAX_RELATIVE_DELAY_SPREAD_SAMPLES + 1, dtype=np.int64
+    )
+    np.savez(path, **arrays)
+    worse = audit_finetune_readiness(cfg, full_recorded_qa=False)
+    assert not _check(worse, "official_secondary_path")["ok"]
+
+
+# ---- 결함: init checkpoint 의 **대역 축** (2026-08-06) ---------------------------------
+def test_init_checkpoint_trained_on_a_narrower_band_is_rejected(tmp_path):
+    """좁은 대역으로 학습한 checkpoint 는 고역 증폭기다 — 게이트가 대역 축을 본다.
+
+    실제 상태: ``runs/pretrain_{base,tiny}_corrected`` 는 cfg.trusted_band_hz
+    [150, 600] 인데 현재 설정이 유도하는 대역은 [150, 1600] 이다. 벌점이 없던
+    600-1600Hz 를 그 모델은 적극 증폭한다([150,800] 설정 실측 +27.01 dB).
+    lead 축만 보던 게이트는 이것을 통과시켰다.
+    """
+
+    cfg = _ready_config(tmp_path)
+    init = Path(cfg["init_ckpt"])
+    narrow = {
+        "model": cfg["model"],
+        "data": {"digital_reference_lead_samples": 3},
+        "digital_reference_lead_samples": 3,
+        "physics_status": "secondary_surrogate_representation_pretrain",
+        "schedule": {"total_steps": 10},
+        # 위쪽 절반을 못 본 채로 학습됐다.
+        "trusted_band_hz": [PRETRAIN_TRUSTED_BAND_HZ[0], 600.0],
+    }
+    _checkpoint(init, cfg=narrow, step=8)
+    _checkpoint(init.parent / "last.pt", cfg=narrow, step=10)
+
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+
+    check = _check(report, "completed_init_checkpoint")
+    assert not check["ok"]
+    assert "대역" in check["message"]
+    assert "+27.01 dB" in check["message"]
+
+
+def test_init_checkpoint_without_a_recorded_band_is_rejected(tmp_path):
+    """대역을 기록하지 않은 checkpoint 는 '모른다' 이지 '괜찮다' 가 아니다."""
+
+    cfg = _ready_config(tmp_path)
+    init = Path(cfg["init_ckpt"])
+    unlabelled = {
+        "model": cfg["model"],
+        "data": {"digital_reference_lead_samples": 3},
+        "digital_reference_lead_samples": 3,
+        "physics_status": "secondary_surrogate_representation_pretrain",
+        "schedule": {"total_steps": 10},
+    }
+    _checkpoint(init, cfg=unlabelled, step=8)
+    _checkpoint(init.parent / "last.pt", cfg=unlabelled, step=10)
+
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+
+    check = _check(report, "completed_init_checkpoint")
+    assert not check["ok"]
+    assert "trusted_band_hz" in check["message"]
+
+
+def test_init_checkpoint_band_exactly_equal_to_the_finetune_band_passes(tmp_path):
+    """경계: checkpoint 대역이 파인튜닝 대역과 **정확히 같을 때** 통과한다.
+
+    100.0/1000.0 Hz 양 끝이 한 눈금도 어긋나지 않은 상태 — 여유 0 이다.
+    더 넓은 대역에서 온 것도 통과해야 한다(벌점을 받아 본 구간이 더 넓다).
+    """
+
+    cfg = _ready_config(tmp_path)
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+    check = _check(report, "completed_init_checkpoint")
+    assert check["ok"], check
+    assert check["details"]["checkpoint"]["trusted_band_hz"] == [100.0, 1_000.0]
+    assert check["details"]["checkpoint"]["expected_trusted_band_hz"] == [100.0, 1_000.0]
+
+    init = Path(cfg["init_ckpt"])
+    wider = {
+        "model": cfg["model"],
+        "data": {"digital_reference_lead_samples": 3},
+        "digital_reference_lead_samples": 3,
+        "physics_status": "secondary_surrogate_representation_pretrain",
+        "schedule": {"total_steps": 10},
+        "trusted_band_hz": [80.0, 1_600.0],
+    }
+    _checkpoint(init, cfg=wider, step=8)
+    _checkpoint(init.parent / "last.pt", cfg=wider, step=10)
+    assert _check(
+        audit_finetune_readiness(cfg, full_recorded_qa=False),
+        "completed_init_checkpoint",
+    )["ok"]
+
+
+def test_the_shipped_init_checkpoints_are_high_frequency_amplifiers():
+    """출하 상태 확인 — 배포 후보 init checkpoint 가 실제로 이 게이트에 걸린다.
+
+    runs/ 는 .gitignore 대상이라 이 기기에만 있다. 없으면 건너뛴다(다른 환경에서
+    빨간불이 되지 않게). 있으면 **[150,600] 으로 학습된 사실**을 못박는다.
+    """
+
+    from deep_anc.dsp.timing import FrequencyBand
+    from deep_anc.train.finetune_readiness import _checkpoint_optimize_band
+
+    found = 0
+    for name in ("pretrain_base_corrected", "pretrain_tiny_corrected"):
+        path = REPO_ROOT / "runs" / name / "ckpt" / "best.pt"
+        if not path.is_file():
+            continue
+        found += 1
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        band = _checkpoint_optimize_band(state)
+        assert band is not None
+        assert band.as_tuple() == (150.0, 600.0), (name, band)
+        # 현재 설정이 요구하는 대역을 덮지 못한다 = 게이트가 거부해야 한다.
+        assert not band.covers(FrequencyBand(lo_hz=150.0, hi_hz=1_600.0))
+    if found == 0:
+        pytest.skip("runs/ 산출물이 없는 트리입니다 (.gitignore 대상)")
+
+
+def test_readiness_alignment_thresholds_actually_reach_the_qa():
+    """readiness 가 선언한 정렬 임계가 **실제로 QA 에 도달하는지** 못 박는다.
+
+    ⚠ 2026-08-06 통합 검증이 잡은 결함의 회귀 테스트. 키 목록이 옛 4개로
+    하드코딩돼 있어서 새 키를 선언하면 경고 한 줄 없이 버려졌다. HANDOFF 가
+    지시한 "키 이름을 새 것으로 갈아라"를 따르는 순간 설정이 무력화되고,
+    그 사실을 알리던 폐기 안내문마저 사라지는 조합이었다.
+
+    목록을 손으로 베끼는 것이 원인이므로 QA 에서 유도하는지도 함께 본다.
+    """
+
+    from deep_anc.data.recorded_qa import (
+        _ALIGNMENT_OVERRIDE_KEYS,
+        settings_from_data_config,
+    )
+    from deep_anc.train.finetune_readiness import (
+        _alignment_cfg_keys,
+        _alignment_overrides,
+    )
+
+    # QA 가 받는 키는 전부 통로를 지나갈 수 있어야 한다 (복사본이 아니라 유도).
+    assert set(_ALIGNMENT_OVERRIDE_KEYS) <= _alignment_cfg_keys()
+
+    data_cfg = {
+        "sample_rate": 48_000,
+        "segment_seconds": 1.0,
+        "digital_reference_lead_samples": 116,
+    }
+
+    # 1) 새 키가 실제로 반영된다 — 이것이 이전에 조용히 버려지던 경로다.
+    declared = {
+        "max_source_err_delay_robust_std_samples": 4.0,
+        "max_source_err_delay_p95_p5_samples": 24.0,
+        "min_source_err_delay_window_ratio": 0.90,
+    }
+    settings = settings_from_data_config(
+        data_cfg, alignment_overrides=_alignment_overrides(declared)
+    )
+    assert settings.max_source_err_delay_robust_std_samples == 4.0
+    assert settings.max_source_err_delay_p95_p5_samples == 24.0
+    assert settings.min_source_err_delay_window_ratio == 0.90
+
+    # 2) 폐기 키는 조용히 무시되지 않고 안내로 남는다.
+    legacy = settings_from_data_config(
+        data_cfg,
+        alignment_overrides=_alignment_overrides(
+            {
+                "max_source_err_delay_std_samples": 64,
+                "max_source_err_delay_range_samples": 256,
+            }
+        ),
+    )
+    assert len(legacy.deprecated_threshold_notes) == 2
+    assert all("폐기" in note for note in legacy.deprecated_threshold_notes)
+
+    # 3) 완화 방향은 통로를 지나가되 QA 가 거절한다 (조용히 통과하지 않는다).
+    with pytest.raises(ValueError, match="강화 방향"):
+        settings_from_data_config(
+            data_cfg,
+            alignment_overrides=_alignment_overrides(
+                {"min_source_err_delay_window_ratio": 0.50}
+            ),
+        )
+
+
+def test_delay_crosscheck_refuses_a_realigned_reference_instead_of_comparing_it():
+    """D2 — **같은 이름이 두 물리량을 오가는 것**을 숫자 비교 전에 잡는다.
+
+    ⚠ 2026-08-06 통합 검증. QA 는 "학습이 실제로 읽는 파일" 을 재므로 재정렬본이
+    있으면 그것을 잰다. 그 값은 정렬 후 **잔여** 음향 지연(약 142 샘플)이고, 이
+    게이트가 P(z) 유도값(1849)과 대조하려는 것은 **원본 재생→ERR 총지연**(관측 약
+    1672)이다. 그대로 비교하면 1706 샘플짜리 가짜 실패가 나오고, 그 가짜 실패가
+    진짜 결함(1672 vs 1849 = 177 샘플, 허용 64 의 2.8배)을 덮는다.
+
+    두 경우 다 FAIL 이지만 **이유가 달라야** 한다 — 그것이 이 테스트의 요점이다.
+    """
+
+    from deep_anc.train.finetune_readiness import _Audit, _audit_measured_source_delay
+
+    primary = {
+        "path": "assets/measured/primary_path_il.npz",
+        "delay_samples": 1_602,
+    }
+
+    def _run(reference: str, observed: float) -> dict:
+        audit = _Audit("t")
+        report = {
+            "sessions": [
+                {
+                    "alignment_reference": reference,
+                    "alignment": {"source_err_delay_median_samples": observed},
+                }
+                for _ in range(10)
+            ]
+        }
+        _audit_measured_source_delay(audit, {}, primary, report)
+        return next(
+            item
+            for item in audit.report()["checks"]
+            if item["id"] == "measured_source_delay_agreement"
+        )
+
+    # (a) 재정렬본 — 숫자를 비교하지 않고 "비교할 수 없다" 고 말해야 한다.
+    realigned = _run("source_aligned.wav", 142.5)
+    assert not realigned["ok"]
+    assert "재정렬본" in realigned["message"]
+    # 가짜 숫자(1706)를 근거로 들지 않는다.
+    assert "차이 1706" not in realigned["message"]
+
+    # (b) 원본 — 진짜 결함이 그대로 드러나야 한다 (가려지면 안 된다).
+    raw = _run("source.wav", 1_672.0)
+    assert not raw["ok"]
+    assert "177" in raw["message"] and "허용 64" in raw["message"]
+
+    # (c) 짝: 원본 기준에서 유도값과 맞으면 통과한다 (게이트가 항상 실패하지 않는다).
+    agreeing = _run("source.wav", 1_849.0)
+    assert agreeing["ok"]

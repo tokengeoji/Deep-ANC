@@ -49,12 +49,52 @@ fxlms:                          # controller=fxlms 또는 DL 폴백용
   weight_norm_limit: 20.0
 
 safety:
-  control_limit: 0.2            # 상쇄 출력 피크 제한 (정규화 스케일)
+  # 2026-08-06: clip_streak_mute / deadline_miss_mute 를 지웠다. 둘 다 **스트릭**이라
+  # (a) 클립 스트릭은 DL 경로에서 리미터와 같은 값을 재 구조적으로 항상 0 이었고
+  # (b) 데드라인 스트릭은 교대 미스(1,0,1,0)에서 매 블록 리셋돼 영원히 발동하지 않았다.
+  # 남겨 두면 SafetyLimits 가 "쓰이지 않는 키" 안내를 남긴다(조용히 무시하지 않는다).
+  # 아래 키는 전부 SafetyLimits 가 생성 시점에 범위 검증한다 — 오타는 거부된다.
+  control_limit: 0.2            # 상쇄 출력 피크 제한 (모델 소프트 리미터와 같은 값)
   fade_ms: 20
-  clip_streak_mute: 20          # 연속 클립 블록 수 → 자동 mute
-  divergence_ratio: 4.0         # 에러파워가 베이스라인 ×4 (+6dB) 시
-  divergence_hold_s: 0.5        #   0.5초 지속되면 자동 mute
-  deadline_miss_mute: 3         # out_ring 3 hop 연속 공백 → DL 페이드아웃/폴백
+
+  saturation_ratio: 0.95        # |y| > 0.95×limit 인 샘플을 포화로 센다 (리미터와 다른 값)
+  saturation_fraction: 0.5      # 블록의 이 비율이 포화면 그 블록을 포화로 판정
+  saturation_window_s: 1.0
+  saturation_rate_mute: 0.5     # 최근 1초의 포화 블록 비율이 넘으면 mute
+
+  output_rms_ratio: 0.6         # rms > 0.6×limit 이면 과출력 블록
+  rms_window_s: 1.0
+  rms_rate_mute: 0.5
+
+  deadline_window_s: 1.0        # 슬라이딩 윈도 미스율 (스트릭 아님)
+  deadline_miss_rate_mute: 0.2
+
+  divergence_ratio: 4.0         # 에러파워가 베이스라인 ×4 (+6dB) 이고
+  divergence_hold_s: 0.5        #   0.5초 지속되면 → 발산 "의심"
+  divergence_rate_mute: 0.5
+  baseline_floor_power: 1.0e-8  # 이보다 작으면 "잰 것이 없다" (fail-closed)
+  baseline_tau_s: 1.0           # 상쇄 출력이 닫힌 구간의 에러 파워 EMA 시정수
+  baseline_grace_s: 3.0         # 유효 베이스라인 없이 ANC 를 켜 둘 수 있는 시간
+  # 의심 → 즉시 상쇄 출력을 닫고(=mute 와 음향적으로 동일) 아래 시간 동안 ANC 없는
+  # 에러 파워를 다시 잰다. 떨어지면 발산 확정 mute, 그대로면 "방이 시끄러워진 것"이므로
+  # 베이스라인을 갱신하고 재개한다. 마이크 하나로는 그 둘을 추측으로 못 가른다.
+  divergence_probe_s: 1.0
+  divergence_probe_confirm_ratio: 2.0   # (1, divergence_ratio) 여야 한다
+  divergence_probe_limit: 3     # 연속 미결 프로브 상한 → 넘으면 fail-closed mute
+  divergence_probe_clear_s: 10.0
+
+  output_dc_limit_ratio: 0.05   # |DC| > 0.05×limit 가 지속되면 mute (보이스코일 보호)
+  output_dc_window_s: 0.2
+  output_dc_rate_mute: 0.5
+  output_dc_blocker_r: 0.9995   # 출력 DC 차단기 극점 (f_c ≈ 3.8 Hz @48k)
+  # DC 판정량은 이동평균이 아니다 — 53 ms 이동평균은 80 Hz 영평균 상쇄음을 DC 로
+  # 오인했다(실측: 80Hz/0.18 → 12블록에 mute). 80 Hz 는 목표 대역 안이다.
+  output_dc_lowpass_hz: 2.0     # 블록률에서 도는 1차 저역통과 (80Hz 이득 0.034)
+  output_dc_ac_dominance: 0.3   # DC 추정값이 AC 대비 이만큼은 되어야 DC 로 센다
+  output_dc_hard_ratio: 0.5     # |DC| > 0.5×limit 이면 AC 와 무관하게 센다
+
+  handoff_window_s: 1.0
+  handoff_drop_rate_mute: 0.2   # 오래된 입력을 버린 블록 비율 (실효 핸드오프 이탈)
 
 noise:                          # ch0 소음 스피커 프로그램
   type: tone                    # tone | multitone | white | band | nonlinear | file

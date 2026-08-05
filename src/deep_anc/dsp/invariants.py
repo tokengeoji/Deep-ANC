@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict
@@ -28,7 +28,14 @@ from pydantic import BaseModel, ConfigDict
 from .interleaved_probe import relative_tau_outliers
 from .timing import Lead, PlantDelays, PlantFingerprint
 
+if TYPE_CHECKING:  # pragma: no cover - 순환 import 를 피하려 타입에서만 참조한다
+    from ..data.timeline import DelayTrajectory
+
 __all__ = [
+    "MAX_STREAM_DELAY_P95_P5_SAMPLES",
+    "MAX_STREAM_DELAY_ROBUST_STD_SAMPLES",
+    "MIN_STREAM_DELAY_VALID_WINDOWS",
+    "MIN_STREAM_DELAY_VALID_WINDOW_RATIO",
     "InvariantResult",
     "InvariantViolation",
     "check_corpus_disjoint",
@@ -327,74 +334,110 @@ def check_lead_agreement(
     )
 
 
+MAX_STREAM_DELAY_ROBUST_STD_SAMPLES = 8.0
+"""``playback → capture`` 지연 궤적 산포(1.4826×MAD)의 상한.
+
+근거는 실측 전수다 (2026-08-06, ``data/recorded_broken`` 앞 30 초, 단일 추정기)::
+
+    정상군 = 재정렬된 47 세션 (source_aligned → ERR)   robust-std 1.221 ~ 2.992
+    오염군 = 같은 세션의 원본 80 개 (source → ERR)     robust-std 25.159 ~ 120.620
+
+두 무리 사이 [2.992, 25.159] 가 **통째로 비어 있다**(8.4배). 8.0 은 그 골짜기의
+기하평균(8.68)을 내림한 값이라 정상군 최대의 2.7배, 오염군 최소의 1/3.1 이다.
+
+옛 임계 64 를 그대로 쓸 수 없는 이유: 64 는 **광대역 argmax 추정기의 잡음 바닥**에
+맞춰진 값이었다. 대역제한 PHAT 로 바꾸면 잡음 바닥이 18 → 1.2~3.0 샘플로 내려가므로
+같은 64 는 오염군(최소 25.2)을 통째로 통과시킨다. 추정기를 고치면 임계도 같이
+고쳐야 한다 — 안 그러면 게이트가 조용히 무력화된다."""
+
+MAX_STREAM_DELAY_P95_P5_SAMPLES = 48.0
+"""``playback → capture`` 지연 궤적 변동폭(p95−p5)의 상한.
+
+같은 전수 측정::
+
+    정상군 47 세션   p95−p5   4.834 ~  11.980
+    오염군 80 세션   p95−p5 228.136 ~ 370.770
+
+골짜기 [11.98, 228.14] 는 19배로 비어 있고, 기하평균 52.3 을 내림해 48.0 을 쓴다
+(정상군 최대의 4.0배, 오염군 최소의 1/4.8). p95−p5 를 쓰고 min/max range 를 쓰지
+않는 이유: range 는 창 하나가 로브를 건너뛰면 통째로 날아간다 — 반증 #17 이 인용한
+세션 101813 의 창 30개 중 27개가 125~150 인데 이상치 3개(479/487/6311)가 range 를
+6186 으로 만들어 정상 세션을 기각시킨 것이 정확히 그 실패다."""
+
+MIN_STREAM_DELAY_VALID_WINDOWS = 8
+"""판정에 필요한 최소 유효창 수.
+
+유효창이 없으면 통계가 NaN 이고 ``NaN > 임계`` 는 False 라 **조용히 통과**한다.
+그래서 "측정 불가"를 통과가 아니라 실패로 떨어뜨린다. 실측 30 초 발췌의 유효창은
+정상군 410~476 / 오염군 335~476 이라 8 은 어느 실데이터도 건드리지 않는다 —
+이 값이 발동한다는 것은 추정 자체가 실패했다는 뜻이다."""
+
+MIN_STREAM_DELAY_VALID_WINDOW_RATIO = 0.77
+"""유효창 **비율** 하한 — 로버스트 통계의 fail-open 구멍을 막는다.
+
+로버스트 통계만으로는 부족하다는 것을 직접 확인했다: 창마다 지연을 1200 샘플씩
+옮긴 합성 신호를 넣으면 추정기가 추적을 놓쳐 91 창 중 **17 창만** 유효해지고, 그
+살아남은 17 창끼리는 서로 붙어 있어 robust-std 0.56 / p95−p5 2.39 로 **PASS 한다.**
+"추적을 놓쳤다"가 "안정하다"로 보고되는 것이다.
+
+⚠ 2026-08-06 통합 검증 — **0.50 이었고, 그 값이 실제로 뚫렸다.**
+이전 주석은 "이 축은 정상/오염을 가르는 축이 아니라 판정 가능성만 가른다"고 적고
+하한을 오염군 최저(0.704) **아래**인 0.50 에 두었다. 그런데 판정량(robust-std,
+p95−p5)은 **살아남은 창만** 보고, 탐색범위(``coarse_search_samples``) 밖으로 튄 창은
+통계에서 아예 빠진다. 그래서 세션 일부만 프레임 슬립으로 어긋나면 어긋난 구간이
+통째로 버려지고 남은 구간은 깨끗해 보인다 — 유일한 목격자가 이 비율 하나뿐이다.
+
+실측 재현(실제 QA 코드경로 ``_validate_alignment``, 출하 임계, 세션
+``20260804_102441_file`` 의 source_aligned 를 앞 구간만 이동):
+  * 앞 15% 를  700 샘플 이동 → vwr 0.651 / 오류 **0건** (구 임계 0.50 에서 PASS)
+  * 앞 15% 를 2000 샘플(42 ms) 이동 → vwr 0.653 / 오류 **0건**
+  * 앞 30% 를  700/2000 샘플 이동 → vwr 0.695 / robust-std 1.2~1.3 / p95−p5 5.2
+    (전 축 PASS. 같은 신호를 옛 원시 std/range 게이트는 std 913.7 / range 2050 으로 잡았다)
+즉 30 초 중 4.5 초가 42 ms 어긋난 세션이 QA 를 전부 통과하고 있었다.
+
+임계 0.77 의 근거(전수 실측):
+  * 정상군 47 세션(재정렬본) 유효창 비율 — 전 파일 0.857~0.997 / QA 발췌 0.861~0.979
+  * 프레임 슬립 주입                     0.651 ~ 0.695
+  * 추적 실패 합성 신호                  0.187
+골짜기 [0.695, 0.857] 의 기하평균 0.7717 을 내림해 0.77 을 쓴다 — 정상군 최저의
+1/1.11, 슬립 주입 최대의 1.11배로 양쪽에 같은 여유를 둔다. 오염군(원본 source.wav,
+최저 0.704)도 이제 이 축에서 함께 떨어지지만 그것은 오기각이 아니다: 그 무리는
+robust-std 25~121 로 어차피 FAIL 이고, 한 결함이 두 축에 걸리는 것은 정상이다.
+**이 값을 낮추려면 위 슬립 주입을 다시 돌려 무엇이 통과하게 되는지 먼저 적어라.**"""
+
+
 def measure_stream_delay_trajectory(
     playback: Sequence[float] | np.ndarray,
     capture: Sequence[float] | np.ndarray,
     *,
     sample_rate: int,
-    window_seconds: float = 1.0,
-    max_lag_samples: int = 8000,
-) -> dict[str, Any]:
-    """재생→캡처 지연을 창 단위로 재서 **궤적**으로 돌려준다.
+    settings: Any | None = None,
+) -> "DelayTrajectory":
+    """재생→캡처 지연 궤적. **자체 구현이 아니라 단일 출처로 위임한다.**
 
-    왜 중앙값 하나가 아니라 궤적인가. 코히런스는 "관계가 있는가"를 말하지만 "그 관계가
-    시간에 대해 안정한가"는 말하지 않는다. 두 클록 도메인이 어긋나면 지연이 세션 안에서
-    **떠다니고**, 그 상태로 학습하면 모델은 존재하지 않는 평균 지연을 배운다.
+    2026-08-06 반증 #14/#18 — 이 함수는 예전에 자기 추정기를 들고 있었다: 대역제한도
+    PHAT 도 없이 1 초 창 광대역 상관의 ``|argmax|`` 를 ±8000 에서 취하고 생 std/range
+    로 판정했다. 같은 ``(source_aligned, ERR)`` 쌍에 대해
+    :func:`deep_anc.data.timeline.estimate_lag_track` 은 robust-std **1.84** 를,
+    이 함수는 **1106.55** 를 냈다 — **600배**. 세션 101813 의 창 30개 중 27개가
+    125~150 인데 이상치 3개(479/487/6311)가 통계를 통째로 날린 것이다.
+    coh²=0.926 인 신호가 129 ms 를 떠다닐 수는 없으니 데이터가 아니라 추정기가 틀렸다.
 
-    실측(2026-08-04, 1초창):
-      * 붕괴 세션 ``source→ERR``: τ std 1019~2216 샘플, range 8869~13532 샘플
-      * 음향 대조군 ``REF→ERR``: τ std 17.7~20.1 샘플, range 106~215 샘플
-    두 무리가 50배 이상 벌어져 있다.
+    그 결과 제대로 재정렬된 47 세션 중 **22개(47%)** 가 QA 에서 오기각됐다.
 
-    ``max_lag_samples`` 는 탐색 범위다. 기본 8000(167ms)은 덕트 기하가 허용하는 최대
-    지연(1.0m ≈ 140샘플)보다 훨씬 크게 잡아, 붕괴한 세션이 "범위 밖이라 못 찾았다"가
-    아니라 **실제로 얼마나 떠다니는지**를 수치로 남기게 한다.
+    그래서 지금 이 함수에는 상관 코드가 한 줄도 없다. 추정은
+    :func:`deep_anc.data.timeline.measure_delay_trajectory` 만 한다 — 두 번째 유도가
+    생기려면 그 함수를 복사해야 하고, 그건 눈에 띈다.
+
+    import 방향에 대해: ``dsp`` 가 ``data`` 를 부르는 것은 층 순서상 역방향이라
+    함수 안에서 지연 import 한다(모듈 최상단에서는 순환이다 — ``timeline`` 이
+    :func:`check_stream_coherence` 를 쓴다). 층을 지키려고 **구현을 복제하는 것**이
+    이 저장소에서 실제로 사고를 냈으므로, 층보다 단일 출처를 우선한다.
     """
 
-    a = np.asarray(playback, dtype=np.float64).reshape(-1)
-    b = np.asarray(capture, dtype=np.float64).reshape(-1)
-    n = int(min(a.size, b.size))
-    window = int(round(float(window_seconds) * float(sample_rate)))
-    if window < 16:
-        raise ValueError(f"지연 궤적 창이 너무 짧습니다: {window} samples")
-    if n < window:
-        # 창 하나도 못 만드는 신호는 "안정하다"고 말할 수 없다. 판정을 미루지 않고
-        # 창을 신호에 맞춰 줄인다 — 짧은 합성 픽스처도 같은 코드로 검사되어야 한다.
-        window = max(16, 1 << int(math.floor(math.log2(max(n // 2, 16)))))
-    lag_limit = int(min(int(max_lag_samples), window - 1))
-    if lag_limit < 1:
-        raise ValueError("지연 탐색 범위가 비었습니다")
+    from ..data.timeline import measure_delay_trajectory as _measure
 
-    from scipy.signal import correlate
-
-    lags = np.arange(-window + 1, window)
-    mask = np.abs(lags) <= lag_limit
-    masked_lags = lags[mask]
-    taus: list[int] = []
-    for start in range(0, n - window + 1, window):
-        left = a[start : start + window]
-        right = b[start : start + window]
-        if float(left.std()) < 1e-9 or float(right.std()) < 1e-9:
-            continue  # 무음 창은 지연을 정의하지 않는다
-        corr = correlate(right - right.mean(), left - left.mean(), mode="full")
-        taus.append(int(masked_lags[int(np.argmax(np.abs(corr[mask])))]))
-
-    values = np.asarray(taus, dtype=np.float64)
-    if values.size == 0:
-        return {
-            "n_windows": 0,
-            "window_samples": int(window),
-            "delay_median_samples": float("nan"),
-            "delay_std_samples": float("inf"),
-            "delay_range_samples": float("inf"),
-        }
-    return {
-        "n_windows": int(values.size),
-        "window_samples": int(window),
-        "delay_median_samples": float(np.median(values)),
-        "delay_std_samples": float(values.std()),
-        "delay_range_samples": float(values.max() - values.min()),
-    }
+    return _measure(playback, capture, sample_rate=int(sample_rate), settings=settings)
 
 
 def check_stream_delay_stability(
@@ -402,10 +445,11 @@ def check_stream_delay_stability(
     capture: Sequence[float] | np.ndarray,
     *,
     sample_rate: int,
-    window_seconds: float = 1.0,
-    max_std_samples: float = 64.0,
-    max_range_samples: float = 256.0,
-    max_lag_samples: int = 8000,
+    max_robust_std_samples: float = MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+    max_p95_p5_samples: float = MAX_STREAM_DELAY_P95_P5_SAMPLES,
+    min_valid_windows: int = MIN_STREAM_DELAY_VALID_WINDOWS,
+    min_valid_window_ratio: float = MIN_STREAM_DELAY_VALID_WINDOW_RATIO,
+    settings: Any | None = None,
     name: str = "stream_delay_stability",
 ) -> InvariantResult:
     """재생→캡처 지연이 세션 내내 **한 값**인가.
@@ -415,38 +459,53 @@ def check_stream_delay_stability(
     떨어지지만 짧은 창에서는 살아 있어, 코히런스 하나만으로는 "음향이 나쁘다"와
     "타임베이스가 떠다닌다"를 구분할 수 없다.
 
-    임계의 근거(2026-08-04 실측):
-      * ``max_std_samples=64`` — 음향 대조군 실측 17.7~20.1 의 3.2배, 붕괴 세션 실측
-        1019~2216 의 1/16. 두 무리 사이가 통째로 비어 있다.
-      * ``max_range_samples=256`` — 대조군 실측 106~215 의 1.2배이고 hop 256 한 개
-        분량이다. 한 hop 을 넘게 떠다니면 프레임 정렬이 이미 깨진 것이다.
+    판정량은 **로버스트 통계뿐**이다 — 임계 근거는
+    :data:`MAX_STREAM_DELAY_ROBUST_STD_SAMPLES` /
+    :data:`MAX_STREAM_DELAY_P95_P5_SAMPLES` 의 전수 측정에 적혀 있다. 원시 std 와 ptp
+    는 진단으로 함께 남기지만 판정에 쓰지 않는다: 실측 정상 세션에서 유효창의 1~2%
+    가 덕트 공진 로브를 한 칸 건너뛰면 raw std 가 1.6 → 17.4 로 부푸는데(세션 121132)
+    시간축은 멀쩡하다. 이상치 몇 개로 좋은 데이터를 버리지 않으려면 판정량 자체가
+    이상치에 둔감해야 한다.
     """
 
-    stats = measure_stream_delay_trajectory(
-        playback,
-        capture,
-        sample_rate=int(sample_rate),
-        window_seconds=float(window_seconds),
-        max_lag_samples=int(max_lag_samples),
+    trajectory = measure_stream_delay_trajectory(
+        playback, capture, sample_rate=int(sample_rate), settings=settings
     )
     measured: dict[str, Any] = {
-        **stats,
-        "max_std_samples": float(max_std_samples),
-        "max_range_samples": float(max_range_samples),
+        **trajectory.as_metadata(),
+        "max_robust_std_samples": float(max_robust_std_samples),
+        "max_p95_p5_samples": float(max_p95_p5_samples),
+        "min_valid_windows": int(min_valid_windows),
+        "min_valid_window_ratio": float(min_valid_window_ratio),
     }
     reasons: list[str] = []
-    if int(stats["n_windows"]) == 0:
-        reasons.append("지연을 잴 수 있는 창이 없습니다 (전 구간 무음)")
-    if float(stats["delay_std_samples"]) > float(max_std_samples):
+    if not trajectory.measurable(int(min_valid_windows)):
+        # "판정 불가"는 통과가 아니다.
         reasons.append(
-            f"지연 표준편차 {stats['delay_std_samples']:.0f} > "
-            f"{float(max_std_samples):.0f} 샘플"
+            f"지연을 잴 수 있는 유효창이 {trajectory.valid_windows}개로 최소 "
+            f"{int(min_valid_windows)}개에 미달합니다 (전체 창 {trajectory.windows}) — "
+            "무음이거나 지연이 탐색 범위를 벗어났습니다"
         )
-    if float(stats["delay_range_samples"]) > float(max_range_samples):
+    elif trajectory.valid_window_ratio < float(min_valid_window_ratio):
+        # 살아남은 창끼리만 보면 로버스트 통계도 "안정" 으로 보인다. 추적을 놓친 것을
+        # 안정으로 보고하지 않으려면 놓친 비율 자체를 판정에 넣어야 한다.
         reasons.append(
-            f"지연 변동폭 {stats['delay_range_samples']:.0f} > "
-            f"{float(max_range_samples):.0f} 샘플"
+            f"지연을 추적할 수 있는 창이 {trajectory.valid_windows}/{trajectory.windows} "
+            f"({trajectory.valid_window_ratio:.3f}) 로 하한 "
+            f"{float(min_valid_window_ratio):.2f} 미만입니다 — 지연이 창별 탐색 범위를 "
+            "벗어났거나 대역 내 내용이 없어 추적을 놓쳤습니다"
         )
+    else:
+        if trajectory.robust_std_samples > float(max_robust_std_samples):
+            reasons.append(
+                f"지연 robust-std {trajectory.robust_std_samples:.2f} > "
+                f"{float(max_robust_std_samples):.2f} 샘플"
+            )
+        if trajectory.p95_p5_samples > float(max_p95_p5_samples):
+            reasons.append(
+                f"지연 p95−p5 {trajectory.p95_p5_samples:.2f} > "
+                f"{float(max_p95_p5_samples):.2f} 샘플"
+            )
     if reasons:
         return InvariantResult(
             name=name,
@@ -463,9 +522,10 @@ def check_stream_delay_stability(
         ok=True,
         detail=(
             f"재생→캡처 지연이 안정합니다: 중앙 "
-            f"{stats['delay_median_samples']:.0f} 샘플, std "
-            f"{stats['delay_std_samples']:.1f} ≤ {float(max_std_samples):.0f}, "
-            f"변동폭 {stats['delay_range_samples']:.0f} ≤ {float(max_range_samples):.0f}"
+            f"{trajectory.median_samples:.2f} 샘플, robust-std "
+            f"{trajectory.robust_std_samples:.2f} ≤ {float(max_robust_std_samples):.2f}, "
+            f"p95−p5 {trajectory.p95_p5_samples:.2f} ≤ {float(max_p95_p5_samples):.2f} "
+            f"(유효창 {trajectory.valid_windows}/{trajectory.windows})"
         ),
         measured=measured,
     )

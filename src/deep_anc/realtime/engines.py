@@ -379,24 +379,26 @@ def secondary_path_npz(runtime_cfg: dict) -> str:
 
 
 def build_engine(runtime_cfg: dict) -> InferenceEngine:
-    """runtime.yaml 로 엔진 구성. controller=fxlms 면 FxLMSEngine."""
+    """runtime.yaml 로 엔진 구성. controller=fxlms 면 FxLMSEngine.
+
+    핸드오프는 **다시 유도하지 않는다**. 예전에는 여기서
+    ``duct.secondary_path.handoff_extra_samples`` 를 직접 읽고 hop 과 비교했는데,
+    같은 값을 ``run_realtime`` 이 :class:`~deep_anc.realtime.safety.PipelineHandoffBudget`
+    으로 또 유도하고 있었다 — 같은 물리량의 두 번째 유도(발생기 A)다. 이제 둘 다
+    예산 타입 하나에서 나오고, 예산이 hop 불일치·입출력 비대칭을 생성 시점에 거부한다.
+    """
     hop = int(runtime_cfg.get("hop", 256))
     if runtime_cfg.get("controller", "dl") == "fxlms":
-        handoff = int(
-            runtime_cfg.get("duct", {})
-            .get("secondary_path", {})
-            .get("handoff_extra_samples", hop)
+        from .safety import PipelineHandoffBudget
+
+        budget = PipelineHandoffBudget.derive(
+            duct_cfg=runtime_cfg.get("duct", {}), hop=hop
         )
-        if handoff != hop:
-            raise ValueError(
-                "실시간 FxLMS의 handoff_extra_samples는 실제 1-hop 파이프라인과 "
-                f"같아야 합니다: 설정={handoff}, hop={hop}"
-            )
         return FxLMSEngine(
             secondary_path_npz(runtime_cfg),
             runtime_cfg.get("fxlms", {}),
             hop=hop,
-            handoff_extra_samples=handoff,
+            handoff_extra_samples=budget.handoff_samples,
         )
     eng = runtime_cfg.get("engine", {})
     kind = str(eng.get("type", "torch"))

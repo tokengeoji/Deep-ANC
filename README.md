@@ -52,17 +52,17 @@ v1.1/v2 연구 항목은 [docs/11](docs/11_v2_roadmap.md)에 승인·기각 근�
 
 | 항목 | 결과 | 상태 |
 |---|---|:---:|
-| 자동 회귀 테스트 | **600개** (인과성·등가성·DSP·데이터·게이트 실패증명) | 통과 |
+| 자동 회귀 테스트 | **604개** (인과성·등가성·DSP·데이터·게이트 실패증명) | 통과 |
 | 오프라인↔스트리밍 수치 등가성 | 최대 오차 약 `3e-8` | 통과 |
 | PyTorch↔ONNX Runtime 등가성 | 최대 오차 `8e-8` 이하 | 통과 |
 | tiny + ORT CPU P99 | **1.44ms** (MAXN) / **1.54ms** (30W) / 게이트 `<3ms` | 통과 |
 | base + ORT CPU P99 | 6.40ms / 게이트 미달 | 미달 |
 | TensorRT FP16 (tiny) | P50 **0.29ms** (MAXN) / P99 3.12ms — **듀티 100% 벤치** | 잠정 |
 | 실시간 구동 (RT 우선순위 적용 후) | xrun 145 → **2** / 20초, step 1.8–2.5ms | 통과 |
-| **실측 `P/S` (G1)** | **재측정·재분석 완료** — 150–1600Hz 일관성 **P 0.9993 / S 0.9990**, P−S 상대 τ spread **1샘플** | 통과 |
-| **실기 ANC 저역** (150–600Hz, tiny) | tone300 **+6.26dB** · band **+5.14dB** · 음성+소음 **+4.39dB** | 동작 |
+| **실측 `P/S` (G1)** | **저장 캡처 재분석으로 재발행** (스피커 0회) — 150–1600Hz 일관성 **P 0.9993 / S 0.9990**, P−S 상대 τ spread **1샘플** | 통과 |
+| **실기 ANC 저역** (150–600Hz 측정, tiny) | tone300 **+6.26dB** · band **+5.14dB** · 음성+소음 **+4.39dB** | 동작 |
 | **실기 ANC 고역** | 1150–1250Hz는 +0.46dB 지만 **2–8kHz 옥타브를 15–22dB 증폭** | **절대 목표 1 위반** |
-| recorded 독립 세션 (G2) | 80세션 / 93.3분 / 4계열 / 64그룹, **형식** QA 80/80 | **재수집 필요** — 시간축 붕괴 |
+| recorded 독립 세션 (G2) | 80세션 중 **47개만 시간축 복구**, 33개는 재녹음 필요 (형식 QA 는 80/80 이었다) | **FAIL** — 시간축 붕괴 |
 | **파인튜닝 진입 게이트** | 당시 9개 전부 PASS — **그런데 플랜트가 틀렸고 데이터가 깨져 있었다** | **무효** |
 | **Stage-2 파인튜닝** (tiny, 50k step) | 완주. val trusted **−0.07 dB** (cluster bootstrap CI [−0.456, +0.481] — 0과 구별 불가) | 완료 |
 | **G4 독립 평가** | 최악 계열 `music` **val +0.58 / test +0.90 dB**, fullband val +0.07 | **FAIL** |
@@ -301,7 +301,9 @@ tiny의 상태는 12개다.</p>
 실측 `P/S` 파인튜닝 전이므로 최종 성능이 아니다. 이 구분은 checkpoint의 `physics_status`
 필드가 강제한다.
 
-**base vs tiny** — 동일 조건(100k step, 같은 seed·데이터, held-out 64 아이템):
+**base vs tiny** — 동일 조건(100k step, 같은 seed·데이터, held-out 64 아이템).
+**전부 `secondary_surrogate` 플랜트 + 당시 trusted 대역 150–600 Hz 기준의 사전학습 지표**이며
+실제 덕트 감쇠가 아니다:
 
 | 지표 (NMSE dB, 낮을수록 좋음) | base 5.99M | tiny 1.16M | 우세 |
 |---|---:|---:|---|
@@ -478,7 +480,7 @@ for r in csv.DictReader(open('results/session_20260804_0939/metrics.csv')):
 | 축방향 공진 | 70 / 210 / 350 / 489 / 629 Hz | `L_eff ≈ 1.226 m` (개방단 보정 `0.61·r_eq`) |
 | 현실적 목표 대역 (`realistic_target_band_hz`) | **80–1600 Hz** | 차단 주파수와 스피커 저역 한계의 교집합. **2026-08-05 에 80–800 에서 확대** |
 | **trusted band** | **150–1600 Hz** | 실측 `S(z)` `consistency_band_hz` ∩ 목표 대역 — 손실이 보는 대역 |
-| **진짜 저역 한계** | **64–150 Hz** | 클린 재측정 후에도 S 부대역 일관성 **0.758** — 스피커 저역 SNR 한계 |
+| **진짜 저역 한계** | **80–150 Hz** | 클린 재측정 후에도 S 부대역 일관성 **0.758** — 스피커 저역 SNR 한계 |
 
 배치(원점 = 좌측 폐단): 소음 스피커 `x=0.0`(축방향 방사) · 기준 마이크 `x=0.100`(벽면) ·
 상쇄 스피커 `x=1.050`(상면 side-branch, Ø40) · 에러 마이크 `x=1.100` · 개구 `x=1.200`.
@@ -569,8 +571,9 @@ delay/all-pass 섭동은 위상 gradient를 상쇄해 다시 영출력 해로 �
 
 **손실 대역(optimize)과 보고 대역(measure)은 다른 것이다.** 손실 대역은 보수적이어야
 하고, 보고 대역은 넓어야 한다 — 넓지 않으면 절대 목표 1(고역도 제거)을 **검증할 방법이
-없고** 대역 밖 피해도 보이지 않는다. 지금은 같은 유도식이 5곳에 복붙돼 있어(§7.8) 이
-분리가 구조적으로 강제되지 않는다.
+없고** 대역 밖 피해도 보이지 않는다. 2026-08-06 에 `BandPlan.resolve(...)` 단일 출처로
+통합했으나(§7.8), **평가가 아직 `BandPlan.measure` 를 소비하지 않아** 분리가 실효를 내지
+못하고 있다.
 
 손실 구성: FP32 trusted NMSE + MR-STFT(256/512/1024/2048) + 대역 밖 do-no-harm 힌지
 + 포화 페널티. 집계는 산술평균이 아니라 **CVaR(최악 상위 분위)** 를 섞는다 — 기능 2 는
@@ -699,18 +702,34 @@ digital/acoustic 모드별 별도 학습이 추가로 필요하다.
 > 1.0 에 수렴하지 않는다는 것은 **느린 클록 드리프트가 아니라 빠른 위상 점프**라는 뜻이며,
 > 일정 ppm 리샘플 dewarp 로는 구제되지 않는다.
 >
-> 원인은 [`record_duct.py`](scripts/data/record_duct.py) 가
+> **원인**: `source.wav` 는 **재생 배열이지 방출 시각이 아니다.** USB DAC 의 PLL 헌팅
+> (주기 4~5초, 진폭 **259~407 샘플**)이 그 둘을 벌려 놓는데,
+> [`record_duct.py`](scripts/data/record_duct.py) 가
 > `sd.Stream(device=(in_dev, out_dev))` 로 **서로 다른 두 장치**(USB AB13X 재생 /
-> Tegra APE I²S 캡처)를 duplex 로 묶고, 콜백에서 출력 커서와 입력 커서를 **인덱스로만**
-> 정렬한 것이다 — "두 커서가 같은 물리 시각"이라고 **단언**하고 측정하지 않았다.
+> Tegra APE I²S 캡처)를 duplex 로 묶고 콜백에서 출력 커서와 입력 커서를 **인덱스로만**
+> 정렬했다 — "두 커서가 같은 물리 시각"이라고 **단언**하고 측정하지 않았다.
+> 수정본은 `src/deep_anc/data/timeline.py` 에서 실제로 **측정**하고 저장 시점에 게이트한다.
 >
-> **오프라인 재정렬로는 부족하다.** `realign_recorded_sessions.py` 로 24세션 표본을 돌리면
-> 16/24(66.7%)가 coh² 0.94 대로 복구되지만, 80세션 전체로 환산하면 약 53세션이라
-> 게이트(`≥80세션 그리고 ≥90분`)를 만족하지 못한다. **게이트를 낮추지 않으므로 재녹음이
-> 정답이다.** 재정렬본은 진단·회귀용으로만 쓴다.
+> **오프라인 재정렬로 80세션 중 47개를 복구했다** (`results/timeline/realign_full.json`,
+> `ref_witness_warp_v1` — REF 마이크를 시간축 증인으로 써 L(t) 를 추정하고 ERR 로만
+> 검증한다). 게이트는 `coh² ≥ 0.9` 그리고 `유효창 비율 ≥ 0.9`:
+>
+> | 지표 (47세션) | 전 | 후 |
+> |---|---|---|
+> | coh²(source→ERR) 150–600 Hz | 0.025 ~ 0.182 (p50 **0.078**) | 0.905 ~ 0.973 (p50 **0.947**) |
+> | coh²(source→ERR) 600–1600 Hz | 0.007 ~ 0.071 (p50 0.019) | 0.596 ~ 0.920 (p50 **0.824**) |
+> | 선형 Wiener 하한 (중앙) | **−0.23 dB** | **−12.09 dB** |
+>
+> 복구본의 잔여 지연 중앙값은 **142.02 ~ 143.37 샘플**(p50 142.53, 세션 간 산포 1.35)로
+> 덕트 기하 예측 **139.9 샘플**과 일치한다 — 재정렬이 물리적으로 옳다는 독립 증거다.
+>
+> **그래도 33세션은 재녹음해야 한다** — 47세션만으로는 게이트(`≥80세션 그리고 ≥90분`)를
+> 못 채운다. **게이트를 낮추지 않는다.** 다만 전량 재녹음이 아니라 실패분만 다시 받으면
+> 되므로 스피커 발음 시간이 93.3분 → **약 38.5분**으로 줄었다.
 >
 > 그리고 **이것이 파인튜닝 train NMSE 가 −2 dB 에서 정체한 진짜 이유다** — 용량 부족이
-> 아니다(§7.7). 입력과 타깃의 대응이 깨진 데이터에서 회귀 손실의 하한은 데이터가 정한다.
+> 아니다(§7.7). 입력과 타깃의 대응이 깨진 데이터에서 회귀 손실의 하한은 데이터가 정하며,
+> 그 하한 **−0.23 dB** 가 관측된 val −0.07 dB 와 사실상 같다.
 
 수집 과정에서 실제로 걸러낸 것들이 이 설계의 이유다.
 
@@ -764,7 +783,7 @@ Deep_ANC/
 │   ├── measured/         # 실측 P/S NPZ (primary_path_il, secondary_path_il)
 │   ├── diagrams/         # 아키텍처 그림 6종 + 덕트 3D/측면도
 │   └── images/           # 실기 시연·데이터셋·지연 예산 그림
-├── tests/                # 회귀 테스트 600개
+├── tests/                # 회귀 테스트 604개
 └── docs/                 # 00~12 + FxLMS 부록
 ```
 
@@ -796,7 +815,7 @@ git clone https://github.com/Roka-jsj/Deep-ANC.git
 cd Deep-ANC
 
 bash scripts/jetson/setup_jetson.sh    # .venv 재생성이 필요할 때만. lib preload 훅 포함 — 필수
-.venv/bin/python -m pytest -q          # 600개 전부 통과해야 정상 (약 14분)
+.venv/bin/python -m pytest -q          # 604개 전부 통과해야 정상 (약 14분)
 .venv/bin/python scripts/data/build_rir_bank.py --n 300
 .venv/bin/python scripts/bench/check_audio_input.py
 ```
@@ -1055,7 +1074,7 @@ manifest는 같은 `group_id`를 split 밖으로 내보내지 않고 source fami
 ```
 
 현행 채택본은 이 경로로 재생성한 것이다(캡처 `225546_f7b0fecd`, 48반복 중 30기각 · 18유지 ·
-앵커 13). 왜 재생성이 필요했는지는 [7.5](#75-sz-가-33틀려-있었다--게이트가-오염-반복-5개를-통과시켰다)에 있다.
+앵커 13). 왜 재생성이 필요했는지는 [7.5](#75-sz-가-33-틀려-있었다--게이트가-오염-반복-5개를-통과시켰다)에 있다.
 
 ### 6.10 파인튜닝 (Stage-2)
 
@@ -1236,7 +1255,7 @@ G4가 소스별 **평균이 아니라 최악값**을 보는 이유는 기능 2�
 | 150–1600 | 0.921 | 0.999 | **0.782** | **0.999** |
 
 → **600 Hz 위는 덕트·스피커 물리 한계가 아니라 오염된 반복 때문이었다.**
-→ **진짜 물리 한계는 64–150 Hz 뿐이다** (클린 후에도 S 부대역 0.758, 독립 캡처 간 `|H|`
+→ **진짜 물리 한계는 80–150 Hz 뿐이다** (클린 후에도 S 부대역 0.758, 독립 캡처 간 `|H|`
 편차 27.8% — 스피커 저역 SNR 8–10 dB).
 
 **형상이 얼마나 틀렸는가.** 벌크지연을 제거하고 150–1600 Hz 에서 `‖Δ‖/‖new‖` 를 재면
@@ -1283,15 +1302,19 @@ G4가 소스별 **평균이 아니라 최악값**을 보는 이유는 기능 2�
 **플랜트는 더 이상 병목이 아니다.** FIR 길이 512 → 8192 로도 −3.87 → −4.16 dB 만 움직이므로
 **용량도 병목이 아니다.**
 
-> [!WARNING]
-> **미해결 불일치.** 위 −6.53 dB(150–600 Hz)는 플랜트 복구 작업에서 나온 값인데, 별도
-> 감사에서 같은 아티팩트로 정규방정식을 다시 푼 결과는 **5.21~5.41 dB** 였다(M·밴드패스
-> 길이 전 조합에서 안정). 두 계산이 1.1~1.3 dB 어긋난다. `configs/train_finetune.yaml` 의
-> `measured_design_ceiling_db: 6.53` 은 **손으로 적은 float 하나**이고 대역 표시가 없으며,
-> 아티팩트에서 유도하는 코드도 대조하는 테스트도 없다 — **§7.8 발생기 A 의 재발이다.**
-> 이 값이 요구 대역([150,1600], 상한 4.77)이 아니라 좁은 대역의 값이라면 게이트가
-> 통과시키면 안 될 목표를 통과시킨다. **재유도 코드로 대체하기 전까지 이 게이트를
-> 근거로 삼지 말 것.**
+> [!IMPORTANT]
+> **게이트가 이 값을 잘못 쓰고 있었다 — 2026-08-06 정정됨.**
+> `configs/train_finetune.yaml` 의 `measured_design_ceiling_db` 는 **대역 표시가 없는 손으로
+> 적은 `6.53`** 이었다. 그런데 그 6.53 은 **150–600 Hz** 에서 푼 값이고
+> `required_path_band_hz` 는 **[150, 1600]** 이다 — 그 대역의 상한은 **4.58 dB**.
+> 즉 게이트가 **2 dB 낙관적인 fail-open** 상태였고, **오판정 방향이 정확히 고역 방치**였다.
+> 지금은 `measured_design_ceiling_db: 4.58` + `measured_design_ceiling_band_hz: [150, 1600]`
+> 로 고쳤고, 선언 대역이 요구 대역을 덮는지 게이트가 검사한다.
+>
+> **남은 불일치(미검증)**: 위 표의 −6.53 dB(150–600 Hz)는 플랜트 복구 작업에서 나온 값인데,
+> 별도 감사가 같은 아티팩트로 정규방정식을 다시 푼 결과는 **5.21~5.41 dB** 였다
+> (M·밴드패스 길이 전 조합에서 안정). 두 계산이 1.1~1.3 dB 어긋난다. **아티팩트에서
+> 상한을 유도하는 코드로 대체하기 전까지 이 숫자를 정밀 근거로 쓰지 말 것.**
 
 `excitation_band_hz` 도 두 경로가 다르다 — 인터리브라 두 채널이 인접 FFT 빈을 번갈아 쓰기
 때문이다: **P(noise) [64, 1648] Hz / S(cancel) [72, 1640] Hz.** `consistency_band_hz`
@@ -1359,7 +1382,7 @@ runs/finetune_tiny/eval_recorded_{val,test}/metrics.md`
 | **1** | 학습에 쓴 `S(z)` 형상이 **54% 틀림** | 오염 반복 5개를 게이트가 통과 (`rejected_repeats: 0`) | **수정됨** (§7.5) — 재발행 완료 |
 | **2** | recorded 80세션 **시간축 붕괴** | coh²(source→ERR) **0.021~0.126** vs coh²(REF→ERR) 0.959~0.991 | **미해결** — 격리함. **재녹음 필요** |
 | **3** | 대역 밖 **2–8 kHz 를 15–22 dB 증폭** | `results/session_20260804_0939/metrics.csv` | **부분** — 손실에 do-no-harm 항 추가됨, λ 미교정·미검증 |
-| **4** | 코퍼스 누수 — 실측 `music` **60/60 트랙이 합성 풀에 존재**, 그중 55개(92%)가 합성 train | `data/source_pool/sources.csv` ∩ `data/raw/` | **부분** — held-out 목록 생성, 게이트 배선 미완 |
+| **4** | 코퍼스 누수 — 실측 `music` **60/60 트랙이 합성 풀에 존재**, 그중 55개(92%)가 합성 train | `data/source_pool/sources.csv` ∩ `data/raw/` | **부분** — `corpus_disjoint` 게이트 + held-out 목록(691 클립) 배선 완료, **실데이터 양성 확인 미완**(manifest 격리 중) |
 
 **결함 4 의 기전**: 같은 오디오에 **상충하는 정답**이 간다. 합성 브랜치는 이상적 P/S 라
 −18 dB 까지 상쇄 가능하고, 실측 브랜치는 정렬 붕괴로 천장이 −0.4 dB 다. 모델이 같은
@@ -1392,28 +1415,39 @@ runs/finetune_tiny/eval_recorded_{val,test}/metrics.md`
 
 **A+B = 14/18 (78%).** 실측: 지연 산술을 독립 수행하는 파일이 **13개**
 (`eval/recorded.py` 35회, `train/finetune_readiness.py` 31회, `train/trainer.py` 17회 …).
-현재도 살아 있는 A 사례:
 
-- 신뢰대역 유도식 `intersect(sp.trusted_band_hz(), duct.realistic_target_band_hz, fs/2)` 가
-  **5곳에 복붙**돼 있다 — `train/trainer.py`, `eval/recorded.py`, `scripts/eval/evaluate_offline.py`,
-  `scripts/demo/evaluate_session.py`, `scripts/demo/render_anc_demo.py`.
-- `intersect_frequency_bands` 자체가 **두 번 정의**돼 있다(`losses/anc_loss.py`, `eval/metrics.py`).
-- `configs/eval*.yaml` 3곳의 `trusted_band_hz: [150, 600]` 은 **죽은 설정**이다 — 어떤 코드도
-  읽지 않는다(전수 grep 확인). 권위 있어 보이는데 아무 효과가 없어 다음 사람을 속인다.
-- `measured_design_ceiling_db: 6.53` 이 대역 표시 없는 손으로 적은 float 이다(§7.5 경고).
-- source→ERR 지연 궤적이 `data/timeline.py` 와 `dsp/invariants.py` 에 **두 벌** 있고,
-  같은 세션에 대해 로버스트 std 1.8 vs 원시 std 1107 로 **정반대 판정**을 낸다.
+**✅ 2026-08-06 에 해소된 A 사례** (직접 grep 으로 재확인):
+
+| 발생기 | 어떻게 고쳤나 |
+|---|---|
+| 신뢰대역 유도식 `intersect(sp.trusted_band_hz(), duct.realistic_target_band_hz, fs/2)` 가 **5곳에 복붙** | [`dsp/timing.py`](src/deep_anc/dsp/timing.py) 의 **`BandPlan.resolve(...)`** 로 통합. 소비처 5곳이 전부 이것을 호출한다 |
+| `intersect_frequency_bands` **두 번 정의** | `dsp/timing.py:147` **한 곳**만 남았다 |
+| `configs/eval*.yaml` 3곳의 죽은 `trusted_band_hz: [150,600]` | **삭제** (삭제 사유 주석만 남음) |
+| `measured_design_ceiling_db: 6.53` — 대역 표시 없는 손 float | **`4.58` + `measured_design_ceiling_band_hz: [150,1600]`** 으로 정정, 대역이 요구 대역을 덮는지 게이트가 검사 |
+| lead 가 trainer 와 게이트에서 **109 vs 113 으로 갈라져 있었다** | **`PlantDelays.lead()`** 로만 만들 수 있다 — 손으로 쓰면 `TypeError` |
+| 서로 다른 플랜트끼리 비교 | **`PlantFingerprint`** 가 막는다 |
+
+**⚠ 아직 살아 있는 것:**
+
+- **source→ERR 지연 궤적이 두 벌이다** — `data/timeline.py:455 estimate_lag_track`
+  (대역제한 GCC-PHAT + 품질선별 + robust) vs `dsp/invariants.py:330
+  measure_stream_delay_trajectory`(광대역 argmax + 원시 std). 같은 세션에서 std **1.8 vs
+  1107** 로 **정반대 판정**을 낸다.
+- **do-no-harm 힌지 마진(`dnh_margin_db: 6.0`)과 G4 임계
+  (`MAX_OUT_OF_BAND_AMPLIFICATION_DB = 1.0`)가 서로를 모른다** — 마진을 정확히 만족하는
+  모델이 게이트를 옥타브 전 대역에서 8~9 dB 차이로 FAIL 한다(§7.7).
+- **`build_engine` 이 handoff 를 `duct` cfg 에서 다시 읽는다**(`realtime/engines.py:388`).
 
 **해야 할 것 (증상 수정보다 우선).**
 
-1. **지연·대역 부기의 단일 출처.** `Lead.derive(...)` / `BandPlan.resolve(...)` 로만 만들 수
-   있게 하고(pydantic frozen, 손으로 생성 시 `TypeError`), 나머지는 **읽기만** 한다.
-   `duct.yaml` 값을 바꿨을 때 5곳이 전부 따라오는지 테스트로 강제한다.
-2. **손실 대역(optimize)과 보고 대역(measure)을 타입으로 분리한다.** 보고 대역이 좁으면
+1. **지연 궤적을 한쪽으로 합쳐라.** 위 두 구현이 공존하는 한 QA 판정은 어느 쪽을 부르느냐에
+   달려 있다 — 발생기 A 그 자체다.
+2. **손실 대역(optimize)과 보고 대역(measure)의 분리를 실제로 소비하라.** 타입
+   (`BandPlan.measure`)은 생겼지만 평가가 아직 `measure` 를 쓰지 않는다. 보고 대역이 좁으면
    절대 목표 1 을 **검증할 방법 자체가 없다.**
-3. **실패 증명 없는 게이트 금지.** 게이트를 열거해 FAIL 시키는 fixture 가 없으면 실패하는
-   메타 테스트 — `src/deep_anc/ops/gate_registry.py` 에 구현했고 현재 72개가 등록돼 있다.
-   **단, 이 메타 테스트는 "발동시킬 수 있는가" 만 강제하고 "정상 데이터에서 발동하지
+3. **실패 증명 없는 게이트 금지 — 절반만 됐다.** 게이트 열거 + FAIL fixture 메타 테스트는
+   `src/deep_anc/ops/gate_registry.py` 에 구현됐고 현재 **72개**가 등록돼 있다.
+   **그러나 이 메타 테스트는 "발동시킬 수 있는가" 만 강제하고 "정상 데이터에서 발동하지
    않는가"(위양성)는 강제하지 못한다.** 실제로 새 QA 정렬 게이트가 올바르게 재정렬된
    세션의 27~44% 를 오검출로 떨어뜨리는 것이 확인됐다. **짝이 되는 위양성 fixture 가
    다음 과제다.**

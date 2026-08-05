@@ -52,11 +52,13 @@ from ..dsp.timing import FrequencyBand
 
 __all__ = [
     "TIMELINE_METHOD",
+    "DelayTrajectory",
     "LagTrack",
     "TimelineReport",
     "TimelineSettings",
     "align_source_to_adc",
     "estimate_lag_track",
+    "measure_delay_trajectory",
     "median_coherence",
     "warp_by_lag_track",
 ]
@@ -145,6 +147,47 @@ class TimelineSettings(BaseModel):
     def hop_samples(self) -> int:
         return max(1, int(round(self.hop_seconds * self.sample_rate)))
 
+    def fit_to_length(self, n_samples: int) -> "TimelineSettings":
+        """짧은 신호에서도 **같은 추정기**가 돌도록 창/탐색폭만 줄인다.
+
+        왜 필요한가: 이 설정은 70 초 실측 세션에 맞춰져 있는데, 합성 픽스처와 단위
+        테스트는 몇 초짜리다. "짧으면 다른 추정기를 쓴다"로 도망가면 그 순간 유도가
+        두 벌이 되고, 그것이 이 모듈이 존재하는 이유인 발생기 A 다. 그래서 줄이는 것은
+        **기하학적 여유(창 길이·탐색폭)뿐**이고 대역·품질 임계·정규화 규약은 손대지
+        않는다 — 즉 짧은 신호에서도 같은 판정식이 돈다.
+
+        여유 계산: :func:`estimate_lag_track` 의 첫 창 시작점은
+        ``centre_lag + coarse`` 이고 ``centre_lag ≤ max_bulk_lag_samples`` 이므로
+        ``max_bulk + coarse + window ≤ n`` 이면 창이 최소 하나는 선다. 안전 여유로
+        남은 예산의 절반만 창에 쓴다.
+        """
+
+        n = int(n_samples)
+        if n < 512:
+            raise ValueError(f"지연 궤적을 추정하기에 신호가 너무 짧습니다: {n} 샘플 < 512")
+        fs = int(self.sample_rate)
+        max_bulk = max(1, min(int(self.max_bulk_lag_samples), n // 4))
+        coarse = max(1, min(int(self.coarse_search_samples), n // 8))
+        refine = max(1, min(int(self.refine_search_samples), coarse))
+        budget = n - (max_bulk + coarse)
+        window_samples = min(self.window_samples, max(256, budget // 2))
+        window_seconds = float(window_samples) / float(fs)
+        # hop:window 비율(기본 0.0625 : 0.25 = 1:4)을 유지한다. hop 만 그대로 두면
+        # 창이 줄어든 만큼 창 개수도 같이 줄어 "판정 불가"로 떨어진다.
+        hop_seconds = min(float(self.hop_seconds), window_seconds / 4.0)
+        update = {
+            "max_bulk_lag_samples": max_bulk,
+            "coarse_search_samples": coarse,
+            "refine_search_samples": refine,
+            "window_seconds": window_seconds,
+            "hop_seconds": hop_seconds,
+        }
+        if all(getattr(self, key) == value for key, value in update.items()):
+            return self
+        # model_copy 는 검증기를 다시 돌리지 않는다 — 축소된 설정도 생성 시점 검증을
+        # 받아야 하므로 새로 만든다.
+        return TimelineSettings(**{**self.model_dump(), **update})
+
 
 # --------------------------------------------------------------------------------------
 # 결과 타입
@@ -213,6 +256,10 @@ class LagTrack(BaseModel):
             return float("nan")
         return float(np.percentile(lags, 95.0) - np.percentile(lags, 5.0))
 
+    @property
+    def valid_count(self) -> int:
+        return int(np.count_nonzero(np.asarray(self.valid, dtype=bool)))
+
     def summary(self) -> dict[str, float]:
         return {
             "lag_median_samples": self.median_samples,
@@ -223,6 +270,107 @@ class LagTrack(BaseModel):
             "valid_window_ratio": self.valid_window_ratio,
             "windows": float(np.asarray(self.valid, dtype=bool).size),
         }
+
+    def trajectory(self, settings: "TimelineSettings") -> "DelayTrajectory":
+        """게이트·리포트가 읽는 **부기 타입**으로 굳힌다.
+
+        numpy 배열째로 넘기면 호출부가 결국 자기 통계를 계산한다 — 그게 두 번째 유도다.
+        """
+
+        return DelayTrajectory(
+            windows=int(np.asarray(self.valid, dtype=bool).size),
+            valid_windows=self.valid_count,
+            window_samples=int(settings.window_samples),
+            hop_samples=int(settings.hop_samples),
+            band_hz=(float(settings.track_band_hz[0]), float(settings.track_band_hz[1])),
+            median_samples=self.median_samples,
+            robust_std_samples=self.robust_std_samples,
+            p95_p5_samples=self.p95_p5_samples,
+            raw_std_samples=self.std_samples,
+            ptp_samples=self.ptp_samples,
+        )
+
+
+class DelayTrajectory(BaseModel):
+    """``playback → capture`` 지연 궤적의 **요약 부기**.
+
+    왜 별도 타입인가
+    ----------------
+    2026-08-06 반증 #14/#18: 같은 (source_aligned, ERR) 쌍을 두 구현이 잰 값이
+    robust-std **1.84 vs 1106.55 (600배)** 로 갈렸고, 그 결과 제대로 재정렬된 세션
+    47개 중 **22개(47%)** 가 QA 에서 오기각됐다. 원인은 임계가 아니라 부기였다 —
+    한쪽은 대역제한 PHAT + 로버스트 통계를, 다른 쪽은 광대역 argmax + 생 std 를 썼고
+    **아무도 두 값을 대조하지 않았다.**
+
+    그래서 지연 궤적 통계는 이 타입으로만 존재한다. ``lag_samples`` 배열을 들고 나가
+    호출부가 ``np.std`` 를 부르는 경로를 없애는 것이 이 타입의 목적이다.
+
+    통계 규약
+    --------
+    * ``robust_std_samples`` = 1.4826 × MAD — **게이트가 보는 산포**.
+    * ``p95_p5_samples`` — **게이트가 보는 변동폭**.
+    * ``raw_std_samples`` / ``ptp_samples`` 는 진단으로만 남긴다. 실측에서 유효창의
+      1~2% 가 덕트 공진 로브를 한 칸 건너뛰면 raw std 가 1.6 → 17.4 로 부풀지만
+      robust-std 는 2.26 으로 멀쩡하다(세션 121132). 숨기지는 않되 판정에는 쓰지 않는다.
+
+    측정 불가와 통과를 구분한다
+    --------------------------
+    유효창이 없으면 통계는 NaN 이고 ``NaN > 임계`` 는 False 라 **조용히 통과**한다.
+    이 저장소에서 반복된 실패 방식이므로 :attr:`measurable` 로 그 상태를 명시한다.
+    """
+
+    model_config = _FROZEN
+
+    windows: int
+    valid_windows: int
+    window_samples: int
+    hop_samples: int
+    band_hz: tuple[float, float]
+    median_samples: float
+    robust_std_samples: float
+    p95_p5_samples: float
+    raw_std_samples: float
+    ptp_samples: float
+
+    @model_validator(mode="after")
+    def _validate(self) -> "DelayTrajectory":
+        if self.windows < 0 or self.valid_windows < 0:
+            raise ValueError(f"창 개수는 0 이상이어야 합니다: {self.windows}/{self.valid_windows}")
+        if self.valid_windows > self.windows:
+            raise ValueError(
+                f"유효창({self.valid_windows})이 전체 창({self.windows})보다 많을 수 없습니다"
+            )
+        if self.window_samples <= 0 or self.hop_samples <= 0:
+            raise ValueError("window/hop 은 양수 샘플이어야 합니다")
+        if self.hop_samples > self.window_samples:
+            raise ValueError("hop 이 window 보다 클 수 없습니다")
+        FrequencyBand.parse(self.band_hz, name="delay_track_band_hz")
+        for name in ("robust_std_samples", "p95_p5_samples", "raw_std_samples", "ptp_samples"):
+            value = float(getattr(self, name))
+            if math.isfinite(value) and value < 0.0:
+                raise ValueError(f"{name} 는 음수일 수 없습니다: {value}")
+        return self
+
+    @property
+    def valid_window_ratio(self) -> float:
+        if self.windows == 0:
+            return 0.0
+        return float(self.valid_windows) / float(self.windows)
+
+    def measurable(self, min_valid_windows: int) -> bool:
+        """판정에 쓸 만큼 유효창이 있고 통계가 유한한가."""
+
+        return (
+            self.valid_windows >= int(min_valid_windows)
+            and math.isfinite(self.robust_std_samples)
+            and math.isfinite(self.p95_p5_samples)
+        )
+
+    def as_metadata(self) -> dict[str, Any]:
+        data = self.model_dump()
+        data["band_hz"] = [float(self.band_hz[0]), float(self.band_hz[1])]
+        data["valid_window_ratio"] = self.valid_window_ratio
+        return data
 
 
 class TimelineReport(BaseModel):
@@ -560,6 +708,37 @@ def estimate_lag_track(
         valid=valid2,
         sample_rate=fs,
     )
+
+
+def measure_delay_trajectory(
+    playback: Sequence[float] | np.ndarray,
+    capture: Sequence[float] | np.ndarray,
+    *,
+    sample_rate: int,
+    settings: TimelineSettings | None = None,
+) -> DelayTrajectory:
+    """``playback → capture`` 지연 궤적의 **유일한** 측정 입구.
+
+    :mod:`deep_anc.dsp.invariants` 의 ``measure_stream_delay_trajectory`` 도,
+    :func:`align_source_to_adc` 의 잔여 검증도, ``recorded_qa`` 의 정렬 게이트도 전부
+    이 함수를 지나간다. 그래서 같은 파일쌍에 대해 **서로 다른 숫자가 나올 수 없다** —
+    반증 #14/#18 이 반증한 것이 정확히 그 불가능해야 할 상태였다(1.84 vs 1106.55).
+
+    짧은 신호는 :meth:`TimelineSettings.fit_to_length` 로 **같은 추정기를 축소해서**
+    돌린다. 다른 추정기로 갈아타지 않는 것이 요점이다.
+
+    핫패스 금지 — 30 초 발췌 기준 약 0.8 s 걸린다.
+    """
+
+    fs = int(sample_rate)
+    src = np.asarray(playback, dtype=np.float64).reshape(-1)
+    cap = np.asarray(capture, dtype=np.float64).reshape(-1)
+    n = int(min(src.size, cap.size))
+    cfg = (settings or TimelineSettings(sample_rate=fs)).fit_to_length(n)
+    if int(cfg.sample_rate) != fs:
+        raise ValueError(f"TimelineSettings.sample_rate({cfg.sample_rate}) != {fs}")
+    track = estimate_lag_track(src[:n], cap[:n], cfg)
+    return track.trajectory(cfg)
 
 
 def warp_by_lag_track(

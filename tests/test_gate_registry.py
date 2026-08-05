@@ -33,6 +33,18 @@ from deep_anc.ops.gate_registry import (
 
 # 게이트 id 를 문자열 리터럴로 들고 있어 스캔이 가능한 소스.
 _SCANNED_SOURCES = ("src/deep_anc/train/finetune_readiness.py",)
+# ⚠ 미선언 탐지는 이 **한 파일**에서만 돈다. ``discover_audit_gate_ids`` 가 찾는 것은
+# ``audit.fail("gate_id", …)`` 형태뿐이고, 나머지 15개 소유 파일은 게이트를
+# ``raise ValueError`` / ``errors.append`` / 스크립트 종료코드로 표현하기 때문이다.
+# 즉 "게이트는 짝 없이 존재할 수 없다"는 **선언된 게이트에 대해서만** 참이고, 새
+# 게이트를 선언 없이 만드는 경로는 열려 있다 — 2026-08-06 에 실제로 그렇게 만들어진
+# 게이트가 있었다(prepare_noise_pool 종료코드 1, 지금은 선언됨).
+#
+# 남은 크기를 숫자로 적어 둔다(2026-08-06 실측): ``return 1``/``sys.exit(1)`` 을 가진
+# scripts/ 파일 16개 중 게이트가 선언된 것은 3개(prepare_noise_pool, record_duct,
+# reanalyse_paths_interleaved)뿐이고 **12개가 미선언**이다. 그중 상당수는 인자 검증
+# 이라 게이트가 아니므로 기계적으로 강제하면 소음이 된다 — 사람이 하나씩 판정해야
+# 하고, 그 전까지 이 축은 사람의 기억에 의존한다는 사실을 여기 남긴다.
 
 # negative fixture 가 "실패를 단언한다"고 인정하는 흔적. 하나도 없으면 그 테스트는
 # 게이트가 거부하는 것을 보고 있지 않다는 뜻이다.
@@ -136,12 +148,128 @@ def test_every_declared_gate_has_a_failing_fixture():
     )
 
 
-def test_positive_fixtures_exist_when_declared():
-    """오기각 방지 — 정상 입력이 통과하는 것도 확인된 게이트가 있어야 한다."""
+_PASS_MARKERS = (
+    '["ok"]',
+    "assert report",
+    "assert budget",
+    "assert track",
+    "assert capture",
+    "== []",
+    "is True",
+    "== 116",
+    "== 256",
+    ").ok",
+    "].ok",
+    "assert check",
+    "assert passed",
+    "verdict is None",
+    "fired == []",
+    "failures == []",
+    "pytest.approx",
+    "np.isfinite",
+    "np.allclose",
+    "assert parsed",
+    "assert not ",
+    "assert ",
+)
 
+# "예외가 없어야 한다" 형태(단언 없이 호출만 하는 정상 짝)는 위 마커로 잡히지 않는다.
+# 그때는 **테스트 이름**이 무엇을 보는지 말해야 한다 — negative 쪽 규칙과 대칭이다.
+_PASS_NAME_MARKERS = (
+    "allowed",
+    "accepts",
+    "passes",
+    "survives",
+    "silent",
+    "preferred",
+    "derives",
+    "recovered",
+    "restored",
+    "round_trips",
+    "does_not",
+    "is_not",
+)
+
+
+def test_every_declared_gate_has_a_positive_fixture():
+    """**핵심 단언 2.** 모든 게이트가 "정상 입력에서 안 울린다" 는 짝을 갖는다.
+
+    2026-08-06 반증 #13: 이 저장소의 게이트는 반응이 전부 차단이다 — readiness 는
+    학습을 막고 런타임 워치독은 mute(상쇄 0 dB) 한다. 그런데 강제된 것은 발동 짝뿐이라
+    **오발동을 반증한 게이트가 0개**였고, 실제로 정상 세션 9개 중 4개를 떨어뜨리는
+    게이트가 살아 있었다. 짝이 없으면 여기서 실패한다.
+    """
+
+    unpaired: list[str] = []
     for declaration in GATES:
-        if declaration.positive_fixture is not None:
-            _resolve(declaration.positive_fixture)
+        if not declaration.positive_fixture:
+            unpaired.append(f"{declaration.gate_id} (positive_fixture 없음)")
+            continue
+        _resolve(declaration.positive_fixture)
+    assert unpaired == [], (
+        "다음 게이트에 '정상 입력에서 발동하지 않는다' 짝이 없습니다: "
+        + ", ".join(unpaired)
+    )
+
+
+def test_positive_fixtures_assert_a_pass_at_a_declared_boundary():
+    """정상 짝이 (a) 통과를 단언하고 (b) **선언한 경계 숫자를 실제로 넣는지** 본다.
+
+    ``positive_probe`` 에 적힌 숫자 중 하나가 fixture 소스에 나타나야 한다. 이것이
+    없으면 "정상값으로 한 번 돌려봤다" 와 "한계까지 몰아봤다" 를 구분할 방법이 없다.
+    """
+
+    problems: list[str] = []
+    for declaration in GATES:
+        path, function = _resolve(declaration.positive_fixture)
+        source = ast.get_source_segment(path.read_text(encoding="utf-8"), function) or ""
+        named = any(marker in function.name for marker in _PASS_NAME_MARKERS)
+        if not any(marker in source for marker in _PASS_MARKERS) and not named:
+            problems.append(
+                f"{declaration.gate_id} → {declaration.positive_fixture} "
+                "(통과를 단언하지 않습니다)"
+            )
+            continue
+        numbers = declaration.probe_numbers()
+        if not any(number in source for number in numbers):
+            problems.append(
+                f"{declaration.gate_id} → positive_probe 의 숫자 {numbers} 가 "
+                f"{declaration.positive_fixture} 소스에 없습니다"
+            )
+    assert problems == [], "; ".join(problems)
+
+
+def test_a_gate_cannot_be_declared_without_a_positive_fixture():
+    """레지스트리 모델이 정상 짝 없는 게이트를 **런타임에** 거부하는가."""
+
+    common = dict(
+        gate_id="example_gate",
+        owner="src/deep_anc/train/finetune_readiness.py",
+        what_it_asserts="예시",
+        negative_fixture=(
+            "tests/test_gate_registry.py::test_gate_ids_are_unique_and_owners_exist"
+        ),
+    )
+    with pytest.raises(Exception):
+        GateDeclaration(**common)  # positive_fixture 없음
+    with pytest.raises(Exception):
+        GateDeclaration(**common, positive_fixture="", positive_probe="한계의 90%")
+    with pytest.raises(Exception):
+        GateDeclaration(
+            **common,
+            positive_fixture=(
+                "tests/test_gate_registry.py::test_gate_ids_are_unique_and_owners_exist"
+            ),
+            positive_probe="정상값으로 돌려봤다",   # 숫자 없음 = 경계를 안 적었다
+        )
+    ok = GateDeclaration(
+        **common,
+        positive_fixture=(
+            "tests/test_gate_registry.py::test_gate_ids_are_unique_and_owners_exist"
+        ),
+        positive_probe="한계의 90% 지점",
+    )
+    assert ok.positive_probe.endswith("지점")
 
 
 def test_gate_ids_are_unique_and_owners_exist():
@@ -160,6 +288,10 @@ def test_a_gate_cannot_be_declared_without_a_negative_fixture():
         gate_id="example_gate",
         owner="src/deep_anc/train/finetune_readiness.py",
         what_it_asserts="예시",
+        positive_fixture=(
+            "tests/test_gate_registry.py::test_gate_ids_are_unique_and_owners_exist"
+        ),
+        positive_probe="한계의 90% 지점",
     )
     with pytest.raises(Exception):
         GateDeclaration(**common)  # negative_fixture 없음
