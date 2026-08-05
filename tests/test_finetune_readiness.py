@@ -10,6 +10,7 @@ import pytest
 import soundfile as sf
 import torch
 
+from deep_anc.config import REPO_ROOT, load_yaml
 from deep_anc.data.manifest import write_manifest
 from deep_anc.train.finetune_readiness import (
     audit_finetune_completion,
@@ -44,30 +45,38 @@ def _official_path(
             "tone_snr_median_db": np.asarray(24.0),
             "tone_snr_min_db": np.asarray(14.0),
             "consistency_band_hz": np.asarray([100.0, 1_000.0]),
+            # 최악 부대역 게이트가 판정할 배열. 총계 하나로는 약한 대역을 숨길 수
+            # 있으므로 게이트가 요구 대역 안 모든 부대역을 따로 본다.
+            "band_consistency": np.asarray([0.99, 0.98, 0.97]),
+            "band_consistency_hz": np.asarray(
+                [[100.0, 300.0], [300.0, 600.0], [600.0, 1_000.0]]
+            ),
         }
-        defaults.update(
-            {key: np.asarray(value) for key, value in (interleaved or {}).items()}
-        )
         extra = defaults
-    np.savez(
-        path,
+    arrays = {
+        "fir": np.asarray([0.5, -0.1, 0.02], dtype=np.float32),
+        "delay_samples": np.asarray(delay, dtype=np.int64),
+        "sample_rate": np.asarray(FS, dtype=np.int64),
+        "fit_improvement_db": np.asarray(np.nan),
+        "coherence_median": np.asarray(consistency),
+        "excitation_band_hz": np.asarray([100.0, 1_000.0]),
+        "calibration_block_size": np.asarray(256, dtype=np.int64),
+        "calibration_latency": np.asarray("high"),
+        "output_channel": np.asarray(channel),
+        "method": np.asarray(method),
+        "repeats": np.asarray(3, dtype=np.int64),
+        "amplitude": np.asarray(amplitude),
+        "xrun_count": np.asarray(0, dtype=np.int64),
+        "delay_spread_samples": np.asarray(1, dtype=np.int64),
+        "max_delay_jitter_samples": np.asarray(8, dtype=np.int64),
         **extra,
-        fir=np.asarray([0.5, -0.1, 0.02], dtype=np.float32),
-        delay_samples=np.asarray(delay, dtype=np.int64),
-        sample_rate=np.asarray(FS, dtype=np.int64),
-        fit_improvement_db=np.asarray(np.nan),
-        coherence_median=np.asarray(consistency),
-        excitation_band_hz=np.asarray([100.0, 1_000.0]),
-        calibration_block_size=np.asarray(256, dtype=np.int64),
-        calibration_latency=np.asarray("high"),
-        output_channel=np.asarray(channel),
-        method=np.asarray(method),
-        repeats=np.asarray(3, dtype=np.int64),
-        amplitude=np.asarray(amplitude),
-        xrun_count=np.asarray(0, dtype=np.int64),
-        delay_spread_samples=np.asarray(1, dtype=np.int64),
-        max_delay_jitter_samples=np.asarray(8, dtype=np.int64),
+    }
+    # ``interleaved`` 는 interleaved 전용 필드뿐 아니라 공통 필드도 덮어쓸 수 있어야
+    # 한다 — 게이트가 "아티팩트가 신고한 허용치"를 믿지 않는지 시험하려면 필요하다.
+    arrays.update(
+        {key: np.asarray(value) for key, value in (interleaved or {}).items()}
     )
+    np.savez(path, **arrays)
 
 
 def _checkpoint(
@@ -478,6 +487,173 @@ def test_interleaved_quality_fields_are_enforced(tmp_path, override, pattern):
             path, expected_output_channel="noise", sample_rate=FS,
             required_band_hz=(100.0, 1_000.0),
         )
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-05 결함 1 회귀 — 아래 세 게이트가 없으면 33%(형상 기준 50%) 틀린 S(z) 가
+# 다시 파인튜닝까지 들어간다. 셋 다 실제로 통과했던 값으로 테스트한다.
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_cannot_declare_its_own_delay_jitter_allowance(tmp_path):
+    """허용치를 아티팩트에서 읽으면 게이트가 자기증명이 된다.
+
+    출하본은 delay_spread 32 를 **같은 NPZ 안의** max_delay_jitter 48 과 비교해
+    통과했다. 측정 시 --max-delay-jitter-ms 를 키우면 검사가 사라지는 구조였다.
+    """
+
+    path = tmp_path / "primary.npz"
+    _official_path(
+        path, channel="noise", delay=4, method="interleaved_multitone",
+        interleaved={"delay_spread_samples": 32, "max_delay_jitter_samples": 48},
+    )
+    with pytest.raises(ValueError, match="상대 τ spread 32 > 허용 3"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_missing_sub_band_consistency_is_rejected(tmp_path):
+    """최악 부대역을 검증할 수 없는 아티팩트는 official 이 될 수 없다."""
+
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    with np.load(path) as data:
+        arrays = {
+            key: data[key] for key in data.files
+            if key not in {"band_consistency", "band_consistency_hz"}
+        }
+    np.savez(path, **arrays)
+    with pytest.raises(ValueError, match="band_consistency"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_weak_sub_band_is_rejected_even_when_the_total_passes(tmp_path):
+    """총계는 에너지 가중이라 약한 대역을 숨긴다 — 최악값이 판정 기준이다."""
+
+    path = tmp_path / "primary.npz"
+    _official_path(
+        path, channel="noise", delay=4, consistency=0.99,
+        method="interleaved_multitone",
+        # 총계 0.99 는 통과하지만 600-1000Hz 부대역만 0.73 이다(출하본 실측값).
+        interleaved={"band_consistency": [0.99, 0.99, 0.73]},
+    )
+    with pytest.raises(ValueError, match="부대역 600-1000Hz 일관성 0.7300"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_weak_sub_band_outside_the_required_band_is_not_judged(tmp_path):
+    """필수 대역 밖은 판정하지 않는다 — 그래야 하한 150Hz 규약이 영구 FAIL 을 안 만든다."""
+
+    path = tmp_path / "primary.npz"
+    _official_path(
+        path, channel="noise", delay=4, method="interleaved_multitone",
+        interleaved={"band_consistency": [0.99, 0.99, 0.40]},
+    )
+    report = audit_official_path_model(
+        path, expected_output_channel="noise", sample_rate=FS,
+        required_band_hz=(100.0, 600.0),   # 600-1000Hz 부대역이 요구 대역 밖
+    )
+    assert report["interleaved"]["band_consistency"][-1] == pytest.approx(0.40)
+
+
+@pytest.mark.parametrize(
+    "params, pattern",
+    [
+        ({"min_alignment_score": 0.5}, "min_alignment_score=0.5 < 0.95"),
+        ({"max_relative_tau_samples": 48.0}, "max_relative_tau_samples=48.0 > 3.0"),
+        ({"max_drift_deviation_samples": 25.0}, "max_drift_deviation_samples"),
+        ({"min_kept_repeats": 3}, "min_kept_repeats=3 < 8"),
+        ({"min_alignment_score": None}, "재분석 파라미터 min_alignment_score 가 없습니다"),
+    ],
+)
+def test_reanalysis_parameter_envelope_is_enforced(tmp_path, params, pattern):
+    """재분석 도구가 게이트를 약화한 값으로 푼 결과는 official 이 될 수 없다."""
+
+    envelope = {
+        "min_alignment_score": 0.95,
+        "max_relative_tau_samples": 3.0,
+        "max_drift_deviation_samples": 2.0,
+        "min_kept_repeats": 8,
+    }
+    for key, value in params.items():
+        if value is None:
+            envelope.pop(key)
+        else:
+            envelope[key] = value
+    path = tmp_path / "primary.npz"
+    _official_path(
+        path, channel="noise", delay=4, method="interleaved_multitone",
+        interleaved={"reanalysis_params_json": json.dumps(envelope, sort_keys=True)},
+    )
+    with pytest.raises(ValueError, match=pattern):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_reanalysis_inside_the_envelope_is_accepted(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(
+        path, channel="noise", delay=4, method="interleaved_multitone",
+        interleaved={
+            "reanalysis_params_json": json.dumps(
+                {
+                    "min_alignment_score": 0.95,
+                    "max_relative_tau_samples": 3.0,
+                    "max_drift_deviation_samples": 2.0,
+                    "min_kept_repeats": 8,
+                },
+                sort_keys=True,
+            )
+        },
+    )
+    report = audit_official_path_model(
+        path, expected_output_channel="noise", sample_rate=FS,
+        required_band_hz=(100.0, 1_000.0),
+    )
+    assert report["interleaved"]["reanalysis_params"]["min_kept_repeats"] == 8
+
+
+def test_shipped_official_artifacts_pass_the_new_gates():
+    """저장소의 현행 P/S 가 실제로 새 게이트를 통과하는지 — 설정과 아티팩트의 정합."""
+
+    duct = load_yaml(REPO_ROOT / "configs/duct.yaml")
+    finetune = load_yaml(REPO_ROOT / "configs/train_finetune.yaml")
+    band = tuple(float(v) for v in finetune["readiness"]["required_path_band_hz"])
+    reports = {}
+    for key, channel in (
+        (duct["digital_reference"]["primary_path_npz"], "noise"),
+        (duct["secondary_path"]["npz"], "cancel"),
+    ):
+        reports[channel] = audit_official_path_model(
+            REPO_ROOT / key, expected_output_channel=channel,
+            sample_rate=48_000, required_band_hz=band,
+            min_consistency=float(finetune["readiness"]["min_path_consistency"]),
+        )
+    # 같은 캡처·같은 반복 집합에서 나왔어야 lead 가 물리량이다.
+    assert (
+        reports["noise"]["interleaved"]["capture_id"]
+        == reports["cancel"]["interleaved"]["capture_id"]
+    )
+    p_delay = reports["noise"]["delay_samples"]
+    s_delay = reports["cancel"]["delay_samples"]
+    # P−S 는 이 측정 방식의 유일한 물리 불변량 — 유효 캡처 9건에서 139~141 이다.
+    assert 139 <= p_delay - s_delay <= 141
+    assert int(duct["digital_reference"]["d_noise_delay_samples"]) == p_delay
+    handoff = int(duct["secondary_path"]["handoff_extra_samples"])
+    data_sim = load_yaml(REPO_ROOT / "configs/data_sim.yaml")
+    assert int(data_sim["digital_reference_lead_samples"]) == (
+        s_delay + handoff - p_delay
+    )
 
 
 def test_unknown_method_is_still_rejected(tmp_path):

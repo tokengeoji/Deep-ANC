@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Any, Iterable
@@ -55,6 +56,33 @@ INTERLEAVED_REQUIRED_FIELDS = (
 INTERLEAVED_MAX_PERIOD_SECONDS = 2.0   # 실측 위상 잔차가 2.26s 에서 2.33rad 로 무너진다
 INTERLEAVED_MIN_TONE_COUNT = 64
 INTERLEAVED_MIN_TONE_SNR_MEDIAN_DB = 12.0
+
+MAX_RELATIVE_DELAY_SPREAD_SAMPLES = 3
+"""P−S 상대 τ 의 유지 반복 내 spread 상한(샘플).
+
+측정 스크립트가 쓴 ``max_delay_jitter_samples`` 를 그대로 믿으면 게이트가
+**자기증명**이 된다 — 둘 다 같은 스크립트가 같은 NPZ 에 쓰므로 측정 시
+``--max-delay-jitter-ms`` 를 키우면 검사가 조용히 사라진다. 실측 2026-08-05:
+32 샘플 프레임 슬립이 허용치 48 을 통과해 형상 기준 50% 틀린 S(z) 로
+파인튜닝 50,000 step 이 낭비됐다. 정상 캡처의 실측 spread 는 0.11~0.26 샘플이다.
+"""
+
+MIN_BAND_CONSISTENCY = 0.90
+"""필수 대역 안 **모든** 부대역이 넘어야 하는 값.
+
+총계는 에너지 가중이라 약한 대역을 숨긴다 — 실측에서 S 의 전대역 총계는
+0.9984 인데 80-150Hz 부대역만 보면 0.706 이다(저역 에너지 비중 0.1%).
+"모든 소리를 제거한다 — 평균이 아니라 최악값" 이 이 프로젝트의 목표다.
+"""
+
+ALLOWED_REANALYSIS_ENVELOPE: dict[str, tuple[float | None, float | None]] = {
+    # 오프라인 재분석은 "파라미터를 바꿔 결과를 고르는" 유혹을 만든다. 아티팩트에
+    # 박힌 파라미터가 이 봉투 안에 있는지 게이트가 **독립적으로** 확인한다.
+    "min_alignment_score": (0.95, None),          # 하한만 강제
+    "max_relative_tau_samples": (None, 3.0),      # 상한만 강제
+    "max_drift_deviation_samples": (None, 2.0),
+    "min_kept_repeats": (8, None),
+}
 
 
 def _repo_path(value: str | Path) -> Path:
@@ -155,6 +183,21 @@ def audit_official_path_model(
             consistency_band = np.asarray(
                 data["consistency_band_hz"], dtype=np.float64
             ).reshape(-1)
+            if "band_consistency" in data.files and "band_consistency_hz" in data.files:
+                band_values = np.asarray(
+                    data["band_consistency"], dtype=np.float64
+                ).reshape(-1)
+                band_edges = np.asarray(
+                    data["band_consistency_hz"], dtype=np.float64
+                ).reshape(-1, 2)
+            else:
+                band_values = None
+                band_edges = None
+            reanalysis_params = (
+                json.loads(str(_npz_scalar(data, "reanalysis_params_json")))
+                if "reanalysis_params_json" in data.files
+                else None
+            )
             interleaved = {
                 "consistency_band_hz": [float(v) for v in consistency_band[:2]],
                 "capture_id": str(_npz_scalar(data, "capture_id")),
@@ -218,6 +261,52 @@ def audit_official_path_model(
                 f"일관성 측정 대역 {tuple(measured_consistency_band)} 이 "
                 f"필수 대역 {required_band_hz} 를 덮지 못합니다"
             )
+
+        # 최악 부대역 게이트 — 총계는 에너지 가중이라 약한 대역을 숨긴다.
+        if band_values is None or band_edges is None:
+            errors.append(
+                "band_consistency/band_consistency_hz 가 없습니다 — "
+                "최악 부대역을 검증할 수 없는 아티팩트는 official 이 될 수 없습니다"
+            )
+        elif band_values.size != band_edges.shape[0]:
+            errors.append(
+                f"band_consistency 길이 {band_values.size} != "
+                f"band_consistency_hz {band_edges.shape[0]}"
+            )
+        else:
+            judged = 0
+            for (lo, hi), value in zip(band_edges, band_values):
+                if lo < band_lo or hi > band_hi:
+                    continue     # 필수 대역 밖은 판정하지 않는다
+                judged += 1
+                if not math.isfinite(float(value)) or float(value) < MIN_BAND_CONSISTENCY:
+                    errors.append(
+                        f"부대역 {lo:.0f}-{hi:.0f}Hz 일관성 {float(value):.4f} "
+                        f"< {MIN_BAND_CONSISTENCY}"
+                    )
+            if judged == 0:
+                errors.append(
+                    f"필수 대역 {required_band_hz} 안에 판정 가능한 부대역이 없습니다"
+                )
+            interleaved["band_consistency"] = [float(v) for v in band_values]
+            interleaved["band_consistency_hz"] = [
+                [float(lo), float(hi)] for lo, hi in band_edges
+            ]
+
+        # 재분석 아티팩트면 파라미터 봉투를 검사한다. 게이트를 약화한 값으로 다시 푼
+        # 결과가 official 이 되면 게이트 전체가 무의미해진다.
+        if reanalysis_params is not None:
+            for key, (lo_ok, hi_ok) in ALLOWED_REANALYSIS_ENVELOPE.items():
+                value = reanalysis_params.get(key)
+                if value is None:
+                    errors.append(f"재분석 파라미터 {key} 가 없습니다")
+                elif not math.isfinite(float(value)):
+                    errors.append(f"재분석 {key}={value!r} 가 유한하지 않습니다")
+                elif lo_ok is not None and float(value) < lo_ok:
+                    errors.append(f"재분석 {key}={value} < {lo_ok}")
+                elif hi_ok is not None and float(value) > hi_ok:
+                    errors.append(f"재분석 {key}={value} > {hi_ok}")
+            interleaved["reanalysis_params"] = reanalysis_params
     if repeats < 3:
         errors.append(f"ESS 반복 {repeats}회 < 3회")
     if not math.isfinite(consistency) or consistency < float(min_consistency):
@@ -241,9 +330,18 @@ def audit_official_path_model(
         errors.append(f"calibration_block_size={block_size}")
     if latency not in {"low", "high"}:
         errors.append(f"calibration_latency={latency!r}")
-    if delay_spread < 0 or max_delay_jitter < 0 or delay_spread > max_delay_jitter:
+    # 허용치를 **아티팩트에서 읽지 않는다**. 측정 스크립트가 자기 허용치를 함께 쓰므로
+    # 그것을 믿으면 게이트가 자기증명이 된다(실측: 32 샘플 슬립이 허용 48 을 통과).
+    if delay_spread < 0 or max_delay_jitter < 0:
         errors.append(
-            f"반복 지연 spread {delay_spread} > 허용 {max_delay_jitter} samples"
+            f"지연 spread 메타데이터가 음수입니다: "
+            f"delay_spread={delay_spread}, max_delay_jitter={max_delay_jitter}"
+        )
+    elif delay_spread > MAX_RELATIVE_DELAY_SPREAD_SAMPLES:
+        errors.append(
+            f"P−S 상대 τ spread {delay_spread} > 허용 "
+            f"{MAX_RELATIVE_DELAY_SPREAD_SAMPLES} samples "
+            f"(아티팩트가 신고한 {max_delay_jitter} 는 참고값일 뿐이다)"
         )
     if errors:
         raise ValueError(f"{model_path}: " + "; ".join(errors))

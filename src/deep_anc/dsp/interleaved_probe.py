@@ -58,7 +58,9 @@ __all__ = [
     "dewarp_recording",
     "estimate_repeat_delay",
     "estimate_transfer",
+    "relative_tau_outliers",
     "schroeder_phases",
+    "timebase_drift",
     "tone_snr_db",
     "track_warp",
 ]
@@ -469,6 +471,57 @@ def complex_consistency(stack: np.ndarray) -> float:
     return float(np.mean(scores))
 
 
+def timebase_drift(taus: np.ndarray) -> tuple[np.ndarray, float]:
+    """반복별 국소 타임베이스 드리프트(샘플/주기)와 그 중앙값.
+
+    재생 클록과 녹음 클록의 상대 오프셋은 주기당 일정한 기울기로 나타난다
+    (실측 364~729 ppm). 그 기울기에서 크게 벗어나는 반복은 스트림이 정상상태가
+    아니었다는 뜻이며, 그 주기 안에서 warp 가 비선형으로 움직여 FFT 의 정수주기
+    가정을 깬다. 판정 근거는 **타임베이스 관측 하나**이고 결과를 보지 않는다.
+
+    실측(20260804_235822_03f4c088): 중앙 4.38 샘플/주기인데 반복 0 의 국소값은
+    10.44, 반복 1 은 5.60 이다 — 워밍업 4주기(0.5s)로는 스트림이 정상상태에 못 든다.
+    """
+
+    t = np.asarray(taus, dtype=np.float64).reshape(-1)
+    if t.size < 3:
+        raise ValueError(f"드리프트 판정에는 반복 3개 이상이 필요합니다: {t.size}")
+    step = np.diff(t)
+    centred = np.concatenate([[step[0]], 0.5 * (step[:-1] + step[1:]), [step[-1]]])
+    return centred, float(np.median(step))
+
+
+def relative_tau_outliers(
+    tau_primary: np.ndarray,
+    tau_secondary: np.ndarray,
+    *,
+    tolerance_samples: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """P−S 상대 τ 의 연속성 위반을 찾는다. ``(위반 마스크, 편차, 중앙값)``.
+
+    두 채널은 **같은 DAC·같은 출력 스트림**의 인터리브다. 따라서 τ_P − τ_S 는
+    설계 원리상 반복에 무관한 상수여야 하고, 이 값이 튀면 출력 버퍼가 한쪽
+    채널에서만 미끄러진 것이다(실측 32 샘플 점프).
+
+    기준(anchor) 반복은 τ 가 양쪽 모두 0 으로 **구조적으로** 고정되므로 중앙값
+    계산에서 제외한다. 중앙값 편차를 쓰되 **MAD 로 스케일하지 않는다** — 오염
+    반복이 과반이면 MAD 가 부풀어(실측 1.35/1.95 → 허용치 12/17 샘플) 슬립
+    블록을 통째로 통과시킨다. 고정 임계가 이 자료에서 유일하게 견고하다.
+    """
+
+    a = np.asarray(tau_primary, dtype=np.float64).reshape(-1)
+    b = np.asarray(tau_secondary, dtype=np.float64).reshape(-1)
+    if a.size != b.size:
+        raise ValueError(f"두 채널의 반복 수가 다릅니다: {a.size} != {b.size}")
+    if float(tolerance_samples) <= 0.0:
+        raise ValueError(f"tolerance_samples 는 양수여야 합니다: {tolerance_samples}")
+    relative = a - b
+    body = relative[1:] if relative.size > 1 else relative
+    centre = float(np.median(body))
+    deviation = np.abs(relative - centre)
+    return deviation > float(tolerance_samples), deviation, centre
+
+
 def align_repeats(
     frequencies_hz: np.ndarray,
     stack: np.ndarray,
@@ -476,6 +529,7 @@ def align_repeats(
     sample_rate: int,
     fit_band_hz: tuple[float, float] | None = None,
     span_samples: float = 512.0,
+    anchor: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """반복별 시간이동을 제거하고 ``(정렬된 stack, τ 배열, 정렬 신뢰도 배열)`` 을 준다.
 
@@ -484,14 +538,22 @@ def align_repeats(
     실패한 반복을 걸러야 한다 — 걸러내지 않으면 잡음 τ 하나가 평균과 일관성을 함께
     망가뜨린다(실측: 상대 τ 편차가 2 → 128 샘플로 튀었다).
 
-    기준은 첫 반복이다. 평균을 기준으로 반복 정제하면 좋아질 것 같지만 실측에서는
-    **악화됐다** — 정렬이 틀린 반복이 평균을 오염시켜 다음 회차를 더 끌고 갔다.
-    고정 기준이 이 자료에서는 더 안전하다.
+    평균을 기준으로 반복 정제하면 좋아질 것 같지만 실측에서는 **악화됐다** —
+    정렬이 틀린 반복이 평균을 오염시켜 다음 회차를 더 끌고 갔다. 고정 기준이
+    이 자료에서는 더 안전하다.
+
+    ``anchor`` 는 기준으로 삼을 반복 인덱스다. 기본 0 은 **안전한 기본값이 아니다** —
+    2026-08-05 실측에서 워밍업 4주기(0.5s) 직후의 첫 분석 주기는 아직 정상상태가
+    아니고(국소 드리프트 10.4 vs 정상 4.4 샘플/주기), 그것을 기준으로 삼으면 전
+    반복의 τ 가 함께 틀어진다. 호출자는 드리프트가 정상인 구간의 **중앙** 반복을
+    지정해야 한다. 실측: 앵커 0 → 150-1600Hz 0.9689, 중앙 앵커 → 0.9991.
     """
 
     freq = np.asarray(frequencies_hz, dtype=np.float64).reshape(-1)
     values = np.asarray(stack, dtype=np.complex128)
-    reference = values[0]
+    if not 0 <= int(anchor) < values.shape[0]:
+        raise ValueError(f"anchor 가 범위 밖입니다: {anchor} / {values.shape[0]}")
+    reference = values[int(anchor)]
     taus = np.zeros(values.shape[0], dtype=np.float64)
     scores = np.zeros(values.shape[0], dtype=np.float64)
     aligned = np.empty_like(values)

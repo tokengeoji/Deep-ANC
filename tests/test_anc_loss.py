@@ -51,8 +51,11 @@ def test_measured_and_target_band_intersection() -> None:
     target = tuple(duct["acoustics"]["realistic_target_band_hz"])
 
     # 구동 대역이 아니라 **재현이 검증된 대역**으로 교집합을 낸다.
+    # S npz 의 consistency_band 는 2026-08-05 재분석으로 [150,1600] 이 됐지만,
+    # duct.yaml 의 현실적 목표 대역이 800Hz 에서 끝나므로 교집합은 800 에서 잘린다.
+    assert sp.trusted_band_hz() == (150.0, 1600.0)
     trusted = intersect_frequency_bands(sp.trusted_band_hz(), target, 24_000.0)
-    assert trusted == (150.0, 600.0)
+    assert trusted == (150.0, 800.0)
 
 
 def test_empty_or_invalid_band_fails_fast() -> None:

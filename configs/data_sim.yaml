@@ -20,7 +20,12 @@ digital_primary_path_mode: secondary_surrogate
 # 새 surrogate 사전학습은 이 실제 선행 공급을 포함한다. 배포 runtime 값도 반드시
 # 109로 맞춰야 하며, checkpoint/ONNX 메타와 다르면 런타임이 시작 전 거부한다.
 # acoustic 모드에서는 반드시 0으로 override해야 한다.
-digital_reference_lead_samples: 113
+# 2026-08-05 재분석: S 1462 + handoff 256 − P 1602 = 116.
+# 독립 캡처 9건에서 115/116/116/116/116/116/116/116/117 로 재현된다 — 절대 지연과
+# 달리 lead 는 진짜 물리량이다. 기하 예측(NS→ERR 1.100m − CS 축방향 0.050m
+# = 1.050m = 146.9샘플, 사이드브랜치 관로 ≈7샘플)과도 일치한다.
+# 앞선 113 은 프레임 슬립 반복 6개와 정상상태 미도달 반복 2개를 포함한 값이다.
+digital_reference_lead_samples: 116
 
 # 소음원 구성 비율 — 키 이름 = data/manifests/<키>.jsonl 태그 (manifest 없으면 합성원 폴백)
 # quiet zone 목표: 소음뿐 아니라 대화(음성)·음악까지 소스 분포에 포함 (digital-ref 는

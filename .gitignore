@@ -52,3 +52,7 @@ id_dsa*
 .env
 .env.*
 !.env.example
+
+# 측정 재분석 시 만들어지는 이전본 백업. git 이력에 원본이 이미 있으므로
+# (git show <이전커밋>:assets/measured/...) 중복이다.
+*.npz.orig

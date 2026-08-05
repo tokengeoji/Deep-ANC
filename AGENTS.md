@@ -13,14 +13,20 @@
 ## 절대 규칙 (사용자 명시 지시 — 위반 금지)
 
 1. **`~/anc_project` 는 읽기 전용.** 기존 FxLMS 실험 환경이다. 파일 생성/수정/삭제 금지. 복사만 허용.
-2. **Jetson 시스템 불가침.** 핀 설정(pinmux/I2S)·RT 커널·전원모드(nvpmodel)·jetson_clocks·
+2. **`~/DeepANC_CRN_n_codex` 는 읽기 전용.** 참고만 하고 **절대 건드리지 말 것** (사용자 명시 지시).
+   파일 생성/수정/삭제 금지, python import 금지(`python3 -B` 로 `__pycache__` 생성도 막을 것).
+   **이 디렉터리에서 별도 작업이 병행될 수 있다** — 실제로 `measurements/A_P_estimate/` 가
+   2026-08-05 20:40 에 갱신됐다. 따라서 스피커·마이크를 쓰기 전에 **오디오 장치 점유를 확인**하라
+   (`fuser -v /dev/snd/*`, `/proc/asound/card*/pcm*/sub*/status`). 점유 중이면 측정·녹음을 하지 말 것 —
+   장치 충돌은 양쪽 측정을 조용히 오염시킨다.
+3. **Jetson 시스템 불가침.** 핀 설정(pinmux/I2S)·RT 커널·전원모드(nvpmodel)·jetson_clocks·
    pulseaudio/pipewire·`/etc/security/limits.d`·apt 설치 등 **sudo가 필요한 모든 시스템 변경 금지.**
    현재 구성(RT 커널, 30W)은 의도된 것이다. 작업은 저장소와 venv 등 유저 공간에서만.
-3. **임의 판단 금지.** 설계에 영향을 주는 불명확한 사항은 추측하지 말고 사용자에게 질문할 것.
-4. **GitHub에 비밀정보 금지.** API 키/토큰/환경변수/개인키(.pem, id_*) 커밋 금지.
+4. **임의 판단 금지.** 설계에 영향을 주는 불명확한 사항은 추측하지 말고 사용자에게 질문할 것.
+5. **GitHub에 비밀정보 금지.** API 키/토큰/환경변수/개인키(.pem, id_*) 커밋 금지.
    `.gitignore`의 앵커 패턴(`/data/` 등)을 비앵커로 바꾸지 말 것 (과거 사고: `data/`가 `src/deep_anc/data/`까지 무시).
-5. **커밋 메시지에 AI 표기 금지.** Co-Authored-By: Claude/Codex 등 붙이지 말 것 (사용자 요청).
-6. **소통은 한국어.** 문서도 한국어로 작성.
+6. **커밋 메시지에 AI 표기 금지.** Co-Authored-By: Claude/Codex 등 붙이지 말 것 (사용자 요청).
+7. **소통은 한국어.** 문서도 한국어로 작성.
 
 ## 환경 요약
 
