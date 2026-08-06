@@ -7,51 +7,59 @@
 ## 0. 라이브 상태
 
 **현재 브랜치: `fix/finetune-readiness-repair`** (main 에서 분기, 아직 merge 안 됨).
-테스트 **701개 전부 통과** (`.venv/bin/python -m pytest -o addopts="" -q`, 약 5.5분).
-Elice 인스턴스는 **사용자가 삭제**했고 산출물은 전부 로컬 회수됨.
+최종 갱신: **2026-08-06 (하드웨어 복구 완료 후)**.
+학습·파인튜닝은 **엘리스 인스턴스에서 한다** (사용자 결정). 로컬은 녹음과 코드 정확성 담당.
 
-### ⛔ 유일한 블로커 — 앰프에서 두 채널이 섞인다 (2026-08-06 확정)
-
-**소프트웨어는 재녹음을 받을 준비가 끝났다. 막고 있는 것은 하드웨어 하나다.**
+### ✅ 하드웨어는 풀렸다 (2026-08-06)
 
 ```
-          레벨 dBFS   결합비   P−S
-8/4          -46.33    0.023    137    ← 정상
-8/6          -32.07    0.700      1
-8/6          -39.91    0.670      1
-8/6          -46.64    0.634      0    ← 8/4 와 같은 레벨인데도 결합
+P(z) 소음→ERR   순수지연 1605 샘플 · 150-1600Hz 일관성 0.9946
+S(z) 상쇄→ERR   순수지연 1464 샘플 · 150-1600Hz 일관성 0.9919
+P − S = 141                              통과 기준 140 ± 3   ← 통과
 ```
 
-`결합비` = 임펄스 응답에서 Δ−143 샘플(=CS→ERR 경로) 위치의 2차 도달 진폭비.
-0.02 면 채널이 분리된 것이고 0.63 이면 거의 완전 결합이다.
+아침의 블로커(앰프 채널 결합, P−S 가 1 로 붕괴)가 해소됐다. P−S 가 물리 기하대로
+나왔다는 것 자체가 채널 분리의 증거다. 측정본은 `results/channel_check/` 에 있고,
+**공식 플랜트(P 1602 / S 1462 / lead 116)는 교체하지 않았다** — 유지 반복이 9개로
+공식본 18개보다 적다.
 
-**구동 레벨은 원인이 아니다** — 14.6 dB 를 내리는 동안 결합비가 0.700 → 0.634 로
-10% 만 움직였다. 레벨 의존 결합(전원 부족)이라면 이렇게 나올 수 없다.
-(이 가설로 사용자에게 볼륨을 세 번 조정하게 했고, 세 번째에 반증됐다.)
+마이크 무신호 진단은 [docs/02 §2.1~2.2](docs/02_hardware_setup.md) 에 사다리로 남겼다.
+핵심: **마이크는 병합 DTB 의 핀먹스 오버레이에 의존한다**(`~/FxLMS/realtime_fxlms/boot_fix/`).
+확인은 `find -L /proc/device-tree -type d -name exp-header-pinmux -print -quit` 한 줄.
 
-사용자 확인과 종합한 결과:
-* 이어폰을 **DAC 출력**(USB-C→3.5mm 동글 AB13X)에 직결하면 좌우가 **정상 분리**된다
-* 앰프(TPA3116D2)에서 스피커 하나를 빼면 **남은 쪽이 두 채널을 다 낸다**
-* 앰프 입력 **3핀 나사단자(L·GND·R)는 비어 있고**, 오디오는 3.5mm 잭으로 들어간다
-* 6핀 나사단자 가운데 2가닥은 **전원**(Jetson USB-C → 어댑터)이다
+### ⛔ "소프트웨어는 준비가 끝났다" 는 **틀렸다** — 2026-08-06 감사가 반증
 
-→ **3.5mm 잭 경로가 모노**일 가능성이 높다.
-
-**해결**: 오디오를 3.5mm 잭 대신 **비어 있는 3핀 나사단자**로 넣는다.
-필요한 것은 `3.5mm 수 플러그 → 벗긴 선 3가닥` 케이블 하나 (안 쓰는 AUX 를 잘라도 된다).
+이전 판본의 이 자리에는 "소프트웨어는 재녹음을 받을 준비가 끝났다. 막고 있는 것은
+하드웨어 하나다" 라고 적혀 있었다. 진입 게이트를 직접 돌리면 **NOT READY / EXIT=1** 이고
+FAIL 이 6개다. 그중 **2개는 스피커와 무관**하다.
 
 ```
-3.5mm 플러그          앰프 3핀 나사단자
-  팁    (L)   ──────→   L IN     (= ch0 소음 스피커)
-  링    (R)   ──────→   R IN     (= ch1 취소 스피커)
-  슬리브(GND) ──────→   GND
+[FAIL] completed_init_checkpoint     체크포인트 26개 전수 확인: cfg 있는 18개 **전부**
+                                     trusted_band [150,600]. [150,1600] 은 0개.
+                                     → 재사전학습이 파인튜닝의 선행조건이다.
+[FAIL] corpus_disjoint               선언 태그 중 manifest 없는 것 3개
+                                     (dns_fullband 0.30 · demand 0.08 · machine 0.07 = 0.45)
+                                     ← music/speech/esc50 은 2026-08-06 에 생성 완료(0.25 회수)
+[FAIL] recorded_dataset_qa           ← 재녹음으로 풀림
+[FAIL] recorded_alignment_integrity  ← 재녹음으로 풀림
+[FAIL] recorded_statistical_power    ← 재녹음으로 풀림
+[FAIL] measured_source_delay_agreement ← 재녹음으로 풀림
 ```
 
-⚠ 연결 전 3핀 단자 옆 인쇄 글자를 확인할 것. `L GND R` / `IN` 이면 맞다.
-   `SUB` 등 다른 글자면 2.1 보드의 서브우퍼 출력일 수 있으니 접근을 달리해야 한다.
+### 재녹음은 33세션 38.5분이다 (93분 아님) — 계산으로 확인
 
-⚠ 이 결합 상태에서 재녹음하면 소스가 양쪽 스피커에서 나와 1차 경로에
-   **336Hz 간격 15dB 깊이 빗살 노치**가 박힌다. 고친 뒤 38.5분을 통째로 다시 받아야 한다.
+```
+복구 성공 47세션   environment 그룹 13 · machine  8 · music 15 · speech  5
+재녹음 대상 33세션 environment     6 · machine  7 · music  5 · speech 15
+합치면            environment    19 · machine 15 · music 20 · speech 20   (하한 9)
+```
+
+v2 그룹은 복구본과 거의 겹치지 않는다(music 2, speech 1 만 중복). **반드시 v2 로 받아라** —
+v1 은 machine 이 8 그룹뿐이라 `make_recorded_manifest` 가 EXIT=2 로 거부한다. 기본값은
+이미 v2 로 바뀌었고, 게이트가 세션의 `program.file` 을 읽어 설정과 대조한다.
+
+⚠ **재녹음이 재사전학습보다 먼저다.** GPU 부하 중에는 녹음이 XRUN 으로 거부된다
+(2026-08-06 실측: 감사 워크플로가 돌 때 녹음 게이트가 세션을 거부했다).
 
 ### 배선을 고친 뒤 — 이 순서로 진행한다 (전부 자동화돼 있다)
 
@@ -218,173 +226,64 @@ lead 116 −4.77 / 400 −10.60 / 800 −15.90 / 1200 −19.31 dB.
 
 ## 0.5 다음 단계 ("이어서 진행해줘" 는 여기부터 위에서 아래로)
 
-**파인튜닝을 지금 재개하면 또 낭비다.** S(z) 는 고쳤지만 **학습 데이터가 그대로**다.
+> 2026-08-06 개정. 이전 판본의 1-A("앰프 구동 레벨을 교정해야 한다 — 이것부터")는
+> **같은 문서 §0 이 반증한 가설**이었다(레벨을 14.6 dB 내려도 결합비가 10% 만 움직였다).
+> 그 항목이 다음 세션을 네 번째로 볼륨을 돌리게 만들 뻔했다. 삭제했다.
 
----
+### 1. 재녹음 33세션 — 로컬에서 해야 하는 유일한 실기 작업 (소리 38.5분)
 
-### ⛔ 1-A. 앰프 구동 레벨을 교정해야 한다 (2026-08-06 확정 — 이것부터)
-
-**이 시스템은 구동 레벨에 좁은 창이 있고, 창 밖에서는 측정이 조용히 틀린 답을 낸다.**
-2026-08-06 실측(전부 `results/calibration_interleaved/`, 같은 코드로 분석):
-
-| 캡처 | 톤 SNR | ERR RMS | **P−S** | 판정 |
-|---|---|---|---|---|
-| 8/4 225546 | 36.6 dB | −44.33 dBFS | **140** | ✅ 기하 예측 147 과 일치 |
-| 8/4 235822 | 35.4 dB | −42.69 dBFS | **140** | ✅ |
-| 8/6 볼륨↓ | (기각) | −47.58 dBFS | 측정 불가 | 신호가 잡음 바닥(−69)에 묻힘 |
-| 8/6 볼륨↑ | 46.5 dB | **−33.07 dBFS** | **1** | ❌ 두 채널이 결합 |
-
-**하드웨어 구성은 8/4 와 지금이 동일하다(사용자 확인).** 바뀐 것은 앰프 노브뿐이고,
-+11.3 dB 과다 구동에서 P−S 가 140 → 1 로 붕괴했다.
-
-기전: TPA3116D2 가 **Jetson USB-C 에서 어댑터로 전원**을 받는다. 이 앰프는 12~24V 용이라
-5V 로는 부족하고, 세게 구동하면 전원이 주저앉아 **공유 전원·접지로 두 채널이 결합**한다.
-그 상태에서는 P(소음경로)와 S(취소경로)를 구분할 수 없고 ANC 가 원리적으로 성립하지 않는다
-(안티노이즈가 소음 스피커에서도 나온다). 임펄스 응답에서 Δ−143 샘플 위치의 2차 도달이
-진폭비 **0.70**(8/4 는 0.02)으로 보이는 것이 그 증거다.
-
-**P−S = 140 이 옳다는 독립 근거 2건**:
-* 덕트 기하 — NS 0.0m / CS 1.050m / ERR 1.100m → 1.050m = **147 샘플**.
-* 재정렬된 실측 47세션의 REF→ERR 잔여지연 **142.53 ± 0.28 샘플**
-  (기하 예측 REF 0.100m → ERR 1.100m = 1.000m = 140). 완전히 독립적인 데이터가 같은 음속·기하를 확인한다.
+**먼저 GPU 작업이 없는지 확인하라.** 부하가 있으면 XRUN 으로 세션이 거부된다.
 
 ```bash
-# 레벨 미터 — 20초 동안 0.25초마다 표시. 숫자를 보며 노브를 돌린다.
+# ① 마이크 확인 (소리 없음, 3초). EXIT=0 이어야 한다.
+.venv/bin/python scripts/data/record_duct.py --program silence --seconds 3 --out-root /tmp/rec_check
+
+# ② 데스크톱 오디오가 APE 카드를 놓게 한다 (PLL_A 재조정 방지)
+pactl set-card-profile alsa_card.platform-sound off
+
+# ③ 앰프 레벨 교정 (소리 20초). 목표값은 도구가 띄운다 — 문서에 되쓰지 마라.
 .venv/bin/python scripts/data/set_amp_level.py --confirm-speaker
-# 목표 ERR -44.0 dBFS ±2. '✅ 맞았습니다' 에서 멈춘다.
 
-# 확인 (6초). 여기서 P−S = 140 이 나와야 다음 단계로 간다.
+# ④ P/S 확인 (소리 6초). P−S = 140 ± 3 이 통과 기준.
 .venv/bin/python scripts/data/measure_paths_interleaved.py --confirm-volume-minimum \
-    --primary-out results/channel_check/primary.npz \
-    --secondary-out results/channel_check/secondary.npz
-```
+    --primary-out results/channel_check/p.npz --secondary-out results/channel_check/s.npz
 
-⚠ **재녹음을 이 교정 전에 하지 마라.** 결합 상태에서는 소스가 양쪽 스피커에서 나와
-1차 경로에 336Hz 간격·15dB 깊이의 빗살 노치가 박힌다. 고친 뒤 전량 다시 받아야 한다.
-
-⚠ **측정 스크립트 기본 latency 를 high → low 로 바꿨다** (커밋 3db056f). 런타임은 low 고정인데
-기본값이 high 라 **측정하는 플랜트와 실제로 도는 플랜트가 다른 모드**였다.
-
-⚠ **원시 캡처를 분석보다 먼저 저장하게 바꿨다** (같은 커밋). 분석 게이트가 실패하면
-스피커 시간이 통째로 날아가고 있었다. 이제 실패해도 `reanalyse_paths_interleaved.py` 로 살린다.
-
----
-
-### ⛔ 1-B. 마이크 입력단 (2026-08-06 해결됨 — 핀 접촉 불량이었다)
-
-아래는 그때의 진단 기록이다. `record_duct.py --program silence` 가 이제 통과한다
-(`레일 비율 0.0000/0.0000`, ch1 −62 dBFS). H2 검증 녹음도 통과했다:
-`coh²(source→ERR,150-600Hz) 0.031 → 0.933`, 유효창 1.000, 잔여지연 143.17 ± 1.90.
-
-### (기록) 마이크 입력단이 죽어 있었을 때
-
-**녹음 전 마이크 상태 실측 결과 두 채널 모두 int32 풀스케일에 붙어 있다.**
-
-```
-ch0  레일 비율 0.0475  RMS 0.3403      ← 정상 세션은 peak 0.0063 / RMS 0.00107
-ch1  레일 비율 0.1033  RMS 0.4020      ← 정상 세션은 peak 0.0390 / RMS 0.00830
-raw int32 min/max = -2147483648 / 2147483647  (양쪽 레일 도달)
-지배 성분 6/12/18/23 Hz, 12초 내내 정상상태 — 기동 트랜지언트 아님
-```
-
-장치 점유는 없었다(`fuser`: pulseaudio 컨트롤 노드만). 즉 **물리적 무전원/미연결**이다.
-이 상태로 재생하면 QA `max_clip_ratio=0.005` 에 10~20배로 걸려 전량 폐기되므로
-AGENTS 규칙 3("소리를 내며 디버깅하지 않는다")에 따라 **재생하지 않았다.**
-
-**이 결함 자체가 게이트 공백이었다** — 기존 자가진단은 하한(`ref_db < -80`)만 봤고 상한이
-없어 "레일에 붙은 마이크"를 오히려 아주 살아 있는 마이크로 통과시킨다. 상한 게이트를
-추가했고 실제로 막는다(`[중단] 마이크 입력이 풀스케일에 붙어 있습니다 … EXIT=1`, 재생 전).
-
-**사용자 조치**: 마이크 프리앰프/입력단 전원과 배선을 연결한 뒤 아래를 순서대로 실행.
-
-```bash
-# (a) 배선 확인 — 소리 안 남. 여기서 EXIT=0 이 나와야 (b)로 간다
-fuser -v /dev/snd/*                       # 장치 점유 확인 (필수)
-.venv/bin/python scripts/data/record_duct.py --program silence --seconds 3 \
-    --out-root /tmp/rec_check
-# 기대: '레일 비율 0.0000/0.0000', ch1(ref) 가 -80 dBFS 보다 큼
-
-# (b) 검증 녹음 25초 — 스피커 우는 시간 25초
-.venv/bin/python scripts/data/record_duct.py --program band --band 80 1600 \
-    --amplitude 0.06 --seconds 25 --source-family environment \
-    --group-id environment-verify --out-root data/recorded_verify
-# 기대: coh²(source→ERR,150-600Hz) 0.0xx → 0.9xx   ← 임무 완료 기준
-#       [중단] 이 뜨면 저장되지 않는다 (실패-폐쇄)
-```
-
----
-
-### 2. 실패 33세션 재녹음 — **유일한 실질 블로커** (§0.6 결함 2)
-
-`record_duct.py` 의 시간축 결함은 **고쳤다**(단언 → 측정, 저장 시점 게이트).
-**오프라인 재정렬로 80세션 중 47개를 복구했다** (`results/timeline/realign_full.json`,
-`ref_witness_warp_v1`, 게이트 `coh² ≥ 0.9` 그리고 `유효창 ≥ 0.9`):
-
-| 지표 (47세션) | 전 | 후 |
-|---|---|---|
-| coh²(source→ERR) 150–600 Hz | 0.025 ~ 0.182 (p50 **0.078**) | 0.905 ~ 0.973 (p50 **0.947**) |
-| coh²(source→ERR) 600–1600 Hz | 0.007 ~ 0.071 | 0.596 ~ 0.920 (p50 0.824) |
-| 선형 Wiener 하한 (중앙) | **−0.23 dB** | **−12.09 dB** |
-| 잔여 지연 중앙값 | — | p50 **142.53** 샘플 (세션 간 산포 1.35) — 기하 예측 **139.9** 와 일치 |
-
-**47세션으로는 게이트(`≥80세션 그리고 ≥90분`)를 못 채운다. 게이트를 낮추지 않는다.**
-다만 실패 33세션만 다시 받으면 되므로 스피커 발음이 93.3분 → **약 38.5분**으로 줄었다.
-
-#### ⚠ 세션 수만 채우면 안 된다 — **그룹 수**가 진짜 제약이다 (2026-08-06 실측)
-
-`min_groups_per_family_per_split = 4` 는 계열마다 val 4 + test 4 + train 최소 1 = **9 그룹**을
-요구한다. 그런데 분할기가 비율(8:1:1)로만 나눠서 val·test 에 계열당 1~2 그룹밖에 안 갔다.
-비율로 4 를 얻으려면 계열당 40 그룹(=160 세션)이 필요하다 — 스피커 시간 2배다.
-**세션을 늘려도 그룹은 안 는다.** 같은 그룹 안의 세션은 독립이 아니기 때문이다.
-
-고친 것 둘:
-
-1. **분할기가 하한을 먼저 확보한다** (`assign_splits(min_units_per_split=...)`).
-   만족시킬 수 없으면 조용히 적게 주지 않고 EXIT=2 로 실패한다. 하한의 단일 출처는
-   `eval.recorded.MIN_GROUPS_PER_FAMILY` 이고 CLI 는 **강화 방향만** 받는다.
-2. **소스 그룹을 세분화했다** — ESC-50 `group_id` 가 카테고리(machine 8개)였는데
-   `esc50.csv` 의 `src_file`(원본 녹음 ID) 묶음으로 바꿨다. **machine 8 → 55, environment 16 → 126.**
-
-재정렬 후 현재 그룹 분포와 필요량:
-
-| 계열 | 살아남음 | 현재 그룹 | 재녹음 | 추가로 필요한 그룹 |
-|---|---|---|---|---|
-| environment | 14 | 13 | 6 | 0 |
-| machine | 13 | 8 | 7 | **1** |
-| music | 15 | 15 | 5 | 0 |
-| speech | 5 | 5 | 15 | **4** |
-
-speech 가 5/20 로 가장 낮다. **무음 희석이 아니다** — 유음 구간(RMS 상위 60%)만 골라도
-coh² 가 오히려 낮다(0.888 vs 0.941). speech 가 실제로 가장 어려운 계열이고, 절대목표 2가
-최악값 문제이므로 그 사실을 게이트 완화로 덮으면 안 된다.
-
-```bash
-# ① 새 소스 — --keep-disjoint-from 이 필수다.
-#    빠뜨리면 같은 클립이 옛 그룹(살아남은 47세션의 environment-thunderstorm)과
-#    새 세분 그룹(thunderstorm-02)에 동시에 들어가 group 단위 split 이 무의미해진다.
-.venv/bin/python scripts/data/build_recording_sources.py --out data/source_pool_v2 \
-    --sessions-per-family 20 --keep-disjoint-from data/source_pool/sources.csv
-
-# ② 재녹음 — 계열별로 쪼갤 수 있다. 중단해도 batch_progress.csv 로 재개된다.
-#    speech 통과율이 25% 였으므로 speech 를 먼저 돌려 통과율을 보고 나머지를 조정하라.
+# ⑤ 재녹음 — **v2 가 기본값이다**. 계열별로 쪼갤 수 있고 중단해도 재개된다.
 .venv/bin/python scripts/data/record_session_batch.py --confirm-speaker \
-    --amplitude 0.06 --families speech                       # 15세션, 발음 17.5분
+    --amplitude 0.06 --families speech
 .venv/bin/python scripts/data/record_session_batch.py --confirm-speaker \
-    --amplitude 0.06 --families machine environment music     # 18세션, 발음 21분
+    --amplitude 0.06 --families machine environment music
 
-# ③ 매니페스트 — 계열×split 의 그룹 수를 출력한다. 하한 미달이면 EXIT=2.
+# ⑥ 매니페스트·QA·게이트 (소리 없음)
+.venv/bin/python scripts/data/make_recorded_holdout.py     # 세션이 재생한 풀에서 유도
 .venv/bin/python scripts/data/make_recorded_manifest.py
 .venv/bin/python scripts/data/validate_recorded_sessions.py
+.venv/bin/python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
+    --set data.digital_primary_path_mode=measured
 ```
 
-복구본은 아직 `data/recorded_broken/` 에 있다(`source_aligned.wav` 47개).
-되돌리기: `quarantine_recorded_sessions.py --restore`.
+⚠ 마이크 핀은 2026-08-06 하루에 **세 번** 빠졌다. ⑤ 전에 고정을 단단히 할 것 —
+38.5분 도중에 빠지면 그 시간이 통째로 날아간다.
 
-⚠ 재생 전 **오디오 장치 점유 확인 필수** (`~/DeepANC_CRN_n_codex` 병행 작업 중).
-⚠ `sources.csv` 의 `clips` 열은 세션당 앞 12개만 저장하므로 제외 목록은 **하한**이다.
-  소스 생성 후 그룹 수를 눈으로 확인하라.
+### 2. 엘리스에서 할 것 (사용자 결정: 데이터셋·사전학습·파인튜닝 전부 엘리스)
 
----
+로컬 디스크는 8.4 G 뿐이고 DNS 압축본만 15.7 G 다. 참고 폴더 3곳과 디스크 전체를
+뒤졌지만 dns_fullband·demand·machine 원본은 이 장비 어디에도 없다.
+
+```bash
+# ① 유실 코퍼스 확보 → manifest (엘리스에서)
+#    dns_fullband 0.30 · demand 0.08 · machine 0.07 = 선언 비중 0.45
+.venv/bin/python scripts/data/prepare_noise_pool.py     # EXIT=0 이 될 때까지
+
+# ② 재사전학습 — trusted_band [150,1600] 으로. 현행 체크포인트는 전부 [150,600] 이다.
+#    Orin 실측 0.44~0.455 it/s(bs16,tiny) → 100k step ≈ 61~63시간. A100 이면 훨씬 짧다.
+
+# ③ 파인튜닝 — 재녹음 데이터를 올린 뒤
+```
+
+⚠ **`allow_missing_source_manifests` 를 학습 설정에 넣지 마라.** 그 키를 켜면 선언한
+소스가 조용히 합성원으로 대체되고, 음성·음악을 한 번도 못 본 모델이 나온다(절대목표 2 위반).
+2026-08-06 이전에는 그것이 **기본 동작**이었다.
 
 ### 3. 손실 λ 교정과 게이트 임계 대조 — **재학습 전에 반드시** (§0.6 결함 3)
 
@@ -402,6 +301,15 @@ do-no-harm 항 자체는 들어갔지만 **세 가지가 남아 있다.**
   초기 5k step 분산을 보고 0.85~1.0 으로 올릴지 판단하라.
 - ✅ `configs/train_finetune.yaml` 은 이미 `band_weight: trusted_only` / `lambda_frame: 0.5`
   로 정정됐다(커밋 `612152c`). 폐기 키도 정리됐다.
+
+> ✅ **2026-08-06 해소** (커밋 83c6954 · ff5de1b). 힌지 마진은 이제 G4 임계에서
+> **유도된다** — `src/deep_anc/dsp/do_no_harm.py` 가 단일 출처이고
+> `margin = 20·log10(10^(G/20) − 1) = −18.27 dB` 다. 설정에 값을 되쓰면 `LossConfig` 가
+> 거부한다. 대역도 옥타브 경계에 정렬시켰다(가로지르면 한 옥타브에 에너지를 몰 수 있었다).
+> λ_dnh 는 0.12 → **0.001** 로 재교정했다(실측 예산비 41.8 → 0.348, 목표 0.2~0.4).
+> 측정은 `ANCLoss.gradient_budget` 하나이고 `tests/test_loss_gradient_budget.py` 가
+> 예산을 걸어 둔다. 남은 미검증 2건은 그 파일 docstring 참조.
+
 
 ---
 

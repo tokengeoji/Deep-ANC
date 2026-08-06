@@ -1251,8 +1251,21 @@ def _audit_measured_source_delay(
         audit.fail("measured_source_delay_agreement", result.detail, **result.measured)
 
 
+DESIGN_CEILING_TOLERANCE_DB = 0.5
+"""선언된 설계 상한과 아티팩트 재계산의 허용 차이.
+
+수치 조건(대역제한 필터 차수, Tikhonov λ, 탭 수)이 조금 달라도 0.2~0.3 dB 는 움직인다.
+0.5 는 그 폭보다 크고, 이 저장소에서 실제로 문제가 된 오차(150-600Hz 의 6.53 을
+150-1600Hz 에 쓴 것 = 약 2 dB)보다 훨씬 작다.
+"""
+
+
 def _audit_plant_confidence_ceiling(
-    audit: "_Audit", readiness_cfg: dict, secondary: dict | None, primary: dict | None
+    audit: "_Audit",
+    readiness_cfg: dict,
+    secondary: dict | None,
+    primary: dict | None,
+    lead_samples: int = 0,
 ) -> None:
     """G1c — 이 플랜트로 **목표를 낼 수 있기는 한가**를 학습 시작 전에 판정한다.
 
@@ -1340,6 +1353,56 @@ def _audit_plant_confidence_ceiling(
                     required_path_band_hz=[req_lo, req_hi],
                 )
                 return
+    # ---- 선언값을 **아티팩트에서 다시 풀어** 대조한다 ------------------------------
+    # 2026-08-06 감사가 재현한 fail-open: 이 값은 사람이 한 번 계산해 설정에 적은
+    # 숫자였고 게이트는 그것을 그대로 믿었다. `--set readiness.measured_design_ceiling_db=30.0`
+    # 으로 날조해도 PASS 하는 것을 직접 확인했다(100.0 도 마찬가지). 배선을 고쳐 P/S 를
+    # 다시 재면 sha 는 바뀌지만 설정의 숫자는 그대로 남아 계속 통과한다 — 게이트가
+    # 자기 자신을 증명하는 구조였다.
+    recomputed: float | None = None
+    recompute_note = ""
+    if design_value is not None:
+        try:
+            from ..dsp.design_ceiling import cached_design_ceiling_db
+
+            band_lo, band_hi = (
+                float(v) for v in tuple(readiness_cfg["measured_design_ceiling_band_hz"])[:2]
+            )
+            solved = cached_design_ceiling_db(
+                _repo_path(primary["path"]),
+                _repo_path(secondary["path"]),
+                lead_samples=int(lead_samples),
+                band_hz=(band_lo, band_hi),
+                sample_rate=float(secondary["sample_rate"]),
+            )
+            recomputed = float(solved.ceiling_db)
+            if not solved.stable_over_regularisation:
+                recompute_note = " (⚠ 정규화에 민감 — 수치를 신뢰하기 어렵다)"
+        except Exception as exc:  # noqa: BLE001 — 재계산 실패는 판정 불가다
+            audit.fail(
+                "plant_confidence_ceiling",
+                f"선언된 설계 상한을 아티팩트에서 다시 풀지 못했습니다: "
+                f"{type(exc).__name__}: {exc} — 재계산할 수 없으면 선언값이 맞다고 "
+                "주장할 수 없습니다",
+                design_ceiling_db=float(design_value),
+            )
+            return
+        # 선언이 재계산보다 **낙관적**이면 거부한다. 보수적인 쪽은 허용한다 —
+        # 사람이 여유를 더 두는 것은 안전한 방향이다.
+        if float(design_value) > recomputed + DESIGN_CEILING_TOLERANCE_DB:
+            audit.fail(
+                "plant_confidence_ceiling",
+                f"선언된 설계 상한 {float(design_value):.2f} dB 가 아티팩트에서 다시 푼 값 "
+                f"{recomputed:.2f} dB 보다 낙관적입니다 (허용 오차 "
+                f"{DESIGN_CEILING_TOLERANCE_DB:.2f} dB){recompute_note}. 선언값을 재계산값으로 "
+                "맞추거나, 계산 조건(대역·탭수·lead)이 다르다면 그 근거를 남기세요 — "
+                "설정에 적힌 숫자를 게이트가 그대로 믿으면 물리적으로 불가능한 목표도 "
+                "통과합니다",
+                design_ceiling_db=float(design_value),
+                recomputed_design_ceiling_db=recomputed,
+            )
+            return
+
     design_ceiling = float(design_value) if design_value is not None else float("inf")
     ceiling = min(gamma_ceiling, design_ceiling)
     binding = "정규방정식 설계 상한" if design_ceiling <= gamma_ceiling else "플랜트 일관성"
@@ -1706,7 +1769,15 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
     _audit_statistical_power(audit, readiness_cfg, entries)
     _audit_corpus_leak(audit, readiness_cfg, data_cfg)
     _audit_measured_source_delay(audit, readiness_cfg, primary, recorded_report)
-    _audit_plant_confidence_ceiling(audit, readiness_cfg, secondary, primary)
+    _audit_plant_confidence_ceiling(
+        audit,
+        readiness_cfg,
+        secondary,
+        primary,
+        # lead 는 path_delay_and_lead 게이트가 이미 실측과 대조한 값이다.
+        # 여기서 다시 유도하면 그것이 두 번째 유도가 된다 (발생기 A).
+        lead_samples=int(data_cfg.get("digital_reference_lead_samples", 0)),
+    )
 
     return audit.report(
         stage=str(cfg.get("stage", "")),

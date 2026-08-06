@@ -1,0 +1,11 @@
+{
+ "89ba6cd3d97e7d706ab42974cb29622f00bed683c512b215bd64b4583d2ead86|a84040b9c00820088687e57a2c18942f9a0e21c09240007cd1475be0ace120f8|116|150.000-1600.000|2048|48000.0": {
+  "ceiling_db": 4.826704564549887,
+  "regularisation": 1e-06,
+  "condition_number": 19846925.33791882,
+  "max_tap": 2.9606820801340676,
+  "stable": true,
+  "primary": "/home/capston/Deep_ANC/assets/measured/primary_path_il.npz",
+  "secondary": "/home/capston/Deep_ANC/assets/measured/secondary_path_il.npz"
+ }
+}

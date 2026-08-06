@@ -1076,6 +1076,26 @@ GATES: tuple[GateDeclaration, ...] = (
         ),
     ),
     GateDeclaration(
+        gate_id="plant_confidence_ceiling_is_recomputed",
+        owner=_READINESS,
+        what_it_asserts=(
+            "선언된 설계 상한이 실측 P/S 아티팩트에서 다시 푼 값보다 낙관적이지 않다 —"
+            " 설정에 적힌 숫자를 그대로 믿으면 물리적으로 불가능한 목표도 통과한다"
+        ),
+        negative_fixture=(
+            "tests/test_design_ceiling.py::"
+            "test_a_numerically_exploding_solution_is_not_called_stable"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_design_ceiling.py::test_shipped_declaration_matches_the_recomputation"
+        ),
+        positive_probe=(
+            "출하 선언 4.58 dB 가 재계산 4.83 dB 안에 들어온다 (허용 오차 0.5 dB) — "
+            "선언 5.5 는 거부된다"
+        ),
+    ),
+    GateDeclaration(
         gate_id="recorded_high_band_alignment",
         owner=_QA,
         what_it_asserts=(
