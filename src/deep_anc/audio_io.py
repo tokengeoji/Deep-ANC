@@ -336,7 +336,17 @@ PortAudio 에 float 변환을 맡기면 풀스케일 규약이 장치마다 달�
 """
 
 MAX_PROBE_CLIP_RATIO = 0.005
-"""마이크 자가진단 상한. QA 의 ``max_clip_ratio`` 와 같은 자리에서, 재생 **전에** 본다."""
+"""마이크 자가진단 **상한**. QA 의 ``max_clip_ratio`` 와 같은 자리에서, 재생 **전에** 본다."""
+
+MIN_PROBE_DBFS = -80.0
+"""마이크 자가진단 **하한**. 이보다 조용하면 무신호로 본다.
+
+상한만 보면 반쪽이다. 2026-08-06 실측: 마이크가 **정확히 0**(peak 0.000000,
+-240 dBFS)을 내보내는데 레일 게이트만으로는 "정상" 으로 통과했다. 죽은 센서로 얻은
+숫자는 틀린 게 아니라 무의미하고, 그걸 모르면 사람이 하드웨어를 헛만진다.
+``record_duct.py`` 는 원래 이 하한을 갖고 있었다(``--ref-check-dbfs`` 기본 -80).
+공용 함수로 옮기면서 하한을 빠뜨린 것이 이 결함이다.
+"""
 
 
 def input_rail_gate(
@@ -387,12 +397,25 @@ def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5
     )
     sd.wait()
     settle = int(0.5 * int(hardware["sample_rate"]))
-    ok, ratios = input_rail_gate(pcm_int32_to_float32(probe[settle:]))
+    probe_f = pcm_int32_to_float32(probe[settle:])
+    ok, ratios = input_rail_gate(probe_f)
     if not ok:
         raise RuntimeError(
             f"마이크 입력이 풀스케일에 붙어 있습니다 (레일 비율 "
             f"{ratios[0]:.4f}/{ratios[1]:.4f} > {MAX_PROBE_CLIP_RATIO}). "
             "이 상태의 계측은 음향과 무관한 숫자를 냅니다 — 볼륨을 돌려도 안 움직입니다.\n"
             "입력단 전원·배선(J30 핀 접촉)을 확인한 뒤 다시 실행하세요."
+        )
+
+    # 하한 — 상한만 보면 반쪽이다. 무신호 마이크도 "레일 아님" 으로 통과한다.
+    levels = [rms_dbfs(probe_f[:, ch]) for ch in range(probe_f.shape[1])]
+    dead = [ch for ch, db in enumerate(levels) if db < MIN_PROBE_DBFS]
+    if dead:
+        detail = " / ".join(f"ch{ch} {levels[ch]:.1f} dBFS" for ch in range(len(levels)))
+        raise RuntimeError(
+            f"마이크가 무신호입니다 ({detail} < {MIN_PROBE_DBFS:.0f} dBFS). "
+            f"채널 {dead} 에 데이터가 오지 않습니다.\n"
+            "이 상태로 계측하면 숫자가 음향과 무관해집니다. "
+            "입력단 전원·배선(J30 핀 접촉)과 I2S 클록을 확인한 뒤 다시 실행하세요."
         )
     return ratios

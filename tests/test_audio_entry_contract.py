@@ -234,3 +234,100 @@ def test_unwired_backlog_only_shrinks():
     assert not stale, (
         f"배선을 마친 항목이 known 에 남아 있습니다: {stale} — 이 목록에서 지우세요."
     )
+
+
+def test_precondition_rejects_a_dead_microphone():
+    """무신호 마이크를 **재생 전에** 막는다 (하한).
+
+    2026-08-06 실측: 마이크가 정확히 0(peak 0.000000, -240 dBFS)을 내보내는데
+    레일 게이트만 있던 공용 함수가 "정상" 으로 통과시켰다. 상한만 보면 반쪽이다 —
+    죽은 센서로 얻은 숫자는 틀린 게 아니라 무의미하고, 그걸 모르면 사람이
+    하드웨어를 헛만진다(실제로 그렇게 볼륨 노브를 헛돌렸다).
+    """
+
+    import numpy as np
+
+    from deep_anc.audio_io import MIN_PROBE_DBFS, assert_measurement_preconditions
+
+    fs = 48000
+    hardware = {"sample_rate": fs, "input": {"card": "APE", "pcm": 1}}
+
+    class _SilentDevice:
+        """항상 디지털 무음을 돌려주는 가짜 장치."""
+
+        def rec(self, frames, **_kwargs):
+            return np.zeros((int(frames), 2), dtype=np.int32)
+
+        def wait(self):
+            return None
+
+    import deep_anc.audio_io as audio_io
+
+    original = audio_io.resolve_alsa_portaudio_device
+    audio_io.resolve_alsa_portaudio_device = lambda *a, **k: 0
+    try:
+        with pytest.raises(RuntimeError, match="무신호"):
+            assert_measurement_preconditions(_SilentDevice(), hardware, seconds=1.0)
+    finally:
+        audio_io.resolve_alsa_portaudio_device = original
+
+    assert MIN_PROBE_DBFS == -80.0
+
+
+def test_precondition_rejects_a_railed_microphone():
+    """풀스케일에 붙은 마이크를 **재생 전에** 막는다 (상한). 짝이 되는 음성 대조다."""
+
+    import numpy as np
+
+    from deep_anc.audio_io import assert_measurement_preconditions
+
+    fs = 48000
+    hardware = {"sample_rate": fs, "input": {"card": "APE", "pcm": 1}}
+
+    class _RailedDevice:
+        def rec(self, frames, **_kwargs):
+            return np.full((int(frames), 2), 2**31 - 1, dtype=np.int32)
+
+        def wait(self):
+            return None
+
+    import deep_anc.audio_io as audio_io
+
+    original = audio_io.resolve_alsa_portaudio_device
+    audio_io.resolve_alsa_portaudio_device = lambda *a, **k: 0
+    try:
+        with pytest.raises(RuntimeError, match="풀스케일"):
+            assert_measurement_preconditions(_RailedDevice(), hardware, seconds=1.0)
+    finally:
+        audio_io.resolve_alsa_portaudio_device = original
+
+
+def test_precondition_accepts_a_healthy_quiet_room():
+    """정상 신호는 통과해야 한다 — 게이트가 꺼져서 통과하는 게 아님을 짝으로 확인한다."""
+
+    import numpy as np
+
+    from deep_anc.audio_io import assert_measurement_preconditions
+
+    fs = 48000
+    hardware = {"sample_rate": fs, "input": {"card": "APE", "pcm": 1}}
+
+    class _HealthyDevice:
+        def rec(self, frames, **_kwargs):
+            rng = np.random.default_rng(0)
+            # 실측 정상 세션 수준: RMS 약 0.001 (-60 dBFS), 레일 0
+            x = rng.standard_normal((int(frames), 2)) * 0.001
+            return (x * (2**31)).astype(np.int32)
+
+        def wait(self):
+            return None
+
+    import deep_anc.audio_io as audio_io
+
+    original = audio_io.resolve_alsa_portaudio_device
+    audio_io.resolve_alsa_portaudio_device = lambda *a, **k: 0
+    try:
+        ratios = assert_measurement_preconditions(_HealthyDevice(), hardware, seconds=1.0)
+    finally:
+        audio_io.resolve_alsa_portaudio_device = original
+    assert max(ratios) == 0.0
