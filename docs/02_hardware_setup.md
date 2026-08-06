@@ -48,17 +48,63 @@
 
 ## 2. 시스템 정책 (중요)
 
-Jetson 의 **핀 설정(pinmux/I2S)과 RT 커널 구성은 의도된 것이므로 절대 변경하지 않는다.**
-전원모드(30W), pulseaudio/pipewire, RT priority limit 등 시스템 상태도 건드리지 않는다.
-이 저장소의 모든 도구는 유저 공간(venv)에서만 동작하도록 만들어졌다.
+전원모드(30W), RT priority limit 등 시스템 상태는 기본적으로 건드리지 않는다.
+이 저장소의 도구는 유저 공간(venv)에서 동작하도록 만들어졌다.
 (성능 튜닝 여지가 있는 항목들은 docs/06 §5 에 "참고"로만 기록)
 
-NVIDIA 일반 문서상 J30 I²S2는 pinmux가 필요한 인터페이스지만, 이 Jetson의 현재 APE/I²S
-구성은 이미 의도적으로 설정된 실험 환경이다. `Jetson-IO`나 device tree를 다시 적용하지 말고,
-아래의 장치 목록과 무음 녹음으로 기존 구성을 읽기 전용 검증한다.
+**핀먹스와 디바이스 트리는 변경해도 된다** (2026-08-06 사용자 명시 허용, [AGENTS.md](../AGENTS.md) §4).
+이전 판본의 "절대 변경 금지" 는 삭제됐다 — 아래 §2.1 이 그 이유다.
 
-이 정책은 입력 문제를 진단할 때도 예외가 없다. `sudo`, Jetson-IO, pinmux/device-tree,
-RT 커널, `nvpmodel`/`jetson_clocks`, pulseaudio/pipewire, apt 설치를 변경하지 않는다.
+### 2.1 마이크는 **병합 DTB의 핀먹스 오버레이에 의존한다** (2026-08-06 확인)
+
+**이 사실을 모르면 마이크 무신호를 절대 못 고친다.** J30 40핀 헤더의 I²S2 핀은 기본
+디바이스 트리에서 muxed 되어 있지 않다. 오버레이를 **사전 병합한 DTB** 로 부팅해야 한다.
+
+```
+설치본:  ~/FxLMS/realtime_fxlms/boot_fix/
+           apply_boot_fix.sh
+           extlinux.conf.new
+           kernel_tegra234-p3737-0000+p3701-0005-nv-user-custom.dtb   (md5 9823e1cb7b7c…)
+```
+
+`/boot/extlinux/extlinux.conf` 의 `LABEL real-time` 항목이 `FDT /boot/dtb/…-nv-user-custom.dtb`
+를 가리켜야 하고, `DEFAULT real-time` 이어야 한다. 부트로더의 OVERLAYS 처리에 의존하지
+않게 병합해 둔 것이라 어느 항목으로 부팅해도 마이크가 산다.
+
+**살아 있는지 확인하는 한 줄** (읽기 전용, sudo 불필요):
+
+```bash
+find -L /proc/device-tree -type d -name exp-header-pinmux -print -quit
+```
+
+노드가 나오면 그 아래에 `hdr40-pin12`(SCK) · `hdr40-pin35`(WS) · `hdr40-pin38`(SD) 이 있고,
+각각 `nvidia,function = i2s2` 여야 한다. 노드가 **없으면** 그 부팅은 핀먹스 없이 올라온
+것이고, 마이크는 무슨 짓을 해도 0 만 낸다.
+
+### 2.2 마이크 무신호 진단 사다리 (2026-08-06 에 실제로 탄 순서)
+
+위에서부터 확인한다. 각 단계는 **앞 단계가 통과했을 때만** 의미가 있다.
+
+| # | 확인 | 명령 | 통과 기준 |
+|---|---|---|---|
+| 1 | USB DAC 인식 | `cat /proc/asound/cards` | `2 [Audio] USB-Audio AB13X` |
+| 2 | 핀먹스 오버레이 | 위 `find -L …` | `exp-header-pinmux` + pin12/35/38 = i2s2 |
+| 3 | 부트 경로 | `uname -r` / `md5sum /boot/dtb/…` | `5.15.148-rt-tegra` / md5 일치 |
+| 4 | XBAR 라우팅 | `amixer -c APE cget name='ADMAIF2 Mux'` | `values=18` (=I2S2) |
+| 5 | PulseAudio 간섭 | `pactl set-card-profile alsa_card.platform-sound off` | 44.1kHz sink 가 PLL_A 를 흔드는 것 차단 |
+| 6 | **I²S2 컨트롤러** | `I2S2 Loopback` on → 재생/캡처 → off | 재생한 톤이 그대로 돌아옴 |
+| 7 | 실제 마이크 | `arecord -D hw:APE,1 -f S32_LE -r 48000 -c 2 -d 2` | 0 이 아닌 샘플 존재 |
+
+6번이 통과하고 7번이 실패하면 **패드 바깥(선·마이크 모듈)** 이다. 6번은 컨트롤러 안에서
+TX→RX 로 도는 것이라 패드까지는 증명하지 못하므로 2번과 함께 봐야 한다.
+
+⚠ **두 마이크가 SD 선(pin38)을 공유하므로 소프트웨어로는 둘을 가를 수 없다.** 공통 SD 에는
+100kΩ 풀다운이 있어 (a) SD 선 빠짐 (b) 한 모듈이 low 로 물음 (c) 둘 다 무전원 이 **전부
+정확히 0** 으로 똑같이 보인다. 마이크 하나만 남기고 다시 재는 물리 시험이 유일한 판별법이다.
+
+살아 있을 때의 모습(참조, `~/anc_project/diagnostics/mic_stats.txt` 2026-08-01):
+`ch0 RMS −4.78 dBFS, 0인 샘플 0.0017%`. 죽은 채널은 `raw = [-1,-1,-1,0,0,-1,0]` 처럼
+LSB 만 흔들리거나, 완전히 끊기면 **전 비트 0** 이다.
 
 ## 3. 하드웨어 점검 순서 (USB 오디오 연결 후)
 
