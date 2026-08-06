@@ -7,14 +7,97 @@
 ## 0. 라이브 상태
 
 **현재 브랜치: `fix/finetune-readiness-repair`** (main 에서 분기, 아직 merge 안 됨).
-테스트 **604개 전부 통과** (`.venv/bin/python -m pytest -q`, 약 14분).
+테스트 **701개 전부 통과** (`.venv/bin/python -m pytest -o addopts="" -q`, 약 5.5분).
 Elice 인스턴스는 **사용자가 삭제**했고 산출물은 전부 로컬 회수됨.
 
-### ⛔ 지금 배포·학습을 재개하면 안 되는 이유 (한 줄 요약)
+### ⛔ 유일한 블로커 — 앰프에서 두 채널이 섞인다 (2026-08-06 확정)
 
-**파인튜닝은 G4 FAIL 했고(`music` val +0.58 / test +0.90), 그 학습에 쓴 데이터 80세션은
-시간축이 붕괴해 전량 격리됐다. 47세션은 오프라인 복구했고 나머지 33세션 재녹음
-(스피커 발음 약 38.5분)이 유일한 블로커다 — 그런데 지금 마이크 입력단이 죽어 있다(§0.5-1).**
+**소프트웨어는 재녹음을 받을 준비가 끝났다. 막고 있는 것은 하드웨어 하나다.**
+
+```
+          레벨 dBFS   결합비   P−S
+8/4          -46.33    0.023    137    ← 정상
+8/6          -32.07    0.700      1
+8/6          -39.91    0.670      1
+8/6          -46.64    0.634      0    ← 8/4 와 같은 레벨인데도 결합
+```
+
+`결합비` = 임펄스 응답에서 Δ−143 샘플(=CS→ERR 경로) 위치의 2차 도달 진폭비.
+0.02 면 채널이 분리된 것이고 0.63 이면 거의 완전 결합이다.
+
+**구동 레벨은 원인이 아니다** — 14.6 dB 를 내리는 동안 결합비가 0.700 → 0.634 로
+10% 만 움직였다. 레벨 의존 결합(전원 부족)이라면 이렇게 나올 수 없다.
+(이 가설로 사용자에게 볼륨을 세 번 조정하게 했고, 세 번째에 반증됐다.)
+
+사용자 확인과 종합한 결과:
+* 이어폰을 **DAC 출력**(USB-C→3.5mm 동글 AB13X)에 직결하면 좌우가 **정상 분리**된다
+* 앰프(TPA3116D2)에서 스피커 하나를 빼면 **남은 쪽이 두 채널을 다 낸다**
+* 앰프 입력 **3핀 나사단자(L·GND·R)는 비어 있고**, 오디오는 3.5mm 잭으로 들어간다
+* 6핀 나사단자 가운데 2가닥은 **전원**(Jetson USB-C → 어댑터)이다
+
+→ **3.5mm 잭 경로가 모노**일 가능성이 높다.
+
+**해결**: 오디오를 3.5mm 잭 대신 **비어 있는 3핀 나사단자**로 넣는다.
+필요한 것은 `3.5mm 수 플러그 → 벗긴 선 3가닥` 케이블 하나 (안 쓰는 AUX 를 잘라도 된다).
+
+```
+3.5mm 플러그          앰프 3핀 나사단자
+  팁    (L)   ──────→   L IN     (= ch0 소음 스피커)
+  링    (R)   ──────→   R IN     (= ch1 취소 스피커)
+  슬리브(GND) ──────→   GND
+```
+
+⚠ 연결 전 3핀 단자 옆 인쇄 글자를 확인할 것. `L GND R` / `IN` 이면 맞다.
+   `SUB` 등 다른 글자면 2.1 보드의 서브우퍼 출력일 수 있으니 접근을 달리해야 한다.
+
+⚠ 이 결합 상태에서 재녹음하면 소스가 양쪽 스피커에서 나와 1차 경로에
+   **336Hz 간격 15dB 깊이 빗살 노치**가 박힌다. 고친 뒤 38.5분을 통째로 다시 받아야 한다.
+
+### 배선을 고친 뒤 — 이 순서로 진행한다 (전부 자동화돼 있다)
+
+```bash
+# ① 마이크 확인 (소리 없음, 3초). 레일 비율 0.0000/0.0000 + EXIT=0 이어야 한다.
+.venv/bin/python scripts/data/record_duct.py --program silence --seconds 3 --out-root /tmp/rec_check
+
+# ② 앰프 레벨 교정 (소리 20초, 실시간 표시). '✅ 맞았습니다' 에서 멈춘다.
+.venv/bin/python scripts/data/set_amp_level.py --confirm-speaker
+
+# ③ P/S 확인 (소리 6초). **P−S = 140 ± 3 이 통과 기준**이다.
+.venv/bin/python scripts/data/measure_paths_interleaved.py --confirm-volume-minimum \
+    --primary-out results/channel_check/p.npz --secondary-out results/channel_check/s.npz
+
+# ④ 재녹음 33세션 (소리 38.5분). 계열별로 쪼갤 수 있고 중단해도 재개된다.
+#    speech 를 먼저 돌려 통과율을 보고 나머지를 조정한다 (구 데이터 통과율 25%).
+.venv/bin/python scripts/data/record_session_batch.py --confirm-speaker \
+    --amplitude 0.06 --families speech
+.venv/bin/python scripts/data/record_session_batch.py --confirm-speaker \
+    --amplitude 0.06 --families machine environment music
+
+# ⑤ 매니페스트·QA·게이트 (소리 없음)
+.venv/bin/python scripts/data/make_recorded_manifest.py
+.venv/bin/python scripts/data/validate_recorded_sessions.py
+.venv/bin/python scripts/train/run_finetune_pipeline.py --check-only \
+    --config configs/train_finetune.yaml --set data.digital_primary_path_mode=measured
+```
+
+⚠ ④ 전에 데스크톱 오디오가 APE 카드를 놓게 할 것:
+   `pactl set-card-profile alsa_card.platform-sound off`
+   (되돌리기: `... output:analog-stereo+input:analog-stereo`)
+   PulseAudio 가 같은 카드에 44.1kHz sink 를 들고 있고, 그것이 깨어나면 PLL_A 가
+   재조정되어 48kHz 캡처의 BCLK 가 세션 중에 이동한다. XRUN 이 아니라 게이트가 못 잡는다.
+
+⚠ **마이크 핀이 2026-08-06 하루에 두 번 빠졌다.** ④ 시작 전에 고정을 단단히 할 것 —
+   38.5분 도중에 빠지면 그 시간이 통째로 날아간다.
+
+### 미완 — 다음 세션이 이어서 할 것
+
+**전 영역 감사 워크플로가 1/7 에서 중단됐다** (세션 종료).
+스크립트가 남아 있으니 그대로 다시 띄우면 된다:
+`.claude/.../workflows/scripts/finetune-readiness-full-audit-wf_92863834-056.js`
+6개 영역(플랜트·데이터·학습·런타임·게이트·문서)을 **실제로 실행해** 검증하고
+각각을 적대적으로 반증한 뒤 종합 판정하는 구성이다. 사용자 요청:
+"파인튜닝까지 준비된 게 없는지 제대로 준비됐는지 시스템부터 끝까지 부분적으로
+하나하나, 종합적으로 모두 검증해라".
 
 ### ⚠ 2026-08-05 세션에서 밝혀진 것 — 앞선 결론 다수가 틀렸다
 
