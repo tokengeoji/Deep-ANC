@@ -51,6 +51,7 @@ __all__ = [
     "cached_design_ceiling_db",
     "constrained_design_ceiling_db",
     "design_ceiling_db",
+    "worst_octave_ceiling_db",
 ]
 
 
@@ -342,3 +343,69 @@ def cached_design_ceiling_db(
     except OSError:
         pass
     return result
+
+
+def worst_octave_ceiling_db(
+    primary_path: "Path",
+    secondary_path: "Path",
+    *,
+    lead_samples: int,
+    band_hz: tuple[float, float],
+    sample_rate: float,
+    taps: int = 2048,
+    cache_path: "Path | None" = None,
+) -> tuple[float, float]:
+    """제어 대역 안 **각 옥타브에서** 푼 상한 중 최악값. 반환 ``(dB, 중심주파수)``.
+
+    왜 대역평균이 아니라 옥타브인가
+    ------------------------------
+    절대목표 1(저역과 고역을 **모두** 제거)의 평가 게이트 G4 는 **옥타브별**로 판정한다.
+    그런데 진입 게이트는 대역평균 상한(에너지가중)만 보고 있었다. 두 값이 크게 다르다 —
+    실측(official P1602/S1462, lead 116)::
+
+        전대역 [150, 1600]          +4.827 dB
+        옥타브  125 [150,  176.8]  +19.891
+        옥타브  250 [176.8, 353.6] +19.648
+        옥타브  500 [353.6, 707.1]  **+2.159**   ← 최악
+        옥타브 1000 [707.1,1414.2]  +5.223
+        옥타브 2000 [1414.2,1600]   +7.384
+
+    대역평균 4.83 은 저역의 큰 여유가 중역의 병목을 가린 값이다. 평균으로 판정하면
+    "목표 1.0 + 여유 3.0 = 4.0 을 만족한다"가 되지만, 실제로 옥타브 500 에서는 2.159 뿐이라
+    여유가 1.159 밖에 없다. **평균이 최악값을 가리는 것**이 이 저장소가 반복해서 겪은
+    실패 형태이고, 여기서도 같은 형태였다.
+
+    옥타브 500 이 유독 낮은 이유는 널 하나가 깊어서가 아니다. 그 옥타브를 반으로 쪼개면
+    353.6–500 은 5.47, 500–707.1 은 5.97 dB 다 — **한 옥타브 안에서 인과 FIR 이 서로
+    모순되는 등화를 요구받는다.** FIR 길이와 정규화 전 범위에서 안정하므로 학습이나
+    정규화로 풀리지 않는다.
+    """
+
+    from pathlib import Path as _Path
+
+    from .do_no_harm import OCTAVE_BAND_CENTERS_HZ, octave_band_edges_hz
+
+    lo_band, hi_band = float(band_hz[0]), float(band_hz[1])
+    worst: tuple[float, float] | None = None
+    for center in OCTAVE_BAND_CENTERS_HZ:
+        lo, hi = octave_band_edges_hz(float(center))
+        lo, hi = max(lo, lo_band), min(hi, hi_band)
+        if hi - lo < 20.0:
+            continue
+        solved = cached_design_ceiling_db(
+            _Path(primary_path),
+            _Path(secondary_path),
+            lead_samples=lead_samples,
+            band_hz=(lo, hi),
+            sample_rate=sample_rate,
+            taps=taps,
+            cache_path=cache_path,
+        )
+        if worst is None or solved.ceiling_db < worst[0]:
+            worst = (float(solved.ceiling_db), float(center))
+    if worst is None:
+        raise ValueError(
+            f"제어 대역 [{lo_band:g}, {hi_band:g}] 안에 옥타브가 없습니다 — "
+            "상한을 옥타브별로 판정할 수 없습니다"
+        )
+    return worst

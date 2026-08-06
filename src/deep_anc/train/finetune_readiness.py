@@ -1227,34 +1227,47 @@ def _audit_measured_source_delay(
     # 아니다. 대조하면 1706.5 샘플 어긋나 무조건 FAIL 하고, 그 가짜 실패가 진짜 결함
     # (원본 관측 1672 vs 유도 1849 = 177 샘플, 허용 64 의 2.8배)을 덮는다.
     # 숫자를 비교하기 전에 **무엇을 잰 값인지** 먼저 본다.
-    realigned = sorted(
+    # QA 가 재정렬본을 쟀으면 그 값은 잔여 음향 지연(약 142 샘플)이다. 이 게이트가
+    # 필요한 것은 **원본 재생→ERR 총지연**이므로 QA 가 따로 내는 raw 키를 읽는다.
+    # 2026-08-06 이전에는 두 물리량이 같은 이름을 써서 1706 샘플짜리 가짜 실패가
+    # 났고, 그 가짜 실패가 진짜 결함(177 샘플)을 덮었다.
+    def _observed(session: dict) -> float | None:
+        alignment = session.get("alignment") or {}
+        reference = str(session.get("alignment_reference", ""))
+        key = (
+            "raw_source_err_delay_median_samples"
+            if reference.startswith("source_aligned")
+            else "source_err_delay_median_samples"
+        )
+        value = alignment.get(key)
+        if value is None:
+            return None
+        value = float(value)
+        return value if math.isfinite(value) else None
+
+    missing_raw = sorted(
         {
-            str(session.get("alignment_reference"))
+            str(session.get("session_id", "?"))
             for session in recorded_report["sessions"]
             if str(session.get("alignment_reference", "")).startswith("source_aligned")
+            and _observed(session) is None
         }
     )
-    if realigned:
+    if missing_raw:
         audit.fail(
             "measured_source_delay_agreement",
-            "QA 가 잰 source→ERR 지연은 **재정렬본**에서 나온 값이라 P(z) 유도값과 "
-            f"대조할 수 없습니다 (기준 파일: {', '.join(realigned)}). 재정렬본의 "
-            "지연은 정렬 후 잔여 음향 지연(약 142 샘플)이고, 이 게이트가 필요한 것은 "
-            "원본 source.wav 의 재생→ERR 총지연(관측 약 1672)입니다. 두 물리량이 같은 "
-            "이름을 쓰고 있어 그대로 비교하면 1706 샘플 어긋난 가짜 실패가 나오고, "
-            "그것이 진짜 결함(관측 1672 vs 유도 1849 = 177 샘플)을 덮습니다. "
-            "QA 가 원본 기준 지연을 별도 키로 함께 내도록 고친 뒤 다시 도세요",
-            alignment_references=realigned,
+            "재정렬된 세션의 **원본 기준** source→ERR 지연이 QA 리포트에 없습니다: "
+            f"{missing_raw[:5]}{' …' if len(missing_raw) > 5 else ''} "
+            f"(총 {len(missing_raw)}개). 재정렬본에서 잰 값(잔여 음향 지연 약 142 샘플)은 "
+            "P(z) 유도값과 물리량이 다르므로 대조할 수 없습니다. QA 를 다시 도세요",
+            sessions_missing_raw_delay=missing_raw[:20],
         )
         return
 
     observations = [
-        float(session["alignment"]["source_err_delay_median_samples"])
-        for session in recorded_report["sessions"]
-        if "source_err_delay_median_samples" in (session.get("alignment") or {})
-        and math.isfinite(
-            float(session["alignment"]["source_err_delay_median_samples"])
-        )
+        value
+        for value in (_observed(session) for session in recorded_report["sessions"])
+        if value is not None
     ]
     minimum_sessions = int(readiness_cfg.get("min_delay_crosscheck_sessions", 8))
     if len(observations) < minimum_sessions:
@@ -1348,6 +1361,20 @@ def _audit_plant_confidence_ceiling(
         return
 
     design_value = readiness_cfg.get("measured_design_ceiling_db")
+    if design_value is None:
+        # **선언 생략도 우회다.** 값 날조(=30.0)는 2026-08-06 에 막았지만 생략(=null)은
+        # 남아 있었고, 그러면 구속 상한이 플랜트 일관성(27.73 dB)으로 폴백해 통과한다.
+        # 실제 인과 FIR 상한은 최악 옥타브에서 2.16 dB 이므로 12배 낙관적인 값으로
+        # 통과하는 것이다. "선언 안 하면 검사 안 함" 은 검사가 없는 것과 같다.
+        audit.fail(
+            "plant_confidence_ceiling",
+            "readiness.measured_design_ceiling_db 가 선언되지 않았습니다 — 선언이 없으면 "
+            "구속 상한이 플랜트 일관성(약 27.7 dB)으로 폴백해 물리적으로 불가능한 목표도 "
+            "통과합니다. 실측 인과 FIR 상한은 최악 옥타브에서 2.16 dB 입니다. "
+            "measured_design_ceiling_db 와 measured_design_ceiling_band_hz 를 선언하세요 "
+            "(게이트가 아티팩트에서 다시 풀어 대조하므로 날조할 수 없습니다)",
+        )
+        return
     if design_value is not None:
         # 상한은 **대역이 붙어야 숫자다.** 2026-08-06 통합 검증에서 잡힌 실제 오판정:
         # 설정이 6.53 dB 를 선언했는데 그것은 150-600Hz 에서 푼 값이었고,
@@ -1400,10 +1427,14 @@ def _audit_plant_confidence_ceiling(
     # 다시 재면 sha 는 바뀌지만 설정의 숫자는 그대로 남아 계속 통과한다 — 게이트가
     # 자기 자신을 증명하는 구조였다.
     recomputed: float | None = None
+    worst_octave_hz: float | None = None
     recompute_note = ""
     if design_value is not None:
         try:
-            from ..dsp.design_ceiling import cached_design_ceiling_db
+            from ..dsp.design_ceiling import (
+                cached_design_ceiling_db,
+                worst_octave_ceiling_db,
+            )
 
             band_lo, band_hi = (
                 float(v) for v in tuple(readiness_cfg["measured_design_ceiling_band_hz"])[:2]
@@ -1415,7 +1446,19 @@ def _audit_plant_confidence_ceiling(
                 band_hz=(band_lo, band_hi),
                 sample_rate=float(secondary["sample_rate"]),
             )
-            recomputed = float(solved.ceiling_db)
+            # **옥타브별 최악값이 진짜 구속이다.** 대역평균은 저역의 큰 여유가 중역의
+            # 병목을 가린다 — 실측 official 에서 전대역 4.83 dB 인데 옥타브 500 은
+            # 2.159 dB 뿐이다. 절대목표 1의 평가(G4)가 옥타브별이므로 진입 게이트도
+            # 같은 축에서 판정해야 한다. 평균이 최악값을 가리는 것이 이 저장소가
+            # 반복해서 겪은 실패 형태다.
+            worst_octave_db, worst_octave_hz = worst_octave_ceiling_db(
+                _repo_path(primary["path"]),
+                _repo_path(secondary["path"]),
+                lead_samples=int(lead_samples),
+                band_hz=(band_lo, band_hi),
+                sample_rate=float(secondary["sample_rate"]),
+            )
+            recomputed = float(min(solved.ceiling_db, worst_octave_db))
             if not solved.stable_over_regularisation:
                 recompute_note = " (⚠ 정규화에 민감 — 수치를 신뢰하기 어렵다)"
         except Exception as exc:  # noqa: BLE001 — 재계산 실패는 판정 불가다
@@ -1449,6 +1492,8 @@ def _audit_plant_confidence_ceiling(
     details = {
         "gamma_ceiling_db": gamma_ceiling,
         "design_ceiling_db": design_ceiling if math.isfinite(design_ceiling) else None,
+        "recomputed_ceiling_db": recomputed,
+        "worst_octave_hz": worst_octave_hz if recomputed is not None else None,
         "design_ceiling_band_hz": (
             [float(v) for v in tuple(readiness_cfg["measured_design_ceiling_band_hz"])[:2]]
             if design_value is not None

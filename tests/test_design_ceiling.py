@@ -139,15 +139,26 @@ def test_shipped_declaration_matches_the_recomputation() -> None:
     )
     lead = int(data_sim["digital_reference_lead_samples"])
 
-    solved = cached_design_ceiling_db(
+    from deep_anc.dsp.design_ceiling import worst_octave_ceiling_db
+
+    band_solved = cached_design_ceiling_db(
         primary, secondary, lead_samples=lead, band_hz=band, sample_rate=float(FS)
     )
-    assert declared <= solved.ceiling_db + DESIGN_CEILING_TOLERANCE_DB, (
-        f"출하 선언 {declared:.2f} dB 가 재계산 {solved.ceiling_db:.2f} dB 보다 낙관적입니다"
+    worst_db, worst_hz = worst_octave_ceiling_db(
+        primary, secondary, lead_samples=lead, band_hz=band, sample_rate=float(FS)
     )
-    # 재계산이 "그럴듯한 숫자" 인지도 함께 본다 — 0 이나 30 이 나오면 계산이 깨진 것이다.
-    assert 3.0 < solved.ceiling_db < 8.0, solved
-    # 경계를 명시한다: 2026-08-06 실측 재계산 4.83 dB, 출하 선언 4.58 dB.
-    # 선언이 4.83 + 0.5 = 5.33 을 넘으면 게이트가 거부한다 (5.5 로 직접 확인).
-    assert solved.ceiling_db == pytest.approx(4.83, abs=0.30), solved
-    assert declared == pytest.approx(4.58, abs=0.01)
+    # **구속하는 것은 옥타브별 최악값이다.** 대역평균은 저역의 큰 여유가 중역의
+    # 병목을 가린다 — 실측: 전대역 4.83 dB 인데 옥타브 500 은 2.16 dB 뿐이다.
+    assert declared <= worst_db + DESIGN_CEILING_TOLERANCE_DB, (
+        f"출하 선언 {declared:.2f} dB 가 최악 옥타브 재계산 {worst_db:.2f} dB "
+        f"({worst_hz:.0f} Hz) 보다 낙관적입니다"
+    )
+    # 재계산이 "그럴듯한 숫자" 인지 — 0 이나 30 이 나오면 계산이 깨진 것이다.
+    assert 3.0 < band_solved.ceiling_db < 8.0, band_solved
+    assert 1.0 < worst_db < 4.0, (worst_db, worst_hz)
+    # 경계를 숫자로 고정한다 (2026-08-06 실측, official P1602/S1462/lead 116):
+    #   전대역 [150,1600] 4.83 dB · 최악 옥타브 500 Hz 2.16 dB · 출하 선언 2.15 dB
+    assert band_solved.ceiling_db == pytest.approx(4.83, abs=0.30), band_solved
+    assert worst_db == pytest.approx(2.16, abs=0.20), (worst_db, worst_hz)
+    assert worst_hz == pytest.approx(500.0, abs=1.0)
+    assert declared == pytest.approx(2.15, abs=0.01)

@@ -609,6 +609,30 @@ def _validate_alignment(
         _append_error(result, f"정렬 검사 실패: {exc}")
         return
 
+    # 원본 기준 지연은 **세션이 이미 기록해 둔 값**을 읽는다. 다시 재면 그것이
+    # 네 번째 유도가 된다 — 2026-08-06 에 실제로 그렇게 만들었다가 지웠다.
+    #   1849   P(z) 유도 (bulk 1602 + argmax 247)
+    #   1651   여기서 다시 잰 값
+    #   1507.8 세션의 timeline.raw_lag_median_samples (n=82 중앙)
+    # 세 값이 전부 달랐고, 셋 다 "재생→ERR 지연" 이라는 같은 이름을 쓰고 있었다.
+    # 세션이 저장 시점에 기록한 값이 그 세션의 사실이므로 그것을 단일 출처로 삼는다.
+    raw_delay_median = float("nan")
+    raw_reference = "source.wav"
+    meta_path = session_path / "session.json"
+    if meta_path.is_file():
+        try:
+            timeline = (
+                json.loads(meta_path.read_text(encoding="utf-8")).get("timeline") or {}
+            )
+            value = timeline.get("raw_lag_median_samples")
+            if value is not None:
+                raw_delay_median = float(value)
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            raw_delay_median = float("nan")
+    if not source_path.name.startswith("source_aligned"):
+        raw_delay_median = float(delay_check.measured["median_samples"])
+        raw_reference = source_path.name
+
     control_coherence = coherence_check.measured.get("control_coherence")
     alignment.update(
         {
@@ -643,6 +667,13 @@ def _validate_alignment(
             "delay_window_samples": int(delay_check.measured["window_samples"]),
             "delay_estimator": "deep_anc.data.timeline.measure_delay_trajectory",
             "ok": bool(coherence_check.ok and high_check.ok and delay_check.ok),
+            # **원본 기준 지연을 별도 키로 낸다.** 위의 source_err_delay_* 는 학습이
+            # 읽는 파일(재정렬본이 있으면 그것)에서 잰 값이라, 재정렬 후 잔여 음향
+            # 지연(약 142 샘플)이다. P(z) 유도값(재생→ERR 총지연 약 1849)과 대조하려면
+            # 원본 source.wav 를 재야 한다. 같은 이름이 두 물리량을 오가던 것이
+            # 2026-08-06 통합 검증이 잡은 결함이고, 이름을 갈라 해소한다.
+            "raw_source_err_delay_median_samples": raw_delay_median,
+            "raw_source_reference_file": raw_reference,
         }
     )
     result["alignment"] = alignment
