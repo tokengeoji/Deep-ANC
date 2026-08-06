@@ -320,15 +320,22 @@ GATES: tuple[GateDeclaration, ...] = (
     GateDeclaration(
         gate_id="measured_source_delay_agreement",
         owner=_READINESS,
-        what_it_asserts="실측 세션의 source→ERR 지연이 P(z) 유도값과 일치한다 (D2)",
+        what_it_asserts=(
+            "합성 브랜치와 실측 브랜치가 모델에게 주는 **총 선행량**이 같다 (D2) —"
+            " 다르면 같은 모델이 두 브랜치에서 서로 다른 예측 과제를 배운다"
+        ),
         negative_fixture=(
             "tests/test_finetune_readiness.py::"
-            "test_readiness_rejects_recorded_delay_disagreeing_with_the_primary_path"
+            "test_the_two_training_branches_must_give_the_same_total_advance"
         ),
         positive_fixture=(
-            "tests/test_finetune_readiness.py::test_every_entry_gate_passes_at_its_declared_boundary"
+            "tests/test_finetune_readiness.py::"
+            "test_the_two_training_branches_must_give_the_same_total_advance"
         ),
-        positive_probe="source→ERR 지연 어긋남 7 샘플 = 허용 8.0 의 90%",
+        positive_probe=(
+            "timeline 모드에서 합성 1718 vs 실측 1718 (차이 0 샘플) — 같은 데이터에서 "
+            "constant 는 1459 샘플 어긋나 FAIL 한다"
+        ),
     ),
     GateDeclaration(
         gate_id="plant_confidence_ceiling",

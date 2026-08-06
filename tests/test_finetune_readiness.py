@@ -306,6 +306,10 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
             "reference_mode": "digital",
             "digital_primary_path_mode": "measured",
             "digital_reference_lead_samples": 3,
+            # 두 브랜치의 총 선행량을 맞추는 구성 — 출하 설정과 같다.
+            # constant 면 합성 D_noise+K 와 실측 잔여+K 가 어긋난다(실측 1460 샘플).
+            "d_noise_delay_samples": 100,
+            "recorded_lead_mode": "timeline",
             "closed_loop": {
                 "feedback_delay_samples": [4, 8],
                 "warmup_seconds": 0.0,
@@ -1108,40 +1112,6 @@ def test_readiness_refuses_when_only_some_declared_tags_have_a_manifest(tmp_path
     assert "manifest 가 없는" in gate["message"]
 
 
-# ---- D2 실측-측정 지연 교차검증 --------------------------------------------------------
-def test_readiness_rejects_recorded_delay_disagreeing_with_the_primary_path(tmp_path):
-    """실측 세션의 source→ERR 지연이 P(z) 유도값과 다르면 FAIL 한다.
-
-    2026-08-05 감사: 독립 세 방법이 ~1670 으로 일치하는데 유도값은 ~1850~1950 이었다.
-    차이 180~280 샘플(4~6 ms), 비용은 계열별 +0.71 ~ +2.39 dB. 검사하는 게이트가 없었다.
-    """
-
-    # P(z) 는 지연 4 를 신고하는데 실측 세션은 60 샘플 지연으로 녹음됐다.
-    manifest = _recorded_manifest(tmp_path / "data", source_delay_samples=60)
-    cfg = _ready_config(tmp_path, manifest=manifest)
-
-    report = audit_finetune_readiness(cfg)
-
-    assert not report["ok"]
-    gate = _gate(report, "measured_source_delay_agreement")
-    assert not gate["ok"]
-    assert "두 방법으로 잰 값이 다릅니다" in gate["message"]
-    assert gate["details"]["mismatch_samples"] > 8.0
-
-
-def test_readiness_refuses_a_delay_crosscheck_with_too_few_sessions(tmp_path):
-    """표본 하나짜리 중앙값으로 지연 부기를 승인하지 않는다."""
-
-    cfg = _ready_config(tmp_path)
-    cfg["readiness"]["min_delay_crosscheck_sessions"] = 10_000
-
-    report = audit_finetune_readiness(cfg)
-
-    gate = _gate(report, "measured_source_delay_agreement")
-    assert not gate["ok"]
-    assert "자기증명" in gate["message"]
-
-
 # ---- G1c 달성 가능 상한 ---------------------------------------------------------------
 def test_readiness_rejects_a_target_above_the_achievable_ceiling(tmp_path):
     """플랜트가 허용하는 상한을 넘는 목표는 **학습 시작 전에** 막는다."""
@@ -1599,24 +1569,6 @@ def test_every_entry_gate_passes_at_its_declared_boundary(tmp_path):
     assert len(report["checks"]) >= 14
 
 
-def test_measured_delay_agreement_is_not_a_free_pass_one_sample_further(tmp_path):
-    """한계의 90% 에서 PASS 하는 그 게이트가 한계를 넘으면 FAIL 하는가.
-
-    오기각 방지 테스트가 "게이트가 꺼져 있어서 통과" 를 증명하는 사고를 막는다.
-    """
-
-    cfg = _boundary_config(tmp_path)
-    manifest = _recorded_manifest(
-        tmp_path / "beyond", source_delay_samples=ERR_MIC_DELAY_SAMPLES + 20
-    )
-    cfg["recorded_manifest"] = str(manifest)
-
-    report = audit_finetune_readiness(cfg)
-
-    gate = _gate(report, "measured_source_delay_agreement")
-    assert not gate["ok"], gate
-
-
 def test_completion_gates_pass_at_the_minimum_sample_boundary(tmp_path):
     """완료 게이트 전부가 **최소 표본**의 정상 산출물에서 PASS 한다.
 
@@ -1852,58 +1804,91 @@ def test_readiness_alignment_thresholds_actually_reach_the_qa():
         )
 
 
-def test_delay_crosscheck_refuses_a_realigned_reference_instead_of_comparing_it():
-    """D2 — **같은 이름이 두 물리량을 오가는 것**을 숫자 비교 전에 잡는다.
+def test_the_two_training_branches_must_give_the_same_total_advance():
+    """D2 재설계 — **두 브랜치가 모델에게 같은 과제를 주는가.**
 
-    ⚠ 2026-08-06 통합 검증. QA 는 "학습이 실제로 읽는 파일" 을 재므로 재정렬본이
-    있으면 그것을 잰다. 그 값은 정렬 후 **잔여** 음향 지연(약 142 샘플)이고, 이
-    게이트가 P(z) 유도값(1849)과 대조하려는 것은 **원본 재생→ERR 총지연**(관측 약
-    1672)이다. 그대로 비교하면 1706 샘플짜리 가짜 실패가 나오고, 그 가짜 실패가
-    진짜 결함(1672 vs 1849 = 177 샘플, 허용 64 의 2.8배)을 덮는다.
+    2026-08-07. 옛 판정은 실측 세션의 **절대** source→ERR 지연을 P(z) 유도값과
+    대조했는데, 그 관측량은 재현되지 않는다 — 82세션 산포가 1425.6~1614.2(폭 189 샘플)로
+    허용치 64 의 3배다. 설정 차이가 아니고(둘 다 latency=low, block=256) 추정기 차이도
+    아니다(같은 추정기로도 248 샘플).
 
-    두 경우 다 FAIL 이지만 **이유가 달라야** 한다 — 그것이 이 테스트의 요점이다.
+    걱정 자체는 옳았다. 그것을 **재현되는 양**으로 다시 세운다 — 총 선행량이다::
+
+        합성 = D_noise + K
+        실측 = d_recorded + K'
+
+    실측(2026-08-06): ``recorded_lead_mode=constant`` 이면 합성 1718 vs 실측 258 로
+    **1460 샘플(30.4 ms)** 어긋난다. ``timeline`` 이면 0.1 샘플이 된다.
     """
 
     from deep_anc.train.finetune_readiness import _Audit, _audit_measured_source_delay
 
-    primary = {
-        "path": "assets/measured/primary_path_il.npz",
-        "delay_samples": 1_602,
-    }
+    primary = {"path": "assets/measured/primary_path_il.npz", "delay_samples": 1_602}
 
-    def _run(reference: str, observed: float) -> dict:
+    def _run(residual: float, lead_mode: str, sessions: int = 10) -> dict:
         audit = _Audit("t")
         report = {
             "sessions": [
-                {
-                    "alignment_reference": reference,
-                    "alignment": {"source_err_delay_median_samples": observed},
-                }
-                for _ in range(10)
+                {"alignment": {"source_err_delay_median_samples": residual}}
+                for _ in range(sessions)
             ]
         }
-        _audit_measured_source_delay(audit, {}, primary, report)
+        data_cfg = {
+            "d_noise_delay_samples": 1_602,
+            "digital_reference_lead_samples": 116,
+            "recorded_lead_mode": lead_mode,
+        }
+        _audit_measured_source_delay(audit, {}, primary, report, data_cfg)
         return next(
             item
             for item in audit.report()["checks"]
             if item["id"] == "measured_source_delay_agreement"
         )
 
-    # (a) 재정렬본 — 숫자를 비교하지 않고 "비교할 수 없다" 고 말해야 한다.
-    realigned = _run("source_aligned.wav", 142.5)
-    assert not realigned["ok"]
-    assert "재정렬본" in realigned["message"]
-    # 가짜 숫자(1706)를 근거로 들지 않는다.
-    assert "차이 1706" not in realigned["message"]
+    # (a) constant 모드 — 실측 잔여 142.5 면 두 브랜치가 1460 샘플 어긋난다. FAIL.
+    constant = _run(142.5, "constant")
+    assert not constant["ok"]
+    assert "총 선행량" in constant["message"]
+    assert "1459" in constant["message"], constant["message"]
+    assert "timeline" in constant["message"]  # 처방을 함께 말한다
 
-    # (b) 원본 — 진짜 결함이 그대로 드러나야 한다 (가려지면 안 된다).
-    raw = _run("source.wav", 1_672.0)
-    assert not raw["ok"]
-    assert "177" in raw["message"] and "허용 64" in raw["message"]
+    # (b) timeline 모드 — 같은 데이터에서 통과한다. 즉 게이트가 항상 실패하지 않는다.
+    timeline = _run(142.5, "timeline")
+    assert timeline["ok"], timeline
+    assert timeline["details"]["synthetic_advance_samples"] == 1_718.0
+    assert timeline["details"]["recorded_advance_samples"] == pytest.approx(1_718.0, abs=1.0)
 
-    # (c) 짝: 원본 기준에서 유도값과 맞으면 통과한다 (게이트가 항상 실패하지 않는다).
-    agreeing = _run("source.wav", 1_849.0)
-    assert agreeing["ok"]
+    # (c) 표본이 모자라면 판정하지 않는다 — 없는 것을 통과로 세지 않는다.
+    thin = _run(142.5, "timeline", sessions=3)
+    assert not thin["ok"]
+    assert "표본" in thin["message"]
+
+
+def test_the_gate_refuses_when_the_synthetic_advance_is_unknown():
+    """``d_noise_delay_samples`` 가 없으면 두 브랜치를 맞출 수 없다 — 추측하지 않는다."""
+
+    from deep_anc.train.finetune_readiness import _Audit, _audit_measured_source_delay
+
+    audit = _Audit("t")
+    report = {
+        "sessions": [
+            {"alignment": {"source_err_delay_median_samples": 142.5}} for _ in range(10)
+        ]
+    }
+    _audit_measured_source_delay(
+        audit,
+        {},
+        {"path": "assets/measured/primary_path_il.npz", "delay_samples": 1_602},
+        report,
+        {"digital_reference_lead_samples": 116},
+    )
+    gate = next(
+        item
+        for item in audit.report()["checks"]
+        if item["id"] == "measured_source_delay_agreement"
+    )
+    assert not gate["ok"]
+    assert "d_noise_delay_samples" in gate["message"]
 
 
 def test_readiness_rejects_a_pool_the_sessions_did_not_actually_play(tmp_path):

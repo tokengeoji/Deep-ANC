@@ -10,7 +10,7 @@
 최종 갱신 **2026-08-07 00:30 KST**. 학습·파인튜닝은 **엘리스에서** 한다(사용자 결정).
 로컬은 녹음과 코드 정확성 담당이고, 로컬에서 할 수 있는 것은 아래 §0.5-1 하나만 남았다.
 
-### 진입 게이트: 11 PASS / 3 FAIL
+### 진입 게이트: 12 PASS / 2 FAIL
 
 ```
 python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
@@ -19,9 +19,11 @@ python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
 
 | FAIL | 담당 | 비고 |
 |---|---|---|
-| `completed_init_checkpoint` | 엘리스 | 체크포인트 26개 전부 `[150,600]`. 재사전학습 필요 |
-| `corpus_disjoint` | 엘리스 | `dns_fullband` 0.30 · `demand` 0.08 · `machine` 0.07 = 0.45 미확보 |
-| `measured_source_delay_agreement` | **사람 결정** | 아래 §0.4 |
+| `completed_init_checkpoint` | **엘리스** | 체크포인트 26개 전부 `[150,600]`. 재사전학습 필요 |
+| `corpus_disjoint` | **엘리스** | `dns_fullband` 0.30 · `demand` 0.08 · `machine` 0.07 = 0.45 미확보 |
+
+**로컬에서 할 수 있는 것은 끝났다.** 남은 둘은 이 장비에서 불가능하다
+(디스크 8.4G, DNS 압축본만 15.7G).
 
 ### 하드웨어 — 해결됐다 (2026-08-06)
 
@@ -57,34 +59,31 @@ speech         16    15      7 / 4 / 4
 세션 기반 교차검증(스피커 무사용, `src/deep_anc/data/path_from_sessions.py`):
 REF→ERR 복소일치 0.9658~0.9949, source→ERR 0.9663~0.9892 (이득만 +2.1~+5.2 dB 다름).
 
-### 0.4 ⛔ 사람이 정해야 하는 것 — `measured_source_delay_agreement`
+### 0.4 ✅ 해소 — 두 학습 브랜치가 30 ms 다른 과제를 배우고 있었다 (2026-08-07)
 
-**게이트가 재현되지 않는 양을 기준으로 삼고 있다.**
+`measured_source_delay_agreement` 가 **재현되지 않는 양**(실측 절대 지연, 82세션 산포
+189 샘플 vs 허용 64)을 기준으로 삼고 있었다. 걱정 자체는 옳았지만 비교 대상이 틀렸다.
 
-```
-82세션 관측 산포   1425.6 ~ 1614.2   폭 189 샘플
-게이트 허용치                        64 샘플
-```
+파고들었더니 **진짜 결함이 그 뒤에 있었다**::
 
-같은 물리량("재생→ERR 지연")이 저장소에 여러 값으로 존재한다::
+    recorded_lead_mode = "constant"  (기본값)
+      합성  x_ref 가 d 보다  D_noise 1602 + K 116 = 1718 샘플 앞선다
+      실측  x_ref 가 d 보다  잔여 142.5 + K 116  =  258 샘플 앞선다
+      → 1460 샘플 (30.4 ms) 어긋남
 
-    1849       P(z) 유도 (bulk 1602 + argmax 247)   ← 게이트가 쓰는 값
-    1507.8     세션이 기록한 raw_lag_median_samples (n=82 중앙)
-    1565~1659  문서가 적은 low-latency 재현 범위
+파인튜닝은 합성 30% + 실측 70% 다. 같은 모델이 두 브랜치에서 **다른 예측 과제**를
+배운다 — 이 상태로 60시간을 돌리면 결과가 무의미하다.
 
-설정 차이가 아니고(둘 다 latency=low, block=256) 추정기 차이도 아니다(같은 추정기로도
-248 샘플). HANDOFF 자신이 이미 적고 있다 — "절대 지연은 재현되지 않는다. P−S 만이
-물리 불변량이다."
+고치는 기계장치(`RecordedLeadPlan.timeline`)는 이미 있었는데 **배선이 끊겨 있었다**.
+`d_noise_delay_samples` 가 duct.yaml 에 있고 `RecordedANCDataset` 은 data_cfg 만 받아서,
+켜면 "d_noise_delay_samples 가 필요합니다" 로 실패했다. 그래서 아무도 켜지 못했다.
 
-게이트의 걱정(합성 d 와 실측 d 가 다른 위치에 놓인다)은 옳지만 비교 대상이 틀렸다.
-선택지::
+- `config.py` 가 duct → data 로 값을 **통과**시킨다 (유도가 아니라 복사)
+- `data_sim.yaml` 에 `recorded_lead_mode: timeline`
+- 게이트를 **총 선행량** 일치로 재설계 — 잔여 지연은 82세션에서 142.0~144.1,
+  std 0.32 로 재현되고 기하 예측 140 과 2.5 샘플 안에서 일치한다
 
-    A  허용치를 관측 산포에 맞춘다 (64 → 200+)     게이트가 사실상 무력해진다
-    B  불변량을 바꾼다 (P−S 또는 REF→ERR 잔여지연)  게이트 재설계 필요. 물리적으로 옳다
-    C  합성 d 지연을 세션 실측 중앙(1508)에 맞춘다  두 브랜치가 같은 곳에 놓인다
-
-**제안은 C 먼저, 그다음 B.** C 는 `configs/duct.yaml` 의 `d_noise_delay_samples` 를
-1602 → 1508 로 바꾸는 것이고 **학습 물리를 바꾸므로** 사람 승인이 필요하다.
+실측 확인 (48세션 전부): 합성 1718 vs 실측 1717.5~1718.5, 차이 **+0.1 샘플**.
 
 ### 0.5 ⛔ 물리 한계 — 옥타브 500 Hz
 

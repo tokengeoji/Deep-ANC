@@ -1194,18 +1194,28 @@ def _audit_measured_source_delay(
     readiness_cfg: dict,
     primary: dict | None,
     recorded_report: dict | None,
+    data_cfg: dict | None = None,
 ) -> None:
-    """D2 — 실측 세션에서 **직접 잰** source→ERR 지연이 P(z) 유도값과 맞는가.
+    """D2 — **두 학습 브랜치가 모델에게 같은 과제를 주는가.**
 
-    전형적인 군집 A 결함이다: 같은 물리량을 두 곳에서 따로 유도하고 아무도 대조하지
-    않았다. 실측 관측(포락선 상관 80세션 중앙값 1672 / 반송파 상관 40세션 1663±73 /
-    제어기 시작지연 스윕 ~1670)이 서로 일치하는데 유도값만 어긋나 있었다.
+    합성 브랜치와 실측 브랜치가 x_ref 를 d 보다 **같은 만큼** 앞세워야 한다. 아니면
+    같은 모델이 두 브랜치에서 서로 다른 예측 과제를 배운다.
+
+    2026-08-07 재설계 — 옛 판정은 **절대** source→ERR 지연을 P(z) 유도값과 대조했는데,
+    그 관측량은 재현되지 않는다(82세션 산포 189 샘플 vs 허용 64). 걱정은 옳았지만
+    비교 대상이 틀렸다. 지금은 **총 선행량**을 본다:
+
+        합성 = D_noise + K
+        실측 = d_recorded + K'
+
+    ``d_recorded``(정렬 잔여 지연)는 82세션에서 142.0~144.1, std 0.32 로 재현되고
+    기하 예측 140 샘플과 2.5 샘플 안에서 일치한다.
+
+    실측(2026-08-06): ``recorded_lead_mode=constant`` 이면 합성 1718 vs 실측 258 로
+    **1460 샘플(30.4 ms)** 어긋났다. ``timeline`` 으로 바꾸면 차이가 0.1 샘플이 된다.
     """
 
-    from ..dsp.invariants import (
-        check_measured_delay_agreement,
-        derive_playback_to_error_delay_samples,
-    )
+    data_cfg = data_cfg or {}
 
     if primary is None:
         audit.fail(
@@ -1227,58 +1237,97 @@ def _audit_measured_source_delay(
     # 아니다. 대조하면 1706.5 샘플 어긋나 무조건 FAIL 하고, 그 가짜 실패가 진짜 결함
     # (원본 관측 1672 vs 유도 1849 = 177 샘플, 허용 64 의 2.8배)을 덮는다.
     # 숫자를 비교하기 전에 **무엇을 잰 값인지** 먼저 본다.
-    # QA 가 재정렬본을 쟀으면 그 값은 잔여 음향 지연(약 142 샘플)이다. 이 게이트가
-    # 필요한 것은 **원본 재생→ERR 총지연**이므로 QA 가 따로 내는 raw 키를 읽는다.
-    # 2026-08-06 이전에는 두 물리량이 같은 이름을 써서 1706 샘플짜리 가짜 실패가
-    # 났고, 그 가짜 실패가 진짜 결함(177 샘플)을 덮었다.
-    def _observed(session: dict) -> float | None:
+    # ⚠ 2026-08-07 재설계 — **비교 대상이 재현되지 않는 양이었다.**
+    #
+    # 옛 게이트는 실측 세션의 **절대** source→ERR 지연을 P(z) 유도값(bulk + argmax)과
+    # 대조했다. 그런데 그 관측량은 재현되지 않는다 — 82세션 실측 산포가
+    # 1425.6~1614.2 (폭 189 샘플) 로 허용치 64 의 3배다. 설정 차이가 아니고
+    # (둘 다 latency=low, block=256) 추정기 차이도 아니다 (같은 추정기로도 248 샘플).
+    # HANDOFF 가 이미 적고 있다: "절대 지연은 재현되지 않는다."
+    #
+    # 게이트의 **걱정은 옳았다**: 합성 d 와 실측 d 가 모델에게 다른 과제를 주면 안 된다.
+    # 그 걱정을 재현되는 양으로 다시 세운다 — **총 선행량**(x_ref 가 d 보다 얼마나
+    # 앞서는가)이다. 두 브랜치가 이것만 맞으면 같은 물리를 배운다.
+    #
+    #     합성:  D_noise + K
+    #     실측:  d_recorded + K'      (K' 는 세션마다 timeline 모드가 유도)
+    #
+    # 재현성 실측(2026-08-06, 82세션): aligned_lag_median 142.0~144.1, std 0.32.
+    # 기하 예측(REF 0.10m → ERR 1.10m = 140 샘플)과 2.5 샘플 안에서 일치한다.
+    # 절대 지연(폭 189)과 달리 이 양은 재현된다.
+    advances: list[float] = []
+    for session in recorded_report["sessions"]:
         alignment = session.get("alignment") or {}
-        reference = str(session.get("alignment_reference", ""))
-        key = (
-            "raw_source_err_delay_median_samples"
-            if reference.startswith("source_aligned")
-            else "source_err_delay_median_samples"
-        )
-        value = alignment.get(key)
-        if value is None:
-            return None
-        value = float(value)
-        return value if math.isfinite(value) else None
-
-    missing_raw = sorted(
-        {
-            str(session.get("session_id", "?"))
-            for session in recorded_report["sessions"]
-            if str(session.get("alignment_reference", "")).startswith("source_aligned")
-            and _observed(session) is None
-        }
-    )
-    if missing_raw:
-        audit.fail(
-            "measured_source_delay_agreement",
-            "재정렬된 세션의 **원본 기준** source→ERR 지연이 QA 리포트에 없습니다: "
-            f"{missing_raw[:5]}{' …' if len(missing_raw) > 5 else ''} "
-            f"(총 {len(missing_raw)}개). 재정렬본에서 잰 값(잔여 음향 지연 약 142 샘플)은 "
-            "P(z) 유도값과 물리량이 다르므로 대조할 수 없습니다. QA 를 다시 도세요",
-            sessions_missing_raw_delay=missing_raw[:20],
-        )
-        return
-
-    observations = [
-        value
-        for value in (_observed(session) for session in recorded_report["sessions"])
-        if value is not None
-    ]
+        residual = alignment.get("source_err_delay_median_samples")
+        if residual is None:
+            continue
+        value = float(residual)
+        if math.isfinite(value):
+            advances.append(value)
     minimum_sessions = int(readiness_cfg.get("min_delay_crosscheck_sessions", 8))
-    if len(observations) < minimum_sessions:
+    if len(advances) < minimum_sessions:
         audit.fail(
             "measured_source_delay_agreement",
-            f"지연 교차검증 표본이 {len(observations)}개로 최소 {minimum_sessions}개에 "
-            "미달합니다 — 표본 하나짜리 중앙값으로 지연 부기를 승인하면 이 게이트도 "
-            "자기증명이 됩니다",
-            observations=len(observations),
+            f"정렬 잔여 지연 표본이 {len(advances)}개로 최소 {minimum_sessions}개에 "
+            "미달합니다 — 표본이 없으면 두 브랜치가 같은 과제를 준다고 말할 수 없습니다",
+            observations=len(advances),
         )
         return
+
+    residual_median = float(np.median(np.asarray(advances, dtype=np.float64)))
+    residual_spread = float(np.max(advances) - np.min(advances))
+    lead = int(data_cfg.get("digital_reference_lead_samples", 0))
+    d_noise = int(data_cfg.get("d_noise_delay_samples", 0))
+    lead_mode = str(data_cfg.get("recorded_lead_mode", "constant"))
+    tolerance = float(readiness_cfg.get("max_measured_delay_mismatch_samples", 64.0))
+
+    if d_noise <= 0:
+        audit.fail(
+            "measured_source_delay_agreement",
+            "data.d_noise_delay_samples 가 없습니다 — 합성 브랜치의 총 선행량을 알 수 "
+            "없으면 실측 브랜치와 맞출 수 없습니다 (duct.yaml 에서 통과됩니다)",
+        )
+        return
+
+    synthetic_advance = float(d_noise + lead)
+    recorded_lead = (
+        float(lead)
+        if lead_mode == "constant"
+        else max(0.0, synthetic_advance - residual_median)
+    )
+    recorded_advance = residual_median + recorded_lead
+    mismatch = abs(synthetic_advance - recorded_advance)
+    if mismatch > tolerance:
+        audit.fail(
+            "measured_source_delay_agreement",
+            "두 학습 브랜치가 모델에게 주는 **총 선행량**이 다릅니다: "
+            f"합성 {synthetic_advance:.0f} (D_noise {d_noise} + lead {lead}) vs "
+            f"실측 {recorded_advance:.1f} (잔여 {residual_median:.1f} + lead {recorded_lead:.0f}) "
+            f"— 차이 {mismatch:.1f} > 허용 {tolerance:.0f} 샘플 "
+            f"({mismatch / 48.0:.1f} ms). 같은 모델이 두 브랜치에서 다른 예측 과제를 "
+            "배웁니다. data.recorded_lead_mode=timeline 으로 세션마다 lead 를 유도하세요 "
+            f"(현재 {lead_mode!r})",
+            synthetic_advance_samples=synthetic_advance,
+            recorded_advance_samples=recorded_advance,
+            recorded_lead_mode=lead_mode,
+            residual_median_samples=residual_median,
+        )
+        return
+
+    audit.pass_(
+        "measured_source_delay_agreement",
+        f"두 브랜치의 총 선행량이 일치합니다: 합성 {synthetic_advance:.0f} vs 실측 "
+        f"{recorded_advance:.1f} (차이 {mismatch:.1f} <= {tolerance:.0f} 샘플). "
+        f"정렬 잔여 지연 {residual_median:.1f} 샘플, {len(advances)}세션 산포 "
+        f"{residual_spread:.1f} — 절대 지연(산포 189)과 달리 이 양은 재현됩니다",
+        synthetic_advance_samples=synthetic_advance,
+        recorded_advance_samples=recorded_advance,
+        residual_median_samples=residual_median,
+        residual_spread_samples=residual_spread,
+        recorded_lead_mode=lead_mode,
+        sessions=len(advances),
+    )
+    return
 
     try:
         with np.load(_repo_path(primary["path"]), allow_pickle=False) as data:
@@ -1853,7 +1902,9 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
     _audit_recorded_alignment(audit, readiness_cfg, recorded_report, full_recorded_qa)
     _audit_statistical_power(audit, readiness_cfg, entries)
     _audit_corpus_leak(audit, readiness_cfg, data_cfg, entries)
-    _audit_measured_source_delay(audit, readiness_cfg, primary, recorded_report)
+    _audit_measured_source_delay(
+        audit, readiness_cfg, primary, recorded_report, data_cfg
+    )
     _audit_plant_confidence_ceiling(
         audit,
         readiness_cfg,
