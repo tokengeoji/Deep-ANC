@@ -70,6 +70,7 @@ from typing import Sequence
 __all__ = [
     "MAX_OUT_OF_BAND_AMPLIFICATION_DB",
     "OCTAVE_BAND_CENTERS_HZ",
+    "GATE_BOUNDARY_GUARD_DB",
     "gate_consistent_margin_db",
     "octave_band_edges_hz",
     "octave_boundary_edges_hz",
@@ -166,10 +167,23 @@ def worst_case_amplification_db(margin_db: float) -> float:
     return 20.0 * math.log10(1.0 + 10.0 ** (margin_db / 20.0))
 
 
+GATE_BOUNDARY_GUARD_DB = 0.01
+"""유도 마진에 항상 빼는 여유. **경계에 정확히 앉지 않게 한다.**
+
+유도가 정확하면 마진을 딱 만족한 모델의 최악 증폭이 정확히 ``G`` 가 된다. 그런데
+게이트는 ``감쇠 <= -G`` 로 **등호를 FAIL** 처리한다 — 즉 유도값을 그대로 쓰면 여유가
+정확히 0 이고, 부동소수점 1e-16 하나에 판정이 갈린다. 실측: 유도 −18.27148961676606
+에서 최악 증폭 0.9999999999999992 dB.
+
+0.01 dB 는 그 경계를 벗어나되 손실을 실질적으로 조이지 않는 값이다(마진이 0.01 dB
+좁아진다). 방향은 항상 **보수적**이다.
+"""
+
+
 def gate_consistent_margin_db(
     gate_db: float = MAX_OUT_OF_BAND_AMPLIFICATION_DB,
     *,
-    plant_uncertainty_db: float = 0.0,
+    plant_uncertainty_db: float = GATE_BOUNDARY_GUARD_DB,
 ) -> float:
     """게이트 임계에서 **유도한** 힌지 마진 — 이것이 유일한 유도 경로다.
 
@@ -180,7 +194,8 @@ def gate_consistent_margin_db(
     희망이고, 2026-08-06 이전의 +6.0 dB 는 희망이었다(실측 −9.53 dB).
 
     ``plant_uncertainty_db`` 는 |S| 추정 오차를 **좁히는 방향으로만** 반영한다 — 이유는
-    모듈 docstring 참조. 기본 0.0 은 "손실이 쓰는 |S| 를 그대로 믿는다" 는 뜻이다.
+    모듈 docstring 참조. 기본값은 :data:`GATE_BOUNDARY_GUARD_DB` 이고, 그것은 경계에
+    정확히 앉는 것을 막기 위한 최소 여유다.
     """
 
     if not math.isfinite(gate_db) or gate_db <= 0.0:

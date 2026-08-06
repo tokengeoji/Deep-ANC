@@ -125,6 +125,10 @@ def design_ceiling_db(
         raise ValueError("P/S FIR 이 비어 있습니다")
     if taps < 16:
         raise ValueError(f"taps 는 16 이상이어야 합니다: {taps}")
+    # 탭 수를 플랜트 지지구간에 맞춘다. FIR 이 10 탭인데 2048 탭 정규방정식을 푸는 것은
+    # 결과를 바꾸지 않으면서 비용만 200배다 — 실측 P/S(각 2048탭)에서는 상한이
+    # 16384 이므로 아무 영향이 없고, 장난감 픽스처에서만 줄어든다.
+    taps = int(min(taps, max(16, 4 * (p.size + s.size))))
 
     length = int(2 ** math.ceil(math.log2(p.size + s.size + taps + int(lead_samples) + 16)))
     p_pad = np.zeros(length)

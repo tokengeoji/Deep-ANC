@@ -347,6 +347,13 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
             "cancellation_ceiling_margin_db": 3.0,
             "min_groups_per_family_per_split": GROUPS_PER_FAMILY_PER_SPLIT,
             "recorded_source_pool_csv": str(source_csv),
+            # 설계 상한 선언 — **생략도 우회다**(2026-08-06). 선언이 없으면 구속 상한이
+            # 플랜트 일관성으로 폴백해 물리적으로 불가능한 목표도 통과한다.
+            # 픽스처 플랜트의 재계산 상한: 최악 옥타브 125 Hz 21.03 dB.
+            # 21.0 은 그 안쪽이면서, 경계 테스트가 미는 target+margin(약 10.9)보다 크다 —
+            # 이 값이 구속하면 다른 게이트의 경계를 시험할 수 없다.
+            "measured_design_ceiling_db": 21.0,
+            "measured_design_ceiling_band_hz": [100, 1000],
             "min_delay_crosscheck_sessions": 8,
             "max_measured_delay_mismatch_samples": 8.0,
         },

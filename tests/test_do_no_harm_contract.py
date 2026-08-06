@@ -125,7 +125,7 @@ def test_a_model_that_exactly_satisfies_the_hinge_passes_the_g4_gate() -> None:
     # 이 fixture 가 몰아붙이는 경계를 명시한다: 출하 마진 **−18.27 dB** 를 정확히
     # 만족하는(= 한 톨도 여유가 없는) 최악 신호다. 여유를 두고 통과시키면 "정상에서
     # 발동하지 않는다" 를 보인 것이 아니다.
-    assert DEFAULT_DNH_MARGIN_DB == pytest.approx(-18.27, abs=0.01)
+    assert DEFAULT_DNH_MARGIN_DB == pytest.approx(-18.28, abs=0.01)
 
     attenuations = _run(_shipped_plan())
     worst_center = min(attenuations, key=lambda fc: attenuations[fc])
@@ -263,10 +263,15 @@ def test_eval_recorded_still_exposes_the_constant() -> None:
 def test_derived_margin_saturates_the_gate_exactly() -> None:
     """유도식이 게이트 임계를 **정확히** 포화시키는지 — 닫힌 형태끼리 대조한다."""
 
-    assert worst_case_amplification_db(gate_consistent_margin_db()) == pytest.approx(
-        MAX_OUT_OF_BAND_AMPLIFICATION_DB, abs=1e-9
-    )
-    assert DEFAULT_DNH_MARGIN_DB == pytest.approx(-18.2715, abs=1e-3)
+    # 경계 **안쪽**에 있어야 한다 — 정확히 같으면 게이트의 등호에 걸린다.
+    worst = worst_case_amplification_db(gate_consistent_margin_db())
+    assert worst < MAX_OUT_OF_BAND_AMPLIFICATION_DB, worst
+    assert worst == pytest.approx(MAX_OUT_OF_BAND_AMPLIFICATION_DB, abs=0.01)
+    # 여유가 0 이 아님을 명시 (2026-08-06 이전에는 정확히 0 이었다)
+    assert MAX_OUT_OF_BAND_AMPLIFICATION_DB - worst > 1e-6
+    # 경계 여유(GATE_BOUNDARY_GUARD_DB=0.01)를 뺀 값이다 — 유도값을 그대로 쓰면
+    # 최악 증폭이 정확히 1.0 dB 가 되고 게이트가 등호를 FAIL 로 본다.
+    assert DEFAULT_DNH_MARGIN_DB == pytest.approx(-18.2815, abs=1e-3)
 
 
 def test_plant_uncertainty_only_tightens_the_margin() -> None:
