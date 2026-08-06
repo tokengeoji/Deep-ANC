@@ -204,8 +204,6 @@ readiness:
   #                   붕괴 세션 std 1019~2216 / range 8869~13532.
   min_source_err_coherence: 0.60
   min_ref_err_coherence: 0.60
-  max_source_err_delay_std_samples: 64
-  max_source_err_delay_range_samples: 256
 
   # ------------------------------------------------------------------------------
   # 코퍼스 누수 (corpus_disjoint) — D1
@@ -237,6 +235,12 @@ readiness:
   #      NS→ERR 거리 1.10 m 의 42% 다. 이보다 크면 마이크 위치를 모르는 것과 같다.
   #   3. 검출력 — 실제 결함 177 샘플은 허용치의 2.8배
   max_measured_delay_mismatch_samples: 64
+  # 지연 궤적 임계 — 폐기된 64/256 은 2026-08-06 에 지웠다. 그 값들은 **광대역 argmax
+  # 추정기의 잡음 바닥(18 샘플)** 에 맞춰진 것이라, 대역제한 PHAT 로 바꾼 지금 그대로 쓰면
+  # 오염군(robust-std 최소 25.2)을 통째로 통과시킨다. QA 가 "더 엄격한 쪽" 으로 마이그레이션
+  # 해 주긴 했지만, 설정만 읽는 사람이 게이트를 오해한다.
+  # 값을 여기 적지 않는다 — deep_anc.dsp.invariants 가 단일 출처이고, 지터 상한은
+  # 신뢰대역 상단(1600Hz)과 코히런스 하한(0.60)에서 유도된다(= 3.41 샘플).
   min_delay_crosscheck_sessions: 8
   # init checkpoint 의 lead 는 surrogate 물리로 학습할 때 쓴 잠정값이다. 실측이
   # 끝나면 몇 샘플 달라지는 것이 정상이고(실측 109/113/116/119, 폭 10샘플),

@@ -749,3 +749,52 @@ def test_do_no_harm_covers_the_whole_complement_of_the_trusted_band() -> None:
         (hi, lo) for (_, hi), (lo, _) in zip(covered, covered[1:]) if lo > hi
     ]
     assert holes == [(150.0, 600.0)]
+
+
+def test_the_shipped_alpha_actually_moves_the_worst_item_budget() -> None:
+    """**출하 설정의 최악값 거동을 숫자로 못 박는다** (절대목표 2).
+
+    2026-08-06 감사가 지적한 빈 곳: alpha=0 과 alpha=1 의 극단은 테스트가 있는데,
+    **실제로 출하되는 값**(0.7)이 배분을 얼마나 움직이는지 강제하는 테스트가 없었다.
+    "CVaR 를 넣었다" 와 "출하 설정이 최악값을 실제로 본다" 는 다른 주장이다.
+
+    측정된 사실: 0.7 은 배분을 **뒤집지 않는다**. 최악 4개의 몫이 늘긴 하지만 최상
+    아이템들이 여전히 상당 부분을 가져간다. 완전히 뒤집는 것은 alpha=1.0 뿐이다.
+    그것을 알고 0.7 을 쓰는 것과 모르고 쓰는 것은 다르므로, 여기에 수치로 남긴다.
+
+    ⚠ 이 테스트는 alpha 를 올리라고 요구하지 않는다. 0.7 을 1.0 으로 올릴지는
+    20k step ablation 이 답할 문제다(초기 분산을 보고 판단). 여기서 강제하는 것은
+    **출하 값이 무엇을 하는지 아무도 모르는 상태가 되지 않는 것**뿐이다.
+    """
+
+    import yaml
+
+    from deep_anc.config import REPO_ROOT
+
+    shipped = float(
+        yaml.safe_load(
+            (REPO_ROOT / "configs" / "train_finetune.yaml").read_text(encoding="utf-8")
+        )["loss"]["nmse_cvar_alpha"]
+    )
+    _, mean_share = _per_item_gradient_share(alpha=0.0, gains=_SPLIT_GAINS)
+    _, shipped_share = _per_item_gradient_share(alpha=shipped, gains=_SPLIT_GAINS)
+    _, pure_share = _per_item_gradient_share(alpha=1.0, gains=_SPLIT_GAINS)
+
+    worst = slice(0, 4)
+    mean_w = float(mean_share[worst].sum())
+    ship_w = float(shipped_share[worst].sum())
+    pure_w = float(pure_share[worst].sum())
+
+    # (a) 출하 값이 평균보다는 확실히 최악값 쪽이다 — 아니면 CVaR 를 넣은 의미가 없다.
+    assert ship_w > 10.0 * mean_w, (
+        f"출하 alpha={shipped} 의 최악4 몫 {ship_w:.4f} 가 평균 집계 {mean_w:.4f} 의 "
+        "10배도 안 됩니다 — 이 설정은 최악값을 사실상 보지 않습니다"
+    )
+    # (b) 그러나 순수 CVaR 만큼은 아니다. 이 간극이 남아 있다는 사실 자체를 고정한다.
+    assert ship_w < pure_w, (ship_w, pure_w)
+    assert pure_w == pytest.approx(1.0, abs=1e-6)
+    # (c) 실제 값을 기록한다 — 누가 alpha 를 바꾸면 여기서 먼저 드러난다.
+    assert ship_w == pytest.approx(0.017, rel=0.35), (
+        f"출하 alpha={shipped} 의 최악4 몫이 {ship_w:.4f} 로 바뀌었습니다. alpha 를 "
+        "조정했다면 이 값과 docstring 을 함께 갱신하세요"
+    )
