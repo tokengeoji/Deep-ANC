@@ -994,7 +994,31 @@ def _recorded_source_clips(csv_path: Path) -> dict[str, list[str]]:
     return families
 
 
-def observed_source_pools(recorded_root: Path) -> dict[str, int]:
+def _recorded_session_root(readiness_cfg: dict, entries: list[dict] | None) -> Path | None:
+    """실측 세션이 실제로 놓인 디렉터리. **매니페스트 항목에서 유도한다.**
+
+    설정이 ``recorded_session_root`` 를 명시하면 그것이 우선한다. 그 외에는 이미 읽어 둔
+    매니페스트 항목의 경로를 따라간다 — 학습이 읽는 것이 매니페스트이므로 그것이 사실이다.
+
+    전역 기본값("data/recorded")을 두면 **tmp_path 픽스처가 개발자의 실제 녹음을 읽는다.**
+    2026-08-06 에 실제로 그렇게 테스트 8개가 깨졌다. 알 수 없으면 ``None`` 을 돌려주고,
+    호출자는 대조를 건너뛴다 — 없는 것을 지어내지 않는다.
+    """
+
+    declared = readiness_cfg.get("recorded_session_root")
+    if declared:
+        return _repo_path(declared)
+    for entry in entries or []:
+        raw = str(entry.get("path") or "")
+        if not raw:
+            continue
+        candidate = Path(raw)
+        if candidate.is_dir():
+            return candidate.parent
+    return None
+
+
+def observed_source_pools(recorded_root: Path | None) -> dict[str, int]:
     """실측 세션이 **실제로 재생한** 소스풀을 세션에서 읽어 센다.
 
     왜 설정이 아니라 세션인가
@@ -1013,7 +1037,7 @@ def observed_source_pools(recorded_root: Path) -> dict[str, int]:
     """
 
     counts: dict[str, int] = {}
-    if not recorded_root.is_dir():
+    if recorded_root is None or not recorded_root.is_dir():
         return counts
     for session_dir in sorted(recorded_root.iterdir()):
         meta = session_dir / "session.json"
@@ -1057,7 +1081,9 @@ def _synthetic_clip_index(
     return by_tag, splits
 
 
-def _audit_corpus_leak(audit: "_Audit", readiness_cfg: dict, data_cfg: dict) -> None:
+def _audit_corpus_leak(
+    audit: "_Audit", readiness_cfg: dict, data_cfg: dict, entries: list[dict] | None = None
+) -> None:
     """D1 — 합성 학습 스트림과 실측이 **같은 원본 오디오**를 쓰지 않는가.
 
     2026-08-05 감사: 실측 music 60 트랙이 **100%** 합성 풀과 겹치고 그중 55개(92%)가
@@ -1079,8 +1105,12 @@ def _audit_corpus_leak(audit: "_Audit", readiness_cfg: dict, data_cfg: dict) -> 
         # 실측 세션이 **실제로 재생한** 풀을 먼저 읽는다. 설정은 대조 대상이지
         # 단일 출처가 아니다 — v2 로 녹음하고 이 키를 v1 로 두면 게이트가 엉뚱한
         # 클립끼리 비교해 PASS 하면서 누수를 100% 통과시킨다 (2026-08-06 재현됨).
+        # 세션 위치는 **매니페스트가 가리키는 곳**에서 유도한다. 전역 기본값
+        # ("data/recorded")을 쓰면 tmp_path 픽스처가 개발자의 실제 녹음을 읽어 버린다 —
+        # 2026-08-06 에 실제로 그렇게 테스트 8개가 깨졌다. 매니페스트가 학습이 읽는
+        # 세션의 단일 출처이므로 그것을 따라간다.
         observed = observed_source_pools(
-            _repo_path(readiness_cfg.get("recorded_session_root", "data/recorded"))
+            _recorded_session_root(readiness_cfg, entries)
         )
         # 설정은 문자열 하나 또는 목록이다. 재녹음이 두 풀에 걸치는 것은 **정상**이다 —
         # 복구된 47세션(v1)과 신규 33세션(v2)을 합치면 계열별 그룹이 하한을 넘기고
@@ -1777,7 +1807,7 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
 
     _audit_recorded_alignment(audit, readiness_cfg, recorded_report, full_recorded_qa)
     _audit_statistical_power(audit, readiness_cfg, entries)
-    _audit_corpus_leak(audit, readiness_cfg, data_cfg)
+    _audit_corpus_leak(audit, readiness_cfg, data_cfg, entries)
     _audit_measured_source_delay(audit, readiness_cfg, primary, recorded_report)
     _audit_plant_confidence_ceiling(
         audit,
