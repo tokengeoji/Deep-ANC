@@ -90,7 +90,15 @@ def already_recorded(out_root: Path) -> set[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sources", default="data/source_pool/sources.csv")
+    parser.add_argument(
+        "--sources",
+        default="data/source_pool_v2/sources.csv",
+        help=(
+            "재생할 소스 목록. **v2 가 기본이다** — v1 은 machine 이 8 그룹뿐이라 "
+            "분할 하한(계열별 9 = val 4 + test 4 + train 1)을 만족할 수 없고, "
+            "그 풀로 녹음하면 make_recorded_manifest 가 EXIT=2 로 거부한다"
+        ),
+    )
     parser.add_argument("--out-root", default="data/recorded")
     parser.add_argument("--amplitude", type=float, default=0.15)
     parser.add_argument("--limit", type=int, default=None, help="이번 실행에서 녹음할 최대 세션 수")

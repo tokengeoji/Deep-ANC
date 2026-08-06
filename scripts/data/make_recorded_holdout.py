@@ -63,7 +63,15 @@ def collect(sources_csv: Path) -> dict[str, list[str]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sources", default="data/source_pool/sources.csv")
+    parser.add_argument(
+        "--sources",
+        action="append",
+        default=None,
+        help=(
+            "실측 재생에 쓴 소스 목록(반복 지정 가능). 기본은 v2. 두 풀이 섞인 "
+            "재녹음이라면 **양쪽을 다 지정해야** held-out 이 실제 재생분을 덮는다"
+        ),
+    )
     parser.add_argument("--out", default="data/manifests/recorded_holdout.json")
     parser.add_argument(
         "--synthetic-root",
@@ -72,11 +80,33 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    sources_csv = REPO_ROOT / args.sources
-    if not sources_csv.is_file():
-        print(f"sources.csv 가 없습니다: {sources_csv}", file=sys.stderr)
+    # 세션이 **실제로 재생한** 풀을 단일 출처로 본다. 설정을 v1 로 둔 채 v2 로 녹음하면
+    # held-out 이 실제 재생분을 못 덮고, 누수 게이트가 PASS 하면서 100% 누수를 통과시킨다
+    # (2026-08-06 재현됨). 인자로 명시하면 그 값이 우선한다.
+    if args.sources:
+        selected = [str(value) for value in args.sources]
+    else:
+        from deep_anc.train.finetune_readiness import observed_source_pools
+
+        observed = observed_source_pools(REPO_ROOT / "data" / "recorded")
+        selected = sorted(observed) or ["data/source_pool_v2/sources.csv"]
+        if observed:
+            print(
+                "실측 세션이 재생한 풀에서 유도: "
+                + ", ".join(f"{k} ({v}세션)" for k, v in sorted(observed.items()))
+            )
+
+    csv_paths = [REPO_ROOT / value for value in selected]
+    missing = [str(p) for p in csv_paths if not p.is_file()]
+    if missing:
+        print(f"sources.csv 가 없습니다: {', '.join(missing)}", file=sys.stderr)
         return 1
-    families = collect(sources_csv)
+    families: dict[str, list[str]] = {}
+    for path in csv_paths:
+        for family, clips in collect(path).items():
+            families.setdefault(family, [])
+            families[family] = sorted(set(families[family]) | set(clips))
+    sources_csv = csv_paths[0]
 
     overlap: dict[str, dict] = {}
     root = REPO_ROOT / args.synthetic_root
@@ -98,7 +128,7 @@ def main() -> int:
             "실측 재생에 쓴 원본. 합성 노이즈 풀 manifest 를 만들 때 이 목록을 제외해 "
             "두 브랜치가 같은 오디오를 보지 않게 한다 (D1 코퍼스 누수)."
         ),
-        "sources_csv": str(sources_csv.relative_to(REPO_ROOT)),
+        "sources_csv": [str(p.relative_to(REPO_ROOT)) for p in csv_paths],
         "families": families,
         "total_clips": sum(len(values) for values in families.values()),
         "overlap_with_synthetic_pool": overlap,

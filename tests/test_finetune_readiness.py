@@ -1895,3 +1895,34 @@ def test_delay_crosscheck_refuses_a_realigned_reference_instead_of_comparing_it(
     # (c) 짝: 원본 기준에서 유도값과 맞으면 통과한다 (게이트가 항상 실패하지 않는다).
     agreeing = _run("source.wav", 1_849.0)
     assert agreeing["ok"]
+
+
+def test_readiness_rejects_a_pool_the_sessions_did_not_actually_play(tmp_path):
+    """설정이 선언한 소스풀과 **세션이 실제로 재생한 풀**이 다르면 FAIL 한다.
+
+    2026-08-06 감사가 재현한 fail-open. ``recorded_source_pool_csv`` 가 v1 을 가리키는데
+    재녹음을 v2 로 하면, 누수 게이트가 **v1 클립끼리 비교해 PASS 하면서 v2 누수를 100%
+    통과**시킨다. v1 은 machine 이 8 그룹뿐이라 분할 하한(9)을 만족할 수 없어 재녹음은
+    v2 로 할 수밖에 없으므로, 이 상태는 우연이 아니라 **예정된 경로**였다.
+    """
+
+    cfg = _ready_config(tmp_path)
+    sessions = tmp_path / "recorded_sessions"
+    for name, played in (
+        ("s0", "data/source_pool_v2/music/music_000.wav"),
+        ("s1", "data/source_pool_v2/speech/speech_000.wav"),
+    ):
+        d = sessions / name
+        d.mkdir(parents=True)
+        (d / "session.json").write_text(
+            json.dumps({"session_id": name, "program": {"type": "file", "file": played}}),
+            encoding="utf-8",
+        )
+    cfg["readiness"]["recorded_session_root"] = str(sessions)
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "corpus_disjoint")
+    assert not gate["ok"]
+    assert "세션이 실제로 재생한 풀" in gate["message"]
+    assert "source_pool_v2" in gate["message"]

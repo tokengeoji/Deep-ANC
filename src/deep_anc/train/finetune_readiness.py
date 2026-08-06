@@ -12,7 +12,7 @@ import datetime as dt
 import hashlib
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 import numpy as np
@@ -994,6 +994,47 @@ def _recorded_source_clips(csv_path: Path) -> dict[str, list[str]]:
     return families
 
 
+def observed_source_pools(recorded_root: Path) -> dict[str, int]:
+    """실측 세션이 **실제로 재생한** 소스풀을 세션에서 읽어 센다.
+
+    왜 설정이 아니라 세션인가
+    ------------------------
+    2026-08-06 감사가 재현한 fail-open: ``readiness.recorded_source_pool_csv`` 는
+    ``data/source_pool/sources.csv``(v1) 를 가리키고 있었는데, v1 은 machine 이 8 그룹뿐이라
+    분할 하한(9)을 만족할 수 없어 **재녹음은 v2 로 해야 한다**. 그런데 이 키를 안 고치고
+    v2 로 녹음하면 누수 게이트가 **v1 클립끼리 비교해 PASS 하면서 v2 누수를 100% 통과**시킨다.
+    실제로 같은 검사가 v1 csv 로는 ok, v2 csv 로는 not ok 를 낸다.
+
+    원인은 발생기 A 다 — "실측이 어떤 오디오를 썼는가" 라는 하나의 물리량을 설정과 세션이
+    따로 들고 있고 아무도 대조하지 않았다. 세션의 ``program.file`` 이 물리적 사실이므로
+    그것을 단일 출처로 삼고, 설정은 **대조 대상**으로만 쓴다.
+
+    반환: ``{"data/source_pool_v2/sources.csv": 세션 수}``.
+    """
+
+    counts: dict[str, int] = {}
+    if not recorded_root.is_dir():
+        return counts
+    for session_dir in sorted(recorded_root.iterdir()):
+        meta = session_dir / "session.json"
+        if not session_dir.is_dir() or not meta.is_file():
+            continue
+        try:
+            payload = json.loads(meta.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        played = str((payload.get("program") or {}).get("file") or "")
+        if not played:
+            continue
+        # data/source_pool_v2/environment/environment_000.wav → data/source_pool_v2
+        parts = PurePosixPath(played).parts
+        if len(parts) < 3:
+            continue
+        pool_csv = str(PurePosixPath(parts[0], parts[1]) / "sources.csv")
+        counts[pool_csv] = counts.get(pool_csv, 0) + 1
+    return counts
+
+
 def _synthetic_clip_index(
     manifest_dir: Path, tags: Iterable[str]
 ) -> tuple[dict[str, list[str]], dict[str, str]]:
@@ -1030,20 +1071,43 @@ def _audit_corpus_leak(audit: "_Audit", readiness_cfg: dict, data_cfg: dict) -> 
     from ..dsp.invariants import check_corpus_disjoint
 
     csv_value = readiness_cfg.get(
-        "recorded_source_pool_csv", "data/source_pool/sources.csv"
+        "recorded_source_pool_csv", "data/source_pool_v2/sources.csv"
     )
     manifest_dir_value = data_cfg.get("noise_manifest_dir", "data/manifests")
     tags = sorted((data_cfg.get("source_mix_ratio") or {}).keys())
     try:
-        csv_path = _repo_path(csv_value)
-        if not csv_path.is_file():
-            raise FileNotFoundError(
-                f"실측 소스 목록이 없습니다: {csv_path} — 겹침을 검사할 수 없으면 "
-                "겹치지 않는다고 주장할 수 없습니다"
+        # 실측 세션이 **실제로 재생한** 풀을 먼저 읽는다. 설정은 대조 대상이지
+        # 단일 출처가 아니다 — v2 로 녹음하고 이 키를 v1 로 두면 게이트가 엉뚱한
+        # 클립끼리 비교해 PASS 하면서 누수를 100% 통과시킨다 (2026-08-06 재현됨).
+        observed = observed_source_pools(
+            _repo_path(readiness_cfg.get("recorded_session_root", "data/recorded"))
+        )
+        declared = {str(csv_value)}
+        if observed and set(observed) != declared:
+            raise ValueError(
+                "실측 세션이 재생한 소스풀과 설정이 다릅니다 — 게이트가 엉뚱한 클립끼리 "
+                "비교하게 됩니다.\n"
+                f"  설정 readiness.recorded_source_pool_csv = {csv_value}\n"
+                f"  세션이 실제로 재생한 풀 = "
+                + ", ".join(f"{k} ({v}세션)" for k, v in sorted(observed.items()))
+                + "\n  설정을 세션에 맞추세요. 두 풀이 섞여 있다면 그 자체가 문제입니다 "
+                "— 한 풀로 통일해 재녹음하거나, 두 풀의 클립을 모두 held-out 에 넣으세요."
             )
-        recorded = _recorded_source_clips(csv_path)
+        csv_paths = [_repo_path(value) for value in sorted(observed or declared)]
+        missing_csv = [str(p) for p in csv_paths if not p.is_file()]
+        if missing_csv:
+            raise FileNotFoundError(
+                f"실측 소스 목록이 없습니다: {', '.join(missing_csv)} — 겹침을 검사할 수 "
+                "없으면 겹치지 않는다고 주장할 수 없습니다"
+            )
+        recorded: dict[str, list[str]] = {}
+        for path in csv_paths:
+            for family, clips in _recorded_source_clips(path).items():
+                recorded.setdefault(family, []).extend(clips)
         if not recorded:
-            raise ValueError(f"{csv_path}: 실측 클립 목록이 비었습니다")
+            raise ValueError(
+                f"{', '.join(str(p) for p in csv_paths)}: 실측 클립 목록이 비었습니다"
+            )
         synthetic, splits = _synthetic_clip_index(_repo_path(manifest_dir_value), tags)
         if not synthetic:
             raise FileNotFoundError(

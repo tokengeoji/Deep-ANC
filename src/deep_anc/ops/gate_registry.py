@@ -1075,6 +1075,24 @@ GATES: tuple[GateDeclaration, ...] = (
             "(정렬 전에는 −12.63 dB 로 실패했다)"
         ),
     ),
+    GateDeclaration(
+        gate_id="recorded_source_pool_agrees_with_sessions",
+        owner=_READINESS,
+        what_it_asserts=(
+            "설정이 선언한 실측 소스풀과 세션이 실제로 재생한 풀이 같다 — 다르면 누수"
+            " 게이트가 엉뚱한 클립끼리 비교해 PASS 하면서 누수를 통과시킨다"
+        ),
+        negative_fixture=(
+            "tests/test_finetune_readiness.py::"
+            "test_readiness_rejects_a_pool_the_sessions_did_not_actually_play"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_recorded_source_pool.py::"
+            "test_observed_pool_is_read_from_what_the_session_played"
+        ),
+        positive_probe="세션 2개가 전부 v2 를 재생했을 때 관측이 v2 1종만 보고한다",
+    ),
     # ---------------- 합성 소스 분포 (절대목표 2 — 모든 소리를 본다) ----------------
     GateDeclaration(
         gate_id="synth_declared_source_manifests_exist",
