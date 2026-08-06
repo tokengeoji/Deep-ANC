@@ -122,6 +122,11 @@ def test_a_model_that_exactly_satisfies_the_hinge_passes_the_g4_gate() -> None:
     38.5분짜리 재녹음과 GPU 시간을 **확정적으로 버린다**.
     """
 
+    # 이 fixture 가 몰아붙이는 경계를 명시한다: 출하 마진 **−18.27 dB** 를 정확히
+    # 만족하는(= 한 톨도 여유가 없는) 최악 신호다. 여유를 두고 통과시키면 "정상에서
+    # 발동하지 않는다" 를 보인 것이 아니다.
+    assert DEFAULT_DNH_MARGIN_DB == pytest.approx(-18.27, abs=0.01)
+
     attenuations = _run(_shipped_plan())
     worst_center = min(attenuations, key=lambda fc: attenuations[fc])
     assert attenuations[worst_center] >= -(MAX_OUT_OF_BAND_AMPLIFICATION_DB + _TOLERANCE_DB), (

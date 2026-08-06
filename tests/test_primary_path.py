@@ -386,6 +386,8 @@ def test_dataset_rir_surrogate_keeps_legacy_rir_and_added_delay(configs):
 def test_dataset_acoustic_mode_ignores_digital_primary_policy(configs):
     data, duct = deepcopy(configs)
     data = _dataset_config(data, "measured", reference_mode="acoustic")
+    # 소스 분포가 아니라 P(z) 정책을 보는 테스트다 — 진단 탈출구를 명시적으로 켠다.
+    data["allow_missing_source_manifests"] = True
     duct["digital_reference"]["primary_path_npz"] = None
     p_ref = np.array([0.5, 0.25], dtype=np.float32)
     p_err = np.array([-0.75, 0.125], dtype=np.float32)

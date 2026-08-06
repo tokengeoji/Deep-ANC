@@ -155,6 +155,7 @@ _RECORDED_DATASET = "src/deep_anc/data/recorded_dataset.py"
 
 _LOSS = "src/deep_anc/losses/anc_loss.py"
 _LOSS_CFG = "src/deep_anc/losses/config.py"
+_SYNTH_DATASET = "src/deep_anc/data/synth_dataset.py"
 _EVAL_RECORDED = "src/deep_anc/eval/recorded.py"
 
 _NEG = "tests/test_gate_negative_fixtures.py"
@@ -1036,6 +1037,65 @@ GATES: tuple[GateDeclaration, ...] = (
             "tests/test_anc_loss.py::test_do_no_harm_bands_are_derived_by_subtracting_the_trusted_band"
         ),
         positive_probe="신뢰대역 150–600Hz 를 뺀 여집합이 빈틈 없이 덮인다",
+    ),
+    GateDeclaration(
+        gate_id="loss_do_no_harm_margin_matches_the_gate",
+        owner=_LOSS_CFG,
+        what_it_asserts=(
+            "대역 밖 힌지 마진이 G4 옥타브 임계에서 유도된 상한을 넘지 않는다 — 넘으면"
+            " 손실을 정확히 만족한 모델이 게이트를 FAIL 한다 (실측 8.5 dB 차이)"
+        ),
+        negative_fixture=(
+            "tests/test_do_no_harm_contract.py::"
+            "test_config_rejects_a_margin_looser_than_the_gate_allows"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_do_no_harm_contract.py::"
+            "test_a_model_that_exactly_satisfies_the_hinge_passes_the_g4_gate"
+        ),
+        positive_probe="유도 마진 −18.27 dB 를 정확히 만족한 최악 신호가 전 옥타브에서 통과",
+    ),
+    GateDeclaration(
+        gate_id="loss_do_no_harm_bands_align_to_octaves",
+        owner=_LOSS_CFG,
+        what_it_asserts=(
+            "대역 밖 힌지 대역이 G4 옥타브 경계를 가로지르지 않는다 — 가로지르면 대역"
+            " 비율을 만족한 채 한 옥타브에 에너지를 몰아넣을 수 있다 (실측 3.1 dB 손해)"
+        ),
+        negative_fixture=(
+            "tests/test_do_no_harm_contract.py::test_config_rejects_bands_that_cross_an_octave_edge"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_do_no_harm_contract.py::test_energy_concentrated_in_one_octave_still_passes"
+        ),
+        positive_probe=(
+            "옥타브 정렬 후 2000 Hz 옥타브에 에너지를 전부 몰아넣어도 최악 −1.00 dB "
+            "(정렬 전에는 −12.63 dB 로 실패했다)"
+        ),
+    ),
+    # ---------------- 합성 소스 분포 (절대목표 2 — 모든 소리를 본다) ----------------
+    GateDeclaration(
+        gate_id="synth_declared_source_manifests_exist",
+        owner=_SYNTH_DATASET,
+        what_it_asserts=(
+            "source_mix_ratio 가 선언한 모든 태그의 manifest 가 구성 시점에 존재한다 —"
+            " 없으면 학습기가 조용히 합성원으로 대체해 선언과 다른 분포로 돈다"
+        ),
+        negative_fixture=(
+            "tests/test_synth_source_manifests.py::"
+            "test_missing_declared_source_manifest_is_rejected"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_synth_source_manifests.py::"
+            "test_all_declared_manifests_present_passes"
+        ),
+        positive_probe=(
+            "선언 3태그(speech 0.15 · music 0.10 · esc50 0.05)의 manifest 가 전부 있으면 "
+            "통과하고 풀을 건드리지 않는다 — 게이트가 꺼져서 통과하는 것이 아니다"
+        ),
     ),
     GateDeclaration(
         gate_id="loss_config_schema",
