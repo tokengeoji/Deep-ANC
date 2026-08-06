@@ -202,7 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-kept-repeats", type=int, default=8)
     parser.add_argument("--max-delay-jitter-ms", type=float, default=0.0625)
     parser.add_argument("--block-size", type=int, default=None)
-    parser.add_argument("--latency", choices=["low", "high"], default="high")
+    # 런타임(run_realtime / record_duct)은 'low' 로 **고정**돼 있다
+    # (configs/hardware_jetson.yaml: "코드는 'low' 고정"). 기본값이 'high' 였던 탓에
+    # 측정하는 플랜트와 실제로 도는 플랜트의 버퍼 구성이 달랐다 — 실측 절대지연이
+    # low 1565~1659 / high 2858~2888 로 갈린다. 출하 npz(calibration_latency=low)도
+    # low 에서 나왔다. 배포와 다른 모드로 잰 플랜트는 그 자체로 fail-open 이다.
+    parser.add_argument("--latency", choices=["low", "high"], default="low")
     parser.add_argument("--input-probe-seconds", type=float, default=3.0)
     parser.add_argument("--primary-out", default="assets/measured/primary_path_il.npz")
     parser.add_argument("--secondary-out", default="assets/measured/secondary_path_il.npz")
@@ -773,6 +778,8 @@ def main(argv: list[str] | None = None) -> int:
 
     capture_id = uuid.uuid4().hex
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 이른 저장본과 최종 저장본이 **같은 값**을 써야 metadata.json 대조가 통과한다.
+    started_at_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     session_dir = diagnostics_root / f"{stamp}_{capture_id[:8]}"
     session_dir.mkdir(parents=True, exist_ok=False)
 
@@ -834,6 +841,67 @@ def main(argv: list[str] | None = None) -> int:
     err = recorded[:, 0].astype(np.float64)
     measurement_report = cw.analyze_int32_input_probe(recorded_raw)
 
+    def _capture_metadata(extra: dict[str, Any] | None = None) -> dict:
+        """재분석에 필요한 **캡처 시점** 메타데이터. 분석 결과에 의존하지 않는다.
+
+        ``reanalyse_paths_interleaved.py`` 가 요구하는 필드가 전부 여기 있어야
+        분석이 실패해도 오프라인에서 되살릴 수 있다.
+        """
+
+        base = {
+            "capture_id": capture_id,
+            "method": METHOD,
+            "started_at_utc": started_at_utc,
+            "sample_rate": fs,
+            "block_size": block_size,
+            "latency": args.latency,
+            "amplitude": float(args.amplitude),
+            "design_band_hz": [float(args.band[0]), float(args.band[1])],
+            "required_band_hz": [need_lo, need_hi],
+            "channel_band_hz": {k: list(v) for k, v in channel_band.items()},
+            "tone_spacing_hz": float(probe.bin_step("noise") * resolution),
+            "period_seconds": float(args.period_seconds),
+            "warmup_periods": int(args.warmup_periods),
+            "repeats": int(args.repeats),
+            "lead_in_samples": int(lead_in),
+            "guard_bins": probe.guard_bins(),
+            "crest_db": {"noise": crest_noise, "cancel": crest_cancel},
+            "warp": warp_report,
+            "telemetry": telemetry,
+            "preflight": preflight_report,
+            "measurement": measurement_report,
+            "invalid_reasons": invalid,
+        }
+        if extra:
+            base.update(extra)
+        return base
+
+    def _write_capture(meta: dict, *, mode: str, **arrays) -> None:
+        raw_path = session_dir / "raw_measurement.npz"
+        with raw_path.open(mode + "b") as handle:
+            np.savez_compressed(
+                handle,
+                output=playback.astype(np.float32),
+                err=recorded[:, 0].astype(np.float32),
+                ref=recorded[:, 1].astype(np.float32),
+                input_raw_int32=recorded_raw.astype(np.int32),
+                preflight_raw_int32=preflight_raw.astype(np.int32),
+                metadata_json=np.asarray(
+                    json.dumps(cw._json_safe(meta), ensure_ascii=False, sort_keys=True)
+                ),
+                **arrays,
+            )
+        with (session_dir / "metadata.json").open(mode, encoding="utf-8") as handle:
+            json.dump(cw._json_safe(meta), handle, ensure_ascii=False, indent=2, sort_keys=True)
+
+    # ── 원시 캡처를 **분석보다 먼저** 저장한다 ──────────────────────────────
+    # 스피커를 울린 시간은 되돌릴 수 없다(사용자 지시: 스피커 구동 하드웨어 수명).
+    # 분석 게이트는 정당하게 실패할 수 있고 실제로 실패한다 —
+    # 2026-08-06: 드리프트 중앙 3.95 / −4.03 샘플/주기로 두 번 연속 전량 기각됐는데,
+    # 저장이 분석 뒤에 있어서 **6초씩 두 번을 그냥 버렸다.**
+    # reanalyse_paths_interleaved.py 가 저장된 캡처만으로 오프라인 재분석을 하므로
+    # (실제로 그렇게 플랜트를 복구했다), 먼저 저장해 두면 실패해도 살릴 수 있다.
+
     invalid: list[str] = []
     if int(telemetry.get("xrun_count", 0)) != 0:
         invalid.append(f"xrun_{telemetry['xrun_count']}")
@@ -865,6 +933,12 @@ def main(argv: list[str] | None = None) -> int:
             f"(범위 {warp_report['delay_range']:.0f} 샘플) · 상관 중앙 "
             f"{warp_report['peak_median']:.3f} · 채택 {warp_report['kept_fraction']:.1%}"
         )
+
+    _write_capture(_capture_metadata(), mode="x")
+    print(
+        f"원시 캡처 저장: {(session_dir / 'raw_measurement.npz').relative_to(REPO_ROOT)}"
+        " — 분석이 실패해도 reanalyse_paths_interleaved.py 로 되살릴 수 있다"
+    )
 
     period_starts = [
         lead_in + (int(args.warmup_periods) + k) * probe.period_samples
@@ -947,30 +1021,9 @@ def main(argv: list[str] | None = None) -> int:
 
     valid = not invalid and not results["noise"]["reasons"] and not results["cancel"]["reasons"]
 
-    metadata = {
-        "capture_id": capture_id,
-        "method": METHOD,
-        "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "sample_rate": fs,
-        "block_size": block_size,
-        "latency": args.latency,
-        "amplitude": float(args.amplitude),
-        "design_band_hz": [float(args.band[0]), float(args.band[1])],
-        "required_band_hz": [need_lo, need_hi],
-        "channel_band_hz": {k: list(v) for k, v in channel_band.items()},
-        "tone_spacing_hz": float(probe.bin_step("noise") * resolution),
-        "period_seconds": float(args.period_seconds),
-        "warmup_periods": int(args.warmup_periods),
-        "repeats": int(args.repeats),
-        # 오프라인 재분석이 period_starts 를 재현하려면 반드시 있어야 한다.
-        "lead_in_samples": int(lead_in),
-        "guard_bins": probe.guard_bins(),
-        "crest_db": {"noise": crest_noise, "cancel": crest_cancel},
-        "warp": warp_report,
-        "telemetry": telemetry,
-        "preflight": preflight_report,
-        "measurement": measurement_report,
-        "invalid_reasons": invalid,
+    # 캡처 시점 필드는 _capture_metadata() 가 단일 출처다 — 여기서 다시 적으면
+    # 이른 저장본과 최종 저장본이 갈라지고, 재분석기의 metadata.json 대조가 깨진다.
+    metadata = _capture_metadata({
         "valid": valid,
         "fit_band_hz": list(fit_band),
         "consistency_band_hz": list(consistency_band),
@@ -1015,32 +1068,21 @@ def main(argv: list[str] | None = None) -> int:
             }
             for drive, item in results.items()
         },
-    }
+    })
 
-    npz_path = session_dir / "raw_measurement.npz"
-    with npz_path.open("xb") as handle:
-        np.savez_compressed(
-            handle,
-            output=playback.astype(np.float32),
-            err=recorded[:, 0].astype(np.float32),
-            ref=recorded[:, 1].astype(np.float32),
-            input_raw_int32=recorded_raw.astype(np.int32),
-            preflight_raw_int32=preflight_raw.astype(np.int32),
-            noise_transfers=results["noise"]["model"]["repeat_transfers"],
-            cancel_transfers=results["cancel"]["model"]["repeat_transfers"],
-            noise_ir=results["noise"]["model"]["ir"].astype(np.float64),
-            cancel_ir=results["cancel"]["model"]["ir"].astype(np.float64),
-            frequencies_hz=results["noise"]["model"]["frequencies_hz"],
-            relative_tau_samples=relative_tau,
-            noise_snr_db=results["noise"]["snr_db"].astype(np.float64),
-            cancel_snr_db=results["cancel"]["snr_db"].astype(np.float64),
-            metadata_json=np.asarray(
-                json.dumps(cw._json_safe(metadata), ensure_ascii=False, sort_keys=True)
-            ),
-        )
-    with (session_dir / "metadata.json").open("x", encoding="utf-8") as handle:
-        json.dump(cw._json_safe(metadata), handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
+    # 이른 저장본을 분석 결과까지 담은 최종본으로 **덮어쓴다**.
+    _write_capture(
+        metadata,
+        mode="w",
+        noise_transfers=results["noise"]["model"]["repeat_transfers"],
+        cancel_transfers=results["cancel"]["model"]["repeat_transfers"],
+        noise_ir=results["noise"]["model"]["ir"].astype(np.float64),
+        cancel_ir=results["cancel"]["model"]["ir"].astype(np.float64),
+        frequencies_hz=results["noise"]["model"]["frequencies_hz"],
+        relative_tau_samples=relative_tau,
+        noise_snr_db=results["noise"]["snr_db"].astype(np.float64),
+        cancel_snr_db=results["cancel"]["snr_db"].astype(np.float64),
+    )
 
     if not valid:
         print(f"\n[실패] 정식 모델을 저장하지 않았습니다. 진단: {session_dir}", file=sys.stderr)
