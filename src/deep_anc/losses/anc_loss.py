@@ -55,6 +55,14 @@ from .config import DoNoHarmPlan, LossConfig
 
 _EPS = 1.0e-10
 
+_DNH_LOG_FLOOR = 1.0e-30
+"""do-no-harm 비율의 로그 하한 (−300 dB). **분자에 더하지 않기 위한 장치다.**
+
+분자에 ``_EPS`` 를 더하면 ``S·y = 0`` 인 모델의 비율이 ``_EPS/_EPS = 0 dB`` 가 되어
+힌지 마진(−18.27 dB)을 넘고, **아무 소리도 내지 않는 모델이 벌점을 받는다.** 상대비에만
+하한을 걸면 ``num=0 → −300 dB → relu 비활성 → 벌점 0·그래디언트 0`` 이 정확히 성립한다.
+"""
+
 
 def band_weights(
     fft_size: int,
@@ -183,6 +191,7 @@ class ANCLoss(nn.Module):
         # 만들기 때문에 S npz 의 신뢰대역이 [150,600] → [150,1600] 으로 넓어져도
         # 여기서 고칠 것이 없고, 겹침이 **구조적으로 불가능**하다.
         self.do_no_harm: DoNoHarmPlan | None = None
+        self.dnh_band_floor = 10.0 ** (float(cfg.dnh_band_floor_db) / 10.0)
         if self.lambda_dnh > 0.0:
             if self.trusted_band_hz is None:
                 raise ValueError(
@@ -325,6 +334,12 @@ class ANCLoss(nn.Module):
         D = torch.fft.rfft(d, dim=-1, norm="ortho")
         sy_pow = SY.real.square() + SY.imag.square()
         d_pow = D.real.square() + D.imag.square()
+        # 분모 하한 — 교란이 사실상 없는 대역에서는 비율이 정의되지 않는다. 이것이
+        # 없으면 ``_EPS/_EPS = 0 dB`` 가 되어 **아무 소리도 내지 않는 모델이 벌점을
+        # 받는다** (마진이 양수(+6.0)일 때는 0 dB < 6.0 이라 가려져 있었고, 게이트에서
+        # 유도한 음수 마진으로 바꾸는 순간 드러났다). 하한은 신호 자신의 전체 전력에
+        # 상대적이라 스케일 불변이다.
+        floor = self.dnh_band_floor * d_pow.sum(dim=-1)
 
         total = s_y.new_zeros(())
         metrics: dict[str, float] = {}
@@ -334,9 +349,11 @@ class ANCLoss(nn.Module):
             lo_bin, hi_bin = self._band_bins(samples, lo, hi)
             if lo_bin > hi_bin:
                 continue
-            num = sy_pow[..., lo_bin : hi_bin + 1].sum(dim=-1) + _EPS
-            den = d_pow[..., lo_bin : hi_bin + 1].sum(dim=-1) + _EPS
-            ratio_db = 10.0 * torch.log10(num / den)
+            num = sy_pow[..., lo_bin : hi_bin + 1].sum(dim=-1)
+            den = torch.maximum(d_pow[..., lo_bin : hi_bin + 1].sum(dim=-1), floor)
+            # num 에 EPS 를 더하지 않는다 — 출력이 정확히 0 이면 벌점도 정확히 0 이어야
+            # 한다. 로그 하한은 상대비에만 걸어 그 성질을 지킨다.
+            ratio_db = 10.0 * torch.log10(num / (den + _EPS) + _DNH_LOG_FLOOR)
             # 최악값 집계 — 대역 밖도 평균은 음수인데 최악이 +30 dB 다.
             total = total + float(item.weight) * self._worst_aggregate(
                 F.relu(ratio_db - float(item.margin_db))

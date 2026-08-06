@@ -28,6 +28,9 @@ from ..dsp.secondary_path import (
     SecondaryPathData,
     load_secondary_path,
 )
+# 대역 밖 예산의 단일 출처 — 손실 힌지가 이 임계에서 유도된다 (발생기 A).
+from ..dsp.do_no_harm import MAX_OUT_OF_BAND_AMPLIFICATION_DB
+
 # 지연·lead·대역 부기의 단일 출처 (발생기 A).
 from ..dsp.timing import (
     BandPlan,
@@ -786,25 +789,10 @@ def evaluate_recorded_segments(
     }
 
 
-MAX_OUT_OF_BAND_AMPLIFICATION_DB = 1.0
-"""옥타브 밴드 감쇠가 이보다 더 음수(=증폭)면 실패다. **절대목표 1의 게이트다.**
-
-왜 fullband 평균으로는 안 되는가
---------------------------------
-``fullband NMSE ≤ 0`` 은 대역 밖 증폭을 **원리적으로** 잡지 못한다. NMSE 는 ``d`` 의
-에너지로 정규화되는데, ``d`` 에 에너지가 거의 없는 대역에서는 ``e`` 가 몇십 dB 커져도
-전체 비율이 거의 안 변하기 때문이다. 실측 반증(results/session_20260804_0939)::
-
-    tone300:  trusted +6.26 dB / fullband **+5.95 dB**   ← 둘 다 판정 기준을 만족
-              band_1000 −16.84 / band_2000 −15.42 / band_4000 −18.03 / band_8000 **−21.56**
-
-즉 8 kHz 를 21 dB 증폭하면서 G4 를 통과했다. 옥타브 감쇠는 ``octave_rows`` 로 이미
-계산해 npz 에 **저장까지 하고 있었는데** 판정에는 한 번도 쓰이지 않았다.
-
-임계 1.0 dB 의 뜻: "개선을 요구하지 않는다. 다만 해치지 마라." 신뢰 대역 밖은 상쇄
-대상이 아니므로 0 dB 근처면 충분하고, 측정 잡음 여유로 1 dB 를 준다. 실제 결함은
-15~22 dB 라 이 허용치의 15~22배다.
-"""
+# ``MAX_OUT_OF_BAND_AMPLIFICATION_DB`` 는 여기에 있었다. 손실 힌지 마진과 이 임계가
+# 서로를 모른 채 각자 적혀 있었고, 실측 결과 **힌지를 정확히 만족한 모델이 게이트를
+# 8.5 dB 차이로 FAIL** 했다. 이제 정의는 ``dsp/do_no_harm.py`` 한 곳이고 손실 마진은
+# 거기에서 유도된다. 이 이름은 기존 참조(테스트·스크립트)를 위해 위에서 import 된다.
 
 MIN_GROUPS_PER_FAMILY = 4
 """cluster bootstrap 이 CI 를 정의할 수 있는 계열당 최소 **독립 그룹** 수.

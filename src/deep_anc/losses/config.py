@@ -26,9 +26,16 @@ from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from ..dsp.do_no_harm import (
+    MAX_OUT_OF_BAND_AMPLIFICATION_DB,
+    gate_consistent_margin_db,
+    octave_boundary_edges_hz,
+    worst_case_amplification_db,
+)
 from ..dsp.timing import FrequencyBand
 
 __all__ = [
+    "DEFAULT_DNH_MARGIN_DB",
     "DEFAULT_DO_NO_HARM_EDGES_HZ",
     "DoNoHarmBand",
     "DoNoHarmPlan",
@@ -37,6 +44,16 @@ __all__ = [
 
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
+
+
+DEFAULT_DNH_MARGIN_DB: float = gate_consistent_margin_db()
+"""do-no-harm 힌지 마진 — **G4 게이트 임계에서 유도된다. 여기에 숫자를 쓰지 마라.**
+
+2026-08-06 이전에는 ``6.0`` 이 리터럴로 적혀 있었고, 게이트는 ``eval/recorded.py`` 에
+``1.0`` 이라고 따로 적혀 있었다. 두 값은 서로를 모른 채 살았고 대조 코드도 테스트도
+없었다 — 실측 결과 **힌지를 정확히 만족한 모델이 게이트를 8.5 dB 차이로 FAIL** 했다
+(4000 Hz 옥타브 −9.53 dB, 한계 −1.0 dB). 유도 근거는 ``dsp/do_no_harm.py`` 참조.
+"""
 
 
 DEFAULT_DO_NO_HARM_EDGES_HZ: tuple[float, ...] = (
@@ -65,9 +82,14 @@ DEFAULT_DO_NO_HARM_EDGES_HZ: tuple[float, ...] = (
 class DoNoHarmBand(BaseModel):
     """대역 밖 '악화 금지' 힌지 한 구간.
 
-    ``margin_db`` 는 "시뮬레이터가 말하는 증폭 중 몇 dB 까지는 |S| 측정오차로 보고
-    봐준다" 는 뜻이다. 1633Hz 위의 |S| 는 가진조차 하지 않은 구간의 FIR 외삽이므로
-    관대해야 한다. 결함 3 의 15~22 dB 증폭은 6 dB 마진을 훌쩍 넘으므로 그래도 잡힌다.
+    ``margin_db`` 는 ``10·log10(bandpower(S·y)/bandpower(d))`` 를 이 값까지 봐준다는
+    뜻이다. **음수가 정상이다** — 게이트가 보는 것은 ``e = d + S·y`` 이고, 위상이
+    동상으로 맞으면 ``|e| = |d| + |S·y|`` 가 되기 때문이다. 옥타브를 1.0 dB 이상 키우지
+    않으려면 반노이즈가 교란보다 **18.3 dB 아래**여야 한다(:mod:`deep_anc.dsp.do_no_harm`).
+
+    2026-08-06 이전 주석은 "``margin_db`` 는 |S| 측정오차를 봐주는 값" 이라며 ``+6.0`` 을
+    정당화했다. 방향이 반대였다 — |S| 를 **과소평가**했다면 실제 증폭은 손실이 아는 것보다
+    나쁘다. 플랜트 불확실성은 마진을 **좁히는** 쪽으로만 작용해야 한다.
     """
 
     model_config = _FROZEN
@@ -78,9 +100,9 @@ class DoNoHarmBand(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "DoNoHarmBand":
-        if not math.isfinite(self.margin_db) or self.margin_db < 0.0:
+        if not math.isfinite(self.margin_db):
             raise ValueError(
-                f"do_no_harm margin_db 는 유한한 0 이상 값이어야 합니다: {self.margin_db}"
+                f"do_no_harm margin_db 는 유한한 값이어야 합니다: {self.margin_db}"
             )
         if not math.isfinite(self.weight) or self.weight < 0.0:
             raise ValueError(
@@ -110,14 +132,40 @@ class DoNoHarmPlan(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "DoNoHarmPlan":
+        p_lo, p_hi = self.protected.as_tuple()
+        nyquist = max((item.band.as_tuple()[1] for item in self.bands), default=0.0)
+        octave_edges = (
+            octave_boundary_edges_hz(nyquist_hz=nyquist) if nyquist > 0.0 else ()
+        )
         for item in self.bands:
             lo, hi = item.band.as_tuple()
-            p_lo, p_hi = self.protected.as_tuple()
             if lo < p_hi and p_lo < hi:
                 raise ValueError(
                     f"do_no_harm 대역 [{lo:g}, {hi:g}] 가 개선 요구 대역 "
                     f"[{p_lo:g}, {p_hi:g}] 와 겹칩니다 — 같은 주파수에 양측 목표와 "
                     "단측 힌지를 동시에 걸면 서로 상쇄합니다"
+                )
+            # 옥타브를 가로지르면 대역별 상한이 옥타브 상한으로 합쳐지지 않는다.
+            crossing = [edge for edge in octave_edges if lo < edge - 1e-6 and edge < hi - 1e-6]
+            if crossing:
+                raise ValueError(
+                    f"do_no_harm 대역 [{lo:g}, {hi:g}] 가 G4 옥타브 경계 "
+                    f"{[round(v, 1) for v in crossing]} Hz 를 가로지릅니다 — 이러면 "
+                    "대역 전체 비율을 만족한 채로 한 옥타브에 에너지를 몰아넣을 수 "
+                    "있고, 실측에서 그 자유도가 게이트를 3.1 dB 더 나쁘게 만들었습니다. "
+                    "경계를 옥타브에 맞춰 자르세요 (DoNoHarmPlan.derive 는 자동으로 합칩니다)"
+                )
+            # 게이트 임계에서 유도한 상한보다 느슨한 마진은 보장이 아니라 희망이다.
+            allowed = gate_consistent_margin_db()
+            if item.margin_db > allowed + 1e-9:
+                raise ValueError(
+                    f"do_no_harm 대역 [{lo:g}, {hi:g}] 의 margin_db="
+                    f"{item.margin_db:+.2f} 는 G4 임계 "
+                    f"{MAX_OUT_OF_BAND_AMPLIFICATION_DB:+.1f} dB 가 허용하는 상한 "
+                    f"{allowed:+.2f} dB 를 넘습니다 — 이 마진을 정확히 만족한 모델은 "
+                    f"옥타브를 최대 {worst_case_amplification_db(item.margin_db):.2f} dB "
+                    "증폭할 수 있어 게이트에서 FAIL 합니다 "
+                    "(2026-08-06 실측: margin +6.0 → 4000 Hz 옥타브 −9.53 dB)"
                 )
         return self
 
@@ -128,19 +176,25 @@ class DoNoHarmPlan(BaseModel):
         protected: FrequencyBand,
         nyquist_hz: float,
         edges_hz: Sequence[float] = DEFAULT_DO_NO_HARM_EDGES_HZ,
-        margin_db: float = 6.0,
+        margin_db: float = DEFAULT_DNH_MARGIN_DB,
         weight_below: float = 1.0,
         weight_above: float = 2.0,
     ) -> "DoNoHarmPlan":
         """경계 목록에서 **보호 대역을 빼서** do-no-harm 대역을 만든다.
 
-        두 가지가 구조적으로 보장된다.
+        세 가지가 구조적으로 보장된다.
 
         1. **겹침 불가** — 빼고 남은 것만 쓰기 때문이다.
         2. **빈틈 불가** — 결과는 ``[0, Nyquist] − protected`` 를 정확히 덮는다.
            경계 목록은 그 여집합을 어디서 자를지만 정한다. 감시하지 않는 주파수 구간이
            하나라도 남으면 모델이 거기에 출력을 쏟아부어도 비용이 0 이고, 그것이 바로
            결함 3 이 손실 안에서 공짜였던 이유다.
+        3. **옥타브를 가로지르지 않는다** — G4 게이트의 옥타브 경계를 절단점에 항상
+           합친다. 이것이 없으면 대역별 상한이 옥타브 상한으로 **합쳐지지 않는다**.
+           실측(2026-08-06): ``[1633, 6000]`` 이 옥타브 2000·4000 을 함께 덮고 있어서,
+           대역 전체 비율을 정확히 만족시키면서 에너지를 2000 옥타브에 몰아넣으면
+           그 옥타브만 −12.63 dB 가 됐다(고르게 퍼뜨렸을 때는 −8.99 dB). 즉 손실을
+           만족한 채로 게이트를 3.1 dB 더 나쁘게 만드는 자유도가 남아 있었다.
         """
 
         nyquist = float(nyquist_hz)
@@ -153,6 +207,9 @@ class DoNoHarmPlan(BaseModel):
             raise ValueError(f"do_no_harm 경계는 유한한 0 이상 값이어야 합니다: {edges_hz!r}")
         if any(b <= a for a, b in zip(edges, edges[1:])):
             raise ValueError(f"do_no_harm 경계는 증가해야 합니다: {edges_hz!r}")
+        # 게이트 옥타브 경계를 절단점에 합친다. 설정이 무엇을 적든 이것은 빠질 수 없다 —
+        # 빠지면 보장이 정리(定理)가 아니라 희망이 된다.
+        edges = sorted(set(edges) | set(octave_boundary_edges_hz(nyquist_hz=nyquist)))
         # 여집합 전체를 덮도록 양끝을 [0, Nyquist] 까지 늘린다.
         if edges[0] > 0.0:
             edges.insert(0, 0.0)
@@ -236,9 +293,21 @@ class LossConfig(BaseModel):
     lambda_dnh: float = 0.12
     do_no_harm_bands: list[list[float]] | None = None
     do_no_harm_edges_hz: list[float] | None = None
-    dnh_margin_db: float = 6.0
+    dnh_margin_db: float = DEFAULT_DNH_MARGIN_DB
     dnh_weight_below: float = 1.0
     dnh_weight_above: float = 2.0
+    dnh_band_floor_db: float = -60.0
+    """대역 교란 전력의 하한 — 전체 전력 대비. 이보다 조용한 대역은 **비율이 정의되지 않는다.**
+
+    비율 힌지에는 분모가 필요하다. 교란이 사실상 없는 대역에서 ``P_sy/P_d`` 를 그대로
+    쓰면 두 잡음바닥을 나누는 것이고, 값이 신호가 아니라 수치 오차로 정해진다. 하한을
+    **신호 자신의 전체 전력에 상대적으로** 두면 스케일 불변이면서, 조용한 대역에 출력을
+    쏟아붓는 것은 여전히 비싸다(분모가 하한에 고정될 뿐 0 이 되지 않는다).
+
+    −60 dB 의 뜻: 그 대역이 전체 교란 전력의 100만분의 1 미만이면 하한을 쓴다. 실측
+    녹음(소음·음성·음악)은 어느 옥타브도 이보다 조용하지 않다 — 이 값이 실제로 작동하는
+    것은 합성 순음 시험처럼 대역이 통째로 비는 경우뿐이다.
+    """
 
     # ---- 시간 국소성 ----
     lambda_frame: float = 0.0
@@ -280,13 +349,19 @@ class LossConfig(BaseModel):
             "lambda_mrstft",
             "lambda_pow",
             "lambda_sat",
-            "dnh_margin_db",
             "dnh_weight_below",
             "dnh_weight_above",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"loss.{name} 는 유한한 0 이상 값이어야 합니다: {value}")
+        # dnh_margin_db 는 **음수가 정상**이다 (게이트 임계에서 유도되며 -18.27 dB).
+        # 상한 검사는 대역이 만들어지는 DoNoHarmPlan 에서 G4 임계와 직접 대조한다 —
+        # 여기서 숫자를 한 번 더 적으면 그것이 세 번째 유도가 된다.
+        if not math.isfinite(self.dnh_margin_db):
+            raise ValueError(
+                f"loss.dnh_margin_db 는 유한한 값이어야 합니다: {self.dnh_margin_db}"
+            )
         if not math.isfinite(self.sat_margin) or self.sat_margin <= 0.0:
             raise ValueError(
                 f"loss.sat_margin 은 유한한 양수여야 합니다: {self.sat_margin} "

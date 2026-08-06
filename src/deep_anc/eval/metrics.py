@@ -12,6 +12,7 @@ import numpy as np
 from scipy import signal
 
 # 대역 산술의 단일 출처 (발생기 A — 같은 함수가 두 벌 있었다).
+from ..dsp.do_no_harm import octave_band_edges_hz
 from ..dsp.timing import intersect_frequency_bands
 
 _EPS = 1.0e-12
@@ -95,9 +96,9 @@ def octave_band_attenuation(
             trusted_band_hz, trusted_band_hz, sample_rate / 2.0
         )
     out: list[dict] = []
-    sqrt2 = np.sqrt(2.0)
     for fc in centers_hz:
-        lo, hi = fc / sqrt2, fc * sqrt2
+        # 경계식은 손실 대역 정렬에도 쓰인다 — 복붙하지 않고 단일 출처를 부른다.
+        lo, hi = octave_band_edges_hz(float(fc))
         if hi >= sample_rate / 2 * 0.98:
             continue
         sos = signal.butter(4, [lo, hi], btype="bandpass", fs=sample_rate, output="sos")

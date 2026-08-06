@@ -312,7 +312,14 @@ def test_do_no_harm_bands_are_derived_by_subtracting_the_trusted_band() -> None:
     narrow = _dnh_criterion().do_no_harm
     assert narrow is not None
     lows = [b.band.as_tuple() for b in narrow.bands if b.band.hi_hz <= 150.0]
-    assert lows == [(0.0, 20.0), (20.0, 80.0), (80.0, 150.0)]
+    # 88.4 Hz 는 G4 옥타브 125 의 하단 경계다. 손실 대역이 옥타브를 가로지르면
+    # 대역별 상한이 옥타브 상한으로 합쳐지지 않는다 (dsp/do_no_harm.py 의 정리).
+    assert lows == [
+        (0.0, 20.0),
+        (20.0, 80.0),
+        (80.0, pytest.approx(88.388, abs=1e-2)),
+        (pytest.approx(88.388, abs=1e-2), 150.0),
+    ]
     assert all(b.band.lo_hz >= 600.0 for b in narrow.bands if b.band.lo_hz > 150.0)
 
     wide = ANCLoss(
@@ -339,7 +346,8 @@ def test_out_of_band_amplification_is_penalised() -> None:
     criterion = _dnh_criterion()
     _, metrics = criterion(y, d, perturb={"jitter": 0})
 
-    assert metrics["dnh_1633_4000_max_db"] == pytest.approx(20.0, abs=0.5)
+    # 대역이 옥타브 경계(2828.4 Hz)에서 잘리므로 2000 Hz 순음은 [1633, 2828] 에 든다.
+    assert metrics["dnh_1633_2828_max_db"] == pytest.approx(20.0, abs=0.5)
     assert metrics["dnh"] > 0.0
 
     off = ANCLoss(
@@ -353,11 +361,20 @@ def test_out_of_band_amplification_is_penalised() -> None:
     assert float(loss_on) > float(loss_off)
 
 
-def test_out_of_band_improvement_earns_no_reward() -> None:
-    """**단측 확인** — 신뢰 못 하는 대역에서 '상쇄하라'를 절대 요구하지 않는다.
+def test_out_of_band_hinge_asks_for_silence_not_cancellation() -> None:
+    """**단측 확인** — 신뢰 못 하는 대역에서 요구하는 것은 '상쇄'가 아니라 '침묵'이다.
 
-    (a) 대역 밖 출력이 0 이어도, (b) 대역 밖 소음을 완벽히 상쇄해도 벌점은 똑같이 0
-    이고 그래디언트도 0 이다. (c) 증폭할 때만 0 을 넘는다.
+    2026-08-06 에 계약이 바뀌었다. 마진이 게이트 임계에서 유도되면서(+6.0 → −18.27 dB)
+    "대역 밖을 완벽히 상쇄하면 벌점 0" 이 성립하지 않는다. **성립할 수 없다** —
+
+    이 항의 판정량은 ``bandpower(S·y)`` 이고 그것은 설계상 **∠S 를 쓰지 않는다**
+    (비신뢰 대역에서 못 믿는 것이 바로 위상이기 때문이다). 위상을 모르면 "완벽 상쇄"와
+    "완벽 증폭"은 같은 숫자다. 그리고 게이트는 최악값을 본다. 그래서 ``|S·y| ≈ |d|`` 는
+    **동전 던지기**이고, 유도 마진은 그것을 벌한다. 옛 마진 +6.0 은 이 동전 던지기를
+    공짜로 만들었고, 그 상태로 학습한 모델이 게이트를 8.5 dB 차이로 FAIL 했다.
+
+    지켜야 하는 진짜 단측 성질은 남아 있고 여기서 강제한다:
+    **최소는 침묵이고, 벌점은 |S·y| 에 대해 단조이며, 상쇄를 보상하지 않는다.**
     """
 
     samples = FS
@@ -367,25 +384,56 @@ def test_out_of_band_improvement_earns_no_reward() -> None:
 
     quiet = torch.zeros(1, 1, samples)
     cancelling = (-d_oob).view(1, 1, -1)
+    inverted = d_oob.view(1, 1, -1)  # 같은 크기, 반대 위상
     amplifying = (3.0 * d_oob).view(1, 1, -1)
 
     values = []
-    for y in (quiet, cancelling, amplifying):
+    for y in (quiet, cancelling, inverted, amplifying):
         s_y = criterion.plant(y, {"jitter": 0}).squeeze(1)
         value, _ = criterion._do_no_harm(s_y, d.squeeze(1))
         values.append(float(value))
 
+    # (a) 침묵이 유일한 최소이고 정확히 0 이다.
     assert values[0] == 0.0
-    # 대역 밖을 완벽히 상쇄해도 보상은 없다 — 힌지는 단측이다.
-    assert values[1] == 0.0
-    assert values[2] > 0.0
+    # (b) 위상 무관 — 상쇄와 증폭이 크기가 같으면 값이 **같다**.
+    assert values[1] == pytest.approx(values[2], rel=1e-6)
+    # (c) 단조 — 크기를 키우면 벌점이 커진다.
+    assert values[0] < values[1] < values[3]
 
-    # 개선 방향에서는 그래디언트조차 만들지 않는다.
-    y = cancelling.clone().requires_grad_(True)
+    # (d) 침묵에서는 그래디언트가 정확히 0 이다 (relu 비활성 구간).
+    y = quiet.clone().requires_grad_(True)
     s_y = criterion.plant(y, {"jitter": 0}).squeeze(1)
     value, _ = criterion._do_no_harm(s_y, d.squeeze(1))
     value.backward()
     assert float(y.grad.abs().max()) == 0.0
+
+    # (e) 상쇄 방향의 그래디언트는 **출력을 줄이는 쪽**이지 늘리는 쪽이 아니다.
+    y = cancelling.clone().requires_grad_(True)
+    s_y = criterion.plant(y, {"jitter": 0}).squeeze(1)
+    value, _ = criterion._do_no_harm(s_y, d.squeeze(1))
+    value.backward()
+    assert float((y.grad * y.detach()).sum()) > 0.0, (
+        "그래디언트가 대역 밖 출력을 키우는 쪽을 가리킵니다 — 이 항은 상쇄를 "
+        "요구해서는 안 됩니다"
+    )
+
+
+def test_out_of_band_hinge_ignores_bands_where_the_disturbance_is_absent() -> None:
+    """교란이 없는 대역에서 **침묵한 모델이 벌점을 받지 않는다.**
+
+    회귀 방어. 분자에 ``_EPS`` 를 더하면 ``S·y = 0`` 인 모델의 비율이 ``_EPS/_EPS =
+    0 dB`` 가 되어 음수 마진을 넘는다. 마진이 +6.0 이던 시절에는 0 < 6 이라 가려져
+    있었고, 게이트에서 마진을 유도하는 순간 드러났다 — 아무 소리도 내지 않는 모델이
+    벌점 8.39 를 받았다.
+    """
+
+    samples = FS
+    d = _tone(300.0, samples).view(1, 1, -1)  # 300 Hz 단일 순음 — 나머지 대역은 비어 있다
+    criterion = _dnh_criterion()
+    s_y = criterion.plant(torch.zeros(1, 1, samples), {"jitter": 0}).squeeze(1)
+    value, metrics = criterion._do_no_harm(s_y, d.squeeze(1))
+    assert float(value) == 0.0, f"침묵한 모델이 벌점 {float(value):.3f} 을 받았습니다"
+    assert metrics["dnh_worst_db"] < -100.0
 
 
 def test_do_no_harm_ignores_the_phase_of_the_secondary_path() -> None:
