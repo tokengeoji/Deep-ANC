@@ -77,8 +77,17 @@ def main() -> int:
 
     if args.restore:
         ledger = _load_ledger(target_root)
+        # --sessions 는 격리할 때뿐 아니라 **되돌릴 때도** 존중해야 한다.
+        # 2026-08-06 이전에는 무시돼서 대장의 80개가 전부 돌아왔다. 재정렬에 실패한
+        # 33개까지 같이 돌아오면 QA 가 그것을 다시 걸러내야 하고, 무엇보다 "무엇을
+        # 되돌렸는가" 를 사람이 통제할 수 없다.
+        wanted = set(args.sessions or [])
         restored = 0
+        skipped_by_filter = 0
         for entry in list(ledger["entries"]):
+            if wanted and entry["session_id"] not in wanted:
+                skipped_by_filter += 1
+                continue
             src = REPO_ROOT / entry["quarantined_to"]
             dst = REPO_ROOT / entry["original_path"]
             if not src.exists():
@@ -97,6 +106,8 @@ def main() -> int:
         if not args.dry_run:
             _save_ledger(target_root, ledger)
         print(f"되돌린 항목: {restored}")
+        if skipped_by_filter:
+            print(f"--sessions 필터로 남겨 둔 항목: {skipped_by_filter}")
         return 0
 
     if not source_root.is_dir():

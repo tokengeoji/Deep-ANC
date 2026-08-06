@@ -216,7 +216,13 @@ readiness:
   # ⚠ 이 값은 **대조 대상**이지 단일 출처가 아니다. 게이트는 세션의 program.file 에서
   #   실제로 재생한 풀을 읽고, 이 값과 다르면 FAIL 한다 (2026-08-06: v1 로 둔 채 v2 로
   #   녹음하면 누수 게이트가 엉뚱한 클립끼리 비교해 PASS 하는 것이 재현됐다).
-  recorded_source_pool_csv: data/source_pool_v2/sources.csv
+  # 목록이다. 재녹음이 두 풀에 걸치는 것은 정상이다 — 복구 47세션(v1) + 신규 33세션(v2)
+  # 을 합치면 계열별 그룹이 하한 9 를 넘고(15~20) 스피커 시간이 93.3분 → 38.5분이 된다.
+  # 게이트는 세션의 program.file 에서 실제 재생 풀을 읽어 **이 목록 안에 있는지** 본다.
+  # 목록에 없는 풀을 재생했으면 그 클립이 held-out 에서 빠지므로 거부한다.
+  recorded_source_pool_csv:
+    - data/source_pool_v2/sources.csv
+    - data/source_pool/sources.csv
 
   # ------------------------------------------------------------------------------
   # 실측-측정 지연 교차검증 (measured_source_delay_agreement) — D2

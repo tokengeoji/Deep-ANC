@@ -46,7 +46,12 @@ def test_observed_pool_is_read_from_what_the_session_played(tmp_path: Path) -> N
 
 
 def test_two_pools_in_one_recording_are_both_reported(tmp_path: Path) -> None:
-    """풀이 섞이면 **섞였다는 사실 자체가** 보여야 한다. 하나만 골라 쓰면 나머지가 샌다."""
+    """풀이 섞이면 **양쪽이 다 보여야** 한다. 하나만 골라 쓰면 나머지 클립이 샌다.
+
+    섞임 자체는 정상이다 — 복구 47세션(v1)과 신규 33세션(v2)을 합치는 것이 스피커
+    시간을 93.3분에서 38.5분으로 줄이는 정상 경로다. 위험한 것은 게이트가 한쪽만
+    보는 것이고, 그래서 관측은 **본 것을 전부** 보고해야 한다.
+    """
 
     _session(tmp_path, "old", "data/source_pool/environment/environment_000.wav")
     _session(tmp_path, "new", "data/source_pool_v2/environment/environment_000.wav")
@@ -119,7 +124,12 @@ def test_shipped_defaults_point_at_v2() -> None:
     cfg = yaml.safe_load(
         (REPO_ROOT / "configs" / "train_finetune.yaml").read_text(encoding="utf-8")
     )
-    assert cfg["readiness"]["recorded_source_pool_csv"] == "data/source_pool_v2/sources.csv"
+    declared = cfg["readiness"]["recorded_source_pool_csv"]
+    declared = [declared] if isinstance(declared, str) else list(declared)
+    # v2 는 반드시 있어야 한다 — 신규 녹음은 v2 로만 받는다(v1 은 machine 8 그룹).
+    assert "data/source_pool_v2/sources.csv" in declared, declared
+    # v1 도 선언돼 있어야 복구 47세션을 섞어 쓸 수 있다 (93.3분 → 38.5분).
+    assert "data/source_pool/sources.csv" in declared, declared
 
     batch = (REPO_ROOT / "scripts" / "data" / "record_session_batch.py").read_text(
         encoding="utf-8"

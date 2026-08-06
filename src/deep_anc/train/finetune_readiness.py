@@ -1082,16 +1082,26 @@ def _audit_corpus_leak(audit: "_Audit", readiness_cfg: dict, data_cfg: dict) -> 
         observed = observed_source_pools(
             _repo_path(readiness_cfg.get("recorded_session_root", "data/recorded"))
         )
-        declared = {str(csv_value)}
-        if observed and set(observed) != declared:
+        # 설정은 문자열 하나 또는 목록이다. 재녹음이 두 풀에 걸치는 것은 **정상**이다 —
+        # 복구된 47세션(v1)과 신규 33세션(v2)을 합치면 계열별 그룹이 하한을 넘기고
+        # 스피커 시간이 93.3분 → 38.5분으로 줄어든다. 위험한 것은 섞임 자체가 아니라
+        # **세션이 재생한 풀을 게이트가 모르는 것**이다. 그래서 요구는 포함관계다:
+        # 관측된 모든 풀이 선언 안에 있어야 한다. 선언에 여분이 있는 것은 무해하다.
+        declared = (
+            {str(csv_value)}
+            if isinstance(csv_value, str)
+            else {str(item) for item in csv_value}
+        )
+        unknown = sorted(set(observed) - declared)
+        if unknown:
             raise ValueError(
-                "실측 세션이 재생한 소스풀과 설정이 다릅니다 — 게이트가 엉뚱한 클립끼리 "
-                "비교하게 됩니다.\n"
+                "실측 세션이 **설정에 없는 소스풀**을 재생했습니다 — 그 풀의 클립은 "
+                "held-out 에서 빠지고, 누수 게이트가 못 본 채 통과합니다.\n"
                 f"  설정 readiness.recorded_source_pool_csv = {csv_value}\n"
                 f"  세션이 실제로 재생한 풀 = "
                 + ", ".join(f"{k} ({v}세션)" for k, v in sorted(observed.items()))
-                + "\n  설정을 세션에 맞추세요. 두 풀이 섞여 있다면 그 자체가 문제입니다 "
-                "— 한 풀로 통일해 재녹음하거나, 두 풀의 클립을 모두 held-out 에 넣으세요."
+                + f"\n  선언에 없는 풀: {unknown}\n"
+                "  설정에 그 풀을 추가하세요 (목록으로 여러 개를 적을 수 있습니다)."
             )
         csv_paths = [_repo_path(value) for value in sorted(observed or declared)]
         missing_csv = [str(p) for p in csv_paths if not p.is_file()]
