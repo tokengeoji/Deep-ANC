@@ -218,3 +218,91 @@ def capture_input_probe(
         }
     )
     return report
+
+
+# ---------------------------------------------------------------------------
+# 캡처 클록 교란 방지
+# ---------------------------------------------------------------------------
+def check_capture_clock_undisturbed(card_id: str) -> tuple[bool, list[str]]:
+    """캡처 카드의 클록을 흔들 수 있는 것이 붙어 있는지 본다.
+
+    왜 필요한가
+    ----------
+    Tegra APE 는 **PLL_A 하나를 I2S1~I2S6 전체가 공유**한다
+    (부팅 DTS ``/sound`` 노드가 ``pll_a``/``plla_out0`` 를 직접 쥐고, 모든 I2S 가
+    ``assigned-clock-parents = <plla_out0>``). 머신 드라이버는 스트림 레이트에 맞춰
+    PLL_A 를 재설정한다.
+
+    그런데 PulseAudio 가 같은 카드에 **44100 Hz** 프로파일을 들고 있다
+    (실측: ``alsa_output.platform-sound.analog-stereo``, ``device.string="front:1"``).
+    데스크톱 알림음 하나로 그 sink 가 깨어나면 PLL_A 가 44.1k 계열로 재조정되고,
+    **그 순간 돌고 있던 우리 48kHz 캡처의 BCLK 가 세션 중간에 이동한다.**
+
+    이건 XRUN 이 아니다 — 어떤 기존 게이트도 못 잡는다. 녹음은 정상 종료되고
+    파일도 멀쩡해 보이는데 시간축만 틀어진다. 2026-08-04 에 80세션을 날린 것과
+    같은 종류의 조용한 실패다.
+
+    반환: ``(안전한가, 사유 목록)``. 사유가 있으면 호출부가 **실패-폐쇄**해야 한다.
+    """
+
+    import subprocess
+
+    reasons: list[str] = []
+
+    # (a) 다른 프로세스가 이 카드의 PCM 을 열고 있는가
+    try:
+        index = alsa_card_index(card_id)
+    except Exception:  # pragma: no cover - 카드가 없으면 다른 곳에서 이미 실패한다
+        return True, []
+    for status in sorted(Path(f"/proc/asound/card{index}").glob("pcm*/sub*/status")):
+        try:
+            first = status.read_text(encoding="utf-8").splitlines()[0].strip()
+        except OSError:
+            continue
+        if first and first != "closed":
+            reasons.append(f"{status.parent.parent.name} 가 열려 있습니다 ({first})")
+
+    # (b) PulseAudio 가 같은 카드를 다른 레이트로 들고 있는가
+    try:
+        out = subprocess.run(
+            ["pactl", "list", "sinks"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception:
+        return not reasons, reasons  # pactl 이 없으면 (a) 만으로 판단한다
+
+    block: list[str] = []
+    for line in out.splitlines() + ["Sink #"]:
+        if line.startswith("Sink #") and block:
+            text = "\n".join(block)
+            if f'device.string = "front:{index}"' in text or f'alsa.card = "{index}"' in text:
+                state = next(
+                    (l.split(":", 1)[1].strip() for l in block if "State:" in l), "?"
+                )
+                spec = next(
+                    (l.split(":", 1)[1].strip() for l in block if "Sample Specification" in l),
+                    "?",
+                )
+                if state.upper() == "RUNNING":
+                    reasons.append(
+                        f"PulseAudio 가 같은 카드를 재생 중입니다 ({spec}) — "
+                        "PLL_A 가 재조정되어 캡처 BCLK 가 세션 중에 이동합니다"
+                    )
+            block = []
+        block.append(line)
+
+    return not reasons, reasons
+
+
+def assert_capture_clock_undisturbed(card_id: str) -> None:
+    """:func:`check_capture_clock_undisturbed` 가 걸리면 안내와 함께 예외를 던진다."""
+
+    ok, reasons = check_capture_clock_undisturbed(card_id)
+    if ok:
+        return
+    raise RuntimeError(
+        "캡처 클록이 교란될 수 있습니다:\n  - "
+        + "\n  - ".join(reasons)
+        + "\n\n해결: 측정 전에 데스크톱 오디오가 이 카드를 놓게 하세요.\n"
+        "  pactl set-card-profile alsa_card.platform-sound off   # 완전히 놓는다\n"
+        "  pactl set-card-profile alsa_card.platform-sound output:analog-stereo+input:analog-stereo   # 되돌리기"
+    )

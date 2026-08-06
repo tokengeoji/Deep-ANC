@@ -145,7 +145,11 @@ def self_test() -> int:
 def measure(args) -> int:
     import sounddevice as sd
 
-    from deep_anc.audio_io import pcm_int32_to_float32, resolve_alsa_portaudio_device
+    from deep_anc.audio_io import (
+        float32_to_pcm_int16,
+        pcm_int32_to_float32,
+        resolve_alsa_portaudio_device,
+    )
 
     hardware = load_yaml(REPO_ROOT / args.hardware)["audio"]
     in_dev = resolve_alsa_portaudio_device(
@@ -157,6 +161,36 @@ def measure(args) -> int:
     err_ch = int(hardware.get("channels", {}).get("error_mic", 0)) if isinstance(
         hardware.get("channels"), dict
     ) else 0
+
+    # ── 재생 **전에** 마이크가 살아 있는지 확인한다 ──────────────────────────
+    # 이 검사가 없어서 2026-08-06 에 레일에 붙은 마이크의 잡음을 대역제한해 -21 dBFS
+    # 로 표시하고 "볼륨을 내리세요" 라고 안내했다. 사용자가 볼륨을 완전히 꺼도 눈금이
+    # 안 움직였고, 오히려 내릴수록 초과가 커졌다 — 눈금이 음향과 무관했기 때문이다.
+    # record_duct.py 가 이미 같은 게이트를 갖고 있다. 여기서 다시 만들지 않고 쓴다.
+    sys.path.insert(0, str(REPO_ROOT / "scripts" / "data"))
+    from record_duct import input_rail_gate  # noqa: E402
+
+    probe = sd.rec(
+        int(1.5 * FS), samplerate=FS, channels=2, dtype="int32", device=in_dev
+    )
+    sd.wait()
+    probe_f = pcm_int32_to_float32(probe[FS // 2 :])
+    rail_ok, clip_ratio = input_rail_gate(probe_f)
+    floor = [band_rms_dbfs(probe_f[:, c].astype(np.float64)) for c in range(2)]
+    print(
+        f"마이크 점검: ch0 {floor[0]:.1f} dBFS / ch1 {floor[1]:.1f} dBFS · "
+        f"레일 비율 {clip_ratio[0]:.4f}/{clip_ratio[1]:.4f}"
+    )
+    if not rail_ok:
+        print(
+            f"\n[중단] 마이크 입력이 풀스케일에 붙어 있습니다 "
+            f"(레일 비율 {clip_ratio[0]:.4f}/{clip_ratio[1]:.4f}). "
+            "이 상태에서는 레벨 눈금이 음향과 무관해집니다 — 볼륨을 아무리 돌려도 "
+            "숫자가 안 움직입니다.\n"
+            "입력단 전원·배선(특히 J30 핀 접촉)을 확인한 뒤 다시 실행하세요.",
+            file=sys.stderr,
+        )
+        return 1
 
     noise = probe_signal(args.seconds)
 
@@ -180,13 +214,19 @@ def measure(args) -> int:
         start = cursor["out"]
         end = min(start + frames, noise.size)
         take = end - start
-        outdata[:] = 0.0
+        outdata[:] = 0
         if take > 0:
-            outdata[:take, 0] = noise[start:end]
+            outdata[:take, 0] = float32_to_pcm_int16(noise[start:end])
         cursor["out"] = end
         if take < frames:
             raise sd.CallbackStop
-        buf = np.concatenate([pending["buf"], indata[:, err_ch].astype(np.float64)])
+        # ⚠ 입력은 반드시 int32 로 받아 pcm_int32_to_float32 로 변환한다.
+        # dtype="float32" 로 열어 PortAudio 에 변환을 맡기면 풀스케일 규약이 달라져
+        # 눈금이 통째로 틀린다(2026-08-06 실측: 소리를 꺼도 -18 dBFS 가 나왔다).
+        # 저장소 전체가 이 규약이다 — run_realtime.py:604, record_duct.py:243.
+        buf = np.concatenate(
+            [pending["buf"], pcm_int32_to_float32(indata[:, err_ch]).astype(np.float64)]
+        )
         while buf.size >= hop:
             try:
                 meter.put_nowait(band_rms_dbfs(buf[:hop]))
@@ -196,8 +236,9 @@ def measure(args) -> int:
         pending["buf"] = buf
 
     levels: list[float] = []
+    # 런타임(run_realtime.py:604)과 **같은 dtype 규약**: 입력 int32 / 출력 int16.
     stream = sd.Stream(
-        samplerate=FS, blocksize=1024, dtype="float32", channels=2,
+        samplerate=FS, blocksize=1024, dtype=("int32", "int16"), channels=2,
         device=(in_dev, out_dev), callback=callback,
     )
     deadline = args.seconds + 3.0
