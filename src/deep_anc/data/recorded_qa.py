@@ -16,8 +16,10 @@ import numpy as np
 import soundfile as sf
 
 from ..dsp.invariants import (
+    CONTROLLED_BAND_TOP_HZ,
     MAX_STREAM_DELAY_P95_P5_SAMPLES,
     MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+    MIN_STREAM_COHERENCE,
     MIN_STREAM_DELAY_VALID_WINDOW_RATIO,
     MIN_STREAM_DELAY_VALID_WINDOWS,
 )
@@ -54,8 +56,28 @@ class RecordedQASettings:
     위한 상한이다. 30 초 = 채널당 5.7 MB 이고, 실측 세션 70 초 중 30 초면 창 30개라
     지연 궤적 통계가 충분히 안정된다."""
 
-    min_source_err_coherence: float = 0.60
+    min_source_err_coherence: float = MIN_STREAM_COHERENCE
     """실측 정상 0.96~0.99 / 붕괴 0.02~0.13 사이의 넓은 골짜기에서 고른 값."""
+
+    alignment_high_band_hz: tuple[float, float] = (600.0, CONTROLLED_BAND_TOP_HZ)
+    """**절대목표 1의 고역 절반.** 2026-08-06 이전에는 이 대역을 보는 게이트가 0개였다.
+
+    ``coh2_600_1600_after`` 는 ``timeline.py`` 가 계산하고 ``record_duct.py`` 가 출력까지
+    했는데, 저장소 전체에서 그 값을 **판정에 쓰는 곳이 없었다**(읽는 곳은 print 1곳과
+    테스트 픽스처 2곳뿐). 신뢰대역이 [150,600] → [150,1600] 으로 넓어진 뒤에도
+    ``alignment_band_hz`` 는 (150,600) 그대로였고 configs 어디서도 오버라이드되지 않았다.
+
+    실측 47 세션(내가 직접 집계): 저역 min 0.905 / p50 0.947 vs **고역 min 0.596 /
+    p50 0.824**. 즉 학습 데이터의 고역 정렬 품질이 저역보다 체계적으로 0.12 낮은데
+    아무도 그것을 보지 않았다."""
+
+    min_source_err_coherence_high: float = MIN_STREAM_COHERENCE
+    """고역에도 **같은 하한**을 건다. 별도 숫자를 만들지 않는 것이 요점이다.
+
+    저역만 0.60 을 요구하고 고역을 안 보면, "제어를 주장하는 대역" 과 "품질을 검사하는
+    대역" 이 갈라진다 — 그것이 정확히 2026-08-06 이전 상태였다. 이 하한과
+    :data:`deep_anc.dsp.invariants.MAX_STREAM_DELAY_ROBUST_STD_SAMPLES` 는 같은 선언
+    (:data:`MIN_STREAM_COHERENCE`)에서 함께 유도된다."""
 
     min_ref_err_coherence: float = 0.60
     """음향 대조군. 이 값이 살아 있는데 source→ERR 만 죽으면 원인은 음향이 아니라
@@ -559,6 +581,20 @@ def _validate_alignment(
             control=ref,
             name="source_err_coherence",
         )
+        # 고역 — 절대목표 1의 나머지 절반. 저역과 **같은 하한**을 건다.
+        high_band = (
+            float(settings.alignment_high_band_hz[0]),
+            float(settings.alignment_high_band_hz[1]),
+        )
+        high_check = check_stream_coherence(
+            src,
+            err,
+            sample_rate=settings.sample_rate,
+            band_hz=high_band,
+            min_coherence=float(settings.min_source_err_coherence_high),
+            nperseg=int(settings.alignment_nperseg),
+            name="source_err_coherence_high",
+        )
         delay_check = check_stream_delay_stability(
             src,
             err,
@@ -577,6 +613,8 @@ def _validate_alignment(
     alignment.update(
         {
             "source_err_coherence": float(coherence_check.measured["coherence"]),
+            "high_band_hz": [float(high_band[0]), float(high_band[1])],
+            "source_err_coherence_high": float(high_check.measured["coherence"]),
             "ref_err_coherence": (
                 float(control_coherence) if control_coherence is not None else float("nan")
             ),
@@ -604,13 +642,17 @@ def _validate_alignment(
             "delay_track_band_hz": list(delay_check.measured["band_hz"]),
             "delay_window_samples": int(delay_check.measured["window_samples"]),
             "delay_estimator": "deep_anc.data.timeline.measure_delay_trajectory",
-            "ok": bool(coherence_check.ok and delay_check.ok),
+            "ok": bool(coherence_check.ok and high_check.ok and delay_check.ok),
         }
     )
     result["alignment"] = alignment
 
     if not coherence_check.ok:
         _append_error(result, coherence_check.detail)
+    if not high_check.ok:
+        # 절대목표 1의 고역 절반. 이 줄이 없으면 위에서 계산한 값이 리포트에만 남고
+        # 판정에는 쓰이지 않는다 — 그것이 2026-08-06 이전 상태였다.
+        _append_error(result, high_check.detail)
     if control_coherence is not None and float(control_coherence) < float(
         settings.min_ref_err_coherence
     ):

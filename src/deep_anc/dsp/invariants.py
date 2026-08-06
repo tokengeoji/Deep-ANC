@@ -334,21 +334,92 @@ def check_lead_agreement(
     )
 
 
-MAX_STREAM_DELAY_ROBUST_STD_SAMPLES = 8.0
-"""``playback → capture`` 지연 궤적 산포(1.4826×MAD)의 상한.
+def coherence_from_delay_jitter(freq_hz: float, robust_std_samples: float, sample_rate: float) -> float:
+    """지연 지터 σ 가 주파수 ``f`` 에서 남기는 크기제곱 코히런스 상한.
 
-근거는 실측 전수다 (2026-08-06, ``data/recorded_broken`` 앞 30 초, 단일 추정기)::
+    ``coh²(f) = exp(-(2π f σ / fs)²)``. 지연 궤적의 요동을 가우시안 위상 요동으로 보면
+    나오는 표준 결과이고, 이 저장소의 실측이 그것을 지지한다 — 재정렬 47 세션에서
+    고역 coh² 와 σ 의 상관이 **r = −0.812**, 저역 예측 p50 0.992 vs 실측 0.947,
+    고역 예측 0.936 vs 실측 0.824 (나머지 0.11 은 가산 잡음 바닥).
+
+    **지연 자체는 코히런스를 낮추지 않는다.** 낮추는 것은 지연의 *변동*이다. 그래서
+    정렬이 잘 된 세션도 지터가 크면 고역이 무너진다.
+    """
+
+    import math
+
+    return float(math.exp(-((2.0 * math.pi * float(freq_hz) * float(robust_std_samples) / float(sample_rate)) ** 2)))
+
+
+def delay_jitter_limit_for_band(
+    top_hz: float, min_coherence: float, sample_rate: float
+) -> float:
+    """제어를 주장하는 대역 상단에서 코히런스를 지키는 **지터 상한**을 유도한다.
+
+    ``σ_max = (fs / 2πf_top) · √(−ln coh_min)``. :func:`coherence_from_delay_jitter` 의 역이다.
+
+    왜 이것이 필요한가 (2026-08-06)
+    ------------------------------
+    이전 상한 ``8.0`` 은 저역의 정상/오염 분리에서만 정해졌다(정상 1.2~3.0 vs 오염
+    25~120). 그런데 σ=8.0 에서 **1600 Hz 의 달성 가능 coh² 는 0.060** 이다. 즉 그 게이트를
+    통과한 세션이 절대목표 1의 고역 절반에 대해 아무 정보도 담고 있지 않을 수 있었고,
+    실제로 고역을 보는 게이트는 저장소에 **하나도 없었다**.
+
+    임계를 손으로 고르지 않는다 — 신뢰대역 상단과 이미 선언된 코히런스 요구
+    (:data:`MIN_STREAM_COHERENCE`)에서 유도한다.
+    """
+
+    import math
+
+    if not 0.0 < float(min_coherence) < 1.0:
+        raise ValueError(f"min_coherence 는 (0,1) 이어야 합니다: {min_coherence}")
+    if float(top_hz) <= 0.0 or float(sample_rate) <= 0.0:
+        raise ValueError(f"주파수는 양수여야 합니다: top={top_hz}, fs={sample_rate}")
+    return float(
+        (float(sample_rate) / (2.0 * math.pi * float(top_hz)))
+        * math.sqrt(-math.log(float(min_coherence)))
+    )
+
+
+MIN_STREAM_COHERENCE = 0.60
+"""``source → ERR`` 크기제곱 코히런스의 하한. **제어를 주장하는 대역 전체에 적용된다.**
+
+실측 정상 0.96~0.99 / 붕괴 0.02~0.13 사이의 넓은 골짜기에서 고른 값이다.
+2026-08-06 이전에는 이 값이 ``recorded_qa`` 안에 있었고 **150–600 Hz 에만** 적용됐다.
+신뢰대역이 [150,1600] 으로 넓어진 뒤에도 그대로였다 — 즉 요구 대역의 위쪽 절반은
+아무도 보지 않았다. 지금은 이 하나의 선언에서 고역 게이트와 지터 상한이 함께 유도된다.
+"""
+
+CONTROLLED_BAND_TOP_HZ = 1600.0
+"""제어를 주장하는 대역의 상단. 지터 상한의 유도원이다.
+
+S(z) 복구 후 신뢰대역이 [150, 1600] 이 됐다(HANDOFF 플랜트 복구 결과). 1633 Hz 는 덕트
+평면파 컷오프이고 그 위는 가진조차 하지 않았다.
+"""
+
+MAX_STREAM_DELAY_ROBUST_STD_SAMPLES = delay_jitter_limit_for_band(
+    CONTROLLED_BAND_TOP_HZ, MIN_STREAM_COHERENCE, 48_000.0
+)
+"""``playback → capture`` 지연 궤적 산포(1.4826×MAD)의 상한. **유도값 ≈ 3.41 샘플.**
+
+옛 값 ``8.0`` 은 실측 전수의 골짜기에서 정했다 (2026-08-06, ``data/recorded_broken``
+앞 30 초, 단일 추정기)::
 
     정상군 = 재정렬된 47 세션 (source_aligned → ERR)   robust-std 1.221 ~ 2.992
     오염군 = 같은 세션의 원본 80 개 (source → ERR)     robust-std 25.159 ~ 120.620
 
-두 무리 사이 [2.992, 25.159] 가 **통째로 비어 있다**(8.4배). 8.0 은 그 골짜기의
-기하평균(8.68)을 내림한 값이라 정상군 최대의 2.7배, 오염군 최소의 1/3.1 이다.
+골짜기 [2.992, 25.159] 는 통째로 비어 있고(8.4배) 8.0 은 그 기하평균(8.68)의 내림이었다.
+**그 근거는 여전히 맞다 — 다만 부족하다.** σ=8.0 을 허용하면 1600 Hz 에서 달성 가능한
+coh² 가 **0.060** 이다. 붕괴한 세션은 걸러내지만, 통과한 세션의 고역이 쓸모없을 수
+있고 그것을 보는 게이트가 없었다.
 
-옛 임계 64 를 그대로 쓸 수 없는 이유: 64 는 **광대역 argmax 추정기의 잡음 바닥**에
-맞춰진 값이었다. 대역제한 PHAT 로 바꾸면 잡음 바닥이 18 → 1.2~3.0 샘플로 내려가므로
-같은 64 는 오염군(최소 25.2)을 통째로 통과시킨다. 추정기를 고치면 임계도 같이
-고쳐야 한다 — 안 그러면 게이트가 조용히 무력화된다."""
+그래서 임계를 대역에서 유도한다: ``σ_max = (fs/2πf_top)·√(−ln coh_min)``.
+f_top = 1600 Hz, coh_min = 0.60 → **3.413 샘플**.
+
+이 변경은 게이트를 **강화**한다(8.0 → 3.41). 실측 47 세션은 σ 최대 2.992 이므로 전부
+그대로 통과한다 — 즉 기존 데이터를 버리지 않으면서 고역 보호를 얻는다. 오염군 최소
+25.159 와의 여유도 7.4배로 오히려 커진다.
+"""
 
 MAX_STREAM_DELAY_P95_P5_SAMPLES = 48.0
 """``playback → capture`` 지연 궤적 변동폭(p95−p5)의 상한.

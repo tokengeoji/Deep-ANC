@@ -1076,6 +1076,25 @@ GATES: tuple[GateDeclaration, ...] = (
         ),
     ),
     GateDeclaration(
+        gate_id="recorded_high_band_alignment",
+        owner=_QA,
+        what_it_asserts=(
+            "source→ERR 코히런스가 **고역(600–1600Hz)에서도** 하한을 만족한다 —"
+            " 절대목표 1의 나머지 절반이고, 2026-08-06 이전에는 보는 게이트가 0개였다"
+        ),
+        negative_fixture=(
+            "tests/test_recorded_qa.py::test_high_band_alignment_failure_is_rejected"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_gate_positive_fixtures.py::"
+            "test_the_delay_gate_now_implies_the_coherence_gate"
+        ),
+        positive_probe=(
+            "지터 상한 3.41 샘플의 94% 까지 민 세션에서 고역 coh² 가 하한 0.60 위에 남는다"
+        ),
+    ),
+    GateDeclaration(
         gate_id="recorded_source_pool_agrees_with_sessions",
         owner=_READINESS,
         what_it_asserts=(

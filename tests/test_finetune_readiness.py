@@ -1808,15 +1808,17 @@ def test_readiness_alignment_thresholds_actually_reach_the_qa():
     }
 
     # 1) 새 키가 실제로 반영된다 — 이것이 이전에 조용히 버려지던 경로다.
+    # 값은 **강화 방향**이어야 통과한다. 2026-08-06 에 지터 상한이 8.0 에서
+    # 대역 유도값 3.41 로 강화되면서 옛 4.0 은 이제 완화 방향이 됐다.
     declared = {
-        "max_source_err_delay_robust_std_samples": 4.0,
+        "max_source_err_delay_robust_std_samples": 3.0,
         "max_source_err_delay_p95_p5_samples": 24.0,
         "min_source_err_delay_window_ratio": 0.90,
     }
     settings = settings_from_data_config(
         data_cfg, alignment_overrides=_alignment_overrides(declared)
     )
-    assert settings.max_source_err_delay_robust_std_samples == 4.0
+    assert settings.max_source_err_delay_robust_std_samples == 3.0
     assert settings.max_source_err_delay_p95_p5_samples == 24.0
     assert settings.min_source_err_delay_window_ratio == 0.90
 

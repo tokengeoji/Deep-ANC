@@ -19,6 +19,13 @@ from deep_anc.data.recorded_qa import (
 from scripts.data.validate_recorded_sessions import main as qa_main
 
 
+import pytest
+
+from deep_anc.dsp.invariants import (
+    MAX_STREAM_DELAY_P95_P5_SAMPLES,
+    MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+)
+
 FS = 48_000
 
 
@@ -485,7 +492,7 @@ def test_qa_measures_source_err_alignment_on_a_healthy_session(tmp_path):
         assert alignment["source_err_coherence"] > 0.9
         assert alignment["ref_err_coherence"] > 0.9
         # 지연이 상수이므로 흔들림이 거의 없어야 한다.
-        assert alignment["source_err_delay_robust_std_samples"] < 8.0
+        assert alignment["source_err_delay_robust_std_samples"] < MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
         assert alignment["source_err_delay_p95_p5_samples"] < 48.0
         assert abs(alignment["source_err_delay_median_samples"] - ERR_DELAY_SAMPLES) <= 2
         # "측정했는가"까지 기록으로 남아야 한다 — 창이 서지 않은 채 통과하면
@@ -591,7 +598,7 @@ def test_qa_rejects_a_drifting_source_err_delay(tmp_path):
     alignment = session["alignment"]
     # 추적은 됐는데(유효창 비율 정상) 값이 움직인다 — 로버스트 축이 잡은 것이다.
     assert alignment["delay_valid_window_ratio"] >= 0.5
-    assert alignment["source_err_delay_robust_std_samples"] > 8.0
+    assert alignment["source_err_delay_robust_std_samples"] > MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
     assert alignment["source_err_delay_p95_p5_samples"] > 48.0
 
 
@@ -772,7 +779,7 @@ def test_qa_does_not_reject_a_realigned_session_over_reverberant_outlier_windows
     alignment = session["alignment"]
     assert alignment["ok"]
     assert abs(alignment["source_err_delay_median_samples"] - ERR_DELAY_SAMPLES) <= 2
-    assert alignment["source_err_delay_robust_std_samples"] < 8.0
+    assert alignment["source_err_delay_robust_std_samples"] < MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
     # 원시 통계는 진단으로 남되 판정에는 쓰이지 않는다는 것도 함께 못 박는다.
     assert "source_err_delay_raw_std_samples" in alignment
     assert "source_err_delay_ptp_samples" in alignment
@@ -855,15 +862,19 @@ def test_legacy_delay_thresholds_are_migrated_and_reported_not_silently_ignored(
         },
     )
 
-    assert settings.max_source_err_delay_robust_std_samples == 8.0
-    assert settings.max_source_err_delay_p95_p5_samples == 48.0
+    assert settings.max_source_err_delay_robust_std_samples == pytest.approx(
+        MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
+    )
+    assert settings.max_source_err_delay_p95_p5_samples == MAX_STREAM_DELAY_P95_P5_SAMPLES
     notes = "\n".join(settings.deprecated_threshold_notes)
     assert "max_source_err_delay_std_samples" in notes
     assert "max_source_err_delay_range_samples" in notes
 
     report = validate_recorded_sessions([], settings)
     assert any("폐기됐습니다" in warning for warning in report["warnings"])
-    assert report["settings"]["max_source_err_delay_robust_std_samples"] == 8.0
+    assert report["settings"]["max_source_err_delay_robust_std_samples"] == pytest.approx(
+        MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
+    )
     assert report["settings"]["deprecated_threshold_notes"]
 
 
@@ -874,9 +885,11 @@ def test_a_stricter_legacy_threshold_is_honoured():
 
     settings = settings_from_data_config(
         _data_cfg(),
-        alignment_overrides={"max_source_err_delay_std_samples": 4.0},
+        alignment_overrides={"max_source_err_delay_std_samples": 2.0},
     )
-    assert settings.max_source_err_delay_robust_std_samples == 4.0
+    # 2.0 은 유도값 3.41 보다 엄격하므로 살아남아야 한다. (예전 4.0 은 옛 상한 8.0
+    # 기준으로 엄격했지만, 대역에서 유도한 지금 상한 3.41 보다는 느슨하다.)
+    assert settings.max_source_err_delay_robust_std_samples == 2.0
 
 
 def test_delay_thresholds_cannot_be_loosened_past_the_measured_valley():
@@ -928,3 +941,61 @@ def test_qa_no_longer_owns_a_second_delay_window_declaration():
     assert any(
         "alignment_window_seconds" in note for note in settings.deprecated_threshold_notes
     )
+
+
+def _high_band_destroyed(frames: int, *, seed: int = 20260806):
+    """저역은 멀쩡하고 **고역만** source 와 무관해진 세션.
+
+    실기에서 이렇게 되는 경로는 여럿이다 — 고역 SNR 부족, 마이크 고역 롤오프,
+    소스에 600–1600 Hz 에너지가 거의 없음. 어느 쪽이든 그 세션으로는 절대목표 1의
+    고역을 배울 수 없다. 지터가 아니라 **다른 원인**으로 고역이 죽은 경우를 만들어,
+    고역 게이트가 지터 게이트의 부산물이 아니라 독립적으로 작동함을 보인다.
+    """
+
+    source = _band_noise(frames, seed)
+    rng = np.random.default_rng(seed + 7)
+    lo_b, lo_a = butter(6, 600.0 / (FS / 2), btype="low")
+    hi_b, hi_a = butter(6, 600.0 / (FS / 2), btype="high")
+    # ERR = source 의 저역(지연) + 고역은 **독립 잡음**
+    err = lfilter(lo_b, lo_a, np.roll(source, ERR_DELAY_SAMPLES))
+    noise = lfilter(hi_b, hi_a, rng.standard_normal(frames))
+    # 고역 잡음을 저역 성분과 같은 규모로 맞추고 전체를 클리핑 밖에 둔다.
+    noise *= float(np.sqrt(np.mean(err**2)) / (np.sqrt(np.mean(noise**2)) + 1e-12))
+    err = err + noise
+    err *= 0.25 / (float(np.max(np.abs(err))) or 1.0)
+    ref = 0.9 * np.roll(source, REF_DELAY_SAMPLES) + 0.01 * rng.standard_normal(frames)
+    mics = np.stack([err, ref], axis=1).astype(np.float32)
+    return mics, source.astype(np.float32)
+
+
+def test_high_band_alignment_failure_is_rejected(tmp_path):
+    """저역이 통과해도 **고역이 죽으면 거부**한다 (절대목표 1의 나머지 절반).
+
+    2026-08-06 이전에는 이런 세션이 통과했다. ``coh2_600_1600_after`` 는 계산·저장·
+    출력까지 됐지만 판정에 쓰는 곳이 저장소 전체에 **0개**였고,
+    ``alignment_band_hz`` 기본값 (150,600) 이 configs 어디서도 오버라이드되지 않았다.
+    """
+
+    mics, source = _high_band_destroyed(SESSION_FRAMES)
+    entries = []
+    for split in ("train", "val", "test"):
+        entry = _write_session(
+            tmp_path / f"hb-{split}",
+            session_id=f"hb-{split}",
+            group_id=f"group-{split}",
+            mics=mics,
+            source=source,
+        )
+        entry["split"] = split
+        entries.append(entry)
+
+    report = validate_recorded_sessions(entries, _settings())
+
+    assert not report["ok"]
+    session = report["sessions"][0]
+    alignment = session["alignment"]
+    # 저역은 살아 있고 고역만 죽었다 — 즉 저역 게이트만으로는 못 잡는다.
+    assert alignment["source_err_coherence"] > 0.60, alignment
+    assert alignment["source_err_coherence_high"] < 0.60, alignment
+    assert not alignment["ok"]
+    assert any("결맞음" in text for text in session["errors"]), session["errors"]

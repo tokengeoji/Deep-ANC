@@ -435,6 +435,50 @@ class ANCLoss(nn.Module):
         return l_sat, u_over_limit
 
     # ---------------------------------------------------------------- forward
+    # ------------------------------------------------------------ 항별 그래디언트 예산
+    def gradient_budget(
+        self,
+        y: torch.Tensor,
+        d: torch.Tensor,
+        perturb: dict | None = None,
+    ) -> dict[str, float]:
+        """각 항이 ``∂/∂y`` 예산에서 차지하는 몫: ``‖λ·∇term‖ / ‖∇nmse‖``.
+
+        왜 손실 안에 있는가
+        ------------------
+        λ 를 고를 때마다 이 값을 재야 하는데, 재는 코드가 스크립트 안에 있으면 항 목록을
+        거기서 다시 적게 된다. 그러면 항이 추가·삭제될 때 조용히 갈라진다 — 실제로
+        2026-08-06 감사가 "λ_dnh 가 새 대역 구성에서 재교정되지 않았다(비 1333%)" 를
+        찾았을 때, 그 1333% 를 만든 계산은 저장소 어디에도 남아 있지 않았다.
+        :meth:`forward` 와 **같은 dict** 를 쓰므로 갈라질 수 없다.
+
+        해석: ``nmse`` 는 항상 1.0 이다(분모). 설계 목표는 보조항이 0.2~0.4 다 —
+        그보다 크면 목적함수가 보조항에 끌려가고, 훨씬 작으면 그 항이 죽은 것이다.
+
+        ⚠ 값은 ``y`` 에 의존한다. ``y=0`` 에서는 dnh 가 0 이라 무의미하므로, 학습 중간을
+        닮은 y(신뢰대역 일부 상쇄 + 대역 밖 누설)에서 재라.
+        """
+
+        y = y.detach().clone().requires_grad_(True)
+        total, _ = self.forward(y, d, perturb=perturb)
+        terms = self._last_terms
+        norms: dict[str, float] = {}
+        for name, (weight, term) in terms.items():
+            if float(weight) == 0.0 or not term.requires_grad:
+                norms[name] = 0.0
+                continue
+            (grad,) = torch.autograd.grad(
+                float(weight) * term, y, retain_graph=True, allow_unused=True
+            )
+            norms[name] = 0.0 if grad is None else float(grad.norm())
+        base = norms.get("nmse", 0.0)
+        if base <= 0.0:
+            raise ValueError(
+                "nmse 항의 그래디언트가 0 입니다 — 예산비를 정의할 분모가 없습니다. "
+                "y 가 목적함수에 영향을 주는 값인지 확인하세요"
+            )
+        return {name: value / base for name, value in norms.items()}
+
     def forward(
         self,
         y: torch.Tensor,
@@ -546,13 +590,20 @@ class ANCLoss(nn.Module):
         l_sat, u_over_limit = self.saturation_penalty(y)
         l_pow = y.pow(2).mean()  # λ=0 기본 — 지표로만 유지
 
-        total = (
-            l_nmse
-            + self.lambda_mrstft * l_mrstft
-            + self.lambda_dnh * l_dnh
-            + self.lambda_frame * l_frame
-            + self.lambda_sat * l_sat
-            + self.lambda_pow * l_pow
+        # 항을 이름과 함께 모아 둔다. forward 는 **합만** 하고, 예산 측정
+        # (gradient_budget)은 같은 dict 를 쓴다 — 항 목록을 두 곳에 적으면 그것이
+        # 발생기 A 이고, 실제로 λ 재교정 때마다 목록이 갈라졌다.
+        self._last_terms = {
+            "nmse": (1.0, l_nmse),
+            "mrstft": (self.lambda_mrstft, l_mrstft),
+            "dnh": (self.lambda_dnh, l_dnh),
+            "frame": (self.lambda_frame, l_frame),
+            "sat": (self.lambda_sat, l_sat),
+            "pow": (self.lambda_pow, l_pow),
+        }
+        total = sum(
+            (weight * term for weight, term in self._last_terms.values()),
+            start=y.new_zeros(()),
         )
         metrics = {
             "loss": float(total.detach()),

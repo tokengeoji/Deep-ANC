@@ -403,18 +403,26 @@ def _jitter_sessions(root: Path, sigma: float, frames: int) -> list[dict]:
 def test_recorded_qa_delay_gates_pass_at_90_percent_of_the_robust_limits(tmp_path):
     """지연 안정성 게이트를 **실제로 도달 가능한 경계**까지 민다 — 오기각 44% 사고의 짝.
 
-    선언된 한계는 robust-std 8.0 / p95−p5 48.0 이지만, 같은 데이터에 걸린 코히런스
-    하한 0.60 이 **먼저** 묶는다. 12 초 세션에 창별 지연 흔들림 σ 를 키우며 실측:
+    2026-08-06 이전: 선언된 한계가 robust-std **8.0** 이었는데 같은 데이터에 걸린
+    코히런스 하한 0.60 이 **먼저** 묶었다. 12 초 세션에 창별 지연 흔들림 σ 를 키우며 실측::
 
         σ=1.0 coh 0.974 rstd 1.24 | σ=3.0 coh 0.880 rstd 2.57
         σ=5.0 coh 0.731 rstd 3.49 | σ=6.0 coh 0.623 rstd 4.92
         σ=7.2 coh 0.501 rstd 6.00 → **코히런스 게이트가 FAIL** (지연 게이트는 여전히 통과)
 
-    즉 robust-std 의 90% 지점(7.2)은 물리적으로 도달할 수 없다. 같은 물리량(시간축
-    안정성)에 두 임계가 따로 걸려 있고 서로 대조되지 않는다 — 발생기 A 다. 이 테스트가
-    그 사실을 고정하고, **도달 가능한 경계(코히런스 하한의 1.2배)** 에서 전 게이트가
-    PASS 하는 것을 요구한다. 실측 정상 세션의 robust-std 는 1.25~1.84 였으므로 이
-    픽스처는 실기 최악보다 2배 나쁜 정상값이다.
+    즉 robust-std 의 90% 지점(7.2)은 물리적으로 도달할 수 없었다. 같은 물리량(시간축
+    안정성)에 두 임계가 따로 걸려 있고 서로 대조되지 않는 발생기 A 였다.
+
+    **지금은 둘이 하나의 선언에서 유도된다** — 지터 상한은
+    ``σ_max = (fs/2πf_top)·√(−ln coh_min)`` 로 신뢰대역 상단 1600 Hz 와 코히런스 하한
+    0.60 에서 나온다(= 3.41 샘플). 그래서 이 픽스처는 지연 게이트를 그 한계의 94% 까지
+    밀고, 코히런스는 하한 위에 남는다. 새 실측(σ 를 키우며)::
+
+        σ=2.0 rstd 2.47 저역coh 0.930 고역coh 0.896 | σ=2.5 rstd 3.21 저역 0.895 고역 0.843
+        σ=3.0 rstd 3.78 → 지연 게이트 FAIL (12개 중 3개)
+
+    실측 정상 세션의 robust-std 는 1.22~2.99 였으므로 이 픽스처(3.21)는 실기 최악보다
+    나쁜 정상값이다.
     """
 
     from deep_anc.dsp.invariants import (
@@ -424,7 +432,8 @@ def test_recorded_qa_delay_gates_pass_at_90_percent_of_the_robust_limits(tmp_pat
 
     settings = _qa_settings()
     frames = 12 * FS                      # 12 초 = 창 180개 이상
-    entries = _jitter_sessions(tmp_path / "jitter", 5.0, frames)
+    # 유도된 상한 3.41 샘플의 94% 지점에 붙게 고른 값이다.
+    entries = _jitter_sessions(tmp_path / "jitter", 2.5, frames)
 
     report = validate_recorded_sessions(entries, settings)
 
@@ -438,13 +447,21 @@ def test_recorded_qa_delay_gates_pass_at_90_percent_of_the_robust_limits(tmp_pat
         float(session["alignment"]["source_err_coherence"])
         for session in report["sessions"]
     ]
-    # 코히런스가 실제로 하한 근처까지 내려갔는가 (= 정말 몰아본 것인가).
-    assert 0.60 < min(coherence) < 0.80, coherence
+    # 코히런스는 하한 위에 남아야 한다 — 이제 먼저 묶는 것은 지연 게이트다.
+    assert min(coherence) > 0.60, coherence
+    high = [
+        float(session["alignment"]["source_err_coherence_high"])
+        for session in report["sessions"]
+    ]
+    # 고역도 함께 판정된다 (2026-08-06 이전에는 이 값을 보는 게이트가 0개였다).
+    assert min(high) > 0.60, high
     measured = [
         float(session["alignment"]["source_err_delay_robust_std_samples"])
         for session in report["sessions"]
     ]
+    # 실제로 한계까지 밀었는가 — 90% 를 넘어야 "경계에서 통과" 라고 말할 수 있다.
     assert max(measured) <= MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
+    assert max(measured) >= 0.90 * MAX_STREAM_DELAY_ROBUST_STD_SAMPLES, measured
     spreads = [
         float(session["alignment"]["source_err_delay_p95_p5_samples"])
         for session in report["sessions"]
@@ -452,21 +469,67 @@ def test_recorded_qa_delay_gates_pass_at_90_percent_of_the_robust_limits(tmp_pat
     assert max(spreads) <= MAX_STREAM_DELAY_P95_P5_SAMPLES
 
 
-def test_the_coherence_gate_binds_before_the_delay_gate(tmp_path):
-    """위 테스트가 '한계의 90%' 를 못 쓰는 이유를 **측정으로** 남긴다.
+def test_the_delay_gate_now_implies_the_coherence_gate(tmp_path):
+    """두 게이트가 **함께 묶이는지** 를 측정으로 강제한다 (2026-08-06 에 계약이 바뀌었다).
 
-    σ=7.2 (robust-std 한계 8.0 의 90%) 에서 실제로 FAIL 하는 것은 지연 게이트가 아니라
-    코히런스 게이트다. 두 임계가 같은 물리량에 따로 걸려 있고 대조되지 않는다.
+    옛 상태: 한계가 robust-std **8.0** 이라 σ=7.2 에서 코히런스만 FAIL 하고 지연은
+    통과했다. 같은 물리량(시간축 안정성)에 두 임계가 따로 걸려 있고 대조되지 않는
+    발생기 A 였고, 그 틈으로 **1600 Hz coh² 0.06 인 세션이 지연 게이트를 통과**할 수
+    있었다 — 절대목표 1의 고역이 학습 데이터에서 사라져도 아무도 몰랐다는 뜻이다.
+
+    지금 지터 상한은 코히런스 하한에서 유도된다
+    (``σ_max = (fs/2πf_top)·√(−ln coh_min)``). 그러면 다음이 **정리**가 된다:
+
+        지연 게이트를 통과했다  ⇒  대역 상단에서도 코히런스 하한을 만족한다
+
+    이 테스트는 지터를 넓게 훑어 그 함의가 한 번도 깨지지 않는 것을 확인한다.
+    반례가 하나라도 나오면 유도가 틀린 것이다.
     """
 
+    from deep_anc.dsp.invariants import MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
+
     settings = _qa_settings()
-    entries = _jitter_sessions(tmp_path / "beyond", 7.2, 12 * FS)[:1]
-    report = validate_recorded_sessions(entries, settings)
-    session = report["sessions"][0]
-    assert session["errors"], session
-    assert any("결맞음" in text for text in session["errors"]), session["errors"]
-    assert not any("떠다닙니다" in text for text in session["errors"]), session["errors"]
-    assert float(session["alignment"]["source_err_delay_robust_std_samples"]) < 8.0
+    checked = 0
+    for sigma in (1.0, 2.0, 2.5, 3.0, 4.0, 6.0):
+        entries = _jitter_sessions(tmp_path / f"sweep{sigma}", sigma, 12 * FS)[:2]
+        report = validate_recorded_sessions(entries, settings)
+        for session in report["sessions"]:
+            alignment = session["alignment"]
+            rstd = float(alignment["source_err_delay_robust_std_samples"])
+            if rstd > MAX_STREAM_DELAY_ROBUST_STD_SAMPLES:
+                continue          # 지연 게이트가 거부한 세션 — 함의의 전제가 아니다
+            checked += 1
+            assert float(alignment["source_err_coherence"]) >= 0.60, (
+                f"σ={sigma}: 지연 게이트를 통과(rstd {rstd:.2f})했는데 코히런스가 "
+                f"{alignment['source_err_coherence']:.3f} 입니다 — 유도가 깨졌습니다"
+            )
+            assert float(alignment["source_err_coherence_high"]) >= 0.60, (
+                f"σ={sigma}: 지연 게이트를 통과(rstd {rstd:.2f})했는데 **고역** "
+                f"코히런스가 {alignment['source_err_coherence_high']:.3f} 입니다"
+            )
+    assert checked >= 4, f"함의를 확인한 세션이 {checked}개뿐입니다 — 훑기가 좁습니다"
+
+
+def test_the_old_limit_would_have_admitted_a_dead_high_band():
+    """옛 상한 8.0 이 무엇을 통과시켰는지 **숫자로** 남긴다 (음성 대조).
+
+    이것이 없으면 위 테스트는 "유도가 맞다" 를 보일 뿐, **유도가 필요했다** 는 것을
+    보이지 못한다.
+    """
+
+    from deep_anc.dsp.invariants import (
+        CONTROLLED_BAND_TOP_HZ,
+        MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+        MIN_STREAM_COHERENCE,
+        coherence_from_delay_jitter,
+    )
+
+    dead = coherence_from_delay_jitter(CONTROLLED_BAND_TOP_HZ, 8.0, 48_000.0)
+    assert dead < 0.07, dead
+    alive = coherence_from_delay_jitter(
+        CONTROLLED_BAND_TOP_HZ, MAX_STREAM_DELAY_ROBUST_STD_SAMPLES, 48_000.0
+    )
+    assert alive == pytest.approx(MIN_STREAM_COHERENCE, abs=1e-9)
 
 
 # ======================================================================================
