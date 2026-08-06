@@ -58,6 +58,10 @@ from deep_anc.data.timeline import (                         # noqa: E402
     TimelineSettings,
     align_source_to_adc,
 )
+from deep_anc.audio_io import (                             # noqa: E402
+    MAX_PROBE_CLIP_RATIO,
+    input_rail_gate,
+)
 from deep_anc.realtime.noise_gen import NoiseProgram         # noqa: E402
 
 # 게이트 하한. CLI 는 이 값 **이상**만 받는다(강화 전용).
@@ -66,27 +70,9 @@ from deep_anc.realtime.noise_gen import NoiseProgram         # noqa: E402
 DEFAULT_MIN_TIMELINE_COHERENCE = 0.90
 DEFAULT_MIN_VALID_WINDOW_RATIO = 0.90
 # 자가진단 상한. QA 의 max_clip_ratio(0.005)와 같은 자리에서 판정하되, 재생 전에 본다.
-MAX_PROBE_CLIP_RATIO = 0.005
-
-
-def input_rail_gate(probe_float: np.ndarray, *, max_clip_ratio: float = MAX_PROBE_CLIP_RATIO):
-    """gate: ``recording_input_rail_preflight`` — 마이크가 풀스케일에 붙어 있는가.
-
-    자가진단에 **상한이 없었다.** 하한만 보면 "죽은 마이크"는 잡지만 "레일에 붙은
-    마이크"는 통과한다 — 오히려 아주 살아 있어 보인다. 2026-08-05 실측: 입력단이
-    무전원/미연결 상태에서 두 채널이 6~23 Hz 초저역으로 int32 풀스케일을 때리고
-    있었다(레일 비율 ch0 0.0475~0.0899 / ch1 0.0768~0.1033, RMS 0.34/0.40). 정상
-    세션은 peak 0.006 / RMS 0.001 이다.
-
-    반환 ``(ok, clip_ratio_per_channel)``. 재생 **전에** 판정하는 것이 요점이다 —
-    스피커를 울린 뒤 QA 에서 걸러 봐야 스피커 연결 시간만 버린다.
-    """
-
-    data = np.asarray(probe_float, dtype=np.float64)
-    if data.ndim == 1:
-        data = data[:, None]
-    ratios = [float(np.mean(np.abs(data[:, ch]) >= 0.999)) for ch in range(data.shape[1])]
-    return bool(max(ratios, default=0.0) <= float(max_clip_ratio)), ratios
+# 레일 게이트와 임계는 src/deep_anc/audio_io.py 가 단일 출처다.
+# 여기 두면 다른 도구가 sys.path 를 조작해 스크립트에서 import 해야 하고,
+# 실제로 그 불편함이 "새 도구는 그냥 안 쓴다" 로 이어졌다(2026-08-06).
 
 
 def timeline_gate(report, *, min_coherence: float, min_valid_window_ratio: float) -> bool:

@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from deep_anc.audio_io import (  # noqa: E402
     DEFAULT_PROBE_SETTLE_SECONDS,
     analyze_int32_input_probe,
-    assert_capture_clock_undisturbed,
+    assert_measurement_preconditions,
     float32_to_pcm_int16,
     pcm_int32_to_float32,
     resolve_alsa_portaudio_device,
@@ -752,7 +752,7 @@ def main(argv: list[str] | None = None) -> int:
         # 캡처 클록 교란 방지 — PulseAudio 가 같은 APE 카드를 44.1kHz 로 잡으면
         # PLL_A 가 재조정되어 우리 48kHz 캡처의 BCLK 가 세션 중에 이동한다.
         # XRUN 이 아니라서 기존 게이트가 못 잡는다(2026-08-06 I2S 설계 검증에서 발견).
-        assert_capture_clock_undisturbed(hardware["input"]["card"])
+        assert_measurement_preconditions(sd, hardware)
         print("출력 없는 ERR/REF raw preflight 중...")
         preflight_raw, preflight_report = _capture_preflight(
             sd, hardware, args.input_probe_seconds

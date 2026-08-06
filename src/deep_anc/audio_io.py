@@ -306,3 +306,93 @@ def assert_capture_clock_undisturbed(card_id: str) -> None:
         "  pactl set-card-profile alsa_card.platform-sound off   # 완전히 놓는다\n"
         "  pactl set-card-profile alsa_card.platform-sound output:analog-stereo+input:analog-stereo   # 되돌리기"
     )
+
+
+# ---------------------------------------------------------------------------
+# 실기 진입 규약 — 오디오 장치를 여는 모든 코드가 지켜야 하는 것
+# ---------------------------------------------------------------------------
+#
+# 왜 규약이 필요한가 (2026-08-06, 하루에 세 번 같은 결함을 재생산했다)
+# ------------------------------------------------------------------
+# 새 계측 도구를 만들 때마다 저장소의 기존 규약을 쓰지 않고 각자 다시 만들었다:
+#
+#   1. 채널 분리 검사기 → 두 번째 지연 추정기를 만들었다 (timeline 과 600배 갈릴 뻔)
+#   2. 레벨 미터 프로브 → 밴드 노이즈로 만들어 멀티톤과 크레스트가 6dB 어긋났다
+#   3. 레벨 미터 입력  → dtype="float32" 로 열어 PortAudio 변환 규약을 벗어났고,
+#                        레일 게이트가 없어 죽은 마이크의 잡음을 레벨로 표시했다
+#
+# 셋 다 "같은 물리량을 두 곳에서 따로 유도한다"(발생기 A)이고, 셋 다 사용자 관측이
+# 잡았다 — 코드가 아니라 사람이 잡았다는 뜻이다. 그래서 규약을 문서가 아니라
+# **테스트로 강제**한다: tests/test_audio_entry_contract.py 가 sounddevice 를 쓰는
+# 모든 파일을 열거하고 아래 규약을 지키는지 검사한다.
+
+MEASUREMENT_DTYPE = ("int32", "int16")
+"""실기 스트림의 dtype 규약 — 입력 int32 / 출력 int16.
+
+PortAudio 에 float 변환을 맡기면 풀스케일 규약이 장치마다 달라진다. 실측:
+``dtype="float32"`` 로 연 미터가 같은 신호를 ``pcm_int32_to_float32`` 대비 수십 dB
+다르게 읽었다. 입력은 **항상** int32 로 받아 :func:`pcm_int32_to_float32` 로 변환하고,
+출력은 int16 으로 :func:`float32_to_pcm_int16` 을 거친다.
+"""
+
+MAX_PROBE_CLIP_RATIO = 0.005
+"""마이크 자가진단 상한. QA 의 ``max_clip_ratio`` 와 같은 자리에서, 재생 **전에** 본다."""
+
+
+def input_rail_gate(
+    probe_float: np.ndarray, *, max_clip_ratio: float = MAX_PROBE_CLIP_RATIO
+) -> tuple[bool, list[float]]:
+    """gate: ``recording_input_rail_preflight`` — 마이크가 풀스케일에 붙어 있는가.
+
+    자가진단에 **상한이 없었다.** 하한만 보면 "죽은 마이크"는 잡지만 "레일에 붙은
+    마이크"는 통과한다 — 오히려 아주 살아 있어 보인다. 2026-08-05/06 실측: 입력단
+    접촉이 빠지면 두 채널이 6~23 Hz 초저역으로 int32 풀스케일을 때린다
+    (레일 비율 0.047~0.111, RMS 0.34~0.45). 정상 세션은 peak 0.006 / RMS 0.001 이다.
+
+    이 상태를 못 막으면 계측이 **음향과 무관한 숫자**를 낸다 — 2026-08-06 에
+    레벨 미터가 그 잡음을 -21 dBFS 로 표시해 사용자가 볼륨 노브를 헛돌렸다.
+
+    반환 ``(ok, clip_ratio_per_channel)``. 재생 **전에** 판정하는 것이 요점이다 —
+    스피커를 울린 뒤 QA 에서 걸러 봐야 스피커 연결 시간만 버린다.
+    """
+
+    data = np.asarray(probe_float, dtype=np.float64)
+    if data.ndim == 1:
+        data = data[:, None]
+    ratios = [float(np.mean(np.abs(data[:, ch]) >= 0.999)) for ch in range(data.shape[1])]
+    return bool(max(ratios, default=0.0) <= float(max_clip_ratio)), ratios
+
+
+def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5) -> list[float]:
+    """스피커를 울리기 **전에** 실기 전제조건을 전부 확인한다. 하나라도 깨지면 예외.
+
+    (a) 캡처 클록이 교란되지 않는가 — PulseAudio 가 같은 APE 카드를 다른 레이트로
+        잡고 있으면 PLL_A 재조정으로 BCLK 가 세션 중에 이동한다.
+    (b) 마이크가 풀스케일 레일에 붙어 있지 않은가.
+
+    반환: 채널별 레일 비율(진단용). 이 함수를 부르지 않고 소리를 내는 진입점은
+    ``tests/test_audio_entry_contract.py`` 가 거부한다.
+    """
+
+    card = hardware["input"]["card"]
+    assert_capture_clock_undisturbed(card)
+
+    device = resolve_alsa_portaudio_device(card, hardware["input"]["pcm"], "input", 2)
+    probe = sd.rec(
+        int(seconds * int(hardware["sample_rate"])),
+        samplerate=int(hardware["sample_rate"]),
+        channels=2,
+        dtype=MEASUREMENT_DTYPE[0],
+        device=device,
+    )
+    sd.wait()
+    settle = int(0.5 * int(hardware["sample_rate"]))
+    ok, ratios = input_rail_gate(pcm_int32_to_float32(probe[settle:]))
+    if not ok:
+        raise RuntimeError(
+            f"마이크 입력이 풀스케일에 붙어 있습니다 (레일 비율 "
+            f"{ratios[0]:.4f}/{ratios[1]:.4f} > {MAX_PROBE_CLIP_RATIO}). "
+            "이 상태의 계측은 음향과 무관한 숫자를 냅니다 — 볼륨을 돌려도 안 움직입니다.\n"
+            "입력단 전원·배선(J30 핀 접촉)을 확인한 뒤 다시 실행하세요."
+        )
+    return ratios
