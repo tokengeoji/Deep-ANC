@@ -48,8 +48,11 @@ sys.path.insert(0, str(REPO / "scripts" / "data"))
 
 import calibrate_wideband as cw  # noqa: E402
 
-from deep_anc.audio_io import pcm_int32_to_float32, resolve_alsa_portaudio_device  # noqa: E402
+from deep_anc.audio_io import (  # noqa: E402
+    assert_measurement_preconditions, pcm_int32_to_float32, resolve_alsa_portaudio_device,
+)
 from deep_anc.config import REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions  # noqa: E402
 
 
 def band_limited_burst(
@@ -186,11 +189,13 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--confirm-volume-minimum", action="store_true")
+    parser.add_argument("--confirm-speaker", action="store_true")
+    parser.add_argument("--confirm-user-present", action="store_true")
     args = parser.parse_args(argv)
 
-    if not args.confirm_volume_minimum:
+    if not (args.confirm_volume_minimum and args.confirm_speaker and args.confirm_user_present):
         print(
-            "[중단] 스피커가 울립니다. --confirm-volume-minimum 을 지정하세요.",
+            "[중단] 스피커 연결·사용자 입회·볼륨 최저를 모두 확인해야 합니다.",
             file=sys.stderr,
         )
         return 2
@@ -199,6 +204,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     hardware = load_yaml(REPO_ROOT / args.hardware)["audio"]
+    try:
+        assert_live_pcm_clock_preconditions(hardware)
+        import sounddevice as sd
+        assert_measurement_preconditions(sd, hardware)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"[중단] 오디오 사전점검 실패: {exc}", file=sys.stderr)
+        return 2
     fs = int(hardware["sample_rate"])
     block_size = int(args.block_size or hardware["block_size"])
     period = int(round(args.period_seconds * fs))

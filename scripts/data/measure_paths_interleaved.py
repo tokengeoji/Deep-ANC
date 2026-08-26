@@ -1112,7 +1112,7 @@ def write_immutable_raw_capture_atomic(
             )
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(raw_temp, raw_path)
+        atomic_publish_noreplace(raw_temp, raw_path)
         _fsync_directory(session_dir)
     except BaseException:
         raw_temp.unlink(missing_ok=True)
@@ -1131,7 +1131,7 @@ def write_immutable_raw_capture_atomic(
             )
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(metadata_temp, metadata_path)
+        atomic_publish_noreplace(metadata_temp, metadata_path)
         _fsync_directory(session_dir)
     except BaseException as exc:
         metadata_temp.unlink(missing_ok=True)
@@ -1178,10 +1178,10 @@ def write_analysis_outputs_atomic(
             )
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(npz_temp, npz_path)
+        atomic_publish_noreplace(npz_temp, npz_path)
         promoted.append(npz_path)
         _fsync_directory(session_dir)
-        os.replace(metadata_temp, metadata_path)
+        atomic_publish_noreplace(metadata_temp, metadata_path)
         promoted.append(metadata_path)
         _fsync_directory(session_dir)
     except BaseException:

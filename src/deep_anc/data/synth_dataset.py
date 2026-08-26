@@ -128,10 +128,11 @@ class SynthANCDataset(IterableDataset):
         self.reference_mode = str(data_cfg.get("reference_mode", "digital"))
         if self.reference_mode not in ("digital", "acoustic"):
             raise ValueError(f"reference_mode: {self.reference_mode}")
-        self.digital_reference_lead = int(
-            data_cfg.get("digital_reference_lead_samples", 0)
+        configured_lead = data_cfg.get("digital_reference_lead_samples")
+        self.digital_reference_lead = (
+            None if configured_lead is None else int(configured_lead)
         )
-        if self.digital_reference_lead < 0:
+        if self.digital_reference_lead is not None and self.digital_reference_lead < 0:
             raise ValueError("digital_reference_lead_samples는 0 이상이어야 합니다")
         if self.reference_mode != "digital" and self.digital_reference_lead:
             raise ValueError(
@@ -242,10 +243,12 @@ class SynthANCDataset(IterableDataset):
                 primary_fir=self.digital_primary_path.fir,
                 plant_delays=plant_delays,
             )
-            if (
-                int(self.timing_contract.digital_reference_lead_samples)
-                != self.digital_reference_lead
-            ):
+            derived_lead = int(self.timing_contract.digital_reference_lead_samples)
+            if self.digital_reference_lead is None:
+                # Compact P/S와 handoff가 유일한 출처다. config가 숫자를 생략한
+                # canonical 형태에서는 여기서 계약값을 주입한다.
+                self.digital_reference_lead = derived_lead
+            elif derived_lead != self.digital_reference_lead:
                 raise ValueError(
                     "digital_reference_lead_samples가 SynthANCDataset의 "
                     "PlantDelays.lead()와 다릅니다: "
@@ -260,6 +263,8 @@ class SynthANCDataset(IterableDataset):
                         "resolved training_timing_contract와 SynthANCDataset이 실제 P(z)에서 "
                         "유도한 계약이 다릅니다"
                     )
+        if self.digital_reference_lead is None:
+            self.digital_reference_lead = 0
 
         self.level_range = tuple(data_cfg.get("level_dbfs", [-35, -10]))
         self.snr_range = tuple(data_cfg.get("snr_mic_noise_db", [5, 30]))

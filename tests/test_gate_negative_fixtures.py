@@ -89,6 +89,17 @@ def test_recorded_mix_ratio_gate_fails_when_recorded_share_is_too_small(tmp_path
     assert check["details"]["recorded_ratio"] == pytest.approx(0.1)
 
 
+def test_recorded_transfer_snapshot_gate_fails_without_transfer_snapshot(tmp_path):
+    """canonical fine-tune은 Elice transfer snapshot 없이는 시작할 수 없다."""
+
+    cfg = _ready_config(tmp_path)
+    cfg["experiment_role"] = "canonical_finetune"
+    cfg["data"]["bootstrap_receipt"] = str(tmp_path / "missing_bootstrap_receipt.json")
+    check = _readiness_gate(cfg, "recorded_transfer_snapshot")
+    assert not check["ok"]
+    assert "receipt" in check["message"] or "transfer" in check["message"]
+
+
 def test_path_delay_and_lead_gate_fails_when_lead_is_hand_written(tmp_path):
     """설정 lead 가 측정 P/S 지연에서 유도되는 값과 다르면 막는다.
 

@@ -42,8 +42,11 @@ sys.path.insert(0, str(REPO / "scripts" / "data"))
 
 import calibrate_wideband as cw  # noqa: E402
 
-from deep_anc.audio_io import pcm_int32_to_float32, resolve_alsa_portaudio_device  # noqa: E402
+from deep_anc.audio_io import (  # noqa: E402
+    assert_measurement_preconditions, pcm_int32_to_float32, resolve_alsa_portaudio_device,
+)
 from deep_anc.config import REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions  # noqa: E402
 from deep_anc.dsp.interleaved_probe import (  # noqa: E402
     align_repeats, build_interleaved_probe, complex_consistency, estimate_transfer,
 )
@@ -108,10 +111,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="반복 시간이동 τ 를 적합할 대역 — 재현되는 대역만 넣는다")
     parser.add_argument("--out-root", default="results/level_sweep")
     parser.add_argument("--confirm-volume-minimum", action="store_true")
+    parser.add_argument("--confirm-speaker", action="store_true")
+    parser.add_argument("--confirm-user-present", action="store_true")
     args = parser.parse_args(argv)
 
-    if not args.confirm_volume_minimum:
-        print("[중단] --confirm-volume-minimum 을 지정하세요.", file=sys.stderr)
+    if not (args.confirm_volume_minimum and args.confirm_speaker and args.confirm_user_present):
+        print("[중단] 스피커 연결·사용자 입회·볼륨 최저 플래그가 필요합니다.", file=sys.stderr)
         return 2
     amplitudes = [float(a) for a in args.amplitudes]
     if any(not 0.0 < a <= DIAGNOSTIC_MAX_AMPLITUDE for a in amplitudes):
@@ -120,6 +125,13 @@ def main(argv: list[str] | None = None) -> int:
 
     fit_band = (float(args.fit_band[0]), float(args.fit_band[1]))
     hardware = load_yaml(REPO_ROOT / args.hardware)["audio"]
+    try:
+        import sounddevice as sd
+        assert_live_pcm_clock_preconditions(hardware)
+        assert_measurement_preconditions(sd, hardware)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"[중단] 오디오 사전점검 실패: {exc}", file=sys.stderr)
+        return 2
     fs = int(hardware["sample_rate"])
     block_size = int(args.block_size or hardware["block_size"])
     session = cw._repo_path(args.out_root, require_results=True) / dt.datetime.now().strftime(

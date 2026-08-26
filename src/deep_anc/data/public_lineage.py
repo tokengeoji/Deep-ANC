@@ -428,7 +428,7 @@ def build_recorded_clip_lineage(
             "esc50": _metadata_evidence(ESC50_METADATA, esc_snapshot),
         },
         "clips": records,
-        "clips_sha256": _canonical_json_sha256(records),
+        "clips_sha256": canonical_json_sha256(records),
     }
 
 

@@ -74,6 +74,10 @@ SPEAKER_STOP_UNCONFIRMED_NOTICE = (
     "[스피커 정지 확인 불가] 오디오 스트림 close를 확인하지 못했습니다. "
     "지금 스피커/앰프를 즉시 물리 분리하세요."
 )
+SPEAKER_PREFLIGHT_ABORT_NOTICE = (
+    "[실기 측정 중단] 출력 스트림을 열기 전에 실패했습니다. "
+    "스피커/앰프가 연결되어 있으면 지금 물리적으로 분리하세요."
+)
 
 # 목표 ERR 대역 RMS (dBFS) — 과거 실측 메모에서 유도된 후보값.
 #
@@ -508,6 +512,7 @@ def measure(args) -> int:
         bootstrap_session, capture_id = _bootstrap_meter_session(args)
     except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
         print(f"[중단] 실기 preflight 실패: {exc}", file=sys.stderr)
+        print(SPEAKER_PREFLIGHT_ABORT_NOTICE, file=sys.stderr, flush=True)
         return 2
 
     fs = OFFICIAL_MEASUREMENT_LEVEL.sample_rate
@@ -568,6 +573,7 @@ def measure(args) -> int:
             )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"[중단] output 직전 precondition/audio lock 실패: {exc}", file=sys.stderr)
+        print(SPEAKER_PREFLIGHT_ABORT_NOTICE, file=sys.stderr, flush=True)
         return 2
     completed_at_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     levels, telemetry, submitted_output_pcm, input_raw = captured

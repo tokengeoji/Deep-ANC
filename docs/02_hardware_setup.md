@@ -132,11 +132,14 @@ probe를 다시 실행한다. 이 결과를 이유로 Jetson 시스템 설정을
 .venv/bin/python scripts/data/record_duct.py --program silence --seconds 10
 # 4) 무음 전체 루프 (스피커 소리 없음, 3-스레드 검증)
 .venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml \
-    --set noise.type=silence --set engine.type=ort --run-seconds 10
+    --set noise.type=silence --set engine.type=ort --run-seconds 10 \
+    --confirm-speaker --confirm-user-present --confirm-volume-minimum
 # 5) 실효 지연 측정 (처프 재생 — 사용자 입회·볼륨 최저!)
-.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --calibrate
+.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --calibrate \
+    --confirm-speaker --confirm-user-present --confirm-volume-minimum
 # 6) I/O 지연 스윕 (선택)
-.venv/bin/python scripts/bench/measure_io_latency.py
+.venv/bin/python scripts/bench/measure_io_latency.py \
+    --confirm-speaker --confirm-user-present --confirm-volume-minimum
 ```
 
 probe는 raw code 다양성, float 변환 RMS, peak, clipping을 함께 검사한다. 19:29 기준 두 채널
@@ -207,7 +210,8 @@ PASS하기 전에는 기존 82세션을 대체하는 장시간 재녹음을 시�
 앰프 볼륨 최저를 실제로 확인한 뒤 다음 정성 진단을 사용할 수 있다.
 
 ```bash
-.venv/bin/python scripts/bench/playback_duct_probe.py --confirm-volume-minimum
+.venv/bin/python scripts/bench/playback_duct_probe.py \
+  --confirm-volume-minimum --confirm-speaker --confirm-user-present
 ```
 
 이 도구는 설정의 축방향 공진과 300Hz를 peak 0.002 단계 톤으로 재생하고 cancel ch1은 항상

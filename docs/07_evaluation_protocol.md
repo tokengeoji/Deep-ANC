@@ -143,7 +143,7 @@ NPZ·JSON·Markdown(선택 PNG)에 저장한다. 출력 반응이 무음 구간�
 
 ```bash
 .venv/bin/python scripts/bench/measure_duct_transfer_map.py \
-  --confirm-volume-minimum
+  --confirm-volume-minimum --confirm-speaker --confirm-user-present
 ```
 
 ### 4.2 단일 callback FxLMS 진단

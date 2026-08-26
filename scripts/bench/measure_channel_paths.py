@@ -27,12 +27,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.audio_io import (  # noqa: E402
+    assert_measurement_preconditions,
     capture_input_probe,
     pcm_int32_to_float32,
     resolve_alsa_portaudio_device,
     rms_dbfs,
 )
 from deep_anc.config import REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions  # noqa: E402
 
 
 DEFAULT_AMPLITUDE = 0.005
@@ -482,12 +484,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="사용자 입회와 물리 앰프 볼륨 최저를 확인",
     )
+    parser.add_argument("--confirm-speaker", action="store_true")
     args = parser.parse_args(argv)
 
-    if not args.confirm_user_present_volume_minimum:
+    if not (args.confirm_user_present_volume_minimum and args.confirm_speaker):
         print(
             "[중단] 사용자 입회와 앰프 볼륨 최저를 확인한 뒤 "
-            "--confirm-user-present-volume-minimum을 지정하세요.",
+            "--confirm-user-present-volume-minimum 및 --confirm-speaker를 지정하세요.",
             file=sys.stderr,
         )
         return 2
@@ -496,6 +499,9 @@ def main(argv: list[str] | None = None) -> int:
         hardware_path = _repo_path(args.hardware)
         hardware_cfg = load_yaml(hardware_path)
         audio = hardware_cfg["audio"]
+        import sounddevice as sd
+        assert_live_pcm_clock_preconditions(audio)
+        assert_measurement_preconditions(sd, audio)
         channels = hardware_cfg["channels"]
         sample_rate = int(audio["sample_rate"])
         validate_probe_settings(

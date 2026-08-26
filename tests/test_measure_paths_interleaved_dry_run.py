@@ -1220,9 +1220,9 @@ def test_completed_capture_is_durable_before_any_postprocessing_fault(
     assert not (tmp_path / "secondary.npz").exists()
 
 
-@pytest.mark.parametrize("fail_on_replace", [1, 2])
+@pytest.mark.parametrize("fail_on_publish", [1, 2])
 def test_analysis_write_exception_preserves_immutable_raw_pair(
-    tmp_path, monkeypatch, fail_on_replace
+    tmp_path, monkeypatch, fail_on_publish
 ):
     raw_path = tmp_path / "raw_measurement.npz"
     raw_metadata_path = tmp_path / "metadata.json"
@@ -1233,18 +1233,18 @@ def test_analysis_write_exception_preserves_immutable_raw_pair(
         for path in (raw_path, raw_metadata_path)
     }
 
-    original_replace = mpi.os.replace
+    original_publish = mpi.atomic_publish_noreplace
     calls = 0
 
-    def injected_replace(source, target):
+    def injected_publish(source, target):
         nonlocal calls
         calls += 1
-        if calls == fail_on_replace:
-            raise OSError("injected replace failure")
-        return original_replace(source, target)
+        if calls == fail_on_publish:
+            raise OSError("injected publish failure")
+        return original_publish(source, target)
 
-    monkeypatch.setattr(mpi.os, "replace", injected_replace)
-    with pytest.raises(OSError, match="injected replace failure"):
+    monkeypatch.setattr(mpi, "atomic_publish_noreplace", injected_publish)
+    with pytest.raises(OSError, match="injected publish failure"):
         mpi.write_analysis_outputs_atomic(
             tmp_path,
             metadata={"valid": True},
@@ -1350,15 +1350,15 @@ def test_raw_temp_truncation_never_exposes_final_capture(tmp_path, monkeypatch):
     _assert_no_partial_files(tmp_path)
 
 
-def test_raw_replace_failure_never_exposes_final_capture(tmp_path, monkeypatch):
+def test_raw_publish_failure_never_exposes_final_capture(tmp_path, monkeypatch):
     metadata, arrays = _raw_payload()
     monkeypatch.setattr(
-        mpi.os,
-        "replace",
-        lambda *_args: (_ for _ in ()).throw(OSError("injected raw replace failure")),
+        mpi,
+        "atomic_publish_noreplace",
+        lambda *_args: (_ for _ in ()).throw(OSError("injected raw publish failure")),
     )
 
-    with pytest.raises(OSError, match="injected raw replace failure"):
+    with pytest.raises(OSError, match="injected raw publish failure"):
         mpi.write_immutable_raw_capture_atomic(
             tmp_path, metadata=metadata, arrays=arrays
         )
@@ -1368,7 +1368,7 @@ def test_raw_replace_failure_never_exposes_final_capture(tmp_path, monkeypatch):
     _assert_no_partial_files(tmp_path)
 
 
-@pytest.mark.parametrize("failure", ["write", "replace"])
+@pytest.mark.parametrize("failure", ["write", "publish"])
 def test_sidecar_failure_preserves_canonical_raw_for_recovery(
     tmp_path, monkeypatch, failure
 ):
@@ -1382,18 +1382,18 @@ def test_sidecar_failure_preserves_canonical_raw_for_recovery(
         monkeypatch.setattr(mpi.json, "dump", failed_dump)
         message = "injected sidecar write failure"
     else:
-        original_replace = mpi.os.replace
+        original_publish = mpi.atomic_publish_noreplace
         calls = 0
 
-        def failed_second_replace(source, target):
+        def failed_second_publish(source, target):
             nonlocal calls
             calls += 1
             if calls == 2:
-                raise OSError("injected sidecar replace failure")
-            return original_replace(source, target)
+                raise OSError("injected sidecar publish failure")
+            return original_publish(source, target)
 
-        monkeypatch.setattr(mpi.os, "replace", failed_second_replace)
-        message = "injected sidecar replace failure"
+        monkeypatch.setattr(mpi, "atomic_publish_noreplace", failed_second_publish)
+        message = "injected sidecar publish failure"
 
     with pytest.raises(mpi.RawCaptureSidecarError, match=message) as caught:
         mpi.write_immutable_raw_capture_atomic(

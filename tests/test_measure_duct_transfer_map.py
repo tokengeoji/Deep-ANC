@@ -72,7 +72,8 @@ def test_confirmation_precedes_yaml_and_hardware_access(monkeypatch, capsys):
         ),
     )
     assert transfer_map.main([]) == 2
-    assert "--confirm-volume-minimum" in capsys.readouterr().err
+    message = capsys.readouterr().err
+    assert "--confirm-volume-minimum" in message or "--confirm-speaker" in message
 
 
 def test_amplitude_and_channel_map_are_hard_gated():
@@ -753,6 +754,8 @@ def test_full_cli_pipeline_with_synthetic_audio_only(tmp_path, monkeypatch):
         "resolve_alsa_portaudio_device",
         lambda *_args, **_kwargs: 2,
     )
+    monkeypatch.setattr(transfer_map, "assert_live_pcm_clock_preconditions", lambda *_args: None)
+    monkeypatch.setattr(transfer_map, "assert_measurement_preconditions", lambda *_args: None)
     monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace())
 
     def synthetic_capture(_sd, **kwargs):
@@ -812,8 +815,10 @@ def test_full_cli_pipeline_with_synthetic_audio_only(tmp_path, monkeypatch):
 
     monkeypatch.setattr(transfer_map, "capture_and_mute", synthetic_capture)
     exit_code = transfer_map.main(
-        [
-            "--confirm-volume-minimum",
+            [
+                "--confirm-volume-minimum",
+                "--confirm-speaker",
+                "--confirm-user-present",
             "--excitation-seconds",
             "0.2",
             "--gap-seconds",

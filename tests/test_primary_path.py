@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -122,7 +123,6 @@ def test_measured_primary_path_is_delay_authority(tmp_path, configs):
     _write_path(path, delay=777)
     data["digital_primary_path_mode"] = "measured"
     duct["digital_reference"]["primary_path_npz"] = str(path)
-    duct["digital_reference"]["d_noise_delay_samples"] = 777
     secondary = load_secondary_path(REPO_ROOT / duct["secondary_path"]["npz"])
 
     primary, total_delay = resolve_digital_primary_path(data, duct, 48_000, secondary)
@@ -150,6 +150,7 @@ def test_secondary_surrogate_falls_back_to_geometry_when_unmeasured(configs):
     data, duct = deepcopy(configs)
     data["digital_primary_path_mode"] = "secondary_surrogate"
     duct["digital_reference"]["d_noise_delay_samples"] = None
+    duct["digital_reference"]["primary_path_npz"] = None
     secondary = load_secondary_path(REPO_ROOT / duct["secondary_path"]["npz"])
 
     primary, total_delay = resolve_digital_primary_path(data, duct, 48_000, secondary)
@@ -162,17 +163,15 @@ def test_secondary_surrogate_falls_back_to_geometry_when_unmeasured(configs):
 
 
 def test_secondary_surrogate_prefers_measured_d_noise_over_geometry(configs):
-    """실측값이 있으면 기하 예측을 덮는다 — 추정보다 측정이 우선이다."""
+    """수동 d_noise 숫자는 canonical resolver에서 거부한다."""
 
     data, duct = deepcopy(configs)
     data["digital_primary_path_mode"] = "secondary_surrogate"
     duct["digital_reference"]["d_noise_delay_samples"] = 1234
     secondary = load_secondary_path(REPO_ROOT / duct["secondary_path"]["npz"])
 
-    primary, total_delay = resolve_digital_primary_path(data, duct, 48_000, secondary)
-
-    assert primary.delay_samples == total_delay == 1234
-    assert 1234 != default_d_noise_delay(duct, 48_000, secondary.delay_samples)
+    with pytest.raises(ValueError, match="수동값은 폐기"):
+        resolve_digital_primary_path(data, duct, 48_000, secondary)
 
 
 def test_configured_d_noise_agrees_with_duct_geometry(configs):
@@ -189,14 +188,8 @@ def test_configured_d_noise_agrees_with_duct_geometry(configs):
     """
 
     _, duct = configs
-    configured = duct["digital_reference"]["d_noise_delay_samples"]
-    if configured is None:
-        pytest.skip("d_noise 미실측")
-    secondary = load_secondary_path(REPO_ROOT / duct["secondary_path"]["npz"])
-    predicted = default_d_noise_delay(duct, 48_000, secondary.delay_samples)
-    assert abs(int(configured) - predicted) <= 48, (
-        f"실측 {configured} vs 기하 {predicted} — 1ms 넘게 어긋난다"
-    )
+    configured = duct["digital_reference"].get("d_noise_delay_samples")
+    assert configured is None
 
 
 def test_configs_explicitly_select_primary_path_policy(configs):
@@ -211,7 +204,7 @@ def test_configs_explicitly_select_primary_path_policy(configs):
     data, duct = configs
     assert data["digital_primary_path_mode"] == "secondary_surrogate"
     assert "primary_path_npz" in duct["digital_reference"]
-    assert "d_noise_delay_samples" in duct["digital_reference"]
+    assert "d_noise_delay_samples" not in duct["digital_reference"]
 
 
 def test_measured_primary_path_artifact_is_loadable(configs):
@@ -301,9 +294,7 @@ def test_dataset_measured_primary_applies_fir_and_delay_once(tmp_path, configs):
     primary_path = tmp_path / "primary.npz"
     _write_path(primary_path, delay=7)
     data = _dataset_config(data, "measured")
-    duct["digital_reference"].update(
-        {"primary_path_npz": str(primary_path), "d_noise_delay_samples": 7}
-    )
+    duct["digital_reference"].update({"primary_path_npz": str(primary_path)})
     secondary = load_secondary_path(REPO_ROOT / duct["secondary_path"]["npz"])
     data["digital_reference_lead_samples"] = int(
         PlantDelays.from_config(
@@ -340,7 +331,8 @@ def test_dataset_secondary_surrogate_applies_s_fir_with_d_noise_once(
     _write_path(secondary_path, delay=123)
     data = _dataset_config(data, "secondary_surrogate")
     duct["secondary_path"]["npz"] = str(secondary_path)
-    duct["digital_reference"]["d_noise_delay_samples"] = 11
+    duct["digital_reference"]["primary_path_npz"] = str(tmp_path / "primary.npz")
+    _write_path(Path(duct["digital_reference"]["primary_path_npz"]), delay=11)
     data["digital_reference_lead_samples"] = int(
         PlantDelays.from_config(
             duct_cfg=duct,
@@ -371,6 +363,7 @@ def test_dataset_secondary_surrogate_applies_s_fir_with_d_noise_once(
 def test_dataset_rir_surrogate_keeps_legacy_rir_and_added_delay(configs):
     data, duct = deepcopy(configs)
     data = _dataset_config(data, "rir_surrogate")
+    data["allow_legacy_d_noise_delay"] = True
     duct["positions_m"]["noise_speaker"] = duct["positions_m"]["error_mic"]
     duct["digital_reference"].update(
         {

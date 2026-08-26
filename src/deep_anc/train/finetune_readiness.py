@@ -3590,6 +3590,7 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
 
     official_timing: TrainingTimingContract | None = None
     if primary is not None and secondary is not None:
+        configured_lead: Any = None
         try:
             primary_artifact = load_secondary_path(primary["path"])
             delays = PlantDelays.from_config(
@@ -3602,11 +3603,20 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
                 primary_fir=primary_artifact.fir,
                 plant_delays=delays,
             )
+            configured_lead = data_cfg.get("digital_reference_lead_samples")
             resolved_timing = TrainingTimingContract.from_data_config(data_cfg)
             if resolved_timing != derived_timing:
                 raise ValueError(
                     "resolved data.training_timing_contract가 official P/S에서 유도한 "
                     "계약과 다릅니다"
+                )
+            if configured_lead is not None and int(configured_lead) != int(
+                derived_timing.digital_reference_lead_samples
+            ):
+                raise ValueError(
+                    "data.digital_reference_lead_samples가 TrainingTimingContract와 "
+                    f"다릅니다: configured={configured_lead}, "
+                    f"expected={derived_timing.digital_reference_lead_samples}"
                 )
             official_timing = derived_timing
             audit.pass_(
@@ -3615,11 +3625,23 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
                 "정확히 같습니다",
                 timing_contract=official_timing.model_dump(),
                 timing_contract_sha256=official_timing.digest(),
+                digital_reference_lead_samples=int(
+                    official_timing.digital_reference_lead_samples
+                ),
             )
         except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+            details: dict[str, Any] = {}
+            if configured_lead is not None and official_timing is None:
+                details = {
+                    "configured_lead": int(configured_lead),
+                    "expected_lead": int(derived_timing.digital_reference_lead_samples)
+                    if "derived_timing" in locals()
+                    else None,
+                }
             audit.fail(
                 "path_delay_and_lead",
                 str(exc),
+                **details,
             )
     else:
         audit.fail(

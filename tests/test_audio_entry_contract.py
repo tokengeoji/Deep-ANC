@@ -47,25 +47,22 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     # 규약 자체를 정의하는 곳
     "src/deep_anc/audio_io.py": (False, True, "규약의 단일 출처. 장치 해석과 게이트를 제공한다"),
     # 실기 런타임
-    "src/deep_anc/realtime/run_realtime.py": (
-        True, False,
-        "ANC 런타임. 자체 안전감독자(realtime/safety.py)가 워치독 7종을 돌린다",
-    ),
-    "src/deep_anc/baselines/fxlms_core.py": (True, False, "FxLMS 기준선 런타임"),
+    "src/deep_anc/realtime/run_realtime.py": (True, True, "ANC 런타임. 명시적 사용자·볼륨·장치 게이트"),
+    "src/deep_anc/baselines/fxlms_core.py": (False, True, "FxLMS 오프라인 기준선 유틸리티"),
     # 측정·수집
     "scripts/data/record_duct.py": (True, True, "실측 세션 수집. 레일 게이트 + 저장 시점 정렬 게이트"),
     "scripts/data/measure_paths_interleaved.py": (True, True, "P/S 동시 측정"),
     "scripts/data/calibrate_wideband.py": (True, True, "채널별 ESS 측정"),
     "scripts/data/set_amp_level.py": (True, True, "앰프 레벨 교정 미터"),
     # 벤치·진단 (실기 필요, 학습 산출물에 직접 들어가지 않음)
-    "scripts/bench/measure_io_latency.py": (True, False, "I/O 왕복 지연 측정"),
-    "scripts/bench/measure_io_jitter.py": (True, False, "콜백 지터 측정"),
-    "scripts/bench/measure_clock_drift.py": (True, False, "클록 드리프트 측정"),
-    "scripts/bench/measure_channel_paths.py": (True, False, "채널별 경로 측정"),
-    "scripts/bench/measure_duct_transfer_map.py": (True, False, "덕트 전달맵 측정"),
-    "scripts/bench/playback_duct_probe.py": (True, False, "재생 프로브"),
-    "scripts/bench/sweep_probe_level.py": (True, False, "프로브 레벨 스윕"),
-    "scripts/demo/evaluate_fxlms_direct.py": (True, False, "FxLMS 실기 평가"),
+    "scripts/bench/measure_io_latency.py": (True, True, "I/O 왕복 지연 측정"),
+    "scripts/bench/measure_io_jitter.py": (True, True, "콜백 지터 측정"),
+    "scripts/bench/measure_clock_drift.py": (True, True, "클록 드리프트 측정"),
+    "scripts/bench/measure_channel_paths.py": (True, True, "채널별 경로 측정"),
+    "scripts/bench/measure_duct_transfer_map.py": (True, True, "덕트 전달맵 측정"),
+    "scripts/bench/playback_duct_probe.py": (True, True, "재생 프로브"),
+    "scripts/bench/sweep_probe_level.py": (True, True, "프로브 레벨 스윕"),
+    "scripts/demo/evaluate_fxlms_direct.py": (True, True, "FxLMS 실기 평가"),
 }
 
 # 재생 전 전제조건을 만족시키는 것으로 인정하는 호출.
@@ -212,18 +209,7 @@ def test_unwired_backlog_only_shrinks():
     부채를 갚으면(전제조건을 배선하면) 이 목록에서 지우고 `True` 로 바꿔라.
     """
 
-    known = {
-        "src/deep_anc/realtime/run_realtime.py",
-        "src/deep_anc/baselines/fxlms_core.py",
-        "scripts/bench/measure_io_latency.py",
-        "scripts/bench/measure_io_jitter.py",
-        "scripts/bench/measure_clock_drift.py",
-        "scripts/bench/measure_channel_paths.py",
-        "scripts/bench/measure_duct_transfer_map.py",
-        "scripts/bench/playback_duct_probe.py",
-        "scripts/bench/sweep_probe_level.py",
-        "scripts/demo/evaluate_fxlms_direct.py",
-    }
+    known = set()
     added = sorted(UNWIRED_BACKLOG - known)
     assert not added, (
         "전제조건이 배선되지 않은 진입점이 새로 생겼습니다: " + ", ".join(added) + "\n"

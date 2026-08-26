@@ -137,7 +137,26 @@ def test_shipped_declaration_matches_the_recomputation() -> None:
     data_sim = yaml.safe_load(
         (REPO_ROOT / "configs" / "data_sim.yaml").read_text(encoding="utf-8")
     )
-    lead = int(data_sim["digital_reference_lead_samples"])
+    from deep_anc.data.primary_path import resolve_digital_primary_path
+    from deep_anc.dsp.secondary_path import load_secondary_path
+    from deep_anc.dsp.timing import PlantDelays
+
+    secondary_data = load_secondary_path(secondary)
+    primary_data, primary_delay = resolve_digital_primary_path(
+        {**data_sim, "digital_primary_path_mode": "measured"},
+        {"digital_reference": {"primary_path_npz": str(primary)},
+         "secondary_path": {"npz": str(secondary), "handoff_extra_samples": 256},
+         "positions_m": {"noise_speaker": 0.0, "error_mic": 1.0,
+                          "cancel_speaker": 1.0}},
+        int(FS), secondary_data,
+    )
+    assert primary_data is not None
+    lead = int(PlantDelays.from_config(
+        duct_cfg={"secondary_path": {"handoff_extra_samples": 256}},
+        secondary_delay_samples=int(secondary_data.delay_samples),
+        primary_delay_samples=int(primary_delay),
+        sample_rate=int(FS),
+    ).lead())
 
     from deep_anc.dsp.design_ceiling import worst_octave_ceiling_db
 

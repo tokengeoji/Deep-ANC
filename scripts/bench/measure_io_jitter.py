@@ -41,6 +41,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from deep_anc.config import load_yaml  # noqa: E402
+from deep_anc.audio_io import (  # noqa: E402
+    assert_measurement_preconditions, pcm_int32_to_float32,
+)
+from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions  # noqa: E402
 
 MAX_AMPLITUDE = 0.02
 DEFAULT_AMPLITUDE = 0.02
@@ -114,10 +118,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="사용자 입회 + 앰프 볼륨 최소 확인. 없으면 실행하지 않는다",
     )
+    parser.add_argument("--confirm-speaker", action="store_true")
+    parser.add_argument("--confirm-user-present", action="store_true")
     args = parser.parse_args(argv)
 
-    if not args.confirm_volume_minimum:
-        print("[중단] 스피커가 울립니다. --confirm-volume-minimum 을 붙여 확인하세요.", file=sys.stderr)
+    if not (args.confirm_volume_minimum and args.confirm_speaker and args.confirm_user_present):
+        print("[중단] 스피커 연결·사용자 입회·볼륨 최저를 모두 확인해야 합니다.", file=sys.stderr)
         return 2
     if not 0.0 < args.amplitude <= MAX_AMPLITUDE:
         print(f"[중단] --amplitude 는 0 초과 {MAX_AMPLITUDE} 이하여야 합니다", file=sys.stderr)
@@ -126,6 +132,13 @@ def main(argv: list[str] | None = None) -> int:
     import sounddevice as sd
 
     hardware = load_yaml(args.hardware)
+    try:
+        assert_live_pcm_clock_preconditions(hardware["audio"])
+        import sounddevice as sd
+        assert_measurement_preconditions(sd, hardware["audio"])
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"[중단] 오디오 사전점검 실패: {exc}", file=sys.stderr)
+        return 2
     fs = int(hardware["audio"].get("sample_rate", 48000))
     device_in, device_out = resolve_devices(hardware)
     period = int(args.period_seconds * fs)
@@ -140,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"연속 {count}주기 × {args.period_seconds}초 · peak {args.amplitude} · "
           f"blocksize {args.blocksize}/{args.latency}")
     recording = sd.playrec(
-        playback, samplerate=fs, channels=2, dtype="float32",
+        playback, samplerate=fs, channels=2, dtype=("int32", "int16"),
         device=(device_in, device_out), blocking=True,
         latency=args.latency, blocksize=args.blocksize,
     )
@@ -151,8 +164,9 @@ def main(argv: list[str] | None = None) -> int:
     reference_fft = np.fft.rfft(reference.astype(np.float64), nfft)
 
     err_all, ref_all = [], []
-    error_channel = recording[:, 0].astype(np.float64)
-    reference_channel = recording[:, 1].astype(np.float64)
+    recording_float = pcm_int32_to_float32(recording)
+    error_channel = recording_float[:, 0].astype(np.float64)
+    reference_channel = recording_float[:, 1].astype(np.float64)
     for k in range(1, count - 1):
         err_seg = error_channel[k * period : (k + 2) * period]
         ref_seg = reference_channel[k * period : (k + 2) * period]
@@ -167,9 +181,9 @@ def main(argv: list[str] | None = None) -> int:
     # ERR-REF 는 물리적으로 고정이므로, 여기서 벗어난 주기는 추정 실패로 본다.
     median_difference = float(np.median(difference))
     valid = np.abs(difference - median_difference) <= 5
-    clip_ratio = float(np.mean(np.abs(recording) >= 0.999))
+    clip_ratio = float(np.mean(np.abs(recording_float) >= 0.999))
 
-    print(f"\n입력 peak {np.max(np.abs(recording)):.4f} · clip {clip_ratio*100:.3f}%")
+    print(f"\n입력 peak {np.max(np.abs(recording_float)):.4f} · clip {clip_ratio*100:.3f}%")
     print(f"유효 추정 {int(valid.sum())}/{len(valid)} 주기 (ERR−REF 중앙 {median_difference:.0f} samples)")
 
     if valid.sum() < 3:

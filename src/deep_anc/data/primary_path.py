@@ -56,16 +56,24 @@ def resolve_digital_primary_path(
             "canonical digital 모드는 primary_path_npz.delay_samples를 사용하고, "
             "legacy 진단만 data.allow_legacy_d_noise_delay=true로 명시하세요"
         )
-    fallback_delay = (
-        int(configured_delay)
-        if configured_delay is not None and allow_legacy_delay
-        else default_d_noise_delay(
-            duct_cfg, int(sample_rate), int(secondary_path.delay_samples)
+    def fallback_delay() -> int:
+        """필요한 모드에서만 legacy/기하 fallback을 계산한다.
+
+        measured primary artifact가 있으면 duct 위치 정보가 없어도 그 artifact의
+        delay가 완전한 authority다. 이전 구현은 분기 전에 geometry fallback을
+        계산해, 최소한의 checkpoint/eval fixture와 외부 경로 artifact를 불필요하게
+        거부했다.
+        """
+        if configured_delay is not None and allow_legacy_delay:
+            return int(configured_delay)
+        return int(
+            default_d_noise_delay(
+                duct_cfg, int(sample_rate), int(secondary_path.delay_samples)
+            )
         )
-    )
 
     if mode == "rir_surrogate":
-        return None, fallback_delay
+        return None, fallback_delay()
 
     path = digital_cfg.get("primary_path_npz")
     primary_delay_artifact = None
@@ -88,7 +96,7 @@ def resolve_digital_primary_path(
         delay = (
             int(primary_delay_artifact.delay_samples)
             if primary_delay_artifact is not None
-            else fallback_delay
+            else fallback_delay()
         )
         delay_source = (
             primary_delay_artifact.source_path

@@ -385,6 +385,30 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_probe="manifest SHA 일치, 최소 표본 1개에서 확인",
     ),
     GateDeclaration(
+        gate_id="recorded_transfer_snapshot",
+        owner=_READINESS,
+        what_it_asserts="canonical fine-tune이 bootstrap transfer snapshot에 결속된 recorded 파일만 사용한다",
+        negative_fixture=(
+            f"{_NEG}::test_recorded_transfer_snapshot_gate_fails_without_transfer_snapshot"
+        ),
+        positive_fixture=(
+            "tests/test_finetune_readiness.py::test_canonical_completion_verifies_selection_capability_marker_metrics_chain"
+        ),
+        positive_probe="bootstrap receipt와 transfer manifest의 64자리 SHA·inode snapshot이 일치",
+    ),
+    GateDeclaration(
+        gate_id="recorded_selection_test_once_chain",
+        owner=_READINESS,
+        what_it_asserts="recorded-val 선택과 single-use test capability 체인이 완료 결과와 일치한다",
+        negative_fixture=(
+            "tests/test_finetune_readiness.py::test_canonical_completion_verifies_selection_capability_marker_metrics_chain"
+        ),
+        positive_fixture=(
+            "tests/test_finetune_readiness.py::test_canonical_completion_verifies_selection_capability_marker_metrics_chain"
+        ),
+        positive_probe="선택/발급/소비/완료 4개 marker의 SHA 체인 검증",
+    ),
+    GateDeclaration(
         gate_id="recorded_val_g4",
         owner=_READINESS,
         what_it_asserts="독립 recorded val 평가가 G4(최악 소스 계열 포함)를 통과했다",
