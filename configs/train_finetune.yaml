@@ -1,23 +1,17 @@
 # Stage-2/3 파인튜닝 — 실측 녹음 혼합 + (선택) closed-loop
 # 실행: .venv/bin/python scripts/train/train.py --config configs/train_finetune.yaml
-# digital-ref 는 configs/data_sim.yaml 의 값을 그대로 쓴다 — 2026-08-05 플랜트 복구 이후
-# 그 값은 **116** 이다 (S 1462 + handoff 256 − P 1602; 독립 캡처 9건 115~117, 중앙 116).
-# (이 줄은 "+109 를 쓰며 배포 runtime 도 109 로 맞춘다"였다. 109 는 실측 P/S 이전의
-#  추정값이고, 지금은 배포 ONNX 만이 109 에 묶여 있다 — configs/runtime_tiny.yaml 참조.)
-# 기존 lead=0/무효 objective checkpoint는 init/resume에 사용하지 않는다.
-#
-# ⚠ init 후보 checkpoint(runs/pretrain_{base,tiny}_corrected/ckpt/best.pt)는
-#   cfg.trusted_band_hz = [150, 600] / lead = 109 로 학습됐다. 현재 설정이 유도하는 값은
-#   [150, 1600] / 116 이다. lead 차이는 파인튜닝이 흡수하도록 설계됐지만 **대역 차이는
-#   다르다** — 좁은 대역으로 학습한 모델은 벌점이 없던 600-1600Hz 를 적극 증폭한다
-#   (configs/duct.yaml 의 실측: [150,800] 설정에서 600-1600Hz +27.01 dB).
-#   즉 이 init 은 고역 증폭기다. 현재 completed_init_checkpoint 게이트는 이 축을 보지
-#   않으므로 PASS 한다. 사전학습을 새 대역·새 손실로 다시 돌리는 편이 옳다.
+# digital-ref 시간축은 strict primary/secondary NPZ와 handoff에서
+# TrainingTimingContract가 유도한다. P/S delay, compact P FIR peak, lead 또는 총 선행량을
+# 이 YAML에 숫자로 복사하지 않는다. legacy corrected checkpoint는 150–600 Hz/옛 plant
+# 계약이므로 init·resume 자격이 없고 diagnostic artifact로만 보존한다.
 
 # 배포 후보는 tiny 다. base 와 동일 조건(100k step, 같은 seed·데이터)으로 비교한 결과
 # held-out trusted NMSE 가 tiny 쪽이 낫고 Jetson 지연 여유도 크다. 진입점이 base 를
 # 가리키면 게이트가 열리는 순간 **배포하지 않을 모델**을 파인튜닝하게 된다.
 stage: open_loop                # 1차 파인튜닝은 open_loop, 이후 closed_loop 로 변경
+experiment_role: canonical_finetune
+canonical_trust_policy: canonical_finetune_v1
+init_eligible: false
 model_config: configs/model_tiny.yaml
 data_config: configs/data_sim.yaml
 duct_config: configs/duct.yaml
@@ -28,6 +22,8 @@ duct_config: configs/duct.yaml
 require_measured_primary_path: true
 require_init_checkpoint: true
 require_recorded_manifest: true
+required_init_experiment_role: canonical_pretrain
+require_init_eligible: true
 
 # scripts/train/check_finetune.py와 train.py가 공용하는 실패-폐쇄 진입 기준.
 # 실제 official P/S와 recorded 데이터가 없으면 어떤 항목도 우회하지 않는다.
@@ -271,9 +267,15 @@ readiness:
   max_init_best_metric_db: 0.0
   allowed_init_physics_statuses: [secondary_surrogate_representation_pretrain]
 
-init_ckpt: runs/pretrain_tiny_corrected/ckpt/best.pt
+# legacy runs/pretrain_tiny_corrected는 lead/대역/loss 계약이 다르므로 기본 init으로
+# 절대 재사용하지 않는다. canonical tiny 100k가 완료된 뒤 그 contract
+# run의 best.pt를 `--set init_ckpt=...`로 명시해야만 게이트가 열린다.
+init_ckpt: null
 
-recorded_manifest: data/manifests/recorded_train.jsonl
+# shared clip/artist/speaker/book의 transitive lineage component로 다시 나눈
+# manifest만 학습에 쓴다. 기존 recorded_train.jsonl의 group_id는 이 관계를
+# 표현하지 않으므로 샘플러에 넣을 수 없다.
+recorded_manifest: data/manifests/recorded_regrouped.jsonl
 recorded_ratio: 0.7             # 실측:합성 = 7:3 혼합 배치
 
 batch_size: 16
@@ -364,6 +366,12 @@ log_every: 100
 # Trainer의 내장 val은 합성 16개뿐이라 실측 fine-tune 종료 권한으로 쓰지 않는다.
 # 예정 step을 끝낸 뒤 독립 recorded val/test G4로 checkpoint를 판정한다.
 early_stop_patience: 0
-ckpt_dir: runs/finetune_tiny
+# canonical A100 1장 경로. DDP resume은 rank별 RNG/plant 상태를 아직 저장하지
+# 않으므로 공식 fine-tune은 world size 1로 fail-closed한다.
+required_world_size: 1
+# loader가 experiment contract SHA/seed를 포함한 새 경로로 해석한다.
+# 구형 runs/finetune_tiny와 절대 섞이지 않는다.
+contract_run_dir: true
+ckpt_dir: runs
 resume: null
 seed: 20260803

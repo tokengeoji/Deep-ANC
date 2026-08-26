@@ -88,6 +88,33 @@ def test_manifest_split_assignment():
     assert counts["train"] == 90 and counts["val"] == 5 and counts["test"] == 5
 
 
+def test_noise_pool_consumes_validated_entry_snapshot_without_manifest_reread(tmp_path):
+    manifest = tmp_path / "music.jsonl"
+    validated = [
+        {
+            "path": str(tmp_path / "validated.wav"),
+            "duration_s": 1.0,
+            "sample_rate": 48_000,
+            "channels": 1,
+            "tag": "music",
+            "split": "train",
+            "content_sha256": "a" * 64,
+        }
+    ]
+    write_manifest(
+        [{**validated[0], "path": str(tmp_path / "forged.wav")}], manifest
+    )
+
+    pool = NoisePool(
+        [manifest],
+        split="train",
+        sample_rate=48_000,
+        validated_entries=validated,
+    )
+
+    assert [entry["path"] for entry in pool.entries] == [str(tmp_path / "validated.wav")]
+
+
 def test_scan_wavs_supports_mp3_and_skips_invalid_files(tmp_path, monkeypatch):
     nested = tmp_path / "nested"
     nested.mkdir()
@@ -171,6 +198,58 @@ def test_noise_pool_excludes_decode_failure_and_retries(tmp_path, monkeypatch):
     assert pool._active_weights[0] == 0.0
 
 
+def test_indexed_noise_pool_decode_retry_does_not_leak_state_between_items(
+    tmp_path, monkeypatch
+):
+    """global-index RNG 경로의 표본은 이전 item decode 이력과 무관해야 한다."""
+
+    manifest = tmp_path / "music.jsonl"
+    broken = tmp_path / "broken.mp3"
+    healthy = tmp_path / "healthy.mp3"
+    write_manifest(
+        [
+            {
+                "path": str(path),
+                "duration_s": 1.0,
+                "sample_rate": 48_000,
+                "channels": 1,
+                "tag": "music",
+                "split": "train",
+            }
+            for path in (broken, healthy)
+        ],
+        manifest,
+    )
+
+    class IndexedDraw:
+        def __init__(self):
+            self.indices = iter((0, 1))
+
+        def choice(self, *_args, **_kwargs):
+            return next(self.indices)
+
+        def integers(self, *_args, **_kwargs):
+            return 0
+
+    monkeypatch.setattr(
+        "deep_anc.data.noise_pool.sf.info",
+        lambda path: (
+            (_ for _ in ()).throw(RuntimeError("damaged"))
+            if Path(path) == broken
+            else SimpleNamespace(frames=128, samplerate=48_000, channels=1)
+        ),
+    )
+    monkeypatch.setattr(
+        "deep_anc.data.noise_pool.sf.read",
+        lambda *_args, **_kwargs: (np.ones((128, 1), dtype=np.float32), 48_000),
+    )
+
+    pool = NoisePool([manifest], split="train", sample_rate=48_000, seed=1)
+    before = pool._active_weights.copy()
+    assert np.all(pool.sample_segment(64, rng=IndexedDraw()) == 1.0)
+    assert np.array_equal(pool._active_weights, before)
+
+
 def test_d_noise_default_geometry(cfgs):
     """digital-ref 기본 지연 = s_delay − t(CS→ERR) + t(NS→ERR) [C2]."""
     _, duct = cfgs
@@ -222,7 +301,7 @@ def test_synth_digital_reference_lead_uses_continuous_future(cfgs, rir_bank):
     data.update(
         {
             "reference_mode": "digital",
-            "digital_reference_lead_samples": 109,
+            "digital_reference_lead_samples": 116,
             "level_dbfs": [0.0, 0.0],
             "snr_mic_noise_db": [300.0, 300.0],
             "dc_hum_prob": 0.0,
@@ -258,9 +337,9 @@ def test_synth_digital_reference_lead_uses_continuous_future(cfgs, rir_bank):
     ds._sample_source = deterministic_source
     item = ds._make_item(DeterministicItemRng(), SyntheticNoise(ds.fs, seed=0))
 
-    assert requested == [ds.segment + 109]
+    assert requested == [ds.segment + 116]
     np.testing.assert_array_equal(
-        item["x"][0].numpy(), np.arange(109, 109 + ds.segment, dtype=np.float32)
+        item["x"][0].numpy(), np.arange(116, 116 + ds.segment, dtype=np.float32)
     )
 
 

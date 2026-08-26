@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
@@ -19,7 +21,7 @@ import soundfile as sf
 import torch
 
 from ..config import REPO_ROOT
-from ..data.manifest import read_manifest
+from ..data.manifest import read_manifest, read_manifest_bytes
 from ..data.primary_path import resolve_digital_primary_path
 from ..data.synth_dataset import _delay_np
 from ..dsp.invariants import check_lead_agreement, check_plant_fingerprint_match
@@ -37,10 +39,13 @@ from ..dsp.timing import (
     FrequencyBand,
     PlantDelays,
     PlantFingerprint,
+    TrainingTimingContract,
     handoff_samples_from_config,
 )
 from ..models import build_model
 from ..train.trainer import validate_training_physics
+from ..train.evaluation_contract import snapshot_regular_file
+from ..train.experiment_contract import validate_embedded_experiment_contract
 from .metrics import (
     band_nmse_db,
     intersect_frequency_bands,
@@ -66,6 +71,7 @@ class RecordedEvalContext:
     primary_delay_samples: int | None
     secondary_path: SecondaryPathData
     secondary_handoff_samples: int
+    checkpoint_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -78,6 +84,10 @@ class RecordedSegment:
     group_id: str
     source_family: str
     start_sample: int
+    recorded_lead_samples: int = 0
+    recorded_delay_samples: float = -1.0
+    timing_contract_sha256: str = ""
+    source_timeline: str = "legacy"
 
 
 def _config_path(value: str | Path) -> Path:
@@ -114,6 +124,8 @@ def validate_resolved_checkpoint(
     if not isinstance(state, dict) or not isinstance(state.get("cfg"), dict):
         raise ValueError("checkpoint에 resolved cfg가 없습니다")
     cfg = state["cfg"]
+    if str(cfg.get("experiment_role", "")) == "canonical_finetune":
+        validate_embedded_experiment_contract(cfg)
     if not isinstance(state.get("model"), dict):
         raise ValueError("checkpoint에 model state_dict가 없습니다")
     for key in ("model", "data", "duct"):
@@ -177,11 +189,24 @@ def load_recorded_eval_context(
     *,
     allow_surrogate: bool = False,
     device: str | torch.device | None = None,
+    checkpoint_bytes: bytes | None = None,
+    checkpoint_sha256: str | None = None,
 ) -> RecordedEvalContext:
     """체크포인트의 resolved cfg만 사용해 모델과 공칭 S(z)를 복원한다."""
 
     checkpoint = Path(checkpoint)
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if checkpoint_bytes is None:
+        snapshot = snapshot_regular_file(checkpoint)
+        checkpoint_bytes = snapshot.content
+        checkpoint_sha256 = snapshot.sha256
+    else:
+        actual_sha = hashlib.sha256(checkpoint_bytes).hexdigest()
+        if checkpoint_sha256 is not None and checkpoint_sha256 != actual_sha:
+            raise ValueError("checkpoint byte snapshot SHA가 다릅니다")
+        checkpoint_sha256 = actual_sha
+    state = torch.load(
+        io.BytesIO(checkpoint_bytes), map_location="cpu", weights_only=False
+    )
     cfg, lead, physics_status, reference_mode = validate_resolved_checkpoint(
         state, allow_surrogate=allow_surrogate
     )
@@ -205,7 +230,7 @@ def load_recorded_eval_context(
     primary_delay: int | None = None
     expected_lead = 0
     if reference_mode == "digital":
-        _, primary_delay = resolve_digital_primary_path(
+        primary_data, primary_delay = resolve_digital_primary_path(
             data_cfg, duct_cfg, fs, secondary
         )
         # lead 는 여기서 다시 유도하지 않는다 — PlantDelays 가 유일한 발원지이고
@@ -217,14 +242,34 @@ def load_recorded_eval_context(
             primary_delay_samples=int(primary_delay),
             sample_rate=fs,
         )
-        expected_lead = int(delays.lead().samples)
-        result = check_lead_agreement(int(lead), delays)
-        if not result.ok:
-            raise ValueError(
-                "checkpoint digital-reference lead가 P/S 지연과 다릅니다: "
-                f"checkpoint={lead}, expected={expected_lead} "
-                f"(S={secondary.delay_samples}+handoff {handoff}, P={primary_delay})"
+        if physics_status == "measured_primary_path":
+            if primary_data is None:  # pragma: no cover - measured resolver 방어
+                raise ValueError("measured checkpoint에 compact P(z)가 없습니다")
+            saved_timing = TrainingTimingContract.from_data_config(data_cfg)
+            actual_timing = TrainingTimingContract.derive(
+                primary_fir=primary_data.fir,
+                plant_delays=delays,
             )
+            if saved_timing != actual_timing:
+                raise ValueError(
+                    "checkpoint training_timing_contract가 resolved P/S와 다릅니다"
+                )
+            expected_lead = int(actual_timing.digital_reference_lead_samples)
+            if int(lead) != int(saved_timing.digital_reference_lead_samples):
+                raise ValueError(
+                    "checkpoint digital-reference lead가 TrainingTimingContract와 "
+                    f"다릅니다: checkpoint={lead}, expected={expected_lead}"
+                )
+        else:
+            # 명시 surrogate 진단만 legacy alias를 PlantDelays와 대조한다.
+            expected_lead = int(delays.lead().samples)
+            result = check_lead_agreement(int(lead), delays)
+            if not result.ok:
+                raise ValueError(
+                    "checkpoint digital-reference lead가 P/S 지연과 다릅니다: "
+                    f"checkpoint={lead}, expected={expected_lead} "
+                    f"(S={secondary.delay_samples}+handoff {handoff}, P={primary_delay})"
+                )
 
     band_plan = BandPlan.resolve(
         plant_trusted_band_hz=secondary.trusted_band_hz(),
@@ -269,17 +314,22 @@ def load_recorded_eval_context(
         primary_delay_samples=primary_delay,
         secondary_path=secondary,
         secondary_handoff_samples=handoff,
+        checkpoint_sha256=str(checkpoint_sha256),
     )
 
 
 def load_and_audit_recorded_manifest(
-    manifest_path: str | Path, split: str
+    manifest_path: str | Path, split: str, *, manifest_bytes: bytes | None = None
 ) -> list[dict]:
     """전체 manifest의 path/session/group split 누수를 검사하고 split을 반환."""
 
     if split not in {"val", "test"}:
         raise ValueError("독립 recorded 평가는 split=val 또는 test만 허용합니다")
-    entries = read_manifest(manifest_path)
+    entries = (
+        read_manifest(manifest_path)
+        if manifest_bytes is None
+        else read_manifest_bytes(manifest_bytes, manifest_path=manifest_path)
+    )
     if not entries:
         raise ValueError(f"recorded manifest가 비어 있습니다: {manifest_path}")
 
@@ -460,8 +510,12 @@ def _read_session_metadata(session_dir: Path) -> dict:
 
 
 def _load_session_audio(
-    entry: dict, sample_rate: int, reference_mode: str
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    entry: dict,
+    sample_rate: int,
+    reference_mode: str,
+    *,
+    allow_legacy_source_timeline: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict, str]:
     session_dir = Path(entry["path"])
     if not session_dir.is_dir():
         raise FileNotFoundError(f"recorded session 디렉터리가 없습니다: {session_dir}")
@@ -493,11 +547,22 @@ def _load_session_audio(
         raise ValueError(f"{mics_path}: NaN/Inf가 있습니다")
 
     source: np.ndarray | None = None
+    source_timeline = "acoustic_ref"
     if reference_mode == "digital":
-        source_path = session_dir / "source.wav"
+        aligned_path = session_dir / "source_aligned.wav"
+        source_path = (
+            aligned_path
+            if aligned_path.is_file()
+            else session_dir / "source.wav"
+        )
+        if not aligned_path.is_file() and not allow_legacy_source_timeline:
+            raise FileNotFoundError(
+                "공식 digital measured 평가는 ADC 시간축 source_aligned.wav만 "
+                f"허용합니다: {aligned_path}"
+            )
         if not source_path.exists():
             raise FileNotFoundError(
-                f"digital-reference 평가에 source.wav가 필요합니다: {source_path}"
+                f"digital-reference 평가에 source가 필요합니다: {source_path}"
             )
         source_audio, source_rate = sf.read(
             source_path, dtype="float32", always_2d=True
@@ -509,8 +574,9 @@ def _load_session_audio(
         source = source_audio[:, 0]
         if not np.all(np.isfinite(source)):
             raise ValueError(f"{source_path}: NaN/Inf가 있습니다")
+        source_timeline = source_path.name
 
-    return mics[:, 0], mics[:, 1], source
+    return mics[:, 0], mics[:, 1], source, metadata, source_timeline
 
 
 def iter_recorded_segments(
@@ -522,6 +588,7 @@ def iter_recorded_segments(
     segment_seconds: float | None = None,
     feedback_delay_samples: int | None = None,
     edge_trim_seconds: float = 0.25,
+    allow_legacy_source_timeline: bool = False,
 ) -> Iterator[RecordedSegment]:
     """manifest 세션을 유한하고 결정론적인 비중첩 segment로 변환한다."""
 
@@ -548,13 +615,46 @@ def iter_recorded_segments(
     edge_trim = int(round(edge_trim_seconds * fs))
 
     reference_mode = str(data_cfg.get("reference_mode", "digital"))
-    lead = int(data_cfg.get("digital_reference_lead_samples", 0))
+    constant_lead = int(data_cfg.get("digital_reference_lead_samples", 0))
+    timing_contract: TrainingTimingContract | None = None
+    timing_contract_sha = ""
+    if reference_mode == "digital" and not allow_legacy_source_timeline:
+        if str(data_cfg.get("recorded_lead_mode", "")) != "timeline":
+            raise ValueError(
+                "공식 digital measured 평가는 recorded_lead_mode=timeline이어야 합니다"
+            )
+        timing_contract = TrainingTimingContract.from_data_config(data_cfg)
+        if int(timing_contract.sample_rate) != fs:
+            raise ValueError("training_timing_contract sample_rate가 평가 설정과 다릅니다")
+        if int(timing_contract.digital_reference_lead_samples) != constant_lead:
+            raise ValueError(
+                "training_timing_contract digital lead가 checkpoint data와 다릅니다"
+            )
+        timing_contract_sha = timing_contract.digest()
     feedback_delay = resolve_feedback_delay(data_cfg, feedback_delay_samples)
 
     for entry in entries:
-        err, ref, source = _load_session_audio(entry, fs, reference_mode)
+        err, ref, source, metadata, source_timeline = _load_session_audio(
+            entry,
+            fs,
+            reference_mode,
+            allow_legacy_source_timeline=allow_legacy_source_timeline,
+        )
+        lead = constant_lead
+        recorded_delay = -1.0
         if reference_mode == "digital":
             assert source is not None
+            if timing_contract is not None:
+                timeline = metadata.get("timeline")
+                if not isinstance(timeline, dict) or (
+                    "aligned_lag_median_samples" not in timeline
+                ):
+                    raise ValueError(
+                        f"{entry['path']}: session.json timeline."
+                        "aligned_lag_median_samples가 없습니다"
+                    )
+                recorded_delay = float(timeline["aligned_lag_median_samples"])
+                lead = timing_contract.recorded_lead_samples(recorded_delay)
             usable = min(err.size, source.size - lead)
         else:
             usable = min(err.size, ref.size)
@@ -592,6 +692,10 @@ def iter_recorded_segments(
                 group_id=str(entry["group_id"]),
                 source_family=str(entry["source_family"]),
                 start_sample=int(start),
+                recorded_lead_samples=int(lead),
+                recorded_delay_samples=float(recorded_delay),
+                timing_contract_sha256=timing_contract_sha,
+                source_timeline=source_timeline,
             )
 
 
@@ -784,6 +888,18 @@ def evaluate_recorded_segments(
         "segment_start_sample": np.asarray(
             [segment.start_sample for segment in metadata], dtype=np.int64
         ),
+        "segment_recorded_lead_samples": np.asarray(
+            [segment.recorded_lead_samples for segment in metadata], dtype=np.int64
+        ),
+        "segment_recorded_delay_samples": np.asarray(
+            [segment.recorded_delay_samples for segment in metadata], dtype=np.float64
+        ),
+        "segment_timing_contract_sha256": np.asarray(
+            [segment.timing_contract_sha256 for segment in metadata], dtype=np.str_
+        ),
+        "segment_source_timeline": np.asarray(
+            [segment.source_timeline for segment in metadata], dtype=np.str_
+        ),
         "source_rows": source_rows,
         "octave_rows": octave_rows,
     }
@@ -942,11 +1058,18 @@ def write_recorded_metrics(
     allow_surrogate: bool,
     edge_trim_samples: int,
     warmup_samples: int,
+    checkpoint_sha256: str | None = None,
+    manifest_sha256: str | None = None,
+    experiment_contract_sha256: str | None = None,
+    selection_sha256: str = "",
+    test_capability_sha256: str = "",
+    test_consumed_marker_sha256: str = "",
+    exclusive: bool = False,
 ) -> tuple[Path, Path]:
     """사람용 Markdown과 기계용 NPZ를 원자적으로 생성한다."""
 
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=not exclusive)
     markdown_path = out_dir / "metrics.md"
     npz_path = out_dir / "metrics.npz"
     trusted = result["trusted"]
@@ -1082,8 +1205,11 @@ def write_recorded_metrics(
     g4_pass = verdict == G4_PASS
 
     fingerprint = _plant_fingerprint_for(context)
-    checkpoint_sha256 = _sha256_if_file(checkpoint)
-    manifest_sha256 = _sha256_if_file(manifest)
+    checkpoint_sha256 = checkpoint_sha256 or context.checkpoint_sha256
+    manifest_sha256 = manifest_sha256 or _sha256_if_file(manifest)
+    experiment_contract_sha256 = experiment_contract_sha256 or str(
+        context.cfg.get("experiment_contract_sha256", "")
+    )
 
     lines = [
         f"# Recorded {split} 오프라인 평가",
@@ -1238,8 +1364,11 @@ def write_recorded_metrics(
         "이 평가는 저장된 오디오 파일만 읽는 오프라인 계산이며 실제 오디오를 출력하지 않습니다.",
     ]
     markdown_tmp = markdown_path.with_suffix(".md.tmp")
-    markdown_tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    markdown_tmp.replace(markdown_path)
+    with markdown_tmp.open("x", encoding="utf-8") as markdown_file:
+        markdown_file.write("\n".join(lines) + "\n")
+        markdown_file.flush()
+        os.fsync(markdown_file.fileno())
+    os.replace(markdown_tmp, markdown_path)
 
     source_rows = result["source_rows"]
     octave_rows = result["octave_rows"]
@@ -1249,6 +1378,16 @@ def write_recorded_metrics(
             file_obj,
             checkpoint=np.asarray(str(Path(checkpoint)), dtype=np.str_),
             checkpoint_sha256=np.asarray(checkpoint_sha256, dtype=np.str_),
+            experiment_contract_sha256=np.asarray(
+                experiment_contract_sha256, dtype=np.str_
+            ),
+            selection_sha256=np.asarray(selection_sha256, dtype=np.str_),
+            test_capability_sha256=np.asarray(
+                test_capability_sha256, dtype=np.str_
+            ),
+            test_consumed_marker_sha256=np.asarray(
+                test_consumed_marker_sha256, dtype=np.str_
+            ),
             manifest=np.asarray(str(Path(manifest)), dtype=np.str_),
             manifest_sha256=np.asarray(manifest_sha256, dtype=np.str_),
             split=np.asarray(split, dtype=np.str_),
@@ -1363,6 +1502,16 @@ def write_recorded_metrics(
             segment_group_id=result["segment_group_id"],
             segment_source_family=result["segment_source_family"],
             segment_start_sample=result["segment_start_sample"],
+            segment_recorded_lead_samples=result[
+                "segment_recorded_lead_samples"
+            ],
+            segment_recorded_delay_samples=result[
+                "segment_recorded_delay_samples"
+            ],
+            segment_timing_contract_sha256=result[
+                "segment_timing_contract_sha256"
+            ],
+            segment_source_timeline=result["segment_source_timeline"],
             source_family=np.asarray(
                 [row["source_family"] for row in source_rows], dtype=np.str_
             ),
@@ -1413,7 +1562,16 @@ def write_recorded_metrics(
                 [row["trusted"] for row in octave_rows], dtype=np.bool_
             ),
         )
-    npz_tmp.replace(npz_path)
+        file_obj.flush()
+        os.fsync(file_obj.fileno())
+    os.replace(npz_tmp, npz_path)
+    directory_fd = os.open(
+        out_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
     return markdown_path, npz_path
 
 

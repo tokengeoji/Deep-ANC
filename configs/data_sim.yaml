@@ -3,6 +3,12 @@
 sample_rate: 48000
 segment_seconds: 1.5
 
+# 공식 학습은 Elice bootstrap이 원자 발행한 receipt의 외부 SHA를 CLI로
+# 주입한 뒤에만 resolved experiment contract를 만든다. 저장소 기본값 null은
+# 실수로 로컬/부분 전송 데이터를 공식 입력으로 쓰지 못하게 하는 fail-closed 값이다.
+bootstrap_receipt: data/manifests/elice_bootstrap_receipt.json
+bootstrap_receipt_sha256: null
+
 # 레퍼런스 모드 [교차검증 C2 — 두 모드의 지연 물리가 다르다]
 #   digital : 소음원을 Jetson이 생성 → 출력버퍼 지연이 소음/상쇄 양경로에 공통 → 광대역 상쇄 가능
 #   acoustic: 외부 소음을 레퍼런스 마이크로 수음 → P≈30ms 예측 필요 → 주기성/협대역 한정
@@ -15,28 +21,45 @@ reference_mode: digital
 #   rir_surrogate      : 기존 1D p_err RIR 경로(호환/비교 실험 전용).
 digital_primary_path_mode: secondary_surrogate
 
-# 자기생성 digital-ref를 실제 소음 출력보다 앞서 공급하는 샘플 수.
-# 현재 P/S 지연차: (S 1342 + runtime handoff 256) - D_noise 추정 1489 = 109.
-# 새 surrogate 사전학습은 이 실제 선행 공급을 포함한다. 배포 runtime 값도 반드시
-# 109로 맞춰야 하며, checkpoint/ONNX 메타와 다르면 런타임이 시작 전 거부한다.
-# acoustic 모드에서는 반드시 0으로 override해야 한다.
-# 2026-08-05 재분석: S 1462 + handoff 256 − P 1602 = 116.
-# 독립 캡처 9건에서 115/116/116/116/116/116/116/116/117 로 재현된다 — 절대 지연과
-# 달리 lead 는 진짜 물리량이다. 기하 예측(NS→ERR 1.100m − CS 축방향 0.050m
-# = 1.050m = 146.9샘플, 사이드브랜치 관로 ≈7샘플)과도 일치한다.
-# 앞선 113 은 프레임 슬립 반복 6개와 정상상태 미도달 반복 2개를 포함한 값이다.
-digital_reference_lead_samples: 116
+# 자기생성 digital-ref의 lead는 이 YAML에 숫자로 선언하지 않는다.
+# compact P를 쓰는 measured/secondary_surrogate 모드에서는 설정 로더가 실제 P/S와
+# handoff의 PlantDelays에서 TrainingTimingContract를 만들고 그 lead를 주입한다.
+# 명시 override는 유도값과 일치할 때만 검증용으로 허용한다. acoustic/rir_surrogate는
+# compact P 단일 계약이 없으므로 기존 모드별 명시값/기본값을 그대로 사용한다.
 
 # 실측 브랜치의 lead 를 **세션마다 유도**한다. 기본값 constant 는 두 브랜치가 모델에게
 # 주는 총 선행량을 어긋나게 한다 (2026-08-06 실측):
-#   합성  x_ref 가 d 보다  D_noise 1602 + K 116 = 1718 샘플 앞선다
-#   실측  x_ref 가 d 보다  잔여 142.5 + K 116  =  258 샘플 앞선다   ← 1460 샘플(30.4ms) 차이
+#   합성  x_ref가 d보다 P의 유효 지연(FIR peak 포함)+K만큼 앞선다.
+#   실측  상수 lead는 정렬 잔여 지연+K만큼만 앞서므로 약 30ms 다른 과제가 된다.
 # 파인튜닝은 합성 30% + 실측 70% 이므로 같은 모델이 두 브랜치에서 다른 과제를 배운다.
-# timeline 은 K' = (D_noise + K) − d_recorded 로 총 선행량을 맞춘다 (K' ≈ 1576).
+# timeline은 TrainingTimingContract가 합성 총 선행량에서 세션별 정렬 잔여 지연을 빼
+# K'를 유도한다. compact FIR peak를 빠뜨린 수동 산술은 허용하지 않는다.
 # 켤 근거(코드 주석이 요구한 "physics 합의"): 82세션 aligned_lag_median 이
 #   142.0~144.1, std 0.32 로 재현되고 기하 예측 140 샘플과 2.5 샘플 안에서 일치한다.
 #   D_noise 1602 는 합성 브랜치와 같은 출처(공식 P 측정)라 자기정합적이다.
 recorded_lead_mode: timeline
+
+# 실측 82세션은 계열별 개수가 다르다(machine 21 / environment 10 / music 10 /
+# speech 7). 세션을 바로 균등 추첨하면 machine이 과대표집되므로
+# 계열→공유 출처의 transitive lineage component→세션을 각 단계에서 균등 추첨한다.
+# 이 모드에서는 regrouped manifest의 source_family/group_id와, 원래 pool 그룹을
+# 보존한 source_pool_group_id가 모두 필수다.
+recorded_sampling: family_lineage_session_balanced
+
+# 실측 세션 반복 노출을 줄이는 1차 안전 증강. x_ref와 d에 같은 gain/polarity/EQ를
+# 적용하고 마이크 잡음은 모델 입력에만 넣는다. 세션 혼합과 lead jitter는 LTI/시간축
+# 검증 전까지 0으로 고정한다.
+recorded_augment:
+  enabled: true
+  level_db_range: [-12.0, 6.0]
+  polarity_flip: true
+  mic_noise_snr_db: [12.0, 40.0]
+  eq_tilt_db: 6.0
+  eq_band_db: 4.0
+  eq_bands_hz: [100.0, 300.0, 700.0, 1400.0]
+  mix_probability: 0.0
+  mix_weight_range: [0.0, 0.7]
+  lead_jitter_samples: 0.0
 
 # 소음원 구성 비율 — 키 이름 = data/manifests/<키>.jsonl 태그 (manifest 없으면 합성원 폴백)
 # quiet zone 목표: 소음뿐 아니라 대화(음성)·음악까지 소스 분포에 포함 (digital-ref 는

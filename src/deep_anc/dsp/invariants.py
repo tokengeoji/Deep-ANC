@@ -26,7 +26,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict
 
 from .interleaved_probe import relative_tau_outliers
-from .timing import Lead, PlantDelays, PlantFingerprint
+from .timing import Lead, PlantDelays, PlantFingerprint, TrainingTimingContract
 
 if TYPE_CHECKING:  # pragma: no cover - 순환 import 를 피하려 타입에서만 참조한다
     from ..data.timeline import DelayTrajectory
@@ -395,6 +395,32 @@ CONTROLLED_BAND_TOP_HZ = 1600.0
 
 S(z) 복구 후 신뢰대역이 [150, 1600] 이 됐다(HANDOFF 플랜트 복구 결과). 1633 Hz 는 덕트
 평면파 컷오프이고 그 위는 가진조차 하지 않았다.
+"""
+
+ABSOLUTE_OBJECTIVE_BAND_HZ = (150.0, CONTROLLED_BAND_TOP_HZ)
+"""절대목표 1(저주파·고주파 **모두** 제거)이 요구하는 대역. **설정이 아니라 코드다.**
+
+2026-08-07 검증: 진입 게이트 14개가 ``--set`` 두 개로 전부 열렸다::
+
+    --set duct.acoustics.realistic_target_band_hz='[80, 600]'
+    --set data.source_mix_ratio='{synthetic: 0.95, esc50: 0.05}'
+        → 14 PASS / 0 FAIL, EXIT=0
+
+대역을 좁히면 "체크포인트가 학습 대역을 덮는다" 가 참이 되고, 혼합비에서 태그를 빼면
+"코퍼스가 서로소다" 가 참이 된다. 두 게이트 다 **설정끼리** 비교하고 있었기 때문에,
+목표를 낮추면 목표 달성이 쉬워지는 구조였다.
+
+목표는 프로젝트가 정한 것이고 실행 인자로 내릴 수 있으면 목표가 아니다. 그래서 여기
+코드에 둔다. ``configs/train_finetune.yaml:183`` 이 "되돌리는 것은 금지" 라고 적어 둔
+것을 주석 대신 **검사**로 만든 것이다.
+"""
+
+REQUIRED_SOURCE_FAMILIES = ("speech", "music")
+"""절대목표 2(소음·음성·음악을 **모두** 제거)가 요구하는 소스 계열. **코드다.**
+
+노이즈만 학습한 모델은 목표 2를 만족할 수 없다. 혼합비에서 이 계열들을 빼면
+``corpus_disjoint`` 는 통과하지만 목표는 달성 불가가 된다 — 게이트가 서로 반대
+방향으로 움직이던 지점이다.
 """
 
 MAX_STREAM_DELAY_ROBUST_STD_SAMPLES = delay_jitter_limit_for_band(
@@ -824,9 +850,9 @@ def derive_playback_to_error_delay_samples(
     이 불일치를 검사하는 게이트가 없었다.
     """
 
-    taps = np.asarray(fir, dtype=np.float64).reshape(-1)
-    if taps.size == 0 or not np.all(np.isfinite(taps)):
-        raise ValueError("P(z) FIR 이 비었거나 유한하지 않습니다")
-    if int(bulk_delay_samples) < 0:
-        raise ValueError(f"벌크지연은 0 이상이어야 합니다: {bulk_delay_samples!r}")
-    return float(int(bulk_delay_samples) + int(np.argmax(np.abs(taps))))
+    return float(
+        TrainingTimingContract.primary_effective_from_fir(
+            int(bulk_delay_samples),
+            np.asarray(fir, dtype=np.float64).reshape(-1),
+        )
+    )

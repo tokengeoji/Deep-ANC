@@ -21,12 +21,12 @@ configs/train_*.yaml ──load_train_config(config.py:73)──▶ cfg{model,da
   SynthANCDataset(data/synth_dataset.py)              n(t) [T=1.5s→71,936샘플(256 배수 내림)]
   ├ RIR 뱅크: data/rir_bank/duct_rirs_v1.npz (build_rir_bank.py 300변형; 분할 5/5/90% 하드코딩)
   │   duct.yaml positions_m/reflection/duct.* ──dsp/duct_sim.py 영상법──▶ p_ref / p_err / f_fb
-  ├ digital-ref: x_ref=n[t+K], K=116(실측 P/S 유도. 배포 중 ONNX artifact 는 109)
+  ├ digital-ref: x_ref=n[t+K], K는 strict P/S와 handoff의 TrainingTimingContract에서 유도
   │   └ d=P(z)*n[t]; primary_path.resolve_digital_primary_path 선택
-  │      ├ secondary_surrogate(현 Stage-1): P FIR/gain=S FIR/gain, 지연 D_noise
+  │      ├ secondary_surrogate(Stage-1): P FIR/gain=S FIR/gain, P 지연은 primary NPZ에서 읽음
   │      ├ measured(파인튜닝): primary_path_npz FIR+실측 순수지연을 각 1회
   │      └ rir_surrogate(legacy/비교): p_err RIR + D_noise−t_ac(NS→ERR) [이중계상 방지]
-  │   D_noise = duct.digital_reference.d_noise_delay_samples = 1602 (실측 P(z))
+  │   P/S bulk delay, compact FIR peak, handoff, lead와 총 선행량은 timing contract가 구분
   ├ err_in = delay(d, fb∈[512,1024]) + 마이크잡음(snr_mic_noise_db)
   │          + 전원 험(dc_hum_prob=0.2; 50/60Hz+2차) + 채널드롭아웃(0.15/0.15 하드코딩)
   ▼
@@ -88,9 +88,9 @@ record_duct.py(hardware.yaml) → data/recorded/<세션> → make_recorded_manif
   → validate_recorded_sessions.py(채널/SR/길이/finite/RMS/clip/family×split QA)
   → RecordedANCDataset(d=err mic, x_ref=digital:source.wav / acoustic:ref mic)
   → MixedIterator(recorded_ratio; 현 Trainer는 recorded train만 소비, val은 합성 최대16개)
-calibrate_wideband.py(ESS) → --output-channel cancel: S(z) 재보정 npz
-                           → --output-channel noise: P(z) FIR+순수지연 npz
-                              → duct.digital_reference.{primary_path_npz,d_noise_delay_samples}
+strict interleaved probe → cancel: S(z), noise: P(z)의 raw+analysis+compact NPZ
+                         → duct의 P/S NPZ 경로만 설정
+                         → TrainingTimingContract가 delay/FIR peak/handoff/lead를 유도
 measure_duct_transfer_map.py(단일 stream/time-division ESS 또는 multitone)
   → NS→REF/ERR + CS→REF/ERR 반복 IR·magnitude/phase/coherence/group delay
   → 같은 I2S ERR-REF TDOA / PortAudio ADC-DAC timestamp / 절대지연을 분리 저장
@@ -122,8 +122,7 @@ P/S와 독립 세션을 수집해 QA/G4를 통과하기 전에는 물리 성능 
 | reflection.* | ✅ | duct_sim(단, build_rir_bank 는 자체 랜덤값으로 대체) |
 | secondary_path.npz | ✅ | Trainer, SynthANCDataset, offline/FxLMS 평가, realtime FxLMS 엔진이 공유 |
 | secondary_path.handoff_extra_samples | ✅ | duct.yaml에 256 명시. 키 부재 시도 `DEFAULT_HANDOFF_SAMPLES=256`을 학습·평가·런타임이 공유 |
-| digital_reference.primary_path_npz | ⚠ | `digital_primary_path_mode=measured`에서 primary_path.py가 로드; null이면 measured 모드 fail-fast |
-| digital_reference.d_noise_delay_samples | ⚠ | primary_path.py/synth_dataset.py, compare_fxlms.py, config.validate_duct. null은 기하추정; measured NPZ delay와 다르면 fail-fast |
+| digital_reference.primary_path_npz | ⚠ | measured와 canonical secondary-surrogate가 strict P의 bulk delay를 읽는 단일 출처. 누락/legacy provenance면 fail-fast |
 
 `secondary_path.delay_jitter_range`와 `calibration.input_ref_rms`는 현재 duct.yaml에 없다.
 지연 지터는 `data_sim.plant_perturbation.delay_jitter_range`, 입출력 스케일은
@@ -134,7 +133,7 @@ P/S와 독립 세션을 수집해 QA/G4를 통과하기 전에는 물리 성능 
 |---|---|---|
 | sample_rate / segment_seconds / reference_mode | ✅ | synth·recorded_dataset, trainer.fs (세그먼트는 256 배수 내림) |
 | digital_primary_path_mode | ⚠ | primary_path.py→synth_dataset.py. 현 YAML은 `secondary_surrogate`; `measured`는 primary NPZ 필수, `rir_surrogate`는 legacy/비교 전용 |
-| digital_reference_lead_samples | ⚠ | synth·recorded_dataset에서 x_ref=n[t+K], run_realtime에서 생성 신호/실재생 FIFO 정렬. 현 학습 YAML은 109, runtime 템플릿은 0; artifact 메타와 런타임 값은 동일해야 하며 acoustic 모드는 K>0 거부 |
+| timing_contract / digital_reference_lead_samples | ⚠ | compact P 모드에서는 설정 로더가 strict P/S와 handoff로 계약과 K를 주입한다. 수동 override는 유도값과 같을 때만 검증용으로 허용. artifact 메타와 runtime은 동일해야 하고 acoustic 모드는 K>0 거부 |
 | source_mix_ratio.* / source_mix_ratio_acoustic.* | ⚠ | SynthANCDataset이 reference_mode에 따라 비율표 선택, 키=manifest 태그. manifest 부재는 Trainer 배너와 dataset 메시지 후 synthetic 폴백 |
 | noise_manifest_dir / rir_bank | ⚠ | SynthANCDataset이 `_resolve_path`로 해석(CWD에 실제 경로가 있으면 우선, 없으면 REPO_ROOT 폴백). RIR 부재 시 경고 후 32개 즉석 생성 |
 | level_dbfs / snr_mic_noise_db | ✅ | synth_dataset. 현 Stage-1 레벨값은 −45∼−20dBFS |
@@ -215,13 +214,24 @@ SynthANCDataset은 RIR·manifest·S(z) 경로에 이 함수를 적용하고 Nois
 
 ## 4. 실행 경로별 진입점
 
+파인튜닝 준비의 현행 순서는 `코드/전체 테스트 → strict P/S 무음 dry-run → 사용자 입회
+레벨 교정 20초 → 같은 연결 창 strict P/S 출력 12.5초 → 즉시 스피커 분리 → 오프라인
+분석/데이터 계보/Elice 준비`다. strict P/S가 합격하기 전에 장시간 재녹음을 선행하지 않는다.
+Elice bootstrap도 학습을 시작하지 않고 exact code, canonical holdout, 환경과 데이터만
+검증한다. `build_elice_transfer_manifest.py`가 recorded 전체, RIR, strict P/S raw·analysis·NPZ,
+regrouped manifest, FMA tracks, holdout, 두 source CSV와 content-addressed provenance report를
+상대경로·content SHA로 결속한다. bootstrap은 commit SHA, holdout SHA와 transfer manifest
+SHA를 외부 trust anchor로 모두 요구한다. readiness, experiment contract와 학습 loader는
+validator가 hash한 같은 recorded/synthetic byte snapshot을 소비한다.
+
 | 경로 | 진입점 | 소비 설정 |
 |---|---|---|
-| 학습(사전) | `scripts/train/train.py --config configs/train_pretrain.yaml` (DDP: torchrun) | train_pretrain → model/data/duct 병합 |
-| 학습(원샷, Elice) | `scripts/elice/bootstrap_all.sh` → `run_parallel_models.sh`(GPU0=base, GPU1=tiny, `mkdir -p runs` 포함) | 〃 |
+| 학습(사전) | `scripts/train/train.py --config configs/train_pretrain_tiny.yaml` (공식 world size 1) | train_pretrain_tiny → model/data/duct/campaign prerequisite 병합 |
+| Elice 환경·데이터 준비 | `scripts/elice/bootstrap_all.sh --expected-commit <40hex> --expected-holdout-sha256 <64hex> --expected-transfer-manifest-sha256 <64hex> --no-update` (학습 자동 시작 없음) | canonical transfer, public raw, environment receipt |
 | 파인튜닝 | `train.py --config configs/train_finetune.yaml` (+recorded_manifest) | train_finetune |
-| 데이터 준비 | `scripts/data/{download_noise.sh, prepare_noise_pool.py, build_rir_bank.py}` | data_sim, duct |
-| 실측/보정 | `scripts/data/{record_duct.py, make_recorded_manifest.py, calibrate_wideband.py}` | hardware, duct |
+| 데이터 준비 | `prepare_noise_pool.py --expected-holdout-sha256 <64hex>` | data_sim, canonical holdout/report, raw content SHA |
+| strict P/S | paired raw level evidence PASS 뒤 `set_amp_level.py`(20초) → `measure_paths_interleaved.py`(12.5초) | hardware, duct, MeasurementLevelContract, measurement_level_evidence |
+| 실측 데이터 | `scripts/data/{record_duct.py, make_recorded_manifest.py}` (strict P/S 합격 뒤 필요할 때만) | hardware, duct |
 | 내보내기 | `scripts/train/export_onnx.py` → `scripts/export/build_trt.sh` | (ckpt 내장 cfg) |
 | 실시간 | `.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml` (--calibrate/--list-devices) | runtime → hardware/duct 병합 |
 | 벤치 | `scripts/bench/measure_{inference,io}_latency.py` | runtime, hardware |

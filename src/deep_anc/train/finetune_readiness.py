@@ -10,25 +10,57 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import io
 import json
 import math
+import os
+import re
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 import numpy as np
 import torch
 
-from ..config import REPO_ROOT
-from ..data.manifest import read_manifest
+from ..audio_io import analyze_int32_input_probe
+from ..config import (
+    REPO_ROOT,
+    loss_selection_sha256,
+    validate_canonical_training_policy,
+)
+from ..data.holdout_contract import (
+    read_regular_file_snapshot,
+    validate_holdout_contract,
+)
+from ..data.manifest import read_manifest, read_manifest_bytes
+from ..data.manifest_contract import validate_manifest_generation
+from ..data.transfer_contract import validate_recorded_training_snapshot
 # 지연·lead 부기의 단일 출처. 게이트가 lead 를 **스스로 유도하면** 그것이 두 번째
 # 유도가 되고, trainer 와 갈라진 채로 양쪽 다 "통과" 한다 (발생기 A, 커밋 aaeef41).
-from ..dsp.invariants import check_lead_agreement
+from ..dsp.invariants import (
+    ABSOLUTE_OBJECTIVE_BAND_HZ,
+    REQUIRED_SOURCE_FAMILIES,
+)
 from ..dsp.secondary_path import load_secondary_path
-from ..dsp.timing import BandPlan, FrequencyBand, PlantDelays
+from ..dsp.interleaved_probe import build_interleaved_probe
+from ..dsp.timing import (
+    BandPlan,
+    FrequencyBand,
+    PlantDelays,
+    TrainingTimingContract,
+)
 from ..data.recorded_qa import (
     settings_from_data_config,
     validate_recorded_sessions,
 )
+from .completion_receipt import validate_completion_receipt
+from .evaluation_contract import (
+    canonical_test_ledger_event_paths_from_payload,
+    canonical_test_ledger_paths_from_payload,
+    read_json_snapshot,
+    snapshot_regular_file,
+    validate_test_open_selection,
+)
+from .experiment_contract import validate_embedded_experiment_contract
 
 
 DEFAULT_REQUIRED_PATH_BAND_HZ = (80.0, 1600.0)
@@ -57,10 +89,124 @@ INTERLEAVED_REQUIRED_FIELDS = (
     # 일관성을 **어느 대역에서 쟀는지**. 이게 없으면 coherence_median 0.95 가 무엇에
     # 대한 0.95 인지 알 수 없고, 좁은 대역에서 잰 값으로 넓은 대역을 주장할 수 있다.
     "consistency_band_hz",
+    "anchor_repeat",
+    "kept_repeat_indices",
+    "alignment_scores",
+    "band_consistency",
+    "band_consistency_hz",
+    # compact FIR 변환 후의 self-describing 지연 계약과 독립 재감사 source.
+    "bulk_delay_samples",
+    "pre_roll_samples",
+    "delay_semantics",
+    "tone_frequencies_hz",
+    "aligned_mean_transfer_real",
+    "aligned_mean_transfer_imag",
+    "aligned_mean_transfer_sha256",
+    "compact_transfer_band_hz",
+    "compact_transfer_tone_count",
+    "compact_transfer_complex_agreement",
+    "compact_transfer_relative_error",
+    "minimum_compact_transfer_agreement",
+    "maximum_compact_transfer_relative_error",
+    "compact_transfer_subband_hz",
+    "compact_transfer_subband_tone_count",
+    "compact_transfer_subband_complex_agreement",
+    "compact_transfer_subband_relative_error",
+    # immutable raw/analysis provenance와 guard=1 clock-corrected separation 증거.
+    "output_pcm_provenance",
+    "source_raw_npz_path",
+    "source_raw_npz_sha256",
+    "source_analysis_npz_path",
+    "source_analysis_npz_sha256",
+    "error_mic_channel",
+    "reference_mic_channel",
+    "noise_output_channel",
+    "cancel_output_channel",
+    "operator_confirmed_user_present",
+    "operator_confirmed_volume_minimum",
+    "operator_confirmed_routing_and_geometry",
+    "separation_algorithm",
+    "separation_algorithm_version",
+    "clock_estimator",
+    "clock_sample_rate",
+    "clock_band_hz",
+    "clock_min_adjacent_score",
+    "clock_max_err_ref_delta_samples",
+    "clock_max_subwindow_spread_samples",
+    "clock_max_adjacent_change_samples",
+    "clock_max_abs_period_delta_samples",
+    "clock_max_drift_deviation_samples",
+    "clock_observation_repeat_indices",
+    "clock_period_delta_samples",
+    "clock_q_ratio",
+    "clock_err_delay_samples",
+    "clock_ref_delay_samples",
+    "clock_err_score",
+    "clock_ref_score",
+    "clock_err_subwindow_spread_samples",
+    "clock_ref_subwindow_spread_samples",
+    "clock_err_ref_delta_samples",
+    "joint_ls_expected_rank",
+    "joint_ls_rank",
+    "joint_ls_condition",
+    "joint_ls_max_condition",
+    "joint_ls_reconstruction_relative_error",
+    "joint_ls_reconstruction_relative_error_p95",
+    "joint_ls_max_reconstruction_relative_error_p95",
+    "separation_crosscheck_band_hz",
+    "separation_crosscheck_complex_agreement",
+    "separation_crosscheck_relative_error",
+    "separation_crosscheck_subband_hz",
+    "separation_crosscheck_subband_complex_agreement",
+    "separation_crosscheck_subband_relative_error",
+    "minimum_separation_crosscheck_agreement",
+    "maximum_separation_crosscheck_relative_error",
+    "repeat_tau_samples",
+    "provisional_repeat_tau_samples",
+    "common_alignment_tau_samples",
+    "drift_samples_per_period",
+    "relative_tau_max_abs_samples",
 )
 INTERLEAVED_MAX_PERIOD_SECONDS = 2.0   # 실측 위상 잔차가 2.26s 에서 2.33rad 로 무너진다
 INTERLEAVED_MIN_TONE_COUNT = 64
-INTERLEAVED_MIN_TONE_SNR_MEDIAN_DB = 12.0
+INTERLEAVED_MIN_TONE_SNR_MEDIAN_DB = 30.0
+INTERLEAVED_DELAY_SEMANTICS = "effective_zeros_before_compact_fir"
+INTERLEAVED_MIN_COMPACT_TRANSFER_AGREEMENT = 0.995
+INTERLEAVED_MAX_COMPACT_TRANSFER_RELATIVE_ERROR = 0.10
+INTERLEAVED_OUTPUT_PCM_PROVENANCE = "observed_submitted_int16"
+INTERLEAVED_SEPARATION_ALGORITHM = "fractional_clock_joint_real_ls"
+INTERLEAVED_SEPARATION_ALGORITHM_VERSION = 1
+INTERLEAVED_CLOCK_ESTIMATOR = "adjacent_cycle_time_domain_three_subwindow_parabolic"
+INTERLEAVED_CLOCK_BAND_HZ = (150.0, 1600.0)
+INTERLEAVED_CLOCK_MIN_SCORE = 0.995
+INTERLEAVED_CLOCK_MAX_ERR_REF_DELTA = 0.25
+INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD = 0.35
+INTERLEAVED_CLOCK_MAX_ADJACENT_CHANGE = 0.50
+INTERLEAVED_CLOCK_MAX_ABS_PERIOD_DELTA = 6.0
+INTERLEAVED_JOINT_LS_MAX_CONDITION = 1.25
+INTERLEAVED_JOINT_LS_MAX_RESIDUAL_P95 = 0.05
+INTERLEAVED_SEPARATION_MIN_AGREEMENT = 0.999
+INTERLEAVED_SEPARATION_MAX_RELATIVE_ERROR = 0.01
+INTERLEAVED_RAW_CAPTURE_SCHEMA = (
+    "interleaved_raw_v4_user_present_observed_pcm_preanalysis"
+)
+INTERLEAVED_OFFICIAL_SAMPLE_RATE = 48_000
+INTERLEAVED_CHANNEL_MAP_FIELDS = {
+    "error_mic_channel": ("error_mic", 0),
+    "reference_mic_channel": ("reference_mic", 1),
+    "noise_output_channel": ("noise_out", 0),
+    "cancel_output_channel": ("cancel_out", 1),
+}
+INTERLEAVED_OPERATOR_CONFIRMATION_FIELDS = (
+    "operator_confirmed_user_present",
+    "operator_confirmed_volume_minimum",
+    "operator_confirmed_routing_and_geometry",
+)
+INTERLEAVED_MAX_RELATIVE_TAU_ABS_SAMPLES = 1.0
+INTERLEAVED_COMPACT_TRANSFER_SUB_BANDS_HZ = np.asarray(
+    ((150.0, 300.0), (300.0, 600.0), (600.0, 1000.0), (1000.0, 1600.0)),
+    dtype=np.float64,
+)
 
 MAX_RELATIVE_DELAY_SPREAD_SAMPLES = 3
 """P−S 상대 τ 의 유지 반복 내 spread 상한(샘플).
@@ -85,7 +231,10 @@ MIN_KEPT_REPEATS = 8
 이전 값은 3 이었다.
 """
 
-MIN_BAND_CONSISTENCY = 0.90
+MIN_BAND_CONSISTENCY = 0.95
+MIN_INTERLEAVED_CONSISTENCY = 0.95
+INTERLEAVED_OFFICIAL_BLOCK_SIZE = 256
+INTERLEAVED_OFFICIAL_LATENCY = "low"
 """필수 대역 안 **모든** 부대역이 넘어야 하는 값.
 
 총계는 에너지 가중이라 약한 대역을 숨긴다 — 실측에서 S 의 전대역 총계는
@@ -232,6 +381,86 @@ def sha256_file(path: str | Path, *, block_bytes: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _canonical_recorded_lineage_snapshot(
+    manifest_path: Path, data_cfg: dict
+) -> tuple[list[dict], str, dict[str, Any]]:
+    """holdout provenance가 증명한 regrouped manifest의 동일 bytes만 반환한다."""
+
+    manifest_dir = _repo_path(
+        data_cfg.get("noise_manifest_dir", "data/manifests")
+    )
+    generation_path = manifest_dir / "manifest_generation.json"
+    generation_snapshot = read_regular_file_snapshot(
+        generation_path,
+        root=REPO_ROOT,
+        label="canonical manifest generation sidecar",
+    )
+    assert generation_snapshot.data is not None
+    try:
+        generation = json.loads(generation_snapshot.data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("canonical manifest generation sidecar가 손상됐습니다") from exc
+    if not isinstance(generation, dict):
+        raise ValueError("canonical manifest generation sidecar 최상위가 mapping이 아닙니다")
+    holdout_value = generation.get("holdout")
+    expected_holdout_sha = generation.get("holdout_sha256")
+    if holdout_value != "data/manifests/recorded_holdout.json":
+        raise ValueError(
+            "canonical manifest generation holdout 경로가 고정 계약과 다릅니다: "
+            f"{holdout_value!r}"
+        )
+    if (
+        not isinstance(expected_holdout_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_holdout_sha) is None
+    ):
+        raise ValueError("canonical manifest generation holdout_sha256가 유효하지 않습니다")
+    holdout_summary = validate_holdout_contract(
+        REPO_ROOT / holdout_value,
+        repo_root=REPO_ROOT,
+        expected_sha256=expected_holdout_sha,
+    )
+    lineage = holdout_summary.get("lineage")
+    if not isinstance(lineage, dict):
+        raise ValueError("canonical holdout provenance에 lineage summary가 없습니다")
+    declared_manifest = lineage.get("regrouped_manifest")
+    if declared_manifest != "data/manifests/recorded_regrouped.jsonl":
+        raise ValueError(
+            "canonical lineage regrouped manifest 경로가 고정 계약과 다릅니다: "
+            f"{declared_manifest!r}"
+        )
+    expected_path = Path(
+        os.path.abspath(REPO_ROOT / str(declared_manifest))
+    )
+    actual_path = Path(os.path.abspath(manifest_path))
+    if actual_path != expected_path:
+        raise ValueError(
+            "학습 recorded_manifest가 canonical lineage 증거의 regrouped manifest와 "
+            f"다릅니다: configured={actual_path}, proven={expected_path}"
+        )
+    manifest_snapshot = read_regular_file_snapshot(
+        actual_path,
+        root=REPO_ROOT,
+        label="canonical recorded regrouped manifest",
+    )
+    expected_manifest_sha = lineage.get("regrouped_manifest_sha256")
+    if manifest_snapshot.sha256 != expected_manifest_sha:
+        raise ValueError(
+            "학습 recorded_manifest bytes가 canonical lineage 증거와 다릅니다: "
+            f"actual={manifest_snapshot.sha256}, proven={expected_manifest_sha}"
+        )
+    assert manifest_snapshot.data is not None
+    entries = read_manifest_bytes(
+        manifest_snapshot.data, manifest_path=actual_path
+    )
+    expected_rows = lineage.get("regrouped_row_count")
+    if expected_rows != len(entries):
+        raise ValueError(
+            "canonical lineage regrouped row count가 실제 manifest와 다릅니다: "
+            f"actual={len(entries)}, proven={expected_rows}"
+        )
+    return entries, manifest_snapshot.sha256, holdout_summary
+
+
 def _npz_scalar(data: Any, key: str) -> Any:
     if key not in data:
         raise ValueError(f"필수 메타데이터 누락: {key}")
@@ -240,6 +469,969 @@ def _npz_scalar(data: Any, key: str) -> Any:
     if array.size != 1:
         raise ValueError(f"{key}는 scalar여야 합니다: shape={array.shape}")
     return array.reshape(-1)[0].item()
+
+
+def _fixed_point_clock_valid_mask(
+    *,
+    base_valid: np.ndarray,
+    common_delay_samples: np.ndarray,
+    adjacent_change_samples: np.ndarray,
+    max_drift_deviation_samples: float,
+    max_adjacent_change_samples: float,
+    min_valid_periods: int,
+) -> tuple[np.ndarray, float]:
+    """Independently reconstruct the official final-median clock mask.
+
+    This deliberately mirrors, rather than trusts, the measurement producer.
+    The mask is monotonically reduced until every survivor is within the hard
+    envelope around the median of those same survivors.
+    """
+
+    valid = np.asarray(base_valid, dtype=np.bool_).reshape(-1).copy()
+    common = np.asarray(common_delay_samples, dtype=np.float64).reshape(-1)
+    adjacent = np.asarray(adjacent_change_samples, dtype=np.float64).reshape(-1)
+    if common.size != valid.size or adjacent.size != valid.size:
+        raise ValueError("source clock witness 배열 길이가 다릅니다")
+    minimum = int(min_valid_periods)
+    if minimum <= 0 or int(valid.sum()) < minimum:
+        raise ValueError("source analysis base clock-valid 반복이 8개 미만입니다")
+
+    initial_median = float(np.median(common[valid]))
+    valid &= (
+        np.abs(common - initial_median) <= float(max_drift_deviation_samples)
+    )
+    valid[1:] &= (
+        ~np.isfinite(adjacent[1:])
+        | (adjacent[1:] <= float(max_adjacent_change_samples))
+    )
+    while True:
+        if int(valid.sum()) < minimum:
+            raise ValueError(
+                "source analysis final-median fixed-point clock-valid 반복이 8개 미만입니다"
+            )
+        median = float(np.median(common[valid]))
+        updated = valid & (
+            np.abs(common - median) <= float(max_drift_deviation_samples)
+        )
+        if np.array_equal(updated, valid):
+            return valid, median
+        valid = updated
+
+
+def _aligned_transfer_sha256(
+    frequencies_hz: np.ndarray,
+    real: np.ndarray,
+    imag: np.ndarray,
+) -> str:
+    frequencies = np.ascontiguousarray(
+        np.asarray(frequencies_hz, dtype="<f8").reshape(-1)
+    )
+    real_values = np.ascontiguousarray(np.asarray(real, dtype="<f8").reshape(-1))
+    imag_values = np.ascontiguousarray(np.asarray(imag, dtype="<f8").reshape(-1))
+    if not (frequencies.size == real_values.size == imag_values.size) or not frequencies.size:
+        raise ValueError("aligned mean transfer source 배열 길이가 맞지 않습니다")
+    digest = hashlib.sha256()
+    digest.update(frequencies.tobytes(order="C"))
+    digest.update(real_values.tobytes(order="C"))
+    digest.update(imag_values.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _compact_transfer_metrics(
+    frequencies_hz: np.ndarray,
+    measured_transfer: np.ndarray,
+    fir: np.ndarray,
+    *,
+    delay_samples: int,
+    sample_rate: int,
+    band_hz: tuple[float, float],
+) -> dict[str, Any]:
+    """NPZ의 source complex transfer를 FIR+effective delay에서 독립 재계산한다."""
+
+    frequencies = np.asarray(frequencies_hz, dtype=np.float64).reshape(-1)
+    measured = np.asarray(measured_transfer, dtype=np.complex128).reshape(-1)
+    taps = np.asarray(fir, dtype=np.float64).reshape(-1)
+    if frequencies.size != measured.size or frequencies.size == 0:
+        raise ValueError("compact transfer source 길이가 맞지 않습니다")
+    if delay_samples < 0 or sample_rate <= 0 or taps.size == 0:
+        raise ValueError("compact transfer FIR/delay/sample_rate가 유효하지 않습니다")
+    if not (
+        np.all(np.isfinite(frequencies))
+        and np.all(np.isfinite(measured))
+        and np.all(np.isfinite(taps))
+    ):
+        raise ValueError("compact transfer source/FIR에 NaN/Inf가 있습니다")
+    indices = np.arange(taps.size, dtype=np.float64) + float(delay_samples)
+
+    def metrics(bounds: tuple[float, float]) -> dict[str, Any]:
+        mask = (frequencies >= float(bounds[0])) & (frequencies <= float(bounds[1]))
+        if int(mask.sum()) < 8:
+            raise ValueError(
+                f"compact transfer {bounds[0]:.0f}-{bounds[1]:.0f}Hz 톤이 "
+                f"{int(mask.sum())}개뿐입니다"
+            )
+        reconstructed = np.exp(
+            -2j * np.pi * np.outer(frequencies[mask], indices) / float(sample_rate)
+        ) @ taps
+        target = measured[mask]
+        target_norm = float(np.linalg.norm(target))
+        model_norm = float(np.linalg.norm(reconstructed))
+        if target_norm <= 0.0 or model_norm <= 0.0:
+            raise ValueError("compact transfer 대역 energy가 0입니다")
+        return {
+            "band_hz": [float(bounds[0]), float(bounds[1])],
+            "tone_count": int(mask.sum()),
+            "complex_agreement": float(
+                abs(complex(np.vdot(target, reconstructed)))
+                / (target_norm * model_norm)
+            ),
+            "relative_error": float(np.linalg.norm(reconstructed - target) / target_norm),
+        }
+
+    return {
+        "overall": metrics((float(band_hz[0]), float(band_hz[1]))),
+        "subbands": [metrics(tuple(row)) for row in INTERLEAVED_COMPACT_TRANSFER_SUB_BANDS_HZ],
+    }
+
+
+def _strict_source_path_and_sha256(
+    data: Any, *, path_key: str, sha_key: str
+) -> tuple[Path, str]:
+    stored_path = str(_npz_scalar(data, path_key))
+    stored_sha = str(_npz_scalar(data, sha_key))
+    if not stored_path:
+        raise ValueError(f"{path_key}가 비었습니다")
+    if len(stored_sha) != 64 or stored_sha != stored_sha.lower() or any(
+        character not in "0123456789abcdef" for character in stored_sha
+    ):
+        raise ValueError(f"{sha_key}가 canonical SHA256가 아닙니다")
+    relative = Path(stored_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{path_key}는 repo-relative results 경로여야 합니다")
+    resolved = (REPO_ROOT / relative).resolve()
+    results_root = (REPO_ROOT / "results").resolve()
+    try:
+        resolved.relative_to(results_root)
+    except ValueError as exc:
+        raise ValueError(f"{path_key}가 REPO_ROOT/results 밖을 가리킵니다") from exc
+    if path_key == "source_raw_npz_path" and resolved.name != "raw_measurement.npz":
+        raise ValueError("source_raw_npz_path basename은 'raw_measurement.npz'여야 합니다")
+    if path_key == "source_analysis_npz_path" and not (
+        resolved.name == "analysis_results.npz"
+        or re.fullmatch(
+            r"analysis_results\.reanalysis_[0-9]{8}T[0-9]{12}Z_[0-9a-f]{8}\.npz",
+            resolved.name,
+        )
+    ):
+        raise ValueError(
+            "source_analysis_npz_path basename은 canonical/versioned analysis_results여야 합니다"
+        )
+    if not resolved.is_file():
+        raise ValueError(f"{path_key} 원본이 없습니다: {resolved}")
+    actual_sha = sha256_file(resolved)
+    if actual_sha != stored_sha:
+        raise ValueError(
+            f"{sha_key} 불일치: stored={stored_sha}, actual={actual_sha}"
+        )
+    return resolved, stored_sha
+
+
+def _audit_observed_raw_source(
+    data: Any,
+    *,
+    capture_id: str,
+    clock_sample_rate: int,
+    period_seconds: float,
+    alignment_count: int,
+    max_drift_deviation_samples: float,
+) -> dict[str, Any]:
+    """official이 가리키는 immutable raw가 실제 submitted PCM 캡처인지 확인한다."""
+
+    official_channel_map: dict[str, int] = {}
+    for field, (logical_name, expected_index) in INTERLEAVED_CHANNEL_MAP_FIELDS.items():
+        raw_value = np.asarray(data[field])
+        if raw_value.shape != () or raw_value.dtype.kind not in "iu":
+            raise ValueError(f"{field}는 scalar integer여야 합니다")
+        value = int(raw_value.item())
+        if value != expected_index:
+            raise ValueError(f"{field}={value}; official index {expected_index}여야 합니다")
+        official_channel_map[logical_name] = value
+    for field in INTERLEAVED_OPERATOR_CONFIRMATION_FIELDS:
+        raw_value = np.asarray(data[field])
+        if raw_value.shape != () or raw_value.dtype.kind != "b" or not bool(
+            raw_value.item()
+        ):
+            raise ValueError(f"{field}는 scalar bool true여야 합니다")
+
+    raw_path, raw_sha = _strict_source_path_and_sha256(
+        data,
+        path_key="source_raw_npz_path",
+        sha_key="source_raw_npz_sha256",
+    )
+    with np.load(raw_path, allow_pickle=False) as raw:
+        required = {
+            "metadata_json",
+            "output",
+            "output_pcm_int16",
+            "input_raw_int32",
+            "preflight_raw_int32",
+        }
+        missing = sorted(required.difference(raw.files))
+        if missing:
+            raise ValueError(
+                "source raw observed PCM 필드가 없습니다: " + ", ".join(missing)
+            )
+        try:
+            metadata = json.loads(str(_npz_scalar(raw, "metadata_json")))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"source raw metadata_json이 유효하지 않습니다: {exc}") from exc
+        if not isinstance(metadata, dict):
+            raise ValueError("source raw metadata_json은 object여야 합니다")
+        if metadata.get("method") != "interleaved_multitone":
+            raise ValueError("source raw method가 interleaved_multitone이 아닙니다")
+        if metadata.get("raw_capture_schema") != INTERLEAVED_RAW_CAPTURE_SCHEMA:
+            raise ValueError(
+                f"source raw schema={metadata.get('raw_capture_schema')!r}; "
+                f"{INTERLEAVED_RAW_CAPTURE_SCHEMA!r} 이어야 합니다"
+            )
+        if metadata.get("capture_id") != capture_id:
+            raise ValueError(
+                f"source raw capture_id={metadata.get('capture_id')!r} != {capture_id!r}"
+            )
+        if metadata.get("channel_map") != official_channel_map:
+            raise ValueError(
+                f"source raw channel_map={metadata.get('channel_map')!r} != "
+                f"official {official_channel_map!r}"
+            )
+        if metadata.get("operator_confirmations") != {
+            "user_present": True,
+            "volume_minimum": True,
+            "routing_and_geometry": True,
+        }:
+            raise ValueError("source raw operator confirmations가 모두 true가 아닙니다")
+        expected_metadata = {
+            "sample_rate": int(clock_sample_rate),
+            "block_size": int(_npz_scalar(data, "calibration_block_size")),
+            "latency": str(_npz_scalar(data, "calibration_latency")),
+            "amplitude": float(_npz_scalar(data, "amplitude")),
+            "period_seconds": float(period_seconds),
+            "repeats": int(alignment_count),
+            "guard_bins": int(_npz_scalar(data, "interleave_guard_bins")),
+        }
+        for key, expected in expected_metadata.items():
+            value = metadata.get(key)
+            equal = (
+                math.isclose(float(value), expected, rel_tol=0.0, abs_tol=0.0)
+                if isinstance(expected, float)
+                else value == expected
+            )
+            if not equal:
+                official_label = (
+                    "interleave_guard_bins" if key == "guard_bins" else key
+                )
+                raise ValueError(
+                    f"source raw {key}={value!r} != official "
+                    f"{official_label}={expected!r}"
+                )
+        invalid_reasons = metadata.get("invalid_reasons")
+        if not isinstance(invalid_reasons, list) or invalid_reasons:
+            raise ValueError(f"source raw invalid_reasons={invalid_reasons!r}")
+        warp = metadata.get("warp")
+        if not isinstance(warp, dict) or bool(warp.get("applied")):
+            raise ValueError("source raw dewarp/warp 캡처는 official provenance가 아닙니다")
+        telemetry = metadata.get("telemetry")
+        if not isinstance(telemetry, dict):
+            raise ValueError("source raw telemetry가 없습니다")
+        if (
+            not bool(telemetry.get("completed"))
+            or int(telemetry.get("xrun_count", -1)) != 0
+            or int(telemetry.get("unexpected_status_count", -1)) != 0
+            or telemetry.get("callback_error") not in (None, "")
+        ):
+            raise ValueError(f"source raw telemetry 결함: {telemetry!r}")
+        contract = metadata.get("analysis_contract")
+        if not isinstance(contract, dict):
+            raise ValueError("source raw analysis_contract가 없습니다")
+        fixed_contract = {
+            "clock_band_hz": list(INTERLEAVED_CLOCK_BAND_HZ),
+            "clock_min_adjacent_score": INTERLEAVED_CLOCK_MIN_SCORE,
+            "clock_max_err_ref_delta_samples": INTERLEAVED_CLOCK_MAX_ERR_REF_DELTA,
+            "clock_max_subwindow_spread_samples": INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD,
+            "clock_max_adjacent_change_samples": INTERLEAVED_CLOCK_MAX_ADJACENT_CHANGE,
+            "clock_max_abs_period_delta_samples": INTERLEAVED_CLOCK_MAX_ABS_PERIOD_DELTA,
+            "separation_algorithm": INTERLEAVED_SEPARATION_ALGORITHM,
+            "separation_algorithm_version": INTERLEAVED_SEPARATION_ALGORITHM_VERSION,
+            "max_drift_deviation_samples": float(max_drift_deviation_samples),
+        }
+        for key, expected in fixed_contract.items():
+            if contract.get(key) != expected:
+                raise ValueError(
+                    f"source raw analysis_contract {key}={contract.get(key)!r} "
+                    f"!= {expected!r}"
+                )
+
+        output = np.asarray(raw["output"])
+        output_pcm = np.asarray(raw["output_pcm_int16"])
+        input_raw = np.asarray(raw["input_raw_int32"])
+        preflight_raw = np.asarray(raw["preflight_raw_int32"])
+        if output.dtype != np.float32 or output.ndim != 2 or output.shape[1] != 2:
+            raise ValueError("source raw output은 [frames,2] float32여야 합니다")
+        if output_pcm.dtype != np.int16 or output_pcm.shape != output.shape:
+            raise ValueError("source raw output_pcm_int16 dtype/shape가 유효하지 않습니다")
+        if input_raw.dtype != np.int32 or input_raw.shape != output.shape:
+            raise ValueError("source raw input_raw_int32 dtype/shape가 유효하지 않습니다")
+        if (
+            preflight_raw.dtype != np.int32
+            or preflight_raw.ndim != 2
+            or preflight_raw.shape[1] != 2
+            or preflight_raw.shape[0] < 1
+        ):
+            raise ValueError("source raw preflight_raw_int32 dtype/shape가 유효하지 않습니다")
+        if not np.all(np.isfinite(output)):
+            raise ValueError("source raw output에 NaN/Inf가 있습니다")
+        design_band = metadata.get("design_band_hz")
+        if not isinstance(design_band, list) or len(design_band) != 2:
+            raise ValueError("source raw design_band_hz가 없습니다")
+        probe = build_interleaved_probe(
+            sample_rate=clock_sample_rate,
+            period_seconds=period_seconds,
+            band_hz=(float(design_band[0]), float(design_band[1])),
+            amplitude=float(expected_metadata["amplitude"]),
+            tone_spacing_hz=None,
+        )
+        if probe.guard_bins() != int(expected_metadata["guard_bins"]):
+            raise ValueError("source raw reconstructed probe guard_bins가 다릅니다")
+        crest = probe.crest_db()
+        stored_crest = metadata.get("crest_db")
+        if not isinstance(stored_crest, dict) or any(
+            not math.isclose(
+                float(got), float(stored_crest.get(name, float("nan"))),
+                rel_tol=0.0, abs_tol=1e-6,
+            )
+            for got, name in zip(crest, ("noise", "cancel"))
+        ):
+            raise ValueError("source raw reconstructed probe crest_db가 다릅니다")
+        reconstructed_channel_band = {
+            drive: [
+                float(value)
+                for value in (
+                    probe.bins_for(drive)[[0, -1]]
+                    * clock_sample_rate
+                    / probe.period_samples
+                )
+            ]
+            for drive in ("noise", "cancel")
+        }
+        if metadata.get("channel_band_hz") != reconstructed_channel_band:
+            raise ValueError("source raw reconstructed channel_band_hz가 다릅니다")
+        lead_in = int(metadata.get("lead_in_samples", -1))
+        warmup = int(metadata.get("warmup_periods", -1))
+        raw_repeats = int(metadata.get("repeats", -1))
+        if lead_in < 0 or warmup < 0 or raw_repeats != alignment_count:
+            raise ValueError("source raw lead/warmup/repeat 계약이 유효하지 않습니다")
+        expected_playback = np.zeros(
+            (
+                lead_in
+                + (warmup + raw_repeats) * probe.period_samples,
+                2,
+            ),
+            dtype=np.float32,
+        )
+        expected_playback[lead_in:, official_channel_map["noise_out"]] = np.tile(
+            probe.noise_signal, warmup + raw_repeats
+        )
+        expected_playback[lead_in:, official_channel_map["cancel_out"]] = np.tile(
+            probe.cancel_signal, warmup + raw_repeats
+        )
+        if not np.array_equal(output, expected_playback):
+            raise ValueError("source raw ideal output이 metadata probe 재구성과 다릅니다")
+        expected_pcm = np.rint(
+            np.clip(output.astype(np.float32), -1.0, 1.0)
+            * np.float32(np.iinfo(np.int16).max)
+        ).astype(np.int16)
+        if not np.array_equal(output_pcm, expected_pcm):
+            raise ValueError(
+                "source raw observed output_pcm_int16이 ideal playback 양자화와 다릅니다"
+            )
+        captured_frames = int(telemetry.get("captured_frames", -1))
+        if captured_frames != output.shape[0]:
+            raise ValueError(
+                f"source raw captured_frames={captured_frames} != {output.shape[0]}"
+            )
+        expected_frames = lead_in + (warmup + raw_repeats) * int(
+            round(period_seconds * clock_sample_rate)
+        )
+        if lead_in < 0 or warmup < 0 or expected_frames != output.shape[0]:
+            raise ValueError(
+                f"source raw frame 계약 {output.shape[0]} != expected {expected_frames}"
+            )
+        recomputed_measurement = analyze_int32_input_probe(input_raw)
+        recomputed_preflight = analyze_int32_input_probe(preflight_raw)
+        if "measurement" in metadata and json.dumps(
+            recomputed_measurement, sort_keys=True
+        ) != json.dumps(metadata["measurement"], sort_keys=True):
+            raise ValueError("source raw measurement report가 input_raw 재계산과 다릅니다")
+        stored_preflight = metadata.get("preflight")
+        if not isinstance(stored_preflight, dict):
+            raise ValueError("source raw preflight report가 없습니다")
+        for key in ("frames", "channels"):
+            if json.dumps(recomputed_preflight.get(key), sort_keys=True) != json.dumps(
+                stored_preflight.get(key), sort_keys=True
+            ):
+                raise ValueError(
+                    f"source raw preflight {key}가 preflight_raw 재계산과 다릅니다"
+                )
+        if int(stored_preflight.get("sample_rate", -1)) != clock_sample_rate:
+            raise ValueError("source raw preflight sample_rate가 clock rate와 다릅니다")
+        for label, report in (
+            ("measurement", recomputed_measurement),
+            ("preflight", recomputed_preflight),
+        ):
+            channels = report.get("channels", [])
+            input_indices = (
+                official_channel_map["error_mic"],
+                official_channel_map["reference_mic"],
+            )
+            if len(channels) < 2 or not all(
+                bool(channels[index].get("valid")) for index in input_indices
+            ):
+                raise ValueError(f"source raw {label} ERR/REF channel이 유효하지 않습니다")
+    return {
+        "path": str(raw_path),
+        "sha256": raw_sha,
+        "frames": int(output.shape[0]),
+        "schema": INTERLEAVED_RAW_CAPTURE_SCHEMA,
+        "channel_map": official_channel_map,
+        "operator_confirmations": {
+            "user_present": True,
+            "volume_minimum": True,
+            "routing_and_geometry": True,
+        },
+        "tone_frequencies_hz": {
+            drive: (
+                probe.bins_for(drive).astype(np.float64)
+                * clock_sample_rate
+                / probe.period_samples
+            ).tolist()
+            for drive in ("noise", "cancel")
+        },
+    }
+
+
+def _complex_pair_metrics(
+    frequencies_hz: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+    band_hz: tuple[float, float],
+) -> tuple[float, float]:
+    frequencies = np.asarray(frequencies_hz, dtype=np.float64).reshape(-1)
+    lhs = np.asarray(left, dtype=np.complex128)
+    rhs = np.asarray(right, dtype=np.complex128)
+    if lhs.ndim != 2 or rhs.shape != lhs.shape or lhs.shape[1] != frequencies.size:
+        raise ValueError("separation source transfer shape가 맞지 않습니다")
+    mask = (frequencies >= band_hz[0]) & (frequencies <= band_hz[1])
+    if int(mask.sum()) < 4:
+        raise ValueError(f"separation source {band_hz} 톤이 부족합니다")
+    lhs_flat = lhs[:, mask].reshape(-1)
+    rhs_flat = rhs[:, mask].reshape(-1)
+    if not np.all(np.isfinite(lhs_flat)) or not np.all(np.isfinite(rhs_flat)):
+        raise ValueError("separation source transfer에 NaN/Inf가 있습니다")
+    lhs_norm = float(np.linalg.norm(lhs_flat))
+    rhs_norm = float(np.linalg.norm(rhs_flat))
+    if lhs_norm <= 0.0 or rhs_norm <= 0.0:
+        raise ValueError("separation source transfer energy가 0입니다")
+    agreement = abs(complex(np.vdot(lhs_flat, rhs_flat))) / (lhs_norm * rhs_norm)
+    relative_error = float(np.linalg.norm(rhs_flat - lhs_flat)) / lhs_norm
+    return float(agreement), float(relative_error)
+
+
+def _audit_interleaved_separation(
+    data: Any,
+    *,
+    artifact_rate: int,
+    period_seconds: float,
+    repeats: int,
+    kept_indices: np.ndarray,
+    alignment_count: int,
+    output_channel: str,
+    capture_id: str,
+) -> dict[str, Any]:
+    """guard=1 official의 clock-corrected demix 증거를 source arrays에서 재감사한다."""
+
+    if int(artifact_rate) != INTERLEAVED_OFFICIAL_SAMPLE_RATE:
+        raise ValueError(
+            f"interleaved sample_rate={artifact_rate}; "
+            f"{INTERLEAVED_OFFICIAL_SAMPLE_RATE}여야 합니다"
+        )
+
+    if not math.isfinite(period_seconds) or not (
+        0.0 < period_seconds <= INTERLEAVED_MAX_PERIOD_SECONDS
+    ):
+        raise ValueError(
+            f"analysis_period_seconds={period_seconds!r}; "
+            f"(0, {INTERLEAVED_MAX_PERIOD_SECONDS}] 이어야 합니다"
+        )
+
+    if str(_npz_scalar(data, "output_pcm_provenance")) != INTERLEAVED_OUTPUT_PCM_PROVENANCE:
+        raise ValueError("output_pcm_provenance가 observed submitted int16이 아닙니다")
+    if str(_npz_scalar(data, "separation_algorithm")) != INTERLEAVED_SEPARATION_ALGORITHM:
+        raise ValueError("separation_algorithm이 공식 fractional joint-LS가 아닙니다")
+    if int(_npz_scalar(data, "separation_algorithm_version")) != (
+        INTERLEAVED_SEPARATION_ALGORITHM_VERSION
+    ):
+        raise ValueError("separation_algorithm_version이 공식 버전과 다릅니다")
+    if str(_npz_scalar(data, "clock_estimator")) != INTERLEAVED_CLOCK_ESTIMATOR:
+        raise ValueError("clock_estimator가 독립 time-domain estimator가 아닙니다")
+    clock_sample_rate = int(_npz_scalar(data, "clock_sample_rate"))
+    if clock_sample_rate <= 0:
+        raise ValueError("clock_sample_rate가 유효하지 않습니다")
+    if clock_sample_rate != int(artifact_rate):
+        raise ValueError(
+            f"clock_sample_rate={clock_sample_rate} != artifact sample_rate={artifact_rate}"
+        )
+    max_drift_deviation = float(
+        _npz_scalar(data, "clock_max_drift_deviation_samples")
+    )
+    if not 0.0 < max_drift_deviation <= 2.0:
+        raise ValueError(
+            "clock_max_drift_deviation_samples는 (0,2] hard envelope 안이어야 합니다"
+        )
+
+    fixed_scalars = {
+        "clock_min_adjacent_score": INTERLEAVED_CLOCK_MIN_SCORE,
+        "clock_max_err_ref_delta_samples": INTERLEAVED_CLOCK_MAX_ERR_REF_DELTA,
+        "clock_max_subwindow_spread_samples": INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD,
+        "clock_max_adjacent_change_samples": INTERLEAVED_CLOCK_MAX_ADJACENT_CHANGE,
+        "clock_max_abs_period_delta_samples": INTERLEAVED_CLOCK_MAX_ABS_PERIOD_DELTA,
+        "joint_ls_max_condition": INTERLEAVED_JOINT_LS_MAX_CONDITION,
+        "joint_ls_max_reconstruction_relative_error_p95": (
+            INTERLEAVED_JOINT_LS_MAX_RESIDUAL_P95
+        ),
+        "minimum_separation_crosscheck_agreement": INTERLEAVED_SEPARATION_MIN_AGREEMENT,
+        "maximum_separation_crosscheck_relative_error": (
+            INTERLEAVED_SEPARATION_MAX_RELATIVE_ERROR
+        ),
+    }
+    for key, expected in fixed_scalars.items():
+        value = float(_npz_scalar(data, key))
+        if not math.isfinite(value) or value != expected:
+            raise ValueError(f"{key}={value!r}; 공식 고정값 {expected!r}와 다릅니다")
+    clock_band = np.asarray(data["clock_band_hz"], dtype=np.float64).reshape(-1)
+    if not np.array_equal(clock_band, np.asarray(INTERLEAVED_CLOCK_BAND_HZ)):
+        raise ValueError("clock_band_hz는 고정 150-1600Hz여야 합니다")
+
+    index_raw = np.asarray(data["clock_observation_repeat_indices"])
+    indices = np.asarray(index_raw, dtype=np.int64).reshape(-1)
+    names = (
+        "clock_period_delta_samples",
+        "clock_q_ratio",
+        "clock_err_delay_samples",
+        "clock_ref_delay_samples",
+        "clock_err_score",
+        "clock_ref_score",
+        "clock_err_subwindow_spread_samples",
+        "clock_ref_subwindow_spread_samples",
+        "clock_err_ref_delta_samples",
+        "joint_ls_rank",
+        "joint_ls_condition",
+        "joint_ls_reconstruction_relative_error",
+    )
+    arrays = {name: np.asarray(data[name]).reshape(-1) for name in names}
+    if index_raw.ndim != 1 or index_raw.dtype.kind not in "iu":
+        raise ValueError("clock_observation_repeat_indices는 1-D integer여야 합니다")
+    if indices.size < MIN_KEPT_REPEATS or any(
+        values.size != indices.size for values in arrays.values()
+    ):
+        raise ValueError("clock/joint-LS witness 배열 길이가 맞지 않거나 8개 미만입니다")
+    if np.any(indices < 0) or np.any(indices >= alignment_count - 1):
+        raise ValueError("clock observation index가 원본 반복 범위 밖입니다")
+    if indices.size > 1 and not np.all(np.diff(indices) > 0):
+        raise ValueError("clock observation indices는 strictly sorted unique여야 합니다")
+    if not set(int(v) for v in kept_indices).issubset(set(int(v) for v in indices)):
+        raise ValueError("kept_repeat_indices가 q-valid clock observations의 subset이 아닙니다")
+
+    float_names = tuple(name for name in names if name != "joint_ls_rank")
+    if any(
+        not np.all(np.isfinite(np.asarray(arrays[name], dtype=np.float64)))
+        for name in float_names
+    ):
+        raise ValueError("clock/joint-LS witness에 NaN/Inf가 있습니다")
+    period_delta = np.asarray(arrays["clock_period_delta_samples"], dtype=np.float64)
+    q_ratio = np.asarray(arrays["clock_q_ratio"], dtype=np.float64)
+    err_delay = np.asarray(arrays["clock_err_delay_samples"], dtype=np.float64)
+    ref_delay = np.asarray(arrays["clock_ref_delay_samples"], dtype=np.float64)
+    err_score = np.asarray(arrays["clock_err_score"], dtype=np.float64)
+    ref_score = np.asarray(arrays["clock_ref_score"], dtype=np.float64)
+    err_spread = np.asarray(
+        arrays["clock_err_subwindow_spread_samples"], dtype=np.float64
+    )
+    ref_spread = np.asarray(
+        arrays["clock_ref_subwindow_spread_samples"], dtype=np.float64
+    )
+    err_ref_delta = np.asarray(arrays["clock_err_ref_delta_samples"], dtype=np.float64)
+    recomputed_delta = np.abs(err_delay - ref_delay)
+    if np.any(err_score < INTERLEAVED_CLOCK_MIN_SCORE) or np.any(
+        ref_score < INTERLEAVED_CLOCK_MIN_SCORE
+    ):
+        raise ValueError("clock adjacent correlation score가 공식 하한 미만입니다")
+    if np.any(err_score > 1.000001) or np.any(ref_score > 1.000001):
+        raise ValueError("clock adjacent correlation score가 정규화 상한 밖입니다")
+    if np.any(err_spread < 0.0) or np.any(ref_spread < 0.0) or np.any(
+        err_ref_delta < 0.0
+    ):
+        raise ValueError("clock spread/delta는 음수일 수 없습니다")
+    weighted_delay = (err_delay * err_score + ref_delay * ref_score) / (
+        err_score + ref_score
+    )
+    period_samples_float = float(clock_sample_rate) * float(period_seconds)
+    period_samples = int(round(period_samples_float))
+    if period_samples <= 0 or not math.isclose(
+        period_samples_float, float(period_samples), rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise ValueError("analysis period가 정수 sample 주기가 아닙니다")
+    recomputed_q = period_samples / (period_samples + weighted_delay)
+    official_tone_frequencies = np.asarray(
+        data["tone_frequencies_hz"], dtype=np.float64
+    ).reshape(-1)
+    official_tone_bins = official_tone_frequencies * float(period_seconds)
+    if (
+        official_tone_frequencies.size < INTERLEAVED_MIN_TONE_COUNT
+        or not np.all(np.isfinite(official_tone_frequencies))
+        or not np.all(np.diff(official_tone_frequencies) > 0.0)
+        or not np.allclose(
+            official_tone_bins,
+            np.rint(official_tone_bins),
+            rtol=0.0,
+            atol=1e-9,
+        )
+        or not np.all(np.diff(np.rint(official_tone_bins).astype(np.int64)) == 2)
+    ):
+        raise ValueError(
+            "tone_frequencies_hz가 period DFT의 strictly sorted step=2 bins가 아닙니다"
+        )
+    if not np.allclose(period_delta, weighted_delay, rtol=0.0, atol=1e-12):
+        raise ValueError("clock_period_delta_samples가 ERR/REF weighted witness와 다릅니다")
+    if not np.allclose(err_ref_delta, recomputed_delta, rtol=0.0, atol=1e-12):
+        raise ValueError("clock_err_ref_delta_samples가 직접 계산과 다릅니다")
+    if not np.allclose(q_ratio, recomputed_q, rtol=0.0, atol=1e-12):
+        raise ValueError("clock_q_ratio가 N/(N+d)와 다릅니다")
+    if np.any(err_ref_delta > INTERLEAVED_CLOCK_MAX_ERR_REF_DELTA):
+        raise ValueError("clock ERR/REF period delta가 공식 상한 초과입니다")
+    if np.any(err_spread > INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD) or np.any(
+        ref_spread > INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD
+    ):
+        raise ValueError("clock subwindow spread가 공식 상한 초과입니다")
+    if np.any(np.abs(period_delta) > INTERLEAVED_CLOCK_MAX_ABS_PERIOD_DELTA):
+        raise ValueError("clock absolute period delta가 공식 ±6 samples 밖입니다")
+    drift_median = float(np.median(period_delta))
+    stored_drift = float(_npz_scalar(data, "drift_samples_per_period"))
+    if not math.isclose(stored_drift, drift_median, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("drift_samples_per_period가 q-valid median 재계산과 다릅니다")
+    if np.any(np.abs(period_delta - drift_median) > max_drift_deviation):
+        raise ValueError("q-valid period delta가 drift median hard envelope 밖입니다")
+    consecutive = np.diff(indices) == 1
+    if np.any(np.abs(np.diff(period_delta))[consecutive] > INTERLEAVED_CLOCK_MAX_ADJACENT_CHANGE):
+        raise ValueError("clock adjacent period change가 공식 상한 초과입니다")
+
+    expected_rank = int(_npz_scalar(data, "joint_ls_expected_rank"))
+    ranks_raw = np.asarray(data["joint_ls_rank"])
+    ranks = np.asarray(ranks_raw, dtype=np.int64).reshape(-1)
+    conditions = np.asarray(arrays["joint_ls_condition"], dtype=np.float64)
+    residuals = np.asarray(
+        arrays["joint_ls_reconstruction_relative_error"], dtype=np.float64
+    )
+    if ranks_raw.ndim != 1 or ranks_raw.dtype.kind not in "iu":
+        raise ValueError("joint_ls_rank는 1-D integer여야 합니다")
+    if expected_rank <= 0 or expected_rank % 2 or np.any(ranks != expected_rank):
+        raise ValueError("joint LS rank가 신고된 full rank와 다릅니다")
+    if np.any(conditions < 1.0):
+        raise ValueError("joint LS condition은 1 미만일 수 없습니다")
+    if np.any(conditions > INTERLEAVED_JOINT_LS_MAX_CONDITION):
+        raise ValueError("joint LS condition이 공식 상한 초과입니다")
+    residual_p95 = float(np.percentile(residuals, 95.0))
+    if np.any(residuals < 0.0):
+        raise ValueError("joint LS reconstruction residual은 음수일 수 없습니다")
+    stored_p95 = float(_npz_scalar(data, "joint_ls_reconstruction_relative_error_p95"))
+    if not math.isclose(stored_p95, residual_p95, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("joint LS residual p95 저장값이 배열 재계산과 다릅니다")
+    if residual_p95 > INTERLEAVED_JOINT_LS_MAX_RESIDUAL_P95:
+        raise ValueError("joint LS reconstruction residual p95가 공식 상한 초과입니다")
+
+    cross_band = np.asarray(data["separation_crosscheck_band_hz"], dtype=np.float64).reshape(-1)
+    cross_subbands = np.asarray(
+        data["separation_crosscheck_subband_hz"], dtype=np.float64
+    ).reshape(-1, 2)
+    if not np.array_equal(cross_band, np.asarray(INTERLEAVED_CLOCK_BAND_HZ)):
+        raise ValueError("separation crosscheck overall band가 150-1600Hz가 아닙니다")
+    if not np.array_equal(cross_subbands, INTERLEAVED_COMPACT_TRANSFER_SUB_BANDS_HZ):
+        raise ValueError("separation crosscheck canonical 4 subband schema가 다릅니다")
+    stored_agreements = np.r_[
+        float(_npz_scalar(data, "separation_crosscheck_complex_agreement")),
+        np.asarray(data["separation_crosscheck_subband_complex_agreement"], dtype=np.float64).reshape(-1),
+    ]
+    stored_errors = np.r_[
+        float(_npz_scalar(data, "separation_crosscheck_relative_error")),
+        np.asarray(data["separation_crosscheck_subband_relative_error"], dtype=np.float64).reshape(-1),
+    ]
+    if stored_agreements.size != 5 or stored_errors.size != 5:
+        raise ValueError("separation crosscheck metric 배열 길이가 다릅니다")
+    if not np.all(np.isfinite(stored_agreements)) or not np.all(np.isfinite(stored_errors)):
+        raise ValueError("separation crosscheck metric에 NaN/Inf가 있습니다")
+    if np.any(stored_agreements < INTERLEAVED_SEPARATION_MIN_AGREEMENT) or np.any(
+        stored_errors > INTERLEAVED_SEPARATION_MAX_RELATIVE_ERROR
+    ):
+        raise ValueError("separation crosscheck가 공식 agreement/error gate를 못 넘습니다")
+    if np.any(stored_agreements > 1.000001) or np.any(stored_errors < 0.0):
+        raise ValueError("separation crosscheck agreement/error domain이 유효하지 않습니다")
+
+    repeat_tau = np.asarray(data["repeat_tau_samples"], dtype=np.float64).reshape(-1)
+    provisional_tau = np.asarray(
+        data["provisional_repeat_tau_samples"], dtype=np.float64
+    ).reshape(-1)
+    common_tau = np.asarray(data["common_alignment_tau_samples"], dtype=np.float64).reshape(-1)
+    if any(values.size != repeats for values in (repeat_tau, provisional_tau, common_tau)):
+        raise ValueError(
+            f"repeats={repeats} != provisional/common repeat tau 길이 "
+            f"{(repeat_tau.size, provisional_tau.size, common_tau.size)}"
+        )
+    if not all(np.all(np.isfinite(values)) for values in (repeat_tau, provisional_tau, common_tau)):
+        raise ValueError("provisional/common repeat tau에 NaN/Inf가 있습니다")
+    if not np.array_equal(repeat_tau, provisional_tau):
+        raise ValueError("repeat_tau_samples는 channel-specific provisional tau여야 합니다")
+    stored_relative_tau_max_abs = float(
+        _npz_scalar(data, "relative_tau_max_abs_samples")
+    )
+    if (
+        not math.isfinite(stored_relative_tau_max_abs)
+        or stored_relative_tau_max_abs < 0.0
+        or stored_relative_tau_max_abs > INTERLEAVED_MAX_RELATIVE_TAU_ABS_SAMPLES
+    ):
+        raise ValueError("relative_tau_max_abs_samples가 official hard bound 밖입니다")
+
+    raw_source = _audit_observed_raw_source(
+        data,
+        capture_id=capture_id,
+        clock_sample_rate=clock_sample_rate,
+        period_seconds=period_seconds,
+        alignment_count=alignment_count,
+        max_drift_deviation_samples=max_drift_deviation,
+    )
+    if not np.array_equal(
+        official_tone_frequencies,
+        np.asarray(raw_source["tone_frequencies_hz"][output_channel]),
+    ):
+        raise ValueError(
+            "official tone_frequencies_hz가 raw reconstructed probe grid와 다릅니다"
+        )
+    analysis_path, analysis_sha = _strict_source_path_and_sha256(
+        data,
+        path_key="source_analysis_npz_path",
+        sha_key="source_analysis_npz_sha256",
+    )
+    raw_parent = Path(raw_source["path"]).parent.resolve()
+    analysis_parent = analysis_path.parent.resolve()
+    if analysis_parent != raw_parent:
+        raise ValueError("source raw/analysis가 같은 immutable capture session이 아닙니다")
+    with np.load(analysis_path, allow_pickle=False) as source:
+        source_required = {
+            "clock_valid_mask",
+            "clock_q_ratio",
+            "clock_period_delta_samples",
+            "clock_err_delay_samples",
+            "clock_ref_delay_samples",
+            "clock_err_score",
+            "clock_ref_score",
+            "clock_err_subwindow_spread_samples",
+            "clock_ref_subwindow_spread_samples",
+            "clock_err_ref_delta_samples",
+            "joint_ls_rank",
+            "joint_ls_condition",
+            "joint_ls_reconstruction_relative_error",
+            "common_alignment_tau_samples",
+            "noise_provisional_tau_samples",
+            "cancel_provisional_tau_samples",
+            f"{output_channel}_frequencies_hz",
+            f"{output_channel}_transfers",
+            f"{output_channel}_cubic_crosscheck_transfers",
+        }
+        missing = sorted(source_required.difference(source.files))
+        if missing:
+            raise ValueError(
+                "source analysis 독립 재감사 배열이 없습니다: " + ", ".join(missing)
+            )
+        source_valid = np.asarray(source["clock_valid_mask"])
+        if source_valid.dtype != np.bool_ or source_valid.ndim != 1:
+            raise ValueError("source analysis clock_valid_mask는 1-D bool이어야 합니다")
+        if source_valid.size != alignment_count:
+            raise ValueError(
+                "source analysis clock 축 길이가 alignment_scores 원본 반복 수와 다릅니다"
+            )
+        source_clock_fields = {
+            "clock_q_ratio": q_ratio,
+            "clock_period_delta_samples": period_delta,
+            "clock_err_delay_samples": err_delay,
+            "clock_ref_delay_samples": ref_delay,
+            "clock_err_score": err_score,
+            "clock_ref_score": ref_score,
+            "clock_err_subwindow_spread_samples": err_spread,
+            "clock_ref_subwindow_spread_samples": ref_spread,
+            "clock_err_ref_delta_samples": err_ref_delta,
+            "joint_ls_condition": conditions,
+            "joint_ls_reconstruction_relative_error": residuals,
+        }
+        source_full: dict[str, np.ndarray] = {}
+        for key, official_values in source_clock_fields.items():
+            full = np.asarray(source[key], dtype=np.float64).reshape(-1)
+            source_full[key] = full
+            if full.size != source_valid.size or not np.array_equal(
+                full[indices], official_values
+            ):
+                raise ValueError(f"official {key}가 source analysis와 다릅니다")
+
+        full_err_delay = source_full["clock_err_delay_samples"]
+        full_ref_delay = source_full["clock_ref_delay_samples"]
+        full_err_score = source_full["clock_err_score"]
+        full_ref_score = source_full["clock_ref_score"]
+        full_err_spread = source_full["clock_err_subwindow_spread_samples"]
+        full_ref_spread = source_full["clock_ref_subwindow_spread_samples"]
+        full_mic_delta = np.abs(full_err_delay - full_ref_delay)
+        score_sum = full_err_score + full_ref_score
+        full_common = (
+            full_err_delay * full_err_score + full_ref_delay * full_ref_score
+        ) / np.maximum(score_sum, np.finfo(np.float64).tiny)
+        base_valid = (
+            np.isfinite(full_common)
+            & np.isfinite(full_mic_delta)
+            & np.isfinite(full_err_spread)
+            & np.isfinite(full_ref_spread)
+            & (full_err_score >= INTERLEAVED_CLOCK_MIN_SCORE)
+            & (full_ref_score >= INTERLEAVED_CLOCK_MIN_SCORE)
+            & (full_err_score <= 1.000001)
+            & (full_ref_score <= 1.000001)
+            & (full_err_spread >= 0.0)
+            & (full_ref_spread >= 0.0)
+            & (full_err_spread <= INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD)
+            & (full_ref_spread <= INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD)
+            & (full_mic_delta <= INTERLEAVED_CLOCK_MAX_ERR_REF_DELTA)
+            & (np.abs(full_common) <= INTERLEAVED_CLOCK_MAX_ABS_PERIOD_DELTA)
+            & ((period_samples + full_common) > 0.0)
+        )
+        adjacent_change = np.full(source_valid.size, np.nan, dtype=np.float64)
+        adjacent_change[1:-1] = np.abs(np.diff(full_common[:-1]))
+        recomputed_valid, _source_drift_median = _fixed_point_clock_valid_mask(
+            base_valid=base_valid,
+            common_delay_samples=full_common,
+            adjacent_change_samples=adjacent_change,
+            max_drift_deviation_samples=max_drift_deviation,
+            max_adjacent_change_samples=INTERLEAVED_CLOCK_MAX_ADJACENT_CHANGE,
+            min_valid_periods=MIN_KEPT_REPEATS,
+        )
+        if not np.array_equal(source_valid, recomputed_valid):
+            raise ValueError(
+                "source analysis clock_valid_mask가 raw witness hard rule 재계산과 다릅니다"
+            )
+        if not np.array_equal(np.flatnonzero(source_valid), indices):
+            raise ValueError("official clock observation indices가 source analysis와 다릅니다")
+        source_q = source_full["clock_q_ratio"]
+        source_q_expected = period_samples / (
+            period_samples + full_common[source_valid]
+        )
+        if np.any(source_q[source_valid] <= 0.0) or not np.allclose(
+            source_q[source_valid], source_q_expected, rtol=0.0, atol=1e-12
+        ):
+            raise ValueError("source analysis clock_q_ratio가 q=N/(N+d)와 다릅니다")
+        source_ranks = np.asarray(source["joint_ls_rank"])
+        if (
+            source_ranks.dtype.kind not in "iu"
+            or source_ranks.ndim != 1
+            or source_ranks.size != source_valid.size
+            or not np.array_equal(source_ranks[indices], ranks)
+        ):
+            raise ValueError("official joint_ls_rank가 source analysis와 다릅니다")
+        source_common = np.asarray(
+            source["common_alignment_tau_samples"], dtype=np.float64
+        ).reshape(-1)
+        source_provisional = np.asarray(
+            source[f"{output_channel}_provisional_tau_samples"], dtype=np.float64
+        ).reshape(-1)
+        if source_common.size != alignment_count or source_provisional.size != alignment_count:
+            raise ValueError("source analysis tau 원본 반복 길이가 alignment_scores와 다릅니다")
+        if not np.array_equal(source_common[kept_indices], common_tau):
+            raise ValueError("official common_alignment_tau_samples가 source analysis와 다릅니다")
+        if not np.array_equal(source_provisional[kept_indices], provisional_tau):
+            raise ValueError("official provisional_repeat_tau_samples가 source analysis와 다릅니다")
+
+        frequencies = np.asarray(
+            source[f"{output_channel}_frequencies_hz"], dtype=np.float64
+        ).reshape(-1)
+        if not np.array_equal(frequencies, official_tone_frequencies):
+            raise ValueError(
+                "official tone_frequencies_hz가 source analysis frequency grid와 다릅니다"
+            )
+        if (
+            frequencies.size != int(_npz_scalar(data, "tone_count"))
+            or frequencies.size < INTERLEAVED_MIN_TONE_COUNT
+            or not np.all(np.isfinite(frequencies))
+            or not np.all(np.diff(frequencies) > 0.0)
+            or frequencies[0] <= 0.0
+            or frequencies[-1] >= artifact_rate / 2.0
+        ):
+            raise ValueError("source analysis tone frequencies/tone_count가 유효하지 않습니다")
+        joint = np.asarray(source[f"{output_channel}_transfers"], dtype=np.complex128)
+        cubic = np.asarray(
+            source[f"{output_channel}_cubic_crosscheck_transfers"], dtype=np.complex128
+        )
+        if joint.ndim != 2 or joint.shape[0] != source_valid.size or cubic.shape != joint.shape:
+            raise ValueError("source analysis joint/cubic transfer shape가 유효하지 않습니다")
+        selected_joint = joint[kept_indices]
+        selected_cubic = cubic[kept_indices]
+        recomputed_rows = [
+            _complex_pair_metrics(
+                frequencies, selected_joint, selected_cubic, tuple(bounds)
+            )
+            for bounds in (
+                tuple(INTERLEAVED_CLOCK_BAND_HZ),
+                *[tuple(row) for row in INTERLEAVED_COMPACT_TRANSFER_SUB_BANDS_HZ],
+            )
+        ]
+        recomputed_agreements = np.asarray([row[0] for row in recomputed_rows])
+        recomputed_errors = np.asarray([row[1] for row in recomputed_rows])
+        if not np.allclose(
+            stored_agreements, recomputed_agreements, rtol=0.0, atol=1e-9
+        ) or not np.allclose(stored_errors, recomputed_errors, rtol=0.0, atol=1e-9):
+            raise ValueError("stored separation crosscheck가 source arrays 재계산과 다릅니다")
+
+    return {
+        "output_pcm_provenance": INTERLEAVED_OUTPUT_PCM_PROVENANCE,
+        "source_raw": raw_source,
+        "channel_map": raw_source["channel_map"],
+        "operator_confirmations": raw_source["operator_confirmations"],
+        "source_analysis": {"path": str(analysis_path), "sha256": analysis_sha},
+        "clock_observation_repeat_indices": indices.tolist(),
+        "clock_period_delta_samples": period_delta.tolist(),
+        "clock_q_ratio": q_ratio.tolist(),
+        "clock_sample_rate": clock_sample_rate,
+        "clock_max_drift_deviation_samples": max_drift_deviation,
+        "drift_samples_per_period": drift_median,
+        "clock_err_delay_samples": err_delay.tolist(),
+        "clock_ref_delay_samples": ref_delay.tolist(),
+        "clock_err_score": err_score.tolist(),
+        "clock_ref_score": ref_score.tolist(),
+        "clock_err_subwindow_spread_samples": err_spread.tolist(),
+        "clock_ref_subwindow_spread_samples": ref_spread.tolist(),
+        "clock_err_ref_delta_samples": err_ref_delta.tolist(),
+        "joint_ls_expected_rank": expected_rank,
+        "joint_ls_rank": ranks.tolist(),
+        "joint_ls_condition": conditions.tolist(),
+        "joint_ls_reconstruction_relative_error": residuals.tolist(),
+        "joint_ls_reconstruction_relative_error_p95": residual_p95,
+        "crosscheck_complex_agreement": stored_agreements.tolist(),
+        "crosscheck_relative_error": stored_errors.tolist(),
+        "provisional_repeat_tau_samples": provisional_tau.tolist(),
+        "common_alignment_tau_samples": common_tau.tolist(),
+        "relative_tau_max_abs_samples": stored_relative_tau_max_abs,
+        "tone_frequencies_hz": official_tone_frequencies.tolist(),
+    }
 
 
 def audit_official_path_model(
@@ -312,32 +1504,137 @@ def audit_official_path_model(
             consistency_band = np.asarray(
                 data["consistency_band_hz"], dtype=np.float64
             ).reshape(-1)
-            if "band_consistency" in data.files and "band_consistency_hz" in data.files:
-                band_values = np.asarray(
-                    data["band_consistency"], dtype=np.float64
-                ).reshape(-1)
-                band_edges = np.asarray(
-                    data["band_consistency_hz"], dtype=np.float64
-                ).reshape(-1, 2)
-            else:
-                band_values = None
-                band_edges = None
+            kept_raw = np.asarray(data["kept_repeat_indices"])
+            alignment_raw = np.asarray(data["alignment_scores"])
+            kept_indices = np.asarray(kept_raw, dtype=np.int64).reshape(-1)
+            alignment_scores = np.asarray(
+                alignment_raw, dtype=np.float64
+            ).reshape(-1)
+            anchor_repeat = int(_npz_scalar(data, "anchor_repeat"))
+            band_values = np.asarray(
+                data["band_consistency"], dtype=np.float64
+            ).reshape(-1)
+            band_edges = np.asarray(
+                data["band_consistency_hz"], dtype=np.float64
+            ).reshape(-1, 2)
             reanalysis_params = (
                 json.loads(str(_npz_scalar(data, "reanalysis_params_json")))
                 if "reanalysis_params_json" in data.files
                 else None
             )
+            bulk_delay = int(_npz_scalar(data, "bulk_delay_samples"))
+            pre_roll = int(_npz_scalar(data, "pre_roll_samples"))
+            delay_semantics = str(_npz_scalar(data, "delay_semantics"))
+            tone_frequencies = np.asarray(
+                data["tone_frequencies_hz"], dtype=np.float64
+            ).reshape(-1)
+            aligned_real = np.asarray(
+                data["aligned_mean_transfer_real"], dtype=np.float64
+            ).reshape(-1)
+            aligned_imag = np.asarray(
+                data["aligned_mean_transfer_imag"], dtype=np.float64
+            ).reshape(-1)
+            source_digest = str(_npz_scalar(data, "aligned_mean_transfer_sha256"))
+            computed_source_digest = _aligned_transfer_sha256(
+                tone_frequencies, aligned_real, aligned_imag
+            )
+            compact_band = np.asarray(
+                data["compact_transfer_band_hz"], dtype=np.float64
+            ).reshape(-1)
+            if compact_band.size != 2:
+                raise ValueError("compact_transfer_band_hz는 [lo, hi]여야 합니다")
+            compact_recomputed = _compact_transfer_metrics(
+                tone_frequencies,
+                aligned_real + 1j * aligned_imag,
+                fir,
+                delay_samples=delay,
+                sample_rate=artifact_rate,
+                band_hz=(float(compact_band[0]), float(compact_band[1])),
+            )
+            compact_stored = {
+                "tone_count": int(_npz_scalar(data, "compact_transfer_tone_count")),
+                "complex_agreement": float(
+                    _npz_scalar(data, "compact_transfer_complex_agreement")
+                ),
+                "relative_error": float(
+                    _npz_scalar(data, "compact_transfer_relative_error")
+                ),
+                "minimum_agreement": float(
+                    _npz_scalar(data, "minimum_compact_transfer_agreement")
+                ),
+                "maximum_relative_error": float(
+                    _npz_scalar(data, "maximum_compact_transfer_relative_error")
+                ),
+                "subband_hz": np.asarray(
+                    data["compact_transfer_subband_hz"], dtype=np.float64
+                ).reshape(-1, 2),
+                "subband_tone_count": np.asarray(
+                    data["compact_transfer_subband_tone_count"], dtype=np.int64
+                ).reshape(-1),
+                "subband_complex_agreement": np.asarray(
+                    data["compact_transfer_subband_complex_agreement"], dtype=np.float64
+                ).reshape(-1),
+                "subband_relative_error": np.asarray(
+                    data["compact_transfer_subband_relative_error"], dtype=np.float64
+                ).reshape(-1),
+            }
+            analysis_period_seconds = float(
+                _npz_scalar(data, "analysis_period_seconds")
+            )
+            capture_id = str(_npz_scalar(data, "capture_id"))
             interleaved = {
                 "consistency_band_hz": [float(v) for v in consistency_band[:2]],
-                "capture_id": str(_npz_scalar(data, "capture_id")),
+                "capture_id": capture_id,
                 "guard_bins": int(_npz_scalar(data, "interleave_guard_bins")),
-                "analysis_period_seconds": float(
-                    _npz_scalar(data, "analysis_period_seconds")
-                ),
+                "analysis_period_seconds": analysis_period_seconds,
                 "tone_count": int(_npz_scalar(data, "tone_count")),
                 "tone_snr_median_db": float(_npz_scalar(data, "tone_snr_median_db")),
                 "tone_snr_min_db": float(_npz_scalar(data, "tone_snr_min_db")),
+                "anchor_repeat": anchor_repeat,
+                "kept_repeat_indices": kept_indices.tolist(),
+                "kept_repeat_indices_is_1d": kept_raw.ndim == 1,
+                "kept_repeat_indices_is_integer": kept_raw.dtype.kind in "iu",
+                "alignment_scores": alignment_scores.tolist(),
+                "alignment_scores_is_1d": alignment_raw.ndim == 1,
+                "source_tone_count": int(tone_frequencies.size),
+                "delay_semantics": delay_semantics,
+                "bulk_delay_samples": bulk_delay,
+                "pre_roll_samples": pre_roll,
+                "aligned_mean_transfer_sha256": source_digest,
+                "computed_aligned_mean_transfer_sha256": computed_source_digest,
+                "compact_transfer": compact_recomputed,
+                "compact_transfer_stored": compact_stored,
             }
+            # separation source를 열기 전에 repeat 축 schema를 먼저 확정한다. 그렇지
+            # 않으면 malformed kept 배열이 source 대조의 2차 오류로 가려진다.
+            if kept_raw.ndim != 1 or kept_raw.dtype.kind not in "iu":
+                raise ValueError("kept_repeat_indices는 1-D integer dtype이어야 합니다")
+            if alignment_raw.ndim != 1 or alignment_scores.size == 0:
+                raise ValueError("alignment_scores는 비어 있지 않은 1-D여야 합니다")
+            if kept_indices.size != repeats:
+                raise ValueError(
+                    f"repeats={repeats} != kept_repeat_indices 길이 {kept_indices.size}"
+                )
+            if np.any(kept_indices < 0) or np.any(
+                kept_indices >= alignment_scores.size
+            ):
+                raise ValueError("kept_repeat_indices가 alignment_scores 범위 밖입니다")
+            if kept_indices.size > 1 and not np.all(np.diff(kept_indices) > 0):
+                raise ValueError("kept_repeat_indices는 strictly sorted unique여야 합니다")
+            if not 0 <= anchor_repeat < alignment_scores.size:
+                raise ValueError("anchor_repeat가 alignment_scores 범위 밖입니다")
+            if anchor_repeat not in set(int(value) for value in kept_indices):
+                raise ValueError("anchor_repeat가 kept_repeat_indices에 없습니다")
+            interleaved["separation"] = _audit_interleaved_separation(
+                data,
+                artifact_rate=artifact_rate,
+                period_seconds=analysis_period_seconds,
+                repeats=repeats,
+                kept_indices=kept_indices,
+                alignment_count=int(alignment_scores.size),
+                output_channel=output_channel,
+                capture_id=capture_id,
+            )
 
     errors: list[str] = []
     if fir.size < 1 or not np.all(np.isfinite(fir)) or np.max(np.abs(fir)) <= 0.0:
@@ -355,6 +1652,136 @@ def audit_official_path_model(
             f"method={method!r}; 허용 method={ALLOWED_PATH_METHODS}"
         )
     elif method == "interleaved_multitone":
+        if block_size != INTERLEAVED_OFFICIAL_BLOCK_SIZE:
+            errors.append(
+                f"interleaved calibration_block_size={block_size}; "
+                f"{INTERLEAVED_OFFICIAL_BLOCK_SIZE} 이어야 합니다"
+            )
+        if latency != INTERLEAVED_OFFICIAL_LATENCY:
+            errors.append(
+                f"interleaved calibration_latency={latency!r}; "
+                f"{INTERLEAVED_OFFICIAL_LATENCY!r} 이어야 합니다"
+            )
+        if interleaved["delay_semantics"] != INTERLEAVED_DELAY_SEMANTICS:
+            errors.append(
+                f"delay_semantics={interleaved['delay_semantics']!r}; "
+                f"{INTERLEAVED_DELAY_SEMANTICS!r} 이어야 합니다"
+            )
+        if delay != interleaved["bulk_delay_samples"] - interleaved["pre_roll_samples"]:
+            errors.append(
+                f"delay 계약 위반: effective={delay}, "
+                f"bulk={interleaved['bulk_delay_samples']}, "
+                f"pre_roll={interleaved['pre_roll_samples']}"
+            )
+        if interleaved["pre_roll_samples"] < 0 or interleaved["bulk_delay_samples"] < 0:
+            errors.append("bulk_delay_samples/pre_roll_samples가 음수입니다")
+        kept = np.asarray(interleaved["kept_repeat_indices"], dtype=np.int64)
+        alignment = np.asarray(interleaved["alignment_scores"], dtype=np.float64)
+        if not interleaved["kept_repeat_indices_is_1d"]:
+            errors.append("kept_repeat_indices는 1-D여야 합니다")
+        if not interleaved["kept_repeat_indices_is_integer"]:
+            errors.append("kept_repeat_indices는 integer dtype이어야 합니다")
+        if not interleaved["alignment_scores_is_1d"] or alignment.size == 0:
+            errors.append("alignment_scores는 비어 있지 않은 1-D여야 합니다")
+        elif not np.all(np.isfinite(alignment)):
+            errors.append("alignment_scores에 NaN/Inf가 있습니다")
+        if kept.size != repeats:
+            errors.append(
+                f"repeats={repeats} != kept_repeat_indices 길이 {kept.size}"
+            )
+        if kept.size == 0:
+            errors.append("kept_repeat_indices가 비었습니다")
+        else:
+            if np.any(kept < 0) or np.any(kept >= alignment.size):
+                errors.append(
+                    f"kept_repeat_indices가 alignment_scores 범위 0.."
+                    f"{alignment.size - 1} 밖입니다"
+                )
+            if kept.size > 1 and not np.all(np.diff(kept) > 0):
+                errors.append("kept_repeat_indices는 strictly sorted unique여야 합니다")
+            if (
+                np.all((kept >= 0) & (kept < alignment.size))
+                and np.any(alignment[kept] < 0.95)
+            ):
+                errors.append("kept repeat alignment_score가 official hard 0.95 미만입니다")
+        anchor_repeat = int(interleaved["anchor_repeat"])
+        if not 0 <= anchor_repeat < alignment.size:
+            errors.append("anchor_repeat가 alignment_scores 범위 밖입니다")
+        elif anchor_repeat not in set(int(v) for v in kept):
+            errors.append("anchor_repeat가 kept_repeat_indices에 없습니다")
+        if (
+            interleaved["aligned_mean_transfer_sha256"]
+            != interleaved["computed_aligned_mean_transfer_sha256"]
+        ):
+            errors.append("aligned mean transfer source SHA256가 배열과 일치하지 않습니다")
+
+        compact = interleaved["compact_transfer"]
+        stored = interleaved["compact_transfer_stored"]
+        overall = compact["overall"]
+        compact_lo, compact_hi = overall["band_hz"]
+        if compact_lo > 150.0 or compact_hi < 1600.0:
+            errors.append(
+                f"compact transfer 대역 {overall['band_hz']}이 150-1600Hz를 덮지 않습니다"
+            )
+        if stored["minimum_agreement"] != INTERLEAVED_MIN_COMPACT_TRANSFER_AGREEMENT:
+            errors.append("artifact compact agreement 임계가 공식 고정값과 다릅니다")
+        if stored["maximum_relative_error"] != INTERLEAVED_MAX_COMPACT_TRANSFER_RELATIVE_ERROR:
+            errors.append("artifact compact relative-error 임계가 공식 고정값과 다릅니다")
+        if stored["tone_count"] != overall["tone_count"]:
+            errors.append("저장/recomputed compact tone_count가 다릅니다")
+        if not math.isclose(
+            stored["complex_agreement"], overall["complex_agreement"],
+            rel_tol=0.0, abs_tol=1e-9,
+        ):
+            errors.append("저장/recomputed compact complex agreement가 다릅니다")
+        if not math.isclose(
+            stored["relative_error"], overall["relative_error"],
+            rel_tol=0.0, abs_tol=1e-9,
+        ):
+            errors.append("저장/recomputed compact relative error가 다릅니다")
+        compact_rows = compact["subbands"]
+        expected_edges = INTERLEAVED_COMPACT_TRANSFER_SUB_BANDS_HZ
+        stored_lengths = {
+            stored["subband_hz"].shape[0],
+            stored["subband_tone_count"].size,
+            stored["subband_complex_agreement"].size,
+            stored["subband_relative_error"].size,
+        }
+        if stored_lengths != {len(compact_rows)} or not np.array_equal(
+            stored["subband_hz"], expected_edges
+        ):
+            errors.append("compact transfer 부대역 schema가 공식 4개 대역과 다릅니다")
+        else:
+            for index, recomputed in enumerate(compact_rows):
+                agreement = float(recomputed["complex_agreement"])
+                relative_error = float(recomputed["relative_error"])
+                label = f"{recomputed['band_hz'][0]:.0f}-{recomputed['band_hz'][1]:.0f}Hz"
+                if int(stored["subband_tone_count"][index]) != recomputed["tone_count"]:
+                    errors.append(f"{label} compact tone_count 저장값 불일치")
+                if not math.isclose(
+                    float(stored["subband_complex_agreement"][index]), agreement,
+                    rel_tol=0.0, abs_tol=1e-9,
+                ):
+                    errors.append(f"{label} compact agreement 저장값 불일치")
+                if not math.isclose(
+                    float(stored["subband_relative_error"][index]), relative_error,
+                    rel_tol=0.0, abs_tol=1e-9,
+                ):
+                    errors.append(f"{label} compact relative error 저장값 불일치")
+                if agreement < INTERLEAVED_MIN_COMPACT_TRANSFER_AGREEMENT:
+                    errors.append(
+                        f"{label} compact agreement {agreement:.6f} < "
+                        f"{INTERLEAVED_MIN_COMPACT_TRANSFER_AGREEMENT:.6f}"
+                    )
+                if relative_error > INTERLEAVED_MAX_COMPACT_TRANSFER_RELATIVE_ERROR:
+                    errors.append(
+                        f"{label} compact relative error {relative_error:.6f} > "
+                        f"{INTERLEAVED_MAX_COMPACT_TRANSFER_RELATIVE_ERROR:.6f}"
+                    )
+        if overall["complex_agreement"] < INTERLEAVED_MIN_COMPACT_TRANSFER_AGREEMENT:
+            errors.append("전대역 compact complex agreement가 공식 하한 미만입니다")
+        if overall["relative_error"] > INTERLEAVED_MAX_COMPACT_TRANSFER_RELATIVE_ERROR:
+            errors.append("전대역 compact relative error가 공식 상한 초과입니다")
         if interleaved["guard_bins"] != 1:
             errors.append(
                 f"interleave_guard_bins={interleaved['guard_bins']}; 1이어야 합니다"
@@ -368,6 +1795,11 @@ def audit_official_path_model(
         if interleaved["tone_count"] < INTERLEAVED_MIN_TONE_COUNT:
             errors.append(
                 f"tone_count={interleaved['tone_count']} < {INTERLEAVED_MIN_TONE_COUNT}"
+            )
+        if interleaved["tone_count"] != interleaved["source_tone_count"]:
+            errors.append(
+                f"tone_count={interleaved['tone_count']} != source 배열 "
+                f"{interleaved['source_tone_count']}"
             )
         snr = interleaved["tone_snr_median_db"]
         if not math.isfinite(snr) or snr < INTERLEAVED_MIN_TONE_SNR_MEDIAN_DB:
@@ -391,18 +1823,31 @@ def audit_official_path_model(
                 f"필수 대역 {required_band_hz} 를 덮지 못합니다"
             )
 
-        # 최악 부대역 게이트 — 총계는 에너지 가중이라 약한 대역을 숨긴다.
-        if band_values is None or band_edges is None:
-            errors.append(
-                "band_consistency/band_consistency_hz 가 없습니다 — "
-                "최악 부대역을 검증할 수 없는 아티팩트는 official 이 될 수 없습니다"
-            )
-        elif band_values.size != band_edges.shape[0]:
+        # 최악 부대역 게이트 — canonical 4개 대역은 required-band 설정과 무관하게
+        # 모두 존재하고 모두 통과해야 한다. 임의의 넓은 대역 하나로 대체할 수 없다.
+        if band_values.size != band_edges.shape[0]:
             errors.append(
                 f"band_consistency 길이 {band_values.size} != "
                 f"band_consistency_hz {band_edges.shape[0]}"
             )
         else:
+            for expected in INTERLEAVED_COMPACT_TRANSFER_SUB_BANDS_HZ:
+                matches = np.all(
+                    np.isclose(band_edges, expected[None, :], rtol=0.0, atol=1e-9),
+                    axis=1,
+                )
+                if int(matches.sum()) != 1:
+                    errors.append(
+                        f"canonical 부대역 {expected[0]:.0f}-{expected[1]:.0f}Hz가 "
+                        "정확히 한 번 존재해야 합니다"
+                    )
+                    continue
+                value = float(band_values[np.flatnonzero(matches)[0]])
+                if not math.isfinite(value) or value < MIN_BAND_CONSISTENCY:
+                    errors.append(
+                        f"canonical 부대역 {expected[0]:.0f}-{expected[1]:.0f}Hz "
+                        f"일관성 {value:.4f} < {MIN_BAND_CONSISTENCY}"
+                    )
             judged = 0
             for (lo, hi), value in zip(band_edges, band_values):
                 if lo < band_lo or hi > band_hi:
@@ -436,14 +1881,29 @@ def audit_official_path_model(
                 elif hi_ok is not None and float(value) > hi_ok:
                     errors.append(f"재분석 {key}={value} > {hi_ok}")
             interleaved["reanalysis_params"] = reanalysis_params
+        # 반환 report는 JSON 직렬화 가능해야 한다.
+        interleaved["compact_transfer_stored"] = {
+            **stored,
+            "subband_hz": stored["subband_hz"].tolist(),
+            "subband_tone_count": stored["subband_tone_count"].tolist(),
+            "subband_complex_agreement": stored[
+                "subband_complex_agreement"
+            ].tolist(),
+            "subband_relative_error": stored["subband_relative_error"].tolist(),
+        }
     if repeats < MIN_KEPT_REPEATS:
         errors.append(
             f"유지된 반복 {repeats}회 < {MIN_KEPT_REPEATS}회 — 평균화가 부족해 "
             "한 번의 이상치가 플랜트 형상을 지배합니다"
         )
-    if not math.isfinite(consistency) or consistency < float(min_consistency):
+    required_consistency = (
+        max(float(min_consistency), MIN_INTERLEAVED_CONSISTENCY)
+        if method == "interleaved_multitone"
+        else float(min_consistency)
+    )
+    if not math.isfinite(consistency) or consistency < required_consistency:
         errors.append(
-            f"반복 일관성 {consistency!r} < {float(min_consistency):.3f}"
+            f"반복 일관성 {consistency!r} < {required_consistency:.3f}"
         )
     if excitation_band.size < 2 or not np.all(np.isfinite(excitation_band[:2])):
         errors.append("excitation_band_hz가 유효하지 않습니다")
@@ -521,9 +1981,9 @@ def _checkpoint_optimize_band(state: dict) -> FrequencyBand | None:
     return FrequencyBand.parse(raw, name="checkpoint trusted")
 
 
-def _load_checkpoint_state(path: Path) -> dict:
+def _decode_checkpoint_state(raw: bytes, path: Path) -> dict:
     try:
-        state = torch.load(path, map_location="cpu", weights_only=False)
+        state = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         raise ValueError(f"checkpoint를 읽을 수 없습니다: {path}: {exc}") from exc
     if not isinstance(state, dict):
@@ -535,6 +1995,10 @@ def _load_checkpoint_state(path: Path) -> dict:
     if not isinstance(state.get("cfg"), dict):
         raise ValueError(f"checkpoint resolved cfg가 없습니다: {path}")
     return state
+
+
+def _load_checkpoint_state(path: Path) -> dict:
+    return _decode_checkpoint_state(path.read_bytes(), path)
 
 
 def _checkpoint_identity(cfg: dict) -> dict:
@@ -553,6 +2017,8 @@ def _checkpoint_identity(cfg: dict) -> dict:
         "recorded_manifest",
         "recorded_ratio",
         "init_ckpt",
+        "experiment_role",
+        "init_eligible",
         "physics_status",
         "digital_reference_lead_samples",
     )
@@ -579,6 +2045,9 @@ def audit_init_checkpoint(
     allowed_physics_statuses: tuple[str, ...] = (
         "secondary_surrogate_representation_pretrain",
     ),
+    required_experiment_role: str | None = None,
+    require_init_eligible: bool = False,
+    expected_loss_selection_sha256: str | None = None,
 ) -> dict[str, Any]:
     """사전학습 best와 같은 run의 완료된 last를 함께 검증한다.
 
@@ -621,6 +2090,40 @@ def audit_init_checkpoint(
     saved_cfg = state["cfg"]
     if saved_cfg.get("model") != expected_model_cfg:
         raise ValueError("init checkpoint 모델 설정이 fine-tune 모델 설정과 다릅니다")
+    experiment_role = str(saved_cfg.get("experiment_role", ""))
+    strict_canonical_init = required_experiment_role is not None
+    if strict_canonical_init:
+        validate_embedded_experiment_contract(saved_cfg)
+        validate_canonical_training_policy(saved_cfg)
+    if (
+        required_experiment_role is not None
+        and experiment_role != str(required_experiment_role)
+    ):
+        raise ValueError(
+            "init checkpoint experiment_role이 승인된 canonical pretrain이 아닙니다: "
+            f"checkpoint={experiment_role!r}, required={required_experiment_role!r}"
+        )
+    if require_init_eligible and saved_cfg.get("init_eligible") is not True:
+        raise ValueError(
+            "init checkpoint가 init_eligible=true가 아닙니다 — loss pilot/measured "
+            "probe는 공식 fine-tune 초기값으로 사용할 수 없습니다"
+        )
+    saved_loss_sha = str(saved_cfg.get("loss_selection_sha256", ""))
+    if strict_canonical_init:
+        recomputed_loss_sha = loss_selection_sha256(saved_cfg.get("loss") or {})
+        if saved_loss_sha != recomputed_loss_sha:
+            raise ValueError(
+                "init checkpoint loss-selection digest가 embedded loss와 다릅니다"
+            )
+        if (
+            expected_loss_selection_sha256 is not None
+            and saved_loss_sha != str(expected_loss_selection_sha256)
+        ):
+            raise ValueError(
+                "canonical pretrain과 fine-tune loss selection이 다릅니다: "
+                f"pretrain={saved_loss_sha}, "
+                f"finetune={expected_loss_selection_sha256}"
+            )
     physics_status = str(saved_cfg.get("physics_status", ""))
     if physics_status not in set(allowed_physics_statuses):
         raise ValueError(
@@ -693,12 +2196,17 @@ def audit_init_checkpoint(
                 f"best={None if saved_band is None else saved_band.as_tuple()}, "
                 f"last={None if last_band is None else last_band.as_tuple()}"
             )
+        if strict_canonical_init:
+            validate_embedded_experiment_contract(last_cfg)
+            validate_completion_receipt(
+                checkpoint.parent,
+                expected_role=str(required_experiment_role),
+                expected_init_eligible=True if require_init_eligible else None,
+            )
         schedule = last_cfg.get("schedule", {}) or {}
-        completion_target = int(
-            last_cfg.get("run_until_step", schedule.get("total_steps", 0))
-        )
+        completion_target = int(schedule.get("total_steps", 0))
         completion_step = int(last_state.get("step", -1))
-        if completion_target <= 0 or completion_step < completion_target:
+        if completion_target <= 0 or completion_step != completion_target:
             raise ValueError(
                 "사전학습이 완료되지 않았습니다: "
                 f"last step={completion_step}, target={completion_target}"
@@ -710,6 +2218,9 @@ def audit_init_checkpoint(
         "step": int(state.get("step", -1)),
         "best_metric_db": best_metric,
         "physics_status": physics_status,
+        "experiment_role": experiment_role,
+        "init_eligible": saved_cfg.get("init_eligible"),
+        "loss_selection_sha256": saved_loss_sha or None,
         "digital_reference_lead_samples": saved_lead,
         "trusted_band_hz": None if saved_band is None else list(saved_band.as_tuple()),
         "expected_trusted_band_hz": (
@@ -720,6 +2231,11 @@ def audit_init_checkpoint(
         "completion_checkpoint": str(completion_path) if require_completed else None,
         "completion_step": completion_step,
         "completion_target_step": completion_target,
+        "completion_receipt": (
+            str(checkpoint.parent / "completion.json")
+            if require_completed and strict_canonical_init
+            else None
+        ),
     }
 
 
@@ -990,8 +2506,36 @@ def _recorded_source_clips(csv_path: Path) -> dict[str, list[str]]:
                 clips = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{csv_path}: clips 열을 읽을 수 없습니다: {exc}") from exc
+            _assert_clip_record_complete(csv_path, row, clips)
             families.setdefault(family, []).extend(str(item) for item in clips)
     return families
+
+
+def _assert_clip_record_complete(csv_path: Path, row: dict, clips: list) -> None:
+    """재생 기록이 **잘려 있으면 거부한다.**
+
+    누수 판정은 이 열이 유일한 근거다. 잘린 항목은 "재생한 적 없는 것" 이 되어 조용히
+    합성 학습셋에 남는다 — 게이트는 그것을 서로소라고 부른다.
+
+    2026-08-07 실측: ``build_recording_sources.py`` 가 ``used[:12]`` 로 잘라
+    v1 225개 · v2 31개 = **256 placement 가 어디에도 기록되지 않았다** (절단행 57/160).
+    그 결과 실측 **test** 세션이 재생한 원본이 합성 **train** 에 살아 있었다.
+    """
+
+    declared = row.get("clip_count")
+    if declared in (None, ""):
+        return
+    try:
+        count = int(declared)
+    except (TypeError, ValueError):
+        raise ValueError(f"{csv_path}: clip_count 를 읽을 수 없습니다: {declared!r}")
+    if count > len(clips):
+        raise ValueError(
+            f"{csv_path}: 재생 기록이 잘려 있습니다 — {row.get('path', '?')} 는 "
+            f"clip_count={count} 인데 clips 에는 {len(clips)}개만 있습니다 "
+            f"(미기록 {count - len(clips)}). 누수 판정의 근거가 불완전하면 "
+            "'서로소' 는 증명이 아니라 무지입니다. sources.csv 를 다시 만드세요"
+        )
 
 
 def _recorded_session_root(readiness_cfg: dict, entries: list[dict] | None) -> Path | None:
@@ -1060,7 +2604,10 @@ def observed_source_pools(recorded_root: Path | None) -> dict[str, int]:
 
 
 def _synthetic_clip_index(
-    manifest_dir: Path, tags: Iterable[str]
+    manifest_dir: Path,
+    tags: Iterable[str],
+    *,
+    validated_entries: dict[str, list[dict]] | None = None,
 ) -> tuple[dict[str, list[str]], dict[str, str]]:
     """합성 학습 스트림이 쓰는 원본 파일과 각 파일의 split 을 모은다."""
 
@@ -1071,7 +2618,12 @@ def _synthetic_clip_index(
         if not path.is_file():
             continue
         rows: list[str] = []
-        for entry in read_manifest(path):
+        entries = (
+            validated_entries.get(str(tag), [])
+            if validated_entries is not None
+            else read_manifest(path)
+        )
+        for entry in entries:
             value = str(entry.get("path", ""))
             if not value:
                 continue
@@ -1100,7 +2652,12 @@ def _audit_corpus_leak(
         "recorded_source_pool_csv", "data/source_pool_v2/sources.csv"
     )
     manifest_dir_value = data_cfg.get("noise_manifest_dir", "data/manifests")
-    tags = sorted((data_cfg.get("source_mix_ratio") or {}).keys())
+    tags = sorted(
+        str(tag)
+        for tag, ratio in (data_cfg.get("source_mix_ratio") or {}).items()
+        if float(ratio) > 0.0
+    )
+    generation: dict[str, Any] | None = None
     try:
         # 실측 세션이 **실제로 재생한** 풀을 먼저 읽는다. 설정은 대조 대상이지
         # 단일 출처가 아니다 — v2 로 녹음하고 이 키를 v1 로 두면 게이트가 엉뚱한
@@ -1148,7 +2705,16 @@ def _audit_corpus_leak(
             raise ValueError(
                 f"{', '.join(str(p) for p in csv_paths)}: 실측 클립 목록이 비었습니다"
             )
-        synthetic, splits = _synthetic_clip_index(_repo_path(manifest_dir_value), tags)
+        manifest_dir = _repo_path(manifest_dir_value)
+        generation = validate_manifest_generation(
+            manifest_dir,
+            required_tags=tags,
+        )
+        synthetic, splits = _synthetic_clip_index(
+            manifest_dir,
+            tags,
+            validated_entries=generation.get("_validated_entries"),
+        )
         if not synthetic:
             raise FileNotFoundError(
                 f"합성 소음 manifest 를 찾지 못했습니다 (dir={manifest_dir_value}, "
@@ -1184,7 +2750,23 @@ def _audit_corpus_leak(
         audit.fail("corpus_disjoint", str(exc))
         return
     if result.ok:
-        audit.pass_("corpus_disjoint", result.detail, **result.measured)
+        lineage = (generation or {}).get("public_lineage") or {}
+        audit.pass_(
+            "corpus_disjoint",
+            result.detail
+            + "; canonical holdout 대비 basename/content SHA/authoritative lineage 교집합 0, "
+            "public component split crossing 0",
+            **result.measured,
+            manifest_build_id=(generation or {}).get("build_id"),
+            public_lineage_schema=lineage.get("lineage_schema"),
+            public_lineage_component_count=lineage.get(
+                "manifest_component_count"
+            ),
+            public_lineage_membership_sha256=lineage.get(
+                "manifest_component_membership_sha256"
+            ),
+            excluded_by_holdout=lineage.get("excluded_by_tag"),
+        )
     else:
         audit.fail("corpus_disjoint", result.detail, **result.measured)
 
@@ -1195,6 +2777,9 @@ def _audit_measured_source_delay(
     primary: dict | None,
     recorded_report: dict | None,
     data_cfg: dict | None = None,
+    secondary: dict | None = None,
+    duct_cfg: dict | None = None,
+    timing_contract: TrainingTimingContract | None = None,
 ) -> None:
     """D2 — **두 학습 브랜치가 모델에게 같은 과제를 주는가.**
 
@@ -1221,6 +2806,12 @@ def _audit_measured_source_delay(
         audit.fail(
             "measured_source_delay_agreement",
             "유효한 official P(z)가 없어 실측 지연과 대조할 수 없습니다",
+        )
+        return
+    if secondary is None:
+        audit.fail(
+            "measured_source_delay_agreement",
+            "유효한 official S(z)가 없어 PlantDelays/총 선행량을 유도할 수 없습니다",
         )
         return
     if not recorded_report or not recorded_report.get("sessions"):
@@ -1276,81 +2867,116 @@ def _audit_measured_source_delay(
 
     residual_median = float(np.median(np.asarray(advances, dtype=np.float64)))
     residual_spread = float(np.max(advances) - np.min(advances))
-    lead = int(data_cfg.get("digital_reference_lead_samples", 0))
-    d_noise = int(data_cfg.get("d_noise_delay_samples", 0))
     lead_mode = str(data_cfg.get("recorded_lead_mode", "constant"))
     tolerance = float(readiness_cfg.get("max_measured_delay_mismatch_samples", 64.0))
 
-    if d_noise <= 0:
+    if timing_contract is None:
         audit.fail(
             "measured_source_delay_agreement",
-            "data.d_noise_delay_samples 가 없습니다 — 합성 브랜치의 총 선행량을 알 수 "
-            "없으면 실측 브랜치와 맞출 수 없습니다 (duct.yaml 에서 통과됩니다)",
+            "official TrainingTimingContract가 없어 합성/실측 선행량을 비교할 수 없습니다",
+        )
+        return
+    timing = timing_contract
+    lead = int(timing.digital_reference_lead_samples)
+    artifact_playback_to_err = float(timing.primary_effective_delay_samples)
+    synthetic_advance = float(timing.synthetic_total_advance_samples)
+
+    # ── 실측 세션이 말하는 재생→ERR. 새로 재지 않고 세션 기록의 부기 합이다
+    # (source→REF + 정렬 후 잔여→ERR). QA 가 이미 계산해 둔다.
+    observed: list[float] = []
+    for session in recorded_report["sessions"]:
+        value = (session.get("alignment") or {}).get(
+            "raw_source_err_delay_median_samples"
+        )
+        if value is None:
+            continue
+        value = float(value)
+        if math.isfinite(value):
+            observed.append(value)
+    if len(observed) < minimum_sessions:
+        audit.fail(
+            "measured_source_delay_agreement",
+            f"재생→ERR 실측 표본이 {len(observed)}개로 최소 {minimum_sessions}개에 "
+            "미달합니다 — 아티팩트가 실측과 맞는지 확인할 수 없습니다",
+            observations=len(observed),
+        )
+        return
+    observed_median = float(np.median(np.asarray(observed, dtype=np.float64)))
+    observed_spread = float(np.max(observed) - np.min(observed))
+
+    # ── 검사 1 (물리): 아티팩트가 세션과 같은 덕트를 말하는가.
+    plant_gap = abs(artifact_playback_to_err - observed_median)
+    if plant_gap > tolerance:
+        audit.fail(
+            "measured_source_delay_agreement",
+            f"official P(z) 가 세션 실측과 다른 덕트를 말합니다: 아티팩트 유도 "
+            f"{artifact_playback_to_err:.1f} vs {len(observed)}세션 실측 중앙 "
+            f"{observed_median:.1f} — 차이 {plant_gap:.1f} > 허용 {tolerance:.0f} 샘플 "
+            f"({plant_gap / 48.0:.2f} ms, 산포 {observed_spread:.1f}). 합성 브랜치는 "
+            "이 아티팩트로 d 를 만들고 실측 브랜치는 저 마이크로 d 를 받으므로, "
+            "둘이 다르면 어느 쪽으로 맞춰도 나머지 한쪽이 틀립니다. P(z) 재측정 또는 "
+            "세션 타임라인 규약을 확정하세요",
+            artifact_playback_to_err_samples=artifact_playback_to_err,
+            observed_playback_to_err_samples=observed_median,
+            observed_spread_samples=observed_spread,
+            mismatch_samples=plant_gap,
+            observations=len(observed),
         )
         return
 
-    synthetic_advance = float(d_noise + lead)
-    recorded_lead = (
-        float(lead)
-        if lead_mode == "constant"
-        else max(0.0, synthetic_advance - residual_median)
-    )
-    recorded_advance = residual_median + recorded_lead
-    mismatch = abs(synthetic_advance - recorded_advance)
-    if mismatch > tolerance:
+    # ── 검사 2 (배선): 실측 브랜치가 실제로 쓰는 총 선행량이 합성과 같은가.
+    # ``RecordedANCDataset`` 이 읽는 것과 **같은 설정 키**로 같은 산술을 한다.
+    try:
+        recorded_advance = timing.recorded_total_advance_samples(
+            recorded_delay_samples=residual_median,
+            mode=lead_mode,
+        )
+    except ValueError as exc:
+        audit.fail("measured_source_delay_agreement", str(exc))
+        return
+    branch_gap = abs(synthetic_advance - recorded_advance)
+    if branch_gap > tolerance:
         audit.fail(
             "measured_source_delay_agreement",
-            "두 학습 브랜치가 모델에게 주는 **총 선행량**이 다릅니다: "
-            f"합성 {synthetic_advance:.0f} (D_noise {d_noise} + lead {lead}) vs "
-            f"실측 {recorded_advance:.1f} (잔여 {residual_median:.1f} + lead {recorded_lead:.0f}) "
-            f"— 차이 {mismatch:.1f} > 허용 {tolerance:.0f} 샘플 "
-            f"({mismatch / 48.0:.1f} ms). 같은 모델이 두 브랜치에서 다른 예측 과제를 "
-            "배웁니다. data.recorded_lead_mode=timeline 으로 세션마다 lead 를 유도하세요 "
-            f"(현재 {lead_mode!r})",
+            "두 학습 브랜치가 모델에게 주는 **총 선행량**이 다릅니다: 합성 "
+            f"{synthetic_advance:.1f} (재생→ERR {artifact_playback_to_err:.1f} + lead "
+            f"{lead}) vs 실측 {recorded_advance:.1f} — 차이 {branch_gap:.1f} > 허용 "
+            f"{tolerance:.0f} 샘플 ({branch_gap / 48.0:.2f} ms; 1600 Hz 에서 "
+            f"{branch_gap / 48000.0 * 1600.0:.1f} 주기). 같은 모델이 두 브랜치에서 "
+            f"다른 예측 과제를 배웁니다 (현재 recorded_lead_mode={lead_mode!r}). "
+            "recorded_lead_mode='timeline'으로 실측 lead를 계약에서 유도해야 하며, "
+            "실측 브랜치의 총 선행량은 벌크 지연이 아니라 **P(z) 군지연을 포함한** "
+            "재생→ERR 지연에서 와야 합니다",
             synthetic_advance_samples=synthetic_advance,
             recorded_advance_samples=recorded_advance,
+            artifact_playback_to_err_samples=artifact_playback_to_err,
             recorded_lead_mode=lead_mode,
             residual_median_samples=residual_median,
+            mismatch_samples=branch_gap,
+            training_timing_contract=timing.model_dump(),
         )
         return
 
     audit.pass_(
         "measured_source_delay_agreement",
-        f"두 브랜치의 총 선행량이 일치합니다: 합성 {synthetic_advance:.0f} vs 실측 "
-        f"{recorded_advance:.1f} (차이 {mismatch:.1f} <= {tolerance:.0f} 샘플). "
-        f"정렬 잔여 지연 {residual_median:.1f} 샘플, {len(advances)}세션 산포 "
-        f"{residual_spread:.1f} — 절대 지연(산포 189)과 달리 이 양은 재현됩니다",
+        f"아티팩트와 실측이 {plant_gap:.1f} 샘플 안에서 같은 덕트를 말하고 "
+        f"(유도 {artifact_playback_to_err:.1f} vs 실측 {observed_median:.1f}, "
+        f"{len(observed)}세션 산포 {observed_spread:.1f}), 두 브랜치의 총 선행량이 "
+        f"{branch_gap:.1f} 샘플 안에서 같습니다 (합성 {synthetic_advance:.1f} vs 실측 "
+        f"{recorded_advance:.1f}, 허용 {tolerance:.0f})",
+        artifact_playback_to_err_samples=artifact_playback_to_err,
+        observed_playback_to_err_samples=observed_median,
+        observed_spread_samples=observed_spread,
+        plant_mismatch_samples=plant_gap,
         synthetic_advance_samples=synthetic_advance,
         recorded_advance_samples=recorded_advance,
+        branch_mismatch_samples=branch_gap,
         residual_median_samples=residual_median,
         residual_spread_samples=residual_spread,
         recorded_lead_mode=lead_mode,
-        sessions=len(advances),
+        training_timing_contract=timing.model_dump(),
+        sessions=len(observed),
     )
-    return
-
-    try:
-        with np.load(_repo_path(primary["path"]), allow_pickle=False) as data:
-            derived = derive_playback_to_error_delay_samples(
-                int(primary["delay_samples"]), data["fir"]
-            )
-    except (FileNotFoundError, OSError, KeyError, ValueError) as exc:
-        audit.fail("measured_source_delay_agreement", f"P(z) 유도 실패: {exc}")
-        return
-
-    observed = float(np.median(np.asarray(observations, dtype=np.float64)))
-    result = check_measured_delay_agreement(
-        observed,
-        derived,
-        tolerance_samples=float(
-            readiness_cfg.get("max_measured_delay_mismatch_samples", 64.0)
-        ),
-        observation_count=len(observations),
-    )
-    if result.ok:
-        audit.pass_("measured_source_delay_agreement", result.detail, **result.measured)
-    else:
-        audit.fail("measured_source_delay_agreement", result.detail, **result.measured)
 
 
 DESIGN_CEILING_TOLERANCE_DB = 0.5
@@ -1580,6 +3206,85 @@ def _audit_plant_confidence_ceiling(
     )
 
 
+def _audit_absolute_objective_scope(
+    audit: "_Audit",
+    readiness_cfg: dict,
+    data_cfg: dict,
+    duct_cfg: dict,
+) -> None:
+    """절대목표를 **설정으로 낮출 수 없게** 만든다.
+
+    다른 게이트들은 설정끼리 비교한다 — "체크포인트 대역이 학습 대역을 덮는가",
+    "선언한 태그에 매니페스트가 있는가". 그래서 목표를 낮추면 목표 달성이 참이 된다.
+    2026-08-07 검증에서 ``--set`` 두 개로 14개가 전부 열렸다.
+
+    이 게이트만 **코드 상수**와 비교한다. 실행 인자로 내릴 수 있으면 목표가 아니다.
+    """
+
+    gate_id = "absolute_objective_scope"
+    problems: list[str] = []
+    obj_lo, obj_hi = ABSOLUTE_OBJECTIVE_BAND_HZ
+
+    # ── 절대목표 1: 저·고역 **둘 다**. 목표 대역이 코드가 요구하는 대역을 덮어야 한다.
+    bands: dict[str, tuple[float, float] | None] = {
+        "readiness.required_path_band_hz": None,
+        "duct.acoustics.realistic_target_band_hz": None,
+    }
+    raw_required = readiness_cfg.get("required_path_band_hz")
+    if raw_required is not None:
+        bands["readiness.required_path_band_hz"] = (
+            float(raw_required[0]),
+            float(raw_required[1]),
+        )
+    raw_target = (duct_cfg.get("acoustics") or {}).get("realistic_target_band_hz")
+    if raw_target is not None:
+        bands["duct.acoustics.realistic_target_band_hz"] = (
+            float(raw_target[0]),
+            float(raw_target[1]),
+        )
+    for name, band in bands.items():
+        if band is None:
+            continue
+        lo, hi = band
+        if lo > obj_lo or hi < obj_hi:
+            problems.append(
+                f"{name}=[{lo:g}, {hi:g}] 가 절대목표 대역 "
+                f"[{obj_lo:g}, {obj_hi:g}] 를 덮지 않습니다"
+            )
+
+    # ── 절대목표 2: 소음·음성·음악 **모두**. 혼합비에서 계열을 뺄 수 없다.
+    mix = data_cfg.get("source_mix_ratio") or {}
+    if isinstance(mix, dict):
+        for family in REQUIRED_SOURCE_FAMILIES:
+            weight = float(mix.get(family, 0.0) or 0.0)
+            if weight <= 0.0:
+                problems.append(
+                    f"data.source_mix_ratio 에 {family!r} 비중이 없습니다 "
+                    f"(현재 {weight:g}) — 절대목표 2 는 음성·음악을 포함합니다"
+                )
+
+    if problems:
+        audit.fail(
+            gate_id,
+            "절대목표가 설정으로 낮춰졌습니다: "
+            + " / ".join(problems)
+            + ". 목표를 낮춰 게이트를 통과시키는 것은 금지입니다 — 목표는 코드에 "
+            "있고(deep_anc.dsp.invariants) 실행 인자로 바꿀 수 없습니다",
+            objective_band_hz=[obj_lo, obj_hi],
+            required_families=list(REQUIRED_SOURCE_FAMILIES),
+            problems=problems,
+        )
+        return
+
+    audit.pass_(
+        gate_id,
+        f"목표 대역 [{obj_lo:g}, {obj_hi:g}] Hz 와 필수 계열 "
+        f"{list(REQUIRED_SOURCE_FAMILIES)} 가 설정에서 유지됩니다",
+        objective_band_hz=[obj_lo, obj_hi],
+        required_families=list(REQUIRED_SOURCE_FAMILIES),
+    )
+
+
 def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dict:
     """resolved train config의 G1–G3 진입 조건을 한 번에 검사한다."""
 
@@ -1602,6 +3307,22 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
         )
     else:
         audit.pass_("config_fail_closed_flags", "필수 fail-closed 설정 3종이 활성입니다")
+
+    if str(cfg.get("experiment_role", "")) == "canonical_finetune":
+        try:
+            transfer = validate_recorded_training_snapshot(
+                data_cfg, repo_root=REPO_ROOT
+            )
+            audit.pass_(
+                "recorded_transfer_snapshot",
+                "bootstrap receipt→transfer manifest→recorded bytes snapshot이 정합합니다",
+                transfer_manifest_sha256=transfer.transfer_manifest.sha256,
+                recorded_aggregate_sha256=transfer.recorded_aggregate_sha256,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            audit.fail("recorded_transfer_snapshot", str(exc))
+
+    _audit_absolute_objective_scope(audit, readiness_cfg, data_cfg, duct_cfg)
 
     reference_mode = str(data_cfg.get("reference_mode", ""))
     primary_mode = str(data_cfg.get("digital_primary_path_mode", ""))
@@ -1698,6 +3419,143 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
                 raise ValueError(
                     f"P/S capture_id 불일치: P={left!r}, S={right!r} — 동시 측정이 아닙니다"
                 )
+            left_anchor = primary["interleaved"]["anchor_repeat"]
+            right_anchor = secondary["interleaved"]["anchor_repeat"]
+            if left_anchor != right_anchor:
+                raise ValueError(
+                    f"P/S anchor_repeat 불일치: P={left_anchor}, S={right_anchor}"
+                )
+            left_kept = primary["interleaved"]["kept_repeat_indices"]
+            right_kept = secondary["interleaved"]["kept_repeat_indices"]
+            if left_kept != right_kept:
+                raise ValueError(
+                    f"P/S kept_repeat_indices 불일치: P={left_kept}, S={right_kept}"
+                )
+            left_period = float(primary["interleaved"]["analysis_period_seconds"])
+            right_period = float(secondary["interleaved"]["analysis_period_seconds"])
+            if left_period != right_period:
+                raise ValueError(
+                    f"P/S analysis_period_seconds 불일치: P={left_period}, S={right_period}"
+                )
+            left_separation = primary["interleaved"]["separation"]
+            right_separation = secondary["interleaved"]["separation"]
+            for source_name in ("source_raw", "source_analysis"):
+                left_source = left_separation[source_name]
+                right_source = right_separation[source_name]
+                if left_source["sha256"] != right_source["sha256"]:
+                    raise ValueError(
+                        f"P/S {source_name} SHA256 불일치: "
+                        f"P={left_source['sha256']}, S={right_source['sha256']}"
+                    )
+                if Path(left_source["path"]).resolve() != Path(
+                    right_source["path"]
+                ).resolve():
+                    raise ValueError(f"P/S {source_name} path가 다릅니다")
+            shared_witness_fields = (
+                "channel_map",
+                "operator_confirmations",
+                "clock_observation_repeat_indices",
+                "clock_period_delta_samples",
+                "clock_q_ratio",
+                "clock_err_delay_samples",
+                "clock_ref_delay_samples",
+                "clock_err_score",
+                "clock_ref_score",
+                "clock_err_subwindow_spread_samples",
+                "clock_ref_subwindow_spread_samples",
+                "clock_err_ref_delta_samples",
+                "joint_ls_expected_rank",
+                "joint_ls_rank",
+                "joint_ls_condition",
+                "joint_ls_reconstruction_relative_error",
+                "joint_ls_reconstruction_relative_error_p95",
+                "clock_sample_rate",
+                "clock_max_drift_deviation_samples",
+                "drift_samples_per_period",
+                "common_alignment_tau_samples",
+            )
+            for key in shared_witness_fields:
+                if left_separation[key] != right_separation[key]:
+                    raise ValueError(f"P/S shared separation witness {key} 불일치")
+            primary_bins = np.rint(
+                np.asarray(
+                    left_separation["tone_frequencies_hz"], dtype=np.float64
+                )
+                * left_period
+            ).astype(np.int64)
+            secondary_bins = np.rint(
+                np.asarray(
+                    right_separation["tone_frequencies_hz"], dtype=np.float64
+                )
+                * right_period
+            ).astype(np.int64)
+            if np.intersect1d(primary_bins, secondary_bins).size:
+                raise ValueError("P/S interleaved tone DFT bins가 서로 겹칩니다")
+            union_bins = np.sort(np.r_[primary_bins, secondary_bins])
+            if union_bins.size < 2 or not np.all(np.diff(union_bins) == 1):
+                raise ValueError("P/S interleaved tone union이 연속 DFT bins가 아닙니다")
+            expected_joint_rank = 2 * int(union_bins.size)
+            if left_separation["joint_ls_expected_rank"] != expected_joint_rank:
+                raise ValueError(
+                    f"joint_ls_expected_rank={left_separation['joint_ls_expected_rank']} != "
+                    f"2*(P tones+S tones)={expected_joint_rank}"
+                )
+            kept_array = np.asarray(left_kept, dtype=np.int64)
+            primary_scores = np.asarray(
+                primary["interleaved"]["alignment_scores"], dtype=np.float64
+            )[kept_array]
+            secondary_scores = np.asarray(
+                secondary["interleaved"]["alignment_scores"], dtype=np.float64
+            )[kept_array]
+            primary_tau = np.asarray(
+                left_separation["provisional_repeat_tau_samples"], dtype=np.float64
+            )
+            secondary_tau = np.asarray(
+                right_separation["provisional_repeat_tau_samples"], dtype=np.float64
+            )
+            common_tau = np.asarray(
+                left_separation["common_alignment_tau_samples"], dtype=np.float64
+            )
+            recomputed_common = (
+                primary_tau * primary_scores + secondary_tau * secondary_scores
+            ) / (primary_scores + secondary_scores)
+            if not np.allclose(common_tau, recomputed_common, rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    "P/S common_alignment_tau_samples가 channel score 가중평균과 다릅니다"
+                )
+            relative_tau = primary_tau - secondary_tau
+            relative_centered = relative_tau - float(np.median(relative_tau))
+            recomputed_max_abs = float(np.max(np.abs(relative_centered)))
+            recomputed_spread = int(
+                np.ceil(float(np.ptp(relative_tau)) - 1e-9)
+            )
+            if recomputed_max_abs > INTERLEAVED_MAX_RELATIVE_TAU_ABS_SAMPLES:
+                raise ValueError(
+                    f"P/S provisional 상대 tau maxabs {recomputed_max_abs:.6f} > "
+                    f"{INTERLEAVED_MAX_RELATIVE_TAU_ABS_SAMPLES:.6f}"
+                )
+            if recomputed_spread > MAX_RELATIVE_DELAY_SPREAD_SAMPLES:
+                raise ValueError(
+                    f"P/S provisional 상대 tau spread {recomputed_spread} > "
+                    f"{MAX_RELATIVE_DELAY_SPREAD_SAMPLES}"
+                )
+            for label, artifact, separation in (
+                ("P", primary, left_separation),
+                ("S", secondary, right_separation),
+            ):
+                if artifact["delay_spread_samples"] != recomputed_spread:
+                    raise ValueError(
+                        f"{label} delay_spread_samples 저장값이 provisional tau 재계산과 다릅니다"
+                    )
+                if not math.isclose(
+                    float(separation["relative_tau_max_abs_samples"]),
+                    recomputed_max_abs,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise ValueError(
+                        f"{label} relative_tau_max_abs_samples 저장값이 provisional tau 재계산과 다릅니다"
+                    )
         for key in ("amplitude", "calibration_block_size", "calibration_latency"):
             left, right = primary[key], secondary[key]
             equal = (
@@ -1730,50 +3588,49 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
     except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         audit.fail("matched_path_measurement_conditions", str(exc))
 
-    configured_lead = int(data_cfg.get("digital_reference_lead_samples", -1))
-    configured_primary_delay = duct_cfg.get("digital_reference", {}).get(
-        "d_noise_delay_samples"
-    )
+    official_timing: TrainingTimingContract | None = None
     if primary is not None and secondary is not None:
-        # handoff 도 lead 도 여기서 다시 유도하지 않는다 — trainer / eval 과 **같은
-        # 함수**를 부른다. 두 곳이 각자 유도해 109 와 113 으로 갈라졌던 것이
-        # 커밋 aaeef41 의 사고이고, 그때 양쪽 다 자기 기준으로는 "통과" 였다.
-        delays = PlantDelays.from_config(
-            duct_cfg=duct_cfg,
-            secondary_delay_samples=int(secondary["delay_samples"]),
-            primary_delay_samples=int(primary["delay_samples"]),
-            sample_rate=int(sample_rate),
-        )
-        handoff = int(delays.handoff_samples)
-        lead_check = check_lead_agreement(configured_lead, delays)
-        expected_lead = int(lead_check.measured["derived_lead_samples"])
-        delay_matches = (
-            configured_primary_delay is not None
-            and int(configured_primary_delay) == int(primary["delay_samples"])
-        )
-        if not lead_check.ok or not delay_matches:
-            audit.fail(
-                "path_delay_and_lead",
-                "P/S 순수지연과 fine-tune lead 설정이 다릅니다",
-                configured_lead=configured_lead,
-                expected_lead=expected_lead,
-                configured_primary_delay=configured_primary_delay,
-                measured_primary_delay=primary["delay_samples"],
+        try:
+            primary_artifact = load_secondary_path(primary["path"])
+            delays = PlantDelays.from_config(
+                duct_cfg=duct_cfg,
+                secondary_delay_samples=int(secondary["delay_samples"]),
+                primary_delay_samples=int(primary["delay_samples"]),
+                sample_rate=int(sample_rate),
             )
-        else:
+            derived_timing = TrainingTimingContract.derive(
+                primary_fir=primary_artifact.fir,
+                plant_delays=delays,
+            )
+            resolved_timing = TrainingTimingContract.from_data_config(data_cfg)
+            if resolved_timing != derived_timing:
+                raise ValueError(
+                    "resolved data.training_timing_contract가 official P/S에서 유도한 "
+                    "계약과 다릅니다"
+                )
+            official_timing = derived_timing
             audit.pass_(
                 "path_delay_and_lead",
-                "P/S 지연·handoff·digital lead가 정합합니다",
-                digital_reference_lead_samples=configured_lead,
-                primary_delay_samples=primary["delay_samples"],
-                secondary_delay_samples=secondary["delay_samples"],
-                handoff_extra_samples=handoff,
+                "official P/S에서 유도한 TrainingTimingContract가 resolved 계약과 "
+                "정확히 같습니다",
+                timing_contract=official_timing.model_dump(),
+                timing_contract_sha256=official_timing.digest(),
+            )
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+            audit.fail(
+                "path_delay_and_lead",
+                str(exc),
             )
     else:
         audit.fail(
             "path_delay_and_lead",
             "유효한 official P/S가 없어 lead를 검증할 수 없습니다",
         )
+    expected_lead = (
+        int(official_timing.digital_reference_lead_samples)
+        if official_timing is not None
+        else -1
+    )
 
     # 파인튜닝이 개선을 요구할 대역. trainer 와 **같은 함수**로 유도한다 —
     # 여기서 손으로 교집합을 쓰면 그것이 여섯 번째 복붙이다(발생기 A).
@@ -1804,7 +3661,7 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
         init = audit_init_checkpoint(
             init_value,
             expected_model_cfg=cfg.get("model", {}),
-            expected_lead=configured_lead,
+            expected_lead=expected_lead,
             expected_optimize_band=expected_optimize_band,
             max_lead_mismatch_samples=int(
                 readiness_cfg.get("max_init_lead_mismatch_samples", 0)
@@ -1822,6 +3679,17 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
                     ["secondary_surrogate_representation_pretrain"],
                 )
             ),
+            required_experiment_role=(
+                str(cfg["required_init_experiment_role"])
+                if cfg.get("required_init_experiment_role") is not None
+                else None
+            ),
+            require_init_eligible=bool(cfg.get("require_init_eligible", False)),
+            expected_loss_selection_sha256=(
+                str(cfg.get("loss_selection_sha256"))
+                if cfg.get("loss_selection_sha256") is not None
+                else None
+            ),
         )
         audit.pass_(
             "completed_init_checkpoint",
@@ -1834,11 +3702,37 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
     manifest_value = cfg.get("recorded_manifest")
     entries: list[dict] = []
     recorded_report: dict | None = None
+    manifest_sha256: str | None = None
+    lineage_summary: dict[str, Any] | None = None
     try:
         if not manifest_value:
             raise ValueError("recorded_manifest가 비었습니다")
-        manifest_path = _repo_path(manifest_value).resolve()
-        entries = read_manifest(manifest_path)
+        manifest_path = _repo_path(manifest_value)
+        if str(cfg.get("experiment_role", "")) == "canonical_finetune":
+            entries, manifest_sha256, holdout_summary = (
+                _canonical_recorded_lineage_snapshot(manifest_path, data_cfg)
+            )
+            lineage_summary = holdout_summary.get("lineage")
+        else:
+            manifest_path = manifest_path.resolve()
+            entries = read_manifest(manifest_path)
+            manifest_sha256 = sha256_file(manifest_path)
+        if str(data_cfg.get("recorded_sampling", "uniform_session")) == (
+            "family_lineage_session_balanced"
+        ):
+            invalid_lineage = [
+                str(entry.get("session_id") or entry.get("path") or index)
+                for index, entry in enumerate(entries)
+                if not str(entry.get("source_pool_group_id") or "").strip()
+                or str(entry.get("source_pool_group_id") or "").strip()
+                == str(entry.get("group_id") or "").strip()
+            ]
+            if invalid_lineage:
+                raise ValueError(
+                    "recorded manifest가 lineage-component regroup 계약을 만족하지 "
+                    "않습니다(source_pool_group_id + 서로 다른 component group_id "
+                    f"필수): {invalid_lineage[:8]}"
+                )
         if full_recorded_qa:
             settings = settings_from_data_config(
                 data_cfg,
@@ -1890,7 +3784,17 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
             "recorded_dataset_qa",
             "recorded 전수 QA·분할·family·최소 분량이 통과했습니다",
             manifest=str(manifest_path),
-            manifest_sha256=sha256_file(manifest_path),
+            manifest_sha256=manifest_sha256,
+            lineage_component_membership_sha256=(
+                None
+                if lineage_summary is None
+                else lineage_summary.get("component_membership_sha256")
+            ),
+            lineage_component_count=(
+                None
+                if lineage_summary is None
+                else lineage_summary.get("component_count")
+            ),
             sessions=int(summary.get("sessions", 0)),
             duration_seconds=float(summary.get("duration_s", 0.0)),
             source_families=sorted(observed_families),
@@ -1903,16 +3807,25 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
     _audit_statistical_power(audit, readiness_cfg, entries)
     _audit_corpus_leak(audit, readiness_cfg, data_cfg, entries)
     _audit_measured_source_delay(
-        audit, readiness_cfg, primary, recorded_report, data_cfg
+        audit,
+        readiness_cfg,
+        primary,
+        recorded_report,
+        data_cfg,
+        secondary=secondary,
+        duct_cfg=duct_cfg,
+        timing_contract=official_timing,
     )
     _audit_plant_confidence_ceiling(
         audit,
         readiness_cfg,
         secondary,
         primary,
-        # lead 는 path_delay_and_lead 게이트가 이미 실측과 대조한 값이다.
-        # 여기서 다시 유도하면 그것이 두 번째 유도가 된다 (발생기 A).
-        lead_samples=int(data_cfg.get("digital_reference_lead_samples", 0)),
+        lead_samples=(
+            int(official_timing.digital_reference_lead_samples)
+            if official_timing is not None
+            else 0
+        ),
     )
 
     return audit.report(
@@ -1939,6 +3852,12 @@ def _audit_g4_metrics(
     checkpoint_sha256: str,
     manifest_sha256: str,
     required_source_families: tuple[str, ...],
+    experiment_contract_sha256: str | None,
+    selection_sha256: str | None = None,
+    test_capability_sha256: str | None = None,
+    test_consumed_marker_sha256: str | None = None,
+    timing_contract_sha256: str | None = None,
+    timing_contract: TrainingTimingContract | None = None,
 ) -> dict[str, Any]:
     metrics_path = _repo_path(path).resolve()
     if not metrics_path.is_file():
@@ -1957,6 +3876,17 @@ def _audit_g4_metrics(
             "n_sessions",
             "n_segments",
         }
+        if experiment_contract_sha256 is not None:
+            required.add("experiment_contract_sha256")
+        if timing_contract_sha256 is not None:
+            required.update(
+                {
+                    "segment_recorded_lead_samples",
+                    "segment_recorded_delay_samples",
+                    "segment_timing_contract_sha256",
+                    "segment_source_timeline",
+                }
+            )
         missing = sorted(required.difference(data.files))
         if missing:
             raise ValueError(f"G4 provenance/판정 필드 누락: {missing}")
@@ -1965,6 +3895,26 @@ def _audit_g4_metrics(
         allow_surrogate = bool(_npz_scalar(data, "allow_surrogate"))
         saved_checkpoint_sha = str(_npz_scalar(data, "checkpoint_sha256"))
         saved_manifest_sha = str(_npz_scalar(data, "manifest_sha256"))
+        saved_contract_sha = (
+            str(_npz_scalar(data, "experiment_contract_sha256"))
+            if "experiment_contract_sha256" in data.files
+            else ""
+        )
+        saved_selection_sha = (
+            str(_npz_scalar(data, "selection_sha256"))
+            if "selection_sha256" in data.files
+            else ""
+        )
+        saved_capability_sha = (
+            str(_npz_scalar(data, "test_capability_sha256"))
+            if "test_capability_sha256" in data.files
+            else ""
+        )
+        saved_consumed_sha = (
+            str(_npz_scalar(data, "test_consumed_marker_sha256"))
+            if "test_consumed_marker_sha256" in data.files
+            else ""
+        )
         trusted_pass = bool(_npz_scalar(data, "g4_trusted_pass"))
         fullband_pass = bool(_npz_scalar(data, "g4_fullband_pass"))
         g4_pass = bool(_npz_scalar(data, "g4_pass"))
@@ -2005,6 +3955,26 @@ def _audit_g4_metrics(
         families = {str(value) for value in np.asarray(data["source_family"]).tolist()}
         n_sessions = int(_npz_scalar(data, "n_sessions"))
         n_segments = int(_npz_scalar(data, "n_segments"))
+        timing_shas = (
+            np.asarray(data["segment_timing_contract_sha256"]).astype(str).reshape(-1)
+            if timing_contract_sha256 is not None
+            else np.asarray([], dtype=str)
+        )
+        source_timelines = (
+            np.asarray(data["segment_source_timeline"]).astype(str).reshape(-1)
+            if timing_contract_sha256 is not None
+            else np.asarray([], dtype=str)
+        )
+        recorded_leads = (
+            np.asarray(data["segment_recorded_lead_samples"], dtype=np.int64).reshape(-1)
+            if timing_contract_sha256 is not None
+            else np.asarray([], dtype=np.int64)
+        )
+        recorded_delays = (
+            np.asarray(data["segment_recorded_delay_samples"], dtype=np.float64).reshape(-1)
+            if timing_contract_sha256 is not None
+            else np.asarray([], dtype=np.float64)
+        )
     errors: list[str] = []
     if split != expected_split:
         errors.append(f"split={split!r}; expected={expected_split!r}")
@@ -2016,6 +3986,18 @@ def _audit_g4_metrics(
         errors.append("평가 checkpoint SHA-256이 완료 후보와 다릅니다")
     if saved_manifest_sha != manifest_sha256:
         errors.append("평가 manifest SHA-256이 readiness manifest와 다릅니다")
+    if (
+        experiment_contract_sha256 is not None
+        and saved_contract_sha != experiment_contract_sha256
+    ):
+        errors.append("평가 experiment contract SHA-256이 완료 후보와 다릅니다")
+    for label, saved, expected in (
+        ("selection", saved_selection_sha, selection_sha256),
+        ("test capability", saved_capability_sha, test_capability_sha256),
+        ("test consumed marker", saved_consumed_sha, test_consumed_marker_sha256),
+    ):
+        if expected is not None and saved != expected:
+            errors.append(f"평가 {label} SHA-256이 완료 체인과 다릅니다")
     if not (trusted_pass and fullband_pass and source_pass and g4_pass):
         errors.append(
             "G4 판정을 통과하지 못했습니다: "
@@ -2050,6 +4032,33 @@ def _audit_g4_metrics(
         errors.append(f"G4 source_family 결과 누락: {missing_families}")
     if n_sessions <= 0 or n_segments <= 0:
         errors.append(f"G4 평가 표본이 비었습니다: sessions={n_sessions}, segments={n_segments}")
+    if timing_contract_sha256 is not None:
+        if timing_shas.size != n_segments or not np.all(
+            timing_shas == timing_contract_sha256
+        ):
+            errors.append("segment timing contract SHA가 checkpoint와 다릅니다")
+        if source_timelines.size != n_segments or not np.all(
+            source_timelines == "source_aligned.wav"
+        ):
+            errors.append("공식 G4가 source_aligned.wav ADC 시간축을 쓰지 않았습니다")
+        if (
+            recorded_leads.size != n_segments
+            or np.any(recorded_leads < 0)
+            or recorded_delays.size != n_segments
+            or not np.all(np.isfinite(recorded_delays))
+            or np.any(recorded_delays < 0.0)
+        ):
+            errors.append("segment별 recorded timeline lead provenance가 유효하지 않습니다")
+        elif timing_contract is not None:
+            expected_leads = np.asarray(
+                [
+                    timing_contract.recorded_lead_samples(float(delay))
+                    for delay in recorded_delays
+                ],
+                dtype=np.int64,
+            )
+            if not np.array_equal(recorded_leads, expected_leads):
+                errors.append("segment recorded lead가 timing contract 유도값과 다릅니다")
     if errors:
         raise ValueError(f"{metrics_path}: " + "; ".join(errors))
     return {
@@ -2113,6 +4122,9 @@ def audit_finetune_completion(
     checkpoint: str | Path,
     val_metrics: str | Path,
     test_metrics: str | Path,
+    selection: str | Path | None = None,
+    test_capability: str | Path | None = None,
+    test_consumed_marker: str | Path | None = None,
     full_recorded_qa: bool = True,
 ) -> dict:
     """measured checkpoint와 독립 val/test G4를 묶어 완료 여부를 판정한다."""
@@ -2124,11 +4136,27 @@ def audit_finetune_completion(
     else:
         audit.fail("readiness", "fine-tune 진입 준비 게이트가 통과하지 않았습니다")
 
-    checkpoint_path = _repo_path(checkpoint).resolve()
+    checkpoint_path = _repo_path(checkpoint)
     candidate_sha: str | None = None
+    contract_sha: str | None = None
+    timing_contract_sha: str | None = None
+    timing_contract_model: TrainingTimingContract | None = None
+    strict_canonical_completion = (
+        str(cfg.get("experiment_role", "")) == "canonical_finetune"
+    )
     try:
-        state = _load_checkpoint_state(checkpoint_path)
+        checkpoint_snapshot = snapshot_regular_file(checkpoint_path)
+        checkpoint_path = checkpoint_snapshot.path
+        state = _decode_checkpoint_state(checkpoint_snapshot.content, checkpoint_path)
         saved_cfg = state["cfg"]
+        if strict_canonical_completion:
+            contract_sha = str(
+                validate_embedded_experiment_contract(saved_cfg)["sha256"]
+            )
+            timing_contract_model = TrainingTimingContract.from_data_config(
+                saved_cfg.get("data") or {}
+            )
+            timing_contract_sha = timing_contract_model.digest()
         if saved_cfg.get("physics_status") != "measured_primary_path":
             raise ValueError(
                 "fine-tuned checkpoint physics_status가 measured_primary_path가 아닙니다"
@@ -2149,21 +4177,26 @@ def audit_finetune_completion(
         ):
             raise ValueError("fine-tuned checkpoint lead가 현재 config와 다릅니다")
         companion_last = checkpoint_path.parent / "last.pt"
-        last_state = _load_checkpoint_state(companion_last)
+        last_snapshot = snapshot_regular_file(companion_last)
+        last_state = _decode_checkpoint_state(last_snapshot.content, companion_last)
         last_cfg = last_state["cfg"]
+        if strict_canonical_completion:
+            validate_embedded_experiment_contract(last_cfg)
         if _checkpoint_identity(last_cfg) != _checkpoint_identity(saved_cfg):
             raise ValueError("fine-tune best.pt와 last.pt의 immutable run 설정이 다릅니다")
         if _model_state_signature(last_state) != _model_state_signature(state):
             raise ValueError("fine-tune best.pt와 last.pt의 model state 구조가 다릅니다")
-        target = int(
-            last_cfg.get(
-                "run_until_step", (last_cfg.get("schedule", {}) or {}).get("total_steps", 0)
+        if strict_canonical_completion:
+            validate_completion_receipt(
+                checkpoint_path.parent,
+                expected_role="canonical_finetune",
+                expected_init_eligible=False,
             )
-        )
+        target = int((last_cfg.get("schedule", {}) or {}).get("total_steps", 0))
         step = int(last_state.get("step", -1))
-        if target <= 0 or step < target:
+        if target <= 0 or step != target:
             raise ValueError(f"fine-tune 학습 미완료: last step={step}, target={target}")
-        candidate_sha = sha256_file(checkpoint_path)
+        candidate_sha = checkpoint_snapshot.sha256
         audit.pass_(
             "measured_finetune_checkpoint",
             "measured fine-tune checkpoint와 완료 last가 정합합니다",
@@ -2175,10 +4208,11 @@ def audit_finetune_completion(
     except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         audit.fail("measured_finetune_checkpoint", str(exc))
 
-    manifest_path = _repo_path(cfg.get("recorded_manifest", "")).resolve()
+    manifest_path = _repo_path(cfg.get("recorded_manifest", ""))
     try:
-        manifest_sha = sha256_file(manifest_path)
-    except (FileNotFoundError, OSError) as exc:
+        manifest_snapshot = snapshot_regular_file(manifest_path)
+        manifest_sha = manifest_snapshot.sha256
+    except (FileNotFoundError, OSError, ValueError) as exc:
         manifest_sha = ""
         audit.fail("recorded_manifest_provenance", str(exc))
     else:
@@ -2189,11 +4223,118 @@ def audit_finetune_completion(
             manifest_sha256=manifest_sha,
         )
 
+    chain: dict[str, str] = {}
+    if strict_canonical_completion:
+      try:
+        if selection is None or test_capability is None or test_consumed_marker is None:
+            raise ValueError(
+                "완료 판정에는 selection/test capability/consumed marker가 모두 필요합니다"
+            )
+        selection_payload, selection_snapshot = read_json_snapshot(_repo_path(selection))
+        # capability 발급 뒤 selection/bundle을 변조해 completion만 우회하는
+        # 경로를 막는다. single-seed clear-pass 또는 검증된 cross-seed final을
+        # 현재 immutable bytes에서 다시 판정한다.
+        validate_test_open_selection(selection_payload)
+        expected_capability_path, expected_consumed_path = (
+            canonical_test_ledger_paths_from_payload(selection_payload)
+        )
+        event_paths = canonical_test_ledger_event_paths_from_payload(
+            selection_payload
+        )
+        if Path(os.path.abspath(_repo_path(test_capability))) != expected_capability_path:
+            raise ValueError("test capability가 campaign-wide canonical ledger 경로가 아닙니다")
+        if Path(os.path.abspath(_repo_path(test_consumed_marker))) != expected_consumed_path:
+            raise ValueError(
+                "test consumed marker가 campaign-wide canonical ledger 경로가 아닙니다"
+            )
+        capability_payload, capability_snapshot = read_json_snapshot(
+            _repo_path(test_capability)
+        )
+        consumed_payload, consumed_snapshot = read_json_snapshot(
+            _repo_path(test_consumed_marker)
+        )
+        if event_paths["failed"].exists() or event_paths["failed"].is_symlink():
+            raise ValueError("recorded test ledger가 failed 상태입니다")
+        completed_payload, completed_snapshot = read_json_snapshot(
+            event_paths["completed"]
+        )
+        selected = selection_payload.get("selected")
+        if not isinstance(selected, dict):
+            raise ValueError("selection.selected가 없습니다")
+        expected_selection = {
+            "selection_split": "val",
+            "manifest_sha256": manifest_sha,
+            "experiment_contract_sha256": contract_sha,
+        }
+        for key, value in expected_selection.items():
+            if selection_payload.get(key) != value:
+                raise ValueError(f"selection {key}가 완료 후보와 다릅니다")
+        if selected.get("checkpoint_sha256") != candidate_sha:
+            raise ValueError("selection checkpoint SHA가 완료 후보와 다릅니다")
+        selected_metrics_sha = str(selected.get("metrics_sha256", ""))
+        if selected_metrics_sha != snapshot_regular_file(val_metrics).sha256:
+            raise ValueError("selection val candidate metrics와 canonical val bytes가 다릅니다")
+        expected_capability = {
+            "selection_sha256": selection_snapshot.sha256,
+            "seed_neutral_campaign_sha256": selection_payload.get(
+                "seed_neutral_campaign_sha256"
+            ),
+            "experiment_contract_sha256": contract_sha,
+            "selected_checkpoint_sha256": candidate_sha,
+            "manifest_sha256": manifest_sha,
+        }
+        for key, value in expected_capability.items():
+            if capability_payload.get(key) != value:
+                raise ValueError(f"test capability {key}가 selection과 다릅니다")
+        expected_consumed = {
+            **expected_capability,
+            "capability_sha256": capability_snapshot.sha256,
+        }
+        expected_consumed.pop("selection_sha256")
+        expected_consumed["selection_sha256"] = selection_snapshot.sha256
+        for key, value in expected_consumed.items():
+            if consumed_payload.get(key) != value:
+                raise ValueError(f"test consumed marker {key}가 capability와 다릅니다")
+        if capability_payload.get("phase") != "issued":
+            raise ValueError("test capability phase가 issued가 아닙니다")
+        if consumed_payload.get("phase") != "running":
+            raise ValueError("test consumed marker phase가 running이 아닙니다")
+        expected_completed = {
+            "phase": "completed",
+            "seed_neutral_campaign_sha256": selection_payload.get(
+                "seed_neutral_campaign_sha256"
+            ),
+            "selection_sha256": selection_snapshot.sha256,
+            "running_marker_sha256": consumed_snapshot.sha256,
+            "experiment_contract_sha256": contract_sha,
+            "selected_checkpoint_sha256": candidate_sha,
+            "manifest_sha256": manifest_sha,
+            "metrics_npz_sha256": snapshot_regular_file(test_metrics).sha256,
+        }
+        for key, value in expected_completed.items():
+            if completed_payload.get(key) != value:
+                raise ValueError(f"test completed ledger {key}가 결과와 다릅니다")
+        chain = {
+            "selection_sha256": selection_snapshot.sha256,
+            "test_capability_sha256": capability_snapshot.sha256,
+            "test_consumed_marker_sha256": consumed_snapshot.sha256,
+            "test_completed_marker_sha256": completed_snapshot.sha256,
+        }
+        audit.pass_(
+            "recorded_selection_test_once_chain",
+            "recorded-val 선택과 single-use test capability 체인이 정합합니다",
+            **chain,
+        )
+      except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        audit.fail("recorded_selection_test_once_chain", str(exc))
+
     required_families = _required_families(cfg.get("readiness", {}) or {})
     fingerprints: dict[str, str] = {}
     for split, path in (("val", val_metrics), ("test", test_metrics)):
         check_id = f"recorded_{split}_g4"
-        if candidate_sha is None or not manifest_sha:
+        if candidate_sha is None or not manifest_sha or (
+            strict_canonical_completion and contract_sha is None
+        ):
             audit.fail(check_id, "checkpoint/manifest provenance가 없어 G4를 검증할 수 없습니다")
             continue
         try:
@@ -2203,6 +4344,20 @@ def audit_finetune_completion(
                 checkpoint_sha256=candidate_sha,
                 manifest_sha256=manifest_sha,
                 required_source_families=required_families,
+                experiment_contract_sha256=contract_sha,
+                selection_sha256=(
+                    chain.get("selection_sha256") if split == "test" else None
+                ),
+                test_capability_sha256=(
+                    chain.get("test_capability_sha256") if split == "test" else None
+                ),
+                test_consumed_marker_sha256=(
+                    chain.get("test_consumed_marker_sha256")
+                    if split == "test"
+                    else None
+                ),
+                timing_contract_sha256=timing_contract_sha,
+                timing_contract=timing_contract_model,
             )
             fingerprints[split] = str(details.pop("plant_fingerprint_json"))
             audit.pass_(check_id, f"독립 recorded {split} G4가 통과했습니다", **details)

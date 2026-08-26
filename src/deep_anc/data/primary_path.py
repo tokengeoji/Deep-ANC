@@ -23,6 +23,7 @@ class DigitalPrimaryPath:
     delay_samples: int
     mode: str
     source_path: str
+    delay_source_path: str
     is_surrogate: bool
 
 
@@ -48,9 +49,16 @@ def resolve_digital_primary_path(
 
     digital_cfg = duct_cfg.get("digital_reference", {})
     configured_delay = digital_cfg.get("d_noise_delay_samples")
+    allow_legacy_delay = bool(data_cfg.get("allow_legacy_d_noise_delay", False))
+    if configured_delay is not None and not allow_legacy_delay:
+        raise ValueError(
+            "duct.digital_reference.d_noise_delay_samples 수동값은 폐기됐습니다. "
+            "canonical digital 모드는 primary_path_npz.delay_samples를 사용하고, "
+            "legacy 진단만 data.allow_legacy_d_noise_delay=true로 명시하세요"
+        )
     fallback_delay = (
         int(configured_delay)
-        if configured_delay is not None
+        if configured_delay is not None and allow_legacy_delay
         else default_d_noise_delay(
             duct_cfg, int(sample_rate), int(secondary_path.delay_samples)
         )
@@ -59,43 +67,61 @@ def resolve_digital_primary_path(
     if mode == "rir_surrogate":
         return None, fallback_delay
 
+    path = digital_cfg.get("primary_path_npz")
+    primary_delay_artifact = None
+    if path:
+        primary_delay_artifact = load_secondary_path(_resolve_path(path))
+        if int(primary_delay_artifact.sample_rate) != int(sample_rate):
+            raise ValueError(
+                f"P(z) sample rate {primary_delay_artifact.sample_rate} != "
+                f"학습 sample rate {sample_rate}"
+            )
+
     if mode == "secondary_surrogate":
-        # 실측 P가 없을 때에만 쓰는 표현 사전학습용 모드. S의 장치 gain/FIR을
-        # 빌리되 D_noise 지연을 적용해 P/S scale infeasibility를 피한다.
+        if primary_delay_artifact is None and bool(
+            data_cfg.get("require_primary_delay_artifact", False)
+        ):
+            raise ValueError(
+                "canonical secondary_surrogate도 strict primary_path_npz의 delay_samples가 "
+                "필요합니다"
+            )
+        delay = (
+            int(primary_delay_artifact.delay_samples)
+            if primary_delay_artifact is not None
+            else fallback_delay
+        )
+        delay_source = (
+            primary_delay_artifact.source_path
+            if primary_delay_artifact is not None
+            else "legacy_geometry_or_explicit_diagnostic"
+        )
+        # 표현 사전학습은 S의 gain/FIR을 빌리되 P의 strict measured delay를 쓴다.
         return (
             DigitalPrimaryPath(
                 fir=np.ascontiguousarray(secondary_path.fir, dtype=np.float32),
-                delay_samples=fallback_delay,
+                delay_samples=delay,
                 mode=mode,
                 source_path=secondary_path.source_path,
+                delay_source_path=delay_source,
                 is_surrogate=True,
             ),
-            fallback_delay,
+            delay,
         )
 
-    path = digital_cfg.get("primary_path_npz")
-    if not path:
+    if primary_delay_artifact is None:
         raise ValueError(
             "digital_primary_path_mode='measured'에는 "
             "duct.digital_reference.primary_path_npz가 필요합니다. "
             "noise→ERR ESS 측정 파일을 지정하세요."
         )
-    primary = load_secondary_path(_resolve_path(path))
-    if int(primary.sample_rate) != int(sample_rate):
-        raise ValueError(
-            f"P(z) sample rate {primary.sample_rate} != 학습 sample rate {sample_rate}"
-        )
-    if configured_delay is not None and int(configured_delay) != int(primary.delay_samples):
-        raise ValueError(
-            "digital_reference.d_noise_delay_samples와 primary_path_npz의 delay가 "
-            f"다릅니다: {configured_delay} != {primary.delay_samples}"
-        )
+    primary = primary_delay_artifact
     return (
         DigitalPrimaryPath(
             fir=np.ascontiguousarray(primary.fir, dtype=np.float32),
             delay_samples=int(primary.delay_samples),
             mode=mode,
             source_path=primary.source_path,
+            delay_source_path=primary.source_path,
             is_surrogate=False,
         ),
         int(primary.delay_samples),

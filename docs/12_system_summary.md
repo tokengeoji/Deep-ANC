@@ -1,5 +1,11 @@
 # 12. 시스템 총정리 — 하드웨어 · 데이터 · 아키텍처 · 결과 · 개선방안
 
+> **보존된 2026-08-06 forensic snapshot이다.** 아래 legacy P/S·lead·checkpoint·격리 판정과
+> 실행 명령을 현행 학습 계약으로 재사용하지 않는다. 2026-08-26 이후의 authoritative 상태와
+> 다음 명령은 [HANDOFF.md](../HANDOFF.md), timing은 `TrainingTimingContract`, 학습 판정은
+> current readiness report가 단일 출처다. 특히 기존 82세션은 전량 폐기가 아니라 historical
+> 계보 복구와 component regrouping 뒤 사용하며, 새 strict P/S 전에는 official delay가 없다.
+
 > 최종 갱신 **2026-08-06**. 이 문서는 **측정된 것만** 담는다. 각 수치의 출처 명령을 함께 적었고,
 > 재현이 불가능한 값은 넣지 않는다. 진행 중인 작업 상태는 [HANDOFF.md](../HANDOFF.md)가 단일 출처다.
 
@@ -14,7 +20,7 @@
 > | "−2 dB 정체 = 용량 부족 → `tiny_wide` 실험" | **철회.** 데이터 시간축 붕괴 + 33~54% 틀린 플랜트 ([§4.5](#45-진단--용량-부족이-아니었다-철회)) |
 > | "1 kHz 위는 변하지 않는다 / 증폭하지 않는 것이 성공 기준" | **2–8 kHz 를 15–22 dB 증폭한다** ([§4.7](#47-실기-anc-사전학습-tiny--ort-cpu)) |
 > | "파인튜닝으로 1.30 dB 개선" | **무효.** 전후가 서로 다른 플랜트 ([§4.4](#44-stage-2-파인튜닝-tiny-50k-step--g4-는-fail)) |
-> | "재생·녹음이 서로 다른 클록 도메인" | 상대 드리프트 **+0.4 ppm.** 실제는 **버퍼 프레임 슬립** ([§1.2](#12-실시간-오디오-체인)) |
+> | "재생·녹음은 사실상 동기(+0.4 ppm)" | **철회.** raw adjacent-cycle 관측은 약 **+620 ppm**이며, 버퍼 프레임 슬립과 별도로 fractional-bin P/S 누설을 만든다 ([§1.2](#12-실시간-오디오-체인)) |
 > | "max 40–58 ms 는 데스크톱 세션 잡음" | **커널 RT 스로틀링** (`sched_rt_runtime_us=950000`) ([§4.6](#46-추론-지연--30w-vs-maxn)) |
 > | GPU 지연 수치 | **듀티 100% 연속 실행** 값. 실제 듀티 6% 에서 3.7배 나빠진다 ([§4.6](#46-추론-지연--30w-vs-maxn)) |
 > | "전수 QA 80/80 PASS" | 형식만 봤다. **시간축이 붕괴**해 있었고 지금은 전량 격리 ([§2.1](#21-실측-덕트-녹음-파인튜닝용-70)) |
@@ -60,7 +66,8 @@ n(t) ──►│ AB13X USB Audio (card 2) → TPA3116D2 앰프 → NS/CS 스피
         └──────────────────────────────────────────────┘
 ```
 
-두 경로 모두 같은 Tegra 발진기를 기준으로 돈다 (각각 +17 ppm, **상대 드리프트 +0.4 ppm**).
+USB DAC와 Tegra APE I²S ADC는 별도 클록 도메인이다. 보존된 raw A의 adjacent-cycle
+시간영역 관측은 주기당 약 **+620 ppm**이었으며, 고정 정수-bin FFT로 무시할 수 없는 값이다.
 
 | 항목 | 값 |
 |---|---|
@@ -71,17 +78,21 @@ n(t) ──►│ AB13X USB Audio (card 2) → TPA3116D2 앰프 → NS/CS 스피
 | 마이크 잡음 바닥 | **−67.4 dBFS** (기동 트랜지언트 0.5초 제외 후) |
 
 > [!NOTE]
-> **두 클록은 사실상 동기다.** 재생(USB AB13X)과 녹음(Tegra APE I²S)의 상대 드리프트는
-> 실측 **+0.4 ppm**(10분에 12샘플)로 무시할 수준이며, 두 클록 모두 **+17 ppm** 으로 같은
-> Tegra 발진기를 공유한다(USB 싱크가 ADAPTIVE). **클록 드리프트는 P/S 실측을 막은 원인이
-> 아니다.**
+> **두 클록을 동기라고 가정하면 안 된다.** raw A에서 실측한 약 +620 ppm은 0.125초/6000
+> sample 주기의 길이를 약 3.72 sample 바꾸며, 1600 Hz를 약 0.124 bin 이동시킨다. 이때
+> guard=1 정수 FFT의 1--1.6 kHz 교차성분은 P/S 모두 약 15%였다. 새 official 측정은 원시
+> ERR/REF adjacent-cycle clock witness로 ``q=N/(N+d)``를 구하고, 실제 제출 int16 PCM의
+> 199개 톤을 fractional-frequency joint real LS로 동시에 분리한다. cubic affine
+> playback-grid 재표본화+정수 FFT와 전대역 및 네 부대역에서 일치하지 않으면 실패한다.
 >
 > `results/clock_drift/20260804_222644/clock_drift.json` 의 `drift_ppm: 92.9` 를 근거로 쓰지
 > 말 것 — `residual_rms_samples: 276`, `residual_max: 824` 로 1차 적합이 성립하지 않으며,
 > **스크립트 자신이 `verdict` 에 "기울기는 작은데 잔차가 크다 — 무작위 점프다. 버퍼
 > 드롭/중복을 의심하고 ALSA 직접 경로로 재확인한다" 라고 판정해 두었다.** 두 번째 세션
 > `20260804_224225` 는 `drift_ppm 1400.1` / "상관 자체가 낮다" 로 역시 무효다.
-> 실제 원인은 **출력 버퍼 프레임 슬립**이다([§2.3](#23-실측-경로-자산), P−S 상대 τ 1.4 → 32 샘플 점프).
+> 이 두 무효 세션만으로 단일 원인을 정할 수 없다. 별도로 확인된 **출력 버퍼 프레임
+> 슬립**([§2.3](#23-실측-경로-자산), P−S 상대 τ 1.4 → 32 샘플 점프)과 지속적인 비동기
+> sample-rate offset은 모두 fail-closed로 검출해야 한다.
 >
 > ```bash
 > .venv/bin/python -c "
@@ -237,9 +248,11 @@ RIR 뱅크를 함께 갱신해야 한다.
 > (+0.09 vs 나머지 −0.85 ~ −2.05).
 >
 > 게이트에 **"합성 매니페스트 ∩ 실측 소스 = ∅"** 항목이 없었다(전형적 군집 B).
-> 현재는 `corpus_disjoint` / `invariant_corpus_disjoint` 게이트와 held-out 목록
-> (`data/manifests/recorded_holdout.json`, 691 클립)이 만들어져 있고
-> `prepare_noise_pool.py --holdout` 이 구성 단계에서 차단한다. **다만 실데이터 양성 확인은
+> 현재는 `corpus_disjoint` / `invariant_corpus_disjoint` 게이트와 active 82세션 historical
+> 재현 held-out 목록(`data/manifests/recorded_holdout.json`, 682 unique clip)이 있고,
+> `prepare_noise_pool.py --expected-holdout-sha256 <64hex>`가 구성 단계에서 차단한다.
+> holdout는 report SHA/CSV row 합집합, manifest schema v2는 raw content SHA를 결속한다.
+> **다만 실데이터 양성 확인은
 > manifest 격리 때문에 미완**이다.
 >
 > **부수 결함 (D4)**: `music` 의 `group_id` 는 `fma_small/<3자리 디렉터리>` = **FMA 트랙 ID
@@ -338,7 +351,7 @@ for f in ['assets/measured/primary_path_il.npz','assets/measured/secondary_path_
 | 부대역 일관성 | 총계 1개 | **요구 대역 안 모든 부대역** | 총계가 80–150 Hz 0.706 을 숨겼다 |
 | readiness `delay_spread` | 아티팩트 신고값 | **상수 3 (신고값 무시)** | 자기증명 구조 차단 |
 | 슬립 과반 | 없음 | **실패 폐쇄** | 유지 무리가 첫 분석 주기와 프레임 정렬이 다르면 판별 불가 |
-| `--warmup-periods` / `--repeats` | 4 / 16 | **16 / 32** | 반복 0 이 캡처 9건 전부에서 정상상태 미도달 |
+| `--warmup-periods` / `--repeats` | 4 / 16 | **32 / 64** | 정상상태 워밍업과 최소 8개 유지 반복의 여유 확보. 기본 자극 12.0초 |
 
 > **`excitation_band_hz` 는 두 경로가 다르다** — 인터리브라 두 채널이 인접 FFT 빈을 번갈아
 > 쓰기 때문이다: **P(noise) [64, 1648] Hz / S(cancel) [72, 1640] Hz.**
@@ -379,7 +392,7 @@ e = d + self.plant(y_nl, perturb)
 | 요소 | 왜 고정하나 |
 |---|---|
 | `P(z)`, `S(z)` | 함께 학습하면 틀린 플랜트를 틀린 `y`로 벌충하고 **아무도 모른다** |
-| `lead = 116` | 같은 이유 (2026-08-05 플랜트 복구 후. 이전 값 113 · 109 는 폐기) |
+| timing contract | strict P/S bulk delay·compact FIR peak·handoff에서 유도. 아래 수동 lead는 legacy 진단값 |
 | 학습 단계 | Stage-1 합성 → **Stage-2 실측(진행 중)** → Stage-3 closed-loop. 각 단계 가정을 G1–G4로 검문 |
 | 런타임 3스레드 | 마감 때문. 오프라인↔스트리밍 등가 `3e-8`이 분할이 수학을 바꾸지 않음을 보장 |
 
@@ -409,15 +422,16 @@ x = np.stack([ref, err])              # [1, 2, hop]
 warp 가 아니라 창 안에 버퍼 프레임 슬립이 들어갈 확률**이었다. 당시의 후보 배제표는
 "클록 도메인 독립성" 자체를 검증 항목에 넣지 않고 전제로 깔았다는 한계가 있다([§1.2](#12-실시간-오디오-체인)).
 
-최종 확정 경로는 **재분석**이다 — 저장된 캡처 11건을 새 기각 규칙으로 전수 재처리했고
-스피커를 한 번도 울리지 않았다([§2.3](#23-실측-경로-자산)).
+아래는 저장된 legacy 캡처 11건을 당시 기각 규칙으로 전수 재처리한 **역사적 진단**이다.
+P−S 불변량을 찾는 데는 유용했지만, 실제 submitted PCM과 q+joint-LS/cubic provenance가 없어
+현재 official/training-ready P/S로 승격할 수 없다([§2.3](#23-실측-경로-자산)).
 
 ```
 $ for d in results/calibration_interleaved/2026*/; do \
     .venv/bin/python scripts/data/reanalyse_paths_interleaved.py "$d" --dry-run; done
  225325_2ffe142b  kept=12/16  584ppm  P=2858 S=2717 P-S=141 lead=115
  225441_ed4db22c  kept=12/24  545ppm  P=1565 S=1425 P-S=140 lead=116
- 225546_f7b0fecd  kept=18/48  542ppm  P=1602 S=1462 P-S=140 lead=116   ← 채택
+ 225546_f7b0fecd  kept=18/48  542ppm  P=1602 S=1462 P-S=140 lead=116   ← 당시 진단 기준선
  225650_6950a52c  kept= 9/12  364ppm  P=1659 S=1519 P-S=140 lead=116
  225844_460f5205  kept=12/24  552ppm  P=1655 S=1515 P-S=140 lead=116
  225856_a9ab3c4c  kept=10/32  617ppm  P=1645 S=1505 P-S=140 lead=116
@@ -910,7 +924,7 @@ taskset -c 4-7 chrt -f 80 .venv/bin/python scripts/bench/measure_inference_laten
 
 | 항목 | 값 | 왜 미검증인가 |
 |---|---|---|
-| 상대 클록 드리프트 | +0.4 ppm / 양 클록 +17 ppm | 실시간 전문가 실측. 재현하려면 스피커 재생 10분 필요 |
+| 상대 클록 드리프트 | raw A 약 +620 ppm (주기당 +3.72/6000 sample) | 보존 raw의 adjacent-cycle 재분석. 다음 물리 측정에서도 ERR/REF 공통 q gate로 재확인 필요 |
 | GPU 듀티 6% 열화 | P50 0.30 → 1.10 ms @306 MHz | 주기 호출 벤치가 저장소에 없다 (`--period-ms` 미구현) |
 | cluster bootstrap CI | [−0.456, +0.481] | 평가 전문가 계산. 산출물로 저장되지 않았다 |
 | 150–600 Hz 이론 상한 6.53 dB | — | 게이트 값은 4.58(150–1600Hz)로 정정됐으나, 150–600Hz 값 자체는 독립 재계산이 5.21~5.41 로 불일치 |

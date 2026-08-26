@@ -20,22 +20,21 @@
 복잡한 소리의 상쇄 파형을 직접 회귀한다. 최종 목표는 ① 저주파와 고주파를 함께
 제거하고 ② 소음뿐 아니라 대화·음악까지 포함한 quiet zone을 만드는 것이다.
 
-현재 단계는 이 최종 성능을 주장하는 단계가 아니다. noise 출력→ERR 1차경로
-`P(z)`의 실측 파일이 아직 없으므로, Stage-1은 측정 `S(z)`의 FIR/gain을
-`P(z)` 대용으로 재사용하는 **secondary-surrogate 표현 사전학습**이다. 이 선택은
-`P/S` 단위 불일치로 학습이 영출력에 고정되는 것을 막지만, surrogate 체크포인트의
-dB를 실제 덕트 감쇠 성능으로 해석해서는 안 된다.
+현재 단계는 최종 성능을 주장하는 단계가 아니라 파인튜닝 준비 계약을 복구하는 단계다.
+기존 P/S와 checkpoint는 strict provenance와 150–1600 Hz 계약을 만족하지 않아
+diagnostic-only다. 새 strict P/S, 데이터 계보, Elice public corpus와 canonical tiny 100k init을
+모두 확보하기 전에는 surrogate checkpoint의 dB를 실제 덕트 감쇠로 해석하지 않는다.
 
 ## 시스템 전체 그림
 
 ```
-[학습 — Elice Cloud 2×A100, 서로 독립된 base/tiny 프로세스]
+[학습 — Elice Cloud A100 80GB 1장, tiny open-loop]
   공개 노이즈·음성·음악 + 합성원 → 연속 source n
-                    ├→ ref를 실제 playback보다 116샘플 먼저 공급
-                    └→ P_surrogate=S의 FIR/gain, D_noise=1602(실측) → d
-  HybridANCNet → y → 공칭 선형 S(z), 총지연 1462+256=1718 → e=d+S·y
+                    ├→ strict P/S timing contract가 ref/playback 정렬을 유도
+                    └→ surrogate pretrain 후 strict measured P로 fine-tune
+  HybridANCNet → y → S(z)+256-sample handoff → e=d+S·y
                     └→ trusted NMSE(150–1600Hz) 최적화 + fullband NMSE 감시
-  결과: physics_status=secondary_surrogate_representation_pretrain 체크포인트
+  결과: 전체 계약 SHA와 completion receipt를 가진 canonical checkpoint
 [배포 — Jetson AGX Orin]
   실측 파인튜닝을 통과한 best.pt → ONNX(정적 스트리밍 그래프) → [ORT CPU | TensorRT FP16]
   3-스레드 런타임: 콜백(5.33ms) ↔ 링버퍼 ↔ 추론 스레드, 안전장치 8종
@@ -47,10 +46,11 @@ dB를 실제 덕트 감쇠 성능으로 해석해서는 안 된다.
 
 | 단계 | 모드 | 목표 | 성능 주장 범위 |
 |---|---|---|---|
-| **Stage-1A (현재)** | digital-ref, secondary surrogate | `P/S` 스케일을 맞춘 공칭 선형 플랜트에서 상쇄 역매핑과 학습 건전성 확립 | **표현 사전학습만**. 실제 덕트 감쇠·FxLMS 우위 주장 금지 |
-| **Stage-1B** | digital-ref, measured P/S | noise→ERR `P(z)`와 cancel→ERR `S(z)`를 같은 출력 gain/볼륨으로 실측하고 recorded 데이터로 파인튜닝 | 독립 실측 val/test를 통과한 대역만 주장 |
-| **Stage-2** | digital-ref 강건화 + acoustic-ref | 실측 다중 plant·비선형 커리큘럼, 외부 주기/준정상 소음 상쇄 | THD/IMD 및 다중 조건 실측 게이트 통과 후 주장 |
-| **Stage-3** | acoustic-ref 광대역 | I/O 지연 단축 후 고역 확장 | 지연과 평면파 한계를 실측으로 검증한 범위만 주장 |
+| **준비(현재)** | strict P/S·계보·Elice | 모든 입력 byte와 timing/checkpoint 계약 복구 | 성능 주장 금지 |
+| **Stage-1A** | digital-ref, secondary surrogate | G0와 loss pilot 뒤 tiny 100k canonical pretrain | 표현 학습만 |
+| **Stage-1B** | digital-ref, measured P/S | recorded 70%+synthetic 30% open-loop 50k와 one-shot G4 | 독립 G4 PASS 범위만 주장 |
+| **Stage-2** | natural-crest challenge | 완전 미사용 4-family challenge | challenge PASS 뒤에만 배포 후보 |
+| **후속** | closed-loop/acoustic-ref | 다중 plant·비선형·외부 소음 | 별도 실측 게이트 뒤 주장 |
 
 같은 코드베이스를 사용하지만 단계 전환에는 config 변경만으로 충분하지 않다.
 Stage-1B에는 같은 장치 조건의 `P/S` 실측이, Stage-2 이후에는 비선형·다중 plant 측정과
@@ -83,9 +83,9 @@ Deep_ANC/
 - 학습 스모크: open/closed-loop 각각 Jetson GPU에서 정상 (bf16 AMP, 손실은 FP32)
 - ONNX export → ORT 등가성 max err 2.4e-8
 - 추론 지연: tiny+ORT CPU P99 **1.50ms** (블록 예산 5.33ms 통과), base+ORT 6.8ms
-- 현재 Stage-1 설정: 공칭 선형 plant, `D_noise=1602`, `S_total=1718`, 실제 playback
-  FIFO **lead 116**, trusted NMSE **150–1600Hz** + fullband 모니터.
-  ⚠ 배포 중인 ONNX 는 실측 이전 값(`lead=109`, trusted 150–600Hz)으로 사전학습된 것이라
-  런타임 설정도 109 다. 두 값이 섞이지 않게 런타임이 시작 전에 거부한다 (docs/06)
+- 현행 timing은 strict P/S NPZ의 bulk delay·compact FIR peak와 256-sample handoff를
+  `TrainingTimingContract`가 유도한다. 수동 delay/lead 숫자는 학습 계약으로 인정하지 않는다.
+- 기존 ONNX와 corrected checkpoint는 legacy diagnostic artifact이며 새 init/resume/배포에
+  사용하지 않는다.
 - 과거 `rir_surrogate` + 미관측 plant 위상 랜덤화 + fullband NMSE로 수행한 0dB 정체
   체크포인트는 학습 목적이 잘못된 실행으로 판정했다. 새 Stage-1에 resume하지 않는다.

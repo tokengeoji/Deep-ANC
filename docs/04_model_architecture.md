@@ -86,17 +86,19 @@ tiny batch 128을 각각 100k step 학습한다. GPU0/base와 GPU1/tiny는 서�
 ## 5. Stage-1 학습 플랜트와 손실 (`losses/anc_loss.py`)
 
 ```
-source n ─→ x_ref=n(t+109) ─→ HybridANCNet ─→ y
-       └→ P_surrogate=S FIR/gain, delay 1602 ───────────────→ d
-y → G_nl(η=10, drive=1) → S(z)(1462+256 지연, 공칭 고정) → e=d+S·y
+source n ─→ x_ref=n(t+K) ─→ HybridANCNet ─→ y
+       └→ P_contract(n) ────────────────────────────────────→ d
+y → G_nl(η=10, drive=1) → S_contract(z)+handoff → e=d+S·y
 
 L = NMSE_150–1600Hz(dB)
     + 1.0·MR-STFT{256,512,1024,2048}×W(f)
     + 1e-3·L_pow + 1.0·L_clip(마진 0.18)
 ```
 
-- `P_surrogate`는 측정 S의 장치 gain/FIR을 P에 재사용해 P/S 단위를 맞춘다.
-  `D_noise=1602`만 별도로 적용한다. 실제 P가 아니므로 이 단계의 dB는 실제 감쇠가 아니다.
+- `P_surrogate`는 측정 S의 장치 gain/FIR을 P에 재사용해 P/S 단위를 맞춘다. P bulk delay,
+  compact FIR peak, S bulk delay, 256-sample handoff와 K는 strict NPZ의
+  `TrainingTimingContract`가 구분한다. 실제 P 주파수응답은 아니므로 이 단계의 dB는 실제
+  감쇠가 아니다.
 - NMSE 목적함수는 S 실측 `consistency_band_hz` 150–1600Hz 와 duct 목표
   `realistic_target_band_hz` 80–1600Hz 의 교집합 = **150–1600Hz** 다
   (2026-08-05 플랜트 복구 전에는 150–600Hz).

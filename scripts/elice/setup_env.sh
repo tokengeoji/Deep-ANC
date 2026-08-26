@@ -9,7 +9,9 @@ cd "$(dirname "$0")/../.."
 python3 -m venv .venv 2>/dev/null || python3 -m venv --without-pip .venv
 VENV_PYTHON="$PWD/.venv/bin/python"
 SETUP_MARKER="$PWD/.venv/.setup-complete"
+ENVIRONMENT_RECEIPT="$PWD/.venv/environment-freeze.txt"
 rm -f "$SETUP_MARKER"
+rm -f "$ENVIRONMENT_RECEIPT" "${ENVIRONMENT_RECEIPT}.building"
 
 "$VENV_PYTHON" -m pip -q install -U pip 2>/dev/null || {
   curl -fsS https://bootstrap.pypa.io/get-pip.py | "$VENV_PYTHON"
@@ -34,6 +36,12 @@ import tqdm
 import yaml
 
 print("torch", torch.__version__, "| cuda:", torch.cuda.is_available())
+if str(torch.__version__) != "2.5.1+cu121":
+    raise SystemExit(
+        f"torch wheel이 exact 2.5.1+cu121이 아닙니다: {torch.__version__}"
+    )
+if str(torch.version.cuda) != "12.1":
+    raise SystemExit(f"torch CUDA build가 exact 12.1이 아닙니다: {torch.version.cuda}")
 if not torch.cuda.is_available():
     raise SystemExit("CUDA를 사용할 수 없어 Elice 학습 환경 셋업을 완료하지 않습니다")
 if torch.cuda.device_count() < 1:
@@ -42,5 +50,13 @@ torch.empty(1, device="cuda")
 for i in range(torch.cuda.device_count()):
     print(f"  GPU{i}:", torch.cuda.get_device_name(i))
 EOF
+LC_ALL=C "$VENV_PYTHON" -m pip freeze --all | LC_ALL=C sort > "${ENVIRONMENT_RECEIPT}.building"
+if [ ! -s "${ENVIRONMENT_RECEIPT}.building" ] || \
+   ! grep -Fxq 'torch==2.5.1+cu121' "${ENVIRONMENT_RECEIPT}.building"; then
+  rm -f "${ENVIRONMENT_RECEIPT}.building"
+  echo "[오류] freeze receipt에 exact torch wheel이 없어 완료 marker를 쓰지 않습니다." >&2
+  exit 1
+fi
+mv -f "${ENVIRONMENT_RECEIPT}.building" "$ENVIRONMENT_RECEIPT"
 touch "$SETUP_MARKER"
-echo "셋업 완료. 다음 단계: bash scripts/data/download_noise.sh && $VENV_PYTHON scripts/data/prepare_noise_pool.py && $VENV_PYTHON scripts/data/build_rir_bank.py"
+echo "셋업 완료. 환경 receipt: $ENVIRONMENT_RECEIPT"

@@ -29,6 +29,7 @@ lead 부기
 
 from __future__ import annotations
 
+import io
 import json
 import math
 from collections import OrderedDict
@@ -41,8 +42,15 @@ import torch
 from pydantic import BaseModel, ConfigDict, model_validator
 from torch.utils.data import IterableDataset, get_worker_info
 
-from .manifest import read_manifest
+from ..dsp.timing import TrainingTimingContract
+from .manifest import read_manifest, read_manifest_bytes
+from .resumable_stream import indexed_rng, worker_global_item_indices
 from .synth_dataset import _delay_np
+from .transfer_contract import (
+    RecordedTrainingSnapshot,
+    TransferContractError,
+    validate_recorded_training_snapshot,
+)
 
 __all__ = ["RecordedANCDataset", "RecordedAugmentConfig", "RecordedLeadPlan"]
 
@@ -66,9 +74,9 @@ class RecordedLeadPlan(BaseModel):
     ``d_recorded`` 는 재정렬 후 ``source_aligned → ERR`` 잔여 지연의 세션 중앙값이고
     ``session.json`` 의 ``timeline.aligned_lag_median_samples`` 에 박혀 있다.
 
-    ⚠ ``timeline`` 모드를 켜기 전에 ``d_noise_delay_samples`` 를 physics 담당과
-    합의해야 한다. 잘못된 기준으로 lead 를 맞추면 결함 5(비교 무효)를 반복한다.
-    그래서 기본값은 ``constant`` — 즉 기존 동작 그대로다.
+    ``timeline`` 의 합성 총 선행량은 resolved :class:`TrainingTimingContract`에서만
+    받는다. primary NPZ ``delay_samples``/compact FIR peak/S delay/handoff를 다시
+    숫자로 복사하거나 합의값으로 주입하는 경로는 허용하지 않는다.
     """
 
     model_config = _FROZEN
@@ -264,9 +272,48 @@ class RecordedANCDataset(IterableDataset):
         data_cfg: dict,
         split: str = "train",
         seed: int = 20260803,
+        timing_contract: TrainingTimingContract | None = None,
+        training_batch_size: int = 1,
+        resume_batch_index: int = 0,
+        transfer_repo_root: str | Path | None = None,
     ) -> None:
         super().__init__()
-        self.entries = read_manifest(manifest_path, split=split)
+        transfer_keys = {
+            "bootstrap_receipt",
+            "bootstrap_receipt_sha256",
+            "transfer_manifest",
+            "transfer_manifest_sha256",
+            "recorded_transfer_aggregate_sha256",
+        }
+        self._recorded_transfer: RecordedTrainingSnapshot | None = None
+        if any(data_cfg.get(key) is not None for key in transfer_keys):
+            if transfer_repo_root is None:
+                from ..config import REPO_ROOT
+
+                transfer_repo_root = REPO_ROOT
+            self._recorded_transfer = validate_recorded_training_snapshot(
+                data_cfg,
+                repo_root=transfer_repo_root,
+            )
+            manifest_absolute = Path(manifest_path).expanduser()
+            if not manifest_absolute.is_absolute():
+                manifest_absolute = Path(transfer_repo_root) / manifest_absolute
+            manifest_absolute = Path(str(manifest_absolute.absolute()))
+            if manifest_absolute != self._recorded_transfer.recorded_manifest.path:
+                raise TransferContractError(
+                    "RecordedANCDataset manifest가 transfer recorded_manifest와 다릅니다: "
+                    f"configured={manifest_absolute}, "
+                    f"validated={self._recorded_transfer.recorded_manifest.path}"
+                )
+            manifest_bytes = self._recorded_transfer.recorded_manifest.data
+            assert manifest_bytes is not None
+            self.entries = read_manifest_bytes(
+                manifest_bytes,
+                manifest_path=manifest_absolute,
+                split=split,
+            )
+        else:
+            self.entries = read_manifest(manifest_path, split=split)
         if not self.entries:
             raise ValueError(f"'{split}' split 세션이 없습니다: {manifest_path}")
         self.fs = int(data_cfg["sample_rate"])
@@ -286,6 +333,53 @@ class RecordedANCDataset(IterableDataset):
         fb = data_cfg.get("closed_loop", {}).get("feedback_delay_samples", [512, 1024])
         self.feedback_delay_range = (int(fb[0]), int(fb[1]))
         self.seed = int(seed)
+        self.training_batch_size = int(training_batch_size)
+        self.resume_batch_index = int(resume_batch_index)
+        if self.training_batch_size < 1 or self.resume_batch_index < 0:
+            raise ValueError("training_batch_size는 1 이상, resume_batch_index는 0 이상")
+
+        self.sampling_mode = str(data_cfg.get("recorded_sampling", "uniform_session"))
+        if self.sampling_mode not in {
+            "uniform_session",
+            "family_group_session_balanced",
+            "family_lineage_session_balanced",
+        }:
+            raise ValueError(
+                f"지원하지 않는 recorded_sampling: {self.sampling_mode!r}"
+            )
+        self._sampling_hierarchy: dict[str, dict[str, tuple[int, ...]]] = {}
+        if self.sampling_mode in {
+            "family_group_session_balanced",
+            "family_lineage_session_balanced",
+        }:
+            hierarchy: dict[str, dict[str, list[int]]] = {}
+            for index, entry in enumerate(self.entries):
+                family = str(entry.get("source_family") or "").strip()
+                group = str(entry.get("group_id") or "").strip()
+                if not family or not group:
+                    raise ValueError(
+                        "recorded_sampling=family_group_session_balanced에는 모든 manifest "
+                        f"entry의 source_family/group_id가 필요합니다: index={index}, "
+                        f"session_id={entry.get('session_id')!r}"
+                    )
+                if self.sampling_mode == "family_lineage_session_balanced":
+                    source_pool_group = str(
+                        entry.get("source_pool_group_id") or ""
+                    ).strip()
+                    if not source_pool_group or source_pool_group == group:
+                        raise ValueError(
+                            "family_lineage_session_balanced에는 lineage regroup 증거인 "
+                            "source_pool_group_id와 서로 다른 component group_id가 "
+                            f"필요합니다: session_id={entry.get('session_id')!r}"
+                        )
+                hierarchy.setdefault(family, {}).setdefault(group, []).append(index)
+            self._sampling_hierarchy = {
+                family: {
+                    group: tuple(indices)
+                    for group, indices in sorted(groups.items())
+                }
+                for family, groups in sorted(hierarchy.items())
+            }
 
         # 재정렬본 강제 여부. 기본은 폴백 허용(기존 세션/픽스처 호환)이고,
         # 파인튜닝 설정에서 true 로 켠다.
@@ -293,9 +387,34 @@ class RecordedANCDataset(IterableDataset):
         self.lead_mode = str(data_cfg.get("recorded_lead_mode", "constant"))
         if self.lead_mode not in {"constant", "timeline"}:
             raise ValueError(f"지원하지 않는 recorded_lead_mode: {self.lead_mode!r}")
-        # timeline 모드의 총 선행량 = D_noise + 합성 lead. 설정에서 **읽기만** 한다.
+        # timeline 은 재정렬된 시간축 위에서 K' 를 유도한다. 재정렬본이 없으면 그 유도가
+        # 원본 재생 배열 위에서 일어나 조용히 틀린다 — 그런데 기본값은 폴백 허용이었고
+        # 어느 설정에도 require_aligned_source 가 없었다 (2026-08-07 발견). 모드가
+        # 이미 그 요구를 함의하므로 설정에 맡기지 않는다.
+        if self.lead_mode == "timeline" and self.reference_mode == "digital":
+            self.require_aligned_source = True
+        self.timing_contract = timing_contract
+        if self.timing_contract is None and data_cfg.get("training_timing_contract"):
+            self.timing_contract = TrainingTimingContract.from_data_config(data_cfg)
+        if self.lead_mode == "timeline" and self.reference_mode == "digital":
+            if self.timing_contract is None:
+                raise ValueError(
+                    "recorded_lead_mode=timeline에는 실제 P(z) FIR에서 유도한 "
+                    "training_timing_contract가 필요합니다"
+                )
+            if (
+                int(self.timing_contract.digital_reference_lead_samples)
+                != self.digital_reference_lead
+            ):
+                raise ValueError(
+                    "training timing의 lead와 data 설정이 다릅니다: "
+                    f"{self.timing_contract.digital_reference_lead_samples} != "
+                    f"{self.digital_reference_lead}"
+                )
         self.total_advance_samples = (
-            int(data_cfg.get("d_noise_delay_samples", 0)) + self.digital_reference_lead
+            None
+            if self.timing_contract is None
+            else int(self.timing_contract.synthetic_total_advance_samples)
         )
         self.augment = RecordedAugmentConfig.from_data_config(data_cfg)
 
@@ -305,18 +424,34 @@ class RecordedANCDataset(IterableDataset):
         floor = 2 if self.augment.mix_probability > 0.0 else 1
         self.cache_size = max(floor, cache_size)
         self._cache: OrderedDict[int, tuple] = OrderedDict()
+        self._cache_files: dict[int, tuple[Path, ...]] = {}
         self._lead_plans: dict[int, RecordedLeadPlan] = {}
 
     # ------------------------------------------------------------------ 세션 I/O
     def _session_metadata(self, entry: dict) -> dict:
         path = Path(entry["path"], "session.json")
-        if not path.is_file():
-            return {}
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            if self._recorded_transfer is not None:
+                raw = self._recorded_transfer.read_verified_recorded_file(path)
+                value = json.loads(raw.decode("utf-8"))
+            else:
+                if not path.is_file():
+                    return {}
+                value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return {}
         return value if isinstance(value, dict) else {}
+
+    def _has_session_file(self, path: Path) -> bool:
+        if self._recorded_transfer is not None:
+            return self._recorded_transfer.has_recorded_file(path)
+        return path.is_file()
+
+    def _read_audio(self, path: Path) -> tuple[np.ndarray, int]:
+        if self._recorded_transfer is None:
+            return sf.read(path, dtype="float32", always_2d=True)
+        raw = self._recorded_transfer.read_verified_recorded_file(path)
+        return sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
 
     def lead_plan(self, index: int) -> RecordedLeadPlan:
         """세션 하나의 lead 부기. 실측 lead 의 **유일한** 유도 지점이다."""
@@ -338,24 +473,42 @@ class RecordedANCDataset(IterableDataset):
                     "session.json 에 timeline.aligned_lag_median_samples 가 없습니다 — "
                     "lead 를 추측으로 채우지 않습니다"
                 )
-            if self.total_advance_samples <= 0:
+            if self.timing_contract is None or self.total_advance_samples is None:
                 raise ValueError(
-                    "recorded_lead_mode=timeline 에는 data_cfg 의 d_noise_delay_samples 가 "
+                    "recorded_lead_mode=timeline 에는 training_timing_contract가 "
                     "필요합니다 (합성 브랜치의 총 선행량과 맞춰야 합니다)"
                 )
-            sigma = float(timeline.get("aligned_lag_robust_std_samples") or 0.0)
+            observed_sigma = float(
+                timeline.get("aligned_lag_robust_std_samples") or 0.0
+            )
+            if not np.isfinite(observed_sigma) or observed_sigma < 0.0:
+                raise ValueError(
+                    "timeline.aligned_lag_robust_std_samples는 유한한 0 이상이어야 "
+                    "합니다"
+                )
+            recorded_delay = float(timeline["aligned_lag_median_samples"])
             plan = RecordedLeadPlan.from_timeline(
                 total_advance_samples=self.total_advance_samples,
-                recorded_delay_samples=float(timeline["aligned_lag_median_samples"]),
+                recorded_delay_samples=recorded_delay,
                 constant_lead_samples=self.digital_reference_lead,
-                jitter_sigma_samples=max(jitter, sigma if self.augment.enabled else 0.0),
+                # 측정 robust std는 QA/evidence이지 증강 지시가 아니다. 공식 1차
+                # 실행의 config jitter=0을 세션 불확도로 몰래 다시 켜지 않는다.
+                jitter_sigma_samples=jitter,
             )
+            expected_lead = self.timing_contract.recorded_lead_samples(recorded_delay)
+            if int(plan.lead_samples) != expected_lead:  # pragma: no cover - 방어
+                raise ValueError(
+                    f"RecordedLeadPlan이 training timing과 다릅니다: "
+                    f"{plan.lead_samples} != {expected_lead}"
+                )
         self._lead_plans[index] = plan
         return plan
 
     def _load_session(self, entry: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         session_dir = Path(entry["path"])
-        mics, sr = sf.read(session_dir / "mics.wav", dtype="float32", always_2d=True)
+        metadata_path = session_dir / "session.json"
+        mics_path = session_dir / "mics.wav"
+        mics, sr = self._read_audio(mics_path)
         if sr != self.fs:
             raise ValueError(f"{session_dir}: 샘플레이트 {sr} != {self.fs}")
         if mics.shape[1] < 2:
@@ -367,19 +520,21 @@ class RecordedANCDataset(IterableDataset):
 
         # 재정렬본 우선. source.wav 는 재생 배열일 뿐 방출 시각이 아니다.
         aligned_path = session_dir / "source_aligned.wav"
+        has_aligned = self._has_session_file(aligned_path)
         if (
             self.require_aligned_source
             and self.reference_mode == "digital"
-            and not aligned_path.is_file()
+            and not has_aligned
         ):
             raise FileNotFoundError(
                 f"{session_dir}: source_aligned.wav 가 필요합니다 — source.wav 는 재생 "
                 "배열이지 ADC 시간축이 아닙니다 "
                 "(scripts/data/realign_recorded_sessions.py 를 먼저 도세요)"
             )
-        source_path = aligned_path if aligned_path.is_file() else session_dir / "source.wav"
-        if source_path.exists():
-            source, source_sr = sf.read(source_path, dtype="float32", always_2d=True)
+        source_path = aligned_path if has_aligned else session_dir / "source.wav"
+        has_source = self._has_session_file(source_path)
+        if has_source:
+            source, source_sr = self._read_audio(source_path)
             if source_sr != self.fs:
                 raise ValueError(
                     f"{session_dir}: {source_path.name} 샘플레이트 {source_sr} != {self.fs}"
@@ -394,20 +549,64 @@ class RecordedANCDataset(IterableDataset):
         else:
             source = np.zeros_like(err)
         n = min(err.size, ref.size, source.size)
+        if self._recorded_transfer is not None:
+            # session.json은 lead/lineage 의미를 결정하므로 audio cache와 같은
+            # generation에 계속 고정한다.
+            if not self._recorded_transfer.has_recorded_file(metadata_path):
+                raise TransferContractError(
+                    f"session.json이 transfer exact 집합에 없습니다: {metadata_path}"
+                )
+            self._recorded_transfer.assert_recorded_file_unchanged(metadata_path)
         return err[:n], ref[:n], source[:n]
+
+    def _transferred_session_paths(self, entry: dict) -> tuple[Path, ...]:
+        if self._recorded_transfer is None:
+            return ()
+        session_dir = Path(entry["path"])
+        paths = [session_dir / "mics.wav", session_dir / "session.json"]
+        aligned = session_dir / "source_aligned.wav"
+        source = (
+            aligned
+            if self._recorded_transfer.has_recorded_file(aligned)
+            else session_dir / "source.wav"
+        )
+        if self._recorded_transfer.has_recorded_file(source):
+            paths.append(source)
+        return tuple(paths)
 
     def _session(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         cached = self._cache.get(index)
         if cached is not None:
+            if self._recorded_transfer is not None:
+                for path in self._cache_files[index]:
+                    self._recorded_transfer.assert_recorded_file_unchanged(path)
             self._cache.move_to_end(index)
             return cached
         loaded = self._load_session(self.entries[index])
+        used_paths = self._transferred_session_paths(self.entries[index])
         self._cache[index] = loaded
+        self._cache_files[index] = used_paths
         while len(self._cache) > self.cache_size:
-            self._cache.popitem(last=False)
+            evicted_index, _ = self._cache.popitem(last=False)
+            self._cache_files.pop(evicted_index, None)
         return loaded
 
     # ------------------------------------------------------------------ 표본 추출
+    def _worker_rng(self, worker_id: int) -> np.random.Generator:
+        """worker마다 독립이면서 재시작 시 재현되는 sampler RNG."""
+
+        return np.random.default_rng(self.seed + int(worker_id) * 1013)
+
+    def _sample_session_index(self, rng: np.random.Generator) -> int:
+        if self.sampling_mode == "uniform_session":
+            return int(rng.integers(len(self.entries)))
+        families = tuple(self._sampling_hierarchy)
+        family = families[int(rng.integers(len(families)))]
+        groups = tuple(self._sampling_hierarchy[family])
+        group = groups[int(rng.integers(len(groups)))]
+        sessions = self._sampling_hierarchy[family][group]
+        return int(sessions[int(rng.integers(len(sessions)))])
+
     def _draw_pair(
         self, index: int, rng: np.random.Generator
     ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -484,13 +683,26 @@ class RecordedANCDataset(IterableDataset):
     def __iter__(self):
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
-        rng = np.random.default_rng(self.seed + worker_id * 1013)
+        num_workers = worker.num_workers if worker is not None else 1
         count = len(self.entries)
+        indices = worker_global_item_indices(
+            start_batch_index=self.resume_batch_index,
+            batch_size=self.training_batch_size,
+            worker_id=worker_id,
+            num_workers=num_workers,
+        )
 
-        while True:
-            pair = self._draw_pair(int(rng.integers(count)), rng)
-            if pair is None:
-                continue
+        for global_index in indices:
+            pair = None
+            attempt = 0
+            while pair is None:
+                rng = indexed_rng(self.seed, 0x524543, global_index, attempt)
+                pair = self._draw_pair(self._sample_session_index(rng), rng)
+                attempt += 1
+                if attempt > max(32, len(self.entries) * 2):
+                    raise RuntimeError(
+                        f"recorded global item {global_index}에 유효한 segment가 없습니다"
+                    )
             x_ref, d = pair
 
             if (
@@ -499,7 +711,7 @@ class RecordedANCDataset(IterableDataset):
                 and count > 1
                 and rng.random() < self.augment.mix_probability
             ):
-                other = self._draw_pair(int(rng.integers(count)), rng)
+                other = self._draw_pair(self._sample_session_index(rng), rng)
                 if other is not None:
                     a = float(rng.uniform(0.3, 1.0))
                     b = float(rng.uniform(*self.augment.mix_weight_range))
@@ -529,8 +741,24 @@ class RecordedANCDataset(IterableDataset):
             "reference_mode": self.reference_mode,
             "require_aligned_source": self.require_aligned_source,
             "lead_mode": self.lead_mode,
+            "sampling_mode": self.sampling_mode,
             "constant_lead_samples": self.digital_reference_lead,
             "total_advance_samples": self.total_advance_samples,
+            "training_timing_contract": (
+                None
+                if self.timing_contract is None
+                else self.timing_contract.model_dump()
+            ),
             "session_cache": self.cache_size,
             "augment": self.augment.model_dump(),
+            "transfer_manifest_sha256": (
+                None
+                if self._recorded_transfer is None
+                else self._recorded_transfer.transfer_manifest.sha256
+            ),
+            "recorded_transfer_aggregate_sha256": (
+                None
+                if self._recorded_transfer is None
+                else self._recorded_transfer.recorded_aggregate_sha256
+            ),
         }

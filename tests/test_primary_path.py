@@ -12,7 +12,9 @@ from deep_anc.config import REPO_ROOT, default_d_noise_delay
 from deep_anc.data.primary_path import resolve_digital_primary_path
 from deep_anc.data.synth_dataset import SynthANCDataset
 from deep_anc.dsp.secondary_path import load_secondary_path
+from deep_anc.dsp.timing import PlantDelays
 from deep_anc.train.trainer import (
+    cfg_snapshot,
     resolve_run_until_step,
     validate_resume_physics,
     validate_training_physics,
@@ -259,27 +261,20 @@ def test_resume_requires_matching_lead_and_physics_mode():
         },
         "require_measured_primary_path": True,
     }
-    matching = {
-        "cfg": {
-            "data": dict(cfg["data"]),
-            "physics_status": "measured_primary_path",
-            "digital_reference_lead_samples": 109,
-        }
-    }
-    validate_resume_physics(matching, cfg)
+    matching_cfg = cfg_snapshot(cfg)
+    matching = {"cfg": matching_cfg}
+    validate_resume_physics(matching, matching_cfg)
 
-    wrong_lead = {"cfg": dict(matching["cfg"], digital_reference_lead_samples=0)}
-    with pytest.raises(ValueError, match="lead 불일치"):
-        validate_resume_physics(wrong_lead, cfg)
+    wrong_lead_cfg = deepcopy(cfg)
+    wrong_lead_cfg["data"]["digital_reference_lead_samples"] = 0
+    with pytest.raises(ValueError, match="experiment contract 불일치"):
+        validate_resume_physics(matching, cfg_snapshot(wrong_lead_cfg))
 
-    wrong_mode = {
-        "cfg": dict(
-            matching["cfg"],
-            physics_status="secondary_surrogate_representation_pretrain",
-        )
-    }
-    with pytest.raises(ValueError, match="physics mode 불일치"):
-        validate_resume_physics(wrong_mode, cfg)
+    wrong_mode_cfg = deepcopy(cfg)
+    wrong_mode_cfg["data"]["digital_primary_path_mode"] = "secondary_surrogate"
+    wrong_mode_cfg["require_measured_primary_path"] = False
+    with pytest.raises(ValueError, match="experiment contract 불일치"):
+        validate_resume_physics(matching, cfg_snapshot(wrong_mode_cfg))
 
 
 def test_resume_rejects_legacy_checkpoint_without_physics_metadata():
@@ -309,6 +304,15 @@ def test_dataset_measured_primary_applies_fir_and_delay_once(tmp_path, configs):
     duct["digital_reference"].update(
         {"primary_path_npz": str(primary_path), "d_noise_delay_samples": 7}
     )
+    secondary = load_secondary_path(REPO_ROOT / duct["secondary_path"]["npz"])
+    data["digital_reference_lead_samples"] = int(
+        PlantDelays.from_config(
+            duct_cfg=duct,
+            secondary_delay_samples=secondary.delay_samples,
+            primary_delay_samples=7,
+            sample_rate=data["sample_rate"],
+        ).lead()
+    )
     ds = SynthANCDataset(
         data,
         duct,
@@ -337,6 +341,14 @@ def test_dataset_secondary_surrogate_applies_s_fir_with_d_noise_once(
     data = _dataset_config(data, "secondary_surrogate")
     duct["secondary_path"]["npz"] = str(secondary_path)
     duct["digital_reference"]["d_noise_delay_samples"] = 11
+    data["digital_reference_lead_samples"] = int(
+        PlantDelays.from_config(
+            duct_cfg=duct,
+            secondary_delay_samples=123,
+            primary_delay_samples=11,
+            sample_rate=data["sample_rate"],
+        ).lead()
+    )
     ds = SynthANCDataset(
         data,
         duct,

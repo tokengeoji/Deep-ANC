@@ -23,7 +23,24 @@ from deep_anc.train.process_lock import (               # noqa: E402
     autostart_state_dir,
     resolve_run_dir,
 )
-from deep_anc.train.trainer import Trainer             # noqa: E402
+from deep_anc.train.trainer import (                   # noqa: E402
+    Trainer,
+    preflight_canonical_resume,
+)
+
+
+def requires_same_run_lock(cfg: dict) -> bool:
+    return str(cfg.get("experiment_role", "")) in {
+        "canonical_pretrain",
+        "canonical_finetune",
+    } or any(
+        bool(cfg.get(name, False))
+        for name in (
+            "require_measured_primary_path",
+            "require_init_checkpoint",
+            "require_recorded_manifest",
+        )
+    )
 
 
 def main() -> int:
@@ -39,6 +56,9 @@ def main() -> int:
     cfg = load_train_config(args.config, args.overrides)
     if args.resume:
         cfg["resume"] = args.resume
+    # canonical resume은 ProcessLock/state-dir조차 만들기 전에 동일 immutable
+    # snapshot으로 contract/model/optimizer/scheduler/RNG를 전부 preview한다.
+    resume_preflight = preflight_canonical_resume(cfg)
 
     # measured/recorded fine-tune은 파일 존재만 확인하고 시작하지 않는다. official
     # P/S 품질·대역·동일 디지털 gain, lead, 완료된 init checkpoint, recorded 전수
@@ -59,26 +79,26 @@ def main() -> int:
                 flush=True,
             )
 
-    if is_guarded_finetune:
+    if requires_same_run_lock(cfg):
         run_dir = resolve_run_dir(cfg["ckpt_dir"])
         state_dir = autostart_state_dir(run_dir)
         # torchrun이면 rank0만 launcher/run lock을 소유한다. 모든 rank가 같은
         # flock을 잡으려 하면 정상 DDP 자체를 중복 실행으로 오인한다.
         if int(os.environ.get("RANK", "0")) != 0:
-            Trainer(cfg).train()
+            Trainer(cfg, resume_preflight=resume_preflight).train()
             return 0
         try:
             with ProcessLock(
                 state_dir / "train.lock",
-                role="fine-tune train",
+                role=f"{cfg.get('experiment_role', 'training')} train",
                 metadata={"run_dir": str(run_dir)},
             ):
-                Trainer(cfg).train()
+                Trainer(cfg, resume_preflight=resume_preflight).train()
         except LockHeldError as exc:
             print(f"[중단] {exc}", file=sys.stderr)
             return 3
     else:
-        Trainer(cfg).train()
+        Trainer(cfg, resume_preflight=resume_preflight).train()
     return 0
 
 

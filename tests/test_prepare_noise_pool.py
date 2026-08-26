@@ -13,6 +13,10 @@ prepare_noise_pool tests/`` 0건, ``gates_for_owner(...)`` 빈 튜플이었다. 
 from __future__ import annotations
 
 import importlib.util
+import fcntl
+import hashlib
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -20,6 +24,16 @@ import numpy as np
 import pytest
 import soundfile as sf
 import yaml
+
+from deep_anc.data.holdout_contract import EXPECTED_HISTORICAL_BUILDERS
+from deep_anc.data.public_lineage import (
+    ESC50_METADATA,
+    FMA_TRACKS,
+    LIBRISPEECH_CHAPTERS,
+    PUBLIC_LINEAGE_SCHEMA,
+    PublicLineageBuild,
+    canonical_json_sha256,
+)
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/data/prepare_noise_pool.py"
 FS = 48_000
@@ -50,13 +64,189 @@ def _build_tree(tmp_path: Path, present_tags: dict[str, float], ratios: dict[str
     for tag in present_tags:
         # data/raw/<계열>/<tag>/ — 스크립트가 깊이를 가정하지 않는지도 함께 본다.
         _write_clips(tmp_path / "data/raw" / f"{tag}_family" / tag, 6)
+    csv_hashes = {}
+    csv_paths = []
+    for pool_name in ("source_pool", "source_pool_v2"):
+        csv_path = tmp_path / "data" / pool_name / "sources.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path.write_text(
+            "source_family,session_index,group_id,path,seconds,clips\n"
+            f'environment,0,g0,{pool_name}/environment_000.wav,1.0,"[]"\n',
+            encoding="utf-8",
+        )
+        csv_paths.append(f"data/{pool_name}/sources.csv")
+        csv_hashes[pool_name] = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+
+    report_path = tmp_path / "results/provenance/source_pool_provenance_report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "PASS",
+                "authority": "historical_builder_reproduction_plus_pcm_validation",
+                "recorded_tree_protection": {"status": "PASS", "file_count": 1},
+                "historical_builders": EXPECTED_HISTORICAL_BUILDERS,
+                "post_repair_csv_sha256": csv_hashes,
+                "downstream_gates": {
+                    "active_holdout": {
+                        "status": "PASS",
+                        "active_session_count": 1,
+                        "active_source_row_count": 1,
+                        "total_clips": 4,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    holdout = tmp_path / "data/manifests/recorded_holdout.json"
+    holdout.parent.mkdir(parents=True, exist_ok=True)
+    families = {
+        "environment": ["held-env.wav"],
+        "machine": ["held-machine.wav"],
+        "music": ["held-music.wav"],
+        "speech": ["held-speech.wav"],
+    }
+    clip_rows = [
+        {
+            "family": family,
+            "clip": clips[0],
+            "content_sha256": f"{index + 1:x}" * 64,
+            "lineage_keys": [f"fixture_holdout:{family}"],
+        }
+        for index, (family, clips) in enumerate(sorted(families.items()))
+    ]
+    fixture_metadata = {
+        "librispeech_chapters": {
+            "path": LIBRISPEECH_CHAPTERS,
+            "sha256": "a" * 64,
+            "size": 1,
+        },
+        "fma_tracks": {"path": FMA_TRACKS, "sha256": "b" * 64, "size": 1},
+        "esc50": {"path": ESC50_METADATA, "sha256": "c" * 64, "size": 1},
+    }
+    holdout.write_text(
+        json.dumps(
+            {
+                "purpose": "test canonical active recorded provenance",
+                "scope": "active_sessions_only",
+                "active_session_count": 1,
+                "active_source_row_count": 1,
+                "source_rows": ["data/source_pool/environment/environment_000.wav"],
+                "sources_csv": csv_paths,
+                "sources_csv_sha256": csv_hashes,
+                "provenance_report": "results/provenance/source_pool_provenance_report.json",
+                "families": families,
+                "clip_lineage": {
+                    "schema_version": 1,
+                    "metadata": fixture_metadata,
+                    "clips": clip_rows,
+                    "clips_sha256": canonical_json_sha256(clip_rows),
+                },
+                "total_clips": 4,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return tmp_path
 
 
 def _run(module, root: Path, monkeypatch) -> int:
     monkeypatch.setattr(module, "REPO_ROOT", root)
+    holdout = root / "data/manifests/recorded_holdout.json"
+    expected = hashlib.sha256(holdout.read_bytes()).hexdigest() if holdout.is_file() else "0" * 64
+
+    def fixture_holdout_validator(path, *, repo_root, expected_sha256=None):
+        actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        if expected_sha256 is not None and actual != expected_sha256:
+            raise module.HoldoutContractError("fixture holdout SHA mismatch")
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        return {
+            "sha256": actual,
+            "families": payload["families"],
+            "clip_lineage": payload["clip_lineage"],
+        }
+
+    def fixture_public_lineage(entries_by_tag, *, tag_roots, repo_root, holdout_lineage):
+        rows_by_tag = {}
+        components = {}
+        for tag, entries in sorted(entries_by_tag.items()):
+            rows_by_tag[tag] = []
+            for entry in entries:
+                item = dict(entry)
+                digest = item["content_sha256"]
+                lineage_key = f"fixture_content:{digest}"
+                group = "public-lineage-" + canonical_json_sha256(
+                    {
+                        "lineage_keys": [lineage_key],
+                        "content_sha256": [digest],
+                    }
+                )
+                item["lineage_schema"] = PUBLIC_LINEAGE_SCHEMA
+                item["lineage_keys"] = [lineage_key]
+                item["group_id"] = group
+                rows_by_tag[tag].append(item)
+                components.setdefault(
+                    group,
+                    {
+                        "members": [],
+                        "tags": [],
+                        "lineage_keys": [lineage_key],
+                        "content_sha256": [digest],
+                        "excluded_by_holdout": False,
+                        "overlap": {
+                            "basename": [],
+                            "content_sha256": [],
+                            "lineage_keys": [],
+                        },
+                    },
+                )
+                components[group]["members"].append(
+                    f"{tag}:{len(components[group]['members'])}"
+                )
+                components[group]["tags"] = sorted(
+                    set(components[group]["tags"] + [tag])
+                )
+        metadata_path = repo_root / "configs/data_sim.yaml"
+        metadata_raw = metadata_path.read_bytes()
+        evidence = {
+            "schema_version": 1,
+            "lineage_schema": PUBLIC_LINEAGE_SCHEMA,
+            "metadata": {
+                "fixture": {
+                    "path": "configs/data_sim.yaml",
+                    "sha256": hashlib.sha256(metadata_raw).hexdigest(),
+                    "size": len(metadata_raw),
+                }
+            },
+            "component_count": len(components),
+            "component_membership_sha256": canonical_json_sha256(
+                {key: components[key] for key in sorted(components)}
+            ),
+            "components": {key: components[key] for key in sorted(components)},
+            "holdout_clips_sha256": holdout_lineage["clips_sha256"],
+            "excluded_by_tag": {tag: 0 for tag in sorted(entries_by_tag)},
+        }
+        return PublicLineageBuild(
+            rows_by_tag,
+            {tag: 0 for tag in sorted(entries_by_tag)},
+            evidence,
+        )
+
+    monkeypatch.setattr(module, "validate_holdout_contract", fixture_holdout_validator)
+    monkeypatch.setattr(module, "build_public_lineage", fixture_public_lineage)
     monkeypatch.setattr(
-        sys, "argv", ["prepare_noise_pool.py", "--out", "data/manifests"]
+        sys,
+        "argv",
+        [
+            "prepare_noise_pool.py",
+            "--out",
+            "data/manifests",
+            "--expected-holdout-sha256",
+            expected,
+        ],
     )
     return module.main()
 
@@ -82,6 +272,9 @@ def test_missing_declared_tag_fails_the_build(tmp_path, monkeypatch, capsys):
     assert "machine" in err and "[실패]" in err
     # 원인을 진단으로 남겨야 한다 — 조용한 폴백이 이 게이트가 막는 것이다.
     assert "폴백" in err
+    assert not list((root / "data/manifests").glob("*.jsonl")), (
+        "필수 태그가 빠진 실패 실행은 일부 manifest도 남기면 안 됩니다"
+    )
 
 
 def test_every_declared_tag_present_builds_all_manifests(tmp_path, monkeypatch, capsys):
@@ -111,8 +304,414 @@ def test_every_declared_tag_present_builds_all_manifests(tmp_path, monkeypatch, 
     assert "완료: manifest 3개" in out
     for tag in ("esc50", "speech", "music"):
         assert (root / "data/manifests" / f"{tag}.jsonl").is_file()
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["training_eligible"] is True
+    assert sidecar["holdout_sha256"] == hashlib.sha256(
+        (root / "data/manifests/recorded_holdout.json").read_bytes()
+    ).hexdigest()
+    assert set(sidecar["manifests"]) == {"esc50", "speech", "music"}
+    for tag, metadata in sidecar["manifests"].items():
+        assert metadata["sha256"] == hashlib.sha256(
+            (root / "data/manifests" / f"{tag}.jsonl").read_bytes()
+        ).hexdigest()
     # 비율 0 인 태그는 만들지도, 요구하지도 않는다.
     assert not (root / "data/manifests/demand.jsonl").exists()
+
+
+def test_missing_holdout_fails_before_writing_any_manifest(tmp_path, monkeypatch, capsys):
+    """학습용 manifest는 recorded holdout 없이 생성할 수 없다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    (root / "data/manifests/recorded_holdout.json").unlink()
+
+    assert _run(module, root, monkeypatch) == 1
+    assert "held-out 목록이 없습니다" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_allow_corpus_leak_is_an_explicit_diagnostic_only_escape_hatch(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    (root / "data/manifests/recorded_holdout.json").unlink()
+    monkeypatch.setattr(module, "REPO_ROOT", root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prepare_noise_pool.py",
+            "--out",
+            "results/diagnostics/leaky-pool",
+            "--allow-corpus-leak",
+        ],
+    )
+
+    assert module.main() == module.DIAGNOSTIC_ONLY_EXIT
+    assert "진단 전용" in capsys.readouterr().err
+    diagnostic = root / "results/diagnostics/leaky-pool"
+    assert (diagnostic / "esc50.jsonl").is_file()
+    sidecar = json.loads(
+        (diagnostic / "manifest_generation.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["training_eligible"] is False
+    assert sidecar["holdout"] is None
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_allow_corpus_leak_cannot_write_official_manifest_directory(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    monkeypatch.setattr(module, "REPO_ROOT", root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prepare_noise_pool.py", "--allow-corpus-leak"],
+    )
+
+    assert module.main() == 2
+    assert "official data/manifests" in capsys.readouterr().err
+    assert not list((root / "data/manifests").glob("*.jsonl"))
+
+
+def _seed_old_generation(root: Path, tags: tuple[str, ...]) -> dict[str, bytes]:
+    out = root / "data/manifests"
+    out.mkdir(parents=True, exist_ok=True)
+    expected: dict[str, bytes] = {}
+    for tag in tags:
+        payload = f'{{"old": "{tag}"}}\n'.encode()
+        (out / f"{tag}.jsonl").write_bytes(payload)
+        expected[f"{tag}.jsonl"] = payload
+    sidecar = b'{"build_id":"old"}\n'
+    (out / "manifest_generation.json").write_bytes(sidecar)
+    expected["manifest_generation.json"] = sidecar
+    return expected
+
+
+def test_staging_write_failure_preserves_entire_previous_generation(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 0.5, "speech": 0.5},
+        ratios={"esc50": 0.5, "speech": 0.5},
+    )
+    expected = _seed_old_generation(root, ("esc50", "speech"))
+    real_write = module.write_manifest
+    calls = 0
+
+    def fail_second_write(entries, path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second staging write failure")
+        return real_write(entries, path)
+
+    monkeypatch.setattr(module, "write_manifest", fail_second_write)
+
+    assert _run(module, root, monkeypatch) == 1
+    assert "기존 세대를 복구" in capsys.readouterr().err
+    for name, payload in expected.items():
+        assert (root / "data/manifests" / name).read_bytes() == payload
+
+
+def test_commit_rename_failure_rolls_back_every_installed_file(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 0.5, "speech": 0.5},
+        ratios={"esc50": 0.5, "speech": 0.5},
+    )
+    expected = _seed_old_generation(root, ("esc50", "speech"))
+    real_replace = os.replace
+    installs = 0
+
+    def fail_second_install(source, target):
+        nonlocal installs
+        source_path = Path(source)
+        if source_path.parent.name == "new":
+            installs += 1
+            if installs == 2:
+                raise OSError("injected second commit rename failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", fail_second_install)
+
+    assert _run(module, root, monkeypatch) == 1
+    assert "기존 세대를 복구" in capsys.readouterr().err
+    for name, payload in expected.items():
+        assert (root / "data/manifests" / name).read_bytes() == payload
+
+
+def test_postcondition_failure_rolls_back_complete_previous_generation(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 0.5, "speech": 0.5},
+        ratios={"esc50": 0.5, "speech": 0.5},
+    )
+    expected = _seed_old_generation(root, ("esc50", "speech"))
+
+    def reject_postcondition(*_args, **_kwargs):
+        raise RuntimeError("injected committed-generation postcondition failure")
+
+    monkeypatch.setattr(module, "_verify_committed_generation", reject_postcondition)
+    assert _run(module, root, monkeypatch) == 1
+    assert "기존 세대를 복구" in capsys.readouterr().err
+    for name, payload in expected.items():
+        assert (root / "data/manifests" / name).read_bytes() == payload
+
+
+def test_raw_tree_symlink_is_rejected_before_manifest_write(tmp_path, monkeypatch, capsys):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0},
+    )
+    outside = tmp_path / "outside-raw"
+    outside.mkdir()
+    (root / "data/raw/linked").symlink_to(outside, target_is_directory=True)
+
+    assert _run(module, root, monkeypatch) == 1
+    assert "symlink" in capsys.readouterr().err
+    assert not list((root / "data/manifests").glob("*.jsonl"))
+
+
+def test_concurrent_prepare_process_lock_fails_before_staging(tmp_path, monkeypatch):
+    module = _load_script()
+    root = tmp_path
+    monkeypatch.setattr(module, "REPO_ROOT", root)
+    parent = root / "data"
+    parent.mkdir()
+    config = root / "config.yaml"
+    config.write_text("source_mix_ratio: {}\n", encoding="utf-8")
+    descriptor = os.open(parent, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(module.ManifestTransactionError, match="다른 manifest prepare"):
+            module.write_generation_transactionally(
+                {},
+                out_dir=parent / "manifests",
+                data_config=config,
+                holdout_path=None,
+                seed=1,
+                training_eligible=False,
+            )
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    assert not list(parent.glob(".noise-manifest-stage-*"))
+
+
+def test_diagnostic_symlink_cannot_alias_official_manifest_directory(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    official = root / "data/manifests"
+    sentinel = official / "sentinel.jsonl"
+    sentinel.write_text("preserve\n", encoding="utf-8")
+    diagnostics = root / "results/diagnostics"
+    diagnostics.symlink_to("../data/manifests", target_is_directory=True)
+    monkeypatch.setattr(module, "REPO_ROOT", root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prepare_noise_pool.py",
+            "--out",
+            "results/diagnostics/leaky",
+            "--allow-corpus-leak",
+        ],
+    )
+
+    assert module.main() == 2
+    assert "symlink" in capsys.readouterr().err
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_generation_binds_raw_audio_content_and_returns_one_read_snapshot(
+    tmp_path, monkeypatch
+):
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    assert _run(module, root, monkeypatch) == 0
+    manifest_dir = root / "data/manifests"
+    snapshot = validate_manifest_generation(
+        manifest_dir,
+        required_tags={"esc50"},
+        repo_root=root,
+    )
+    entries = snapshot["_validated_entries"]["esc50"]
+    assert entries and all("content_sha256" in row for row in entries)
+    assert snapshot["schema_version"] == 3
+
+    # validator가 반환한 entry는 검증했던 동일 byte snapshot이다. 이후 JSONL 교체가
+    # snapshot을 바꾸지 않으며, raw bytes 교체는 다음 소비 검증에서 즉시 실패한다.
+    original_path = entries[0]["path"]
+    (manifest_dir / "esc50.jsonl").write_text('{"forged": true}\n', encoding="utf-8")
+    assert snapshot["_validated_entries"]["esc50"][0]["path"] == original_path
+    audio = Path(original_path)
+    audio.write_bytes(audio.read_bytes() + b"tamper")
+    # manifest SHA 오류가 raw hash보다 먼저 나지 않게 검증된 manifest bytes를 복구한다.
+    (manifest_dir / "esc50.jsonl").write_bytes(
+        snapshot["_validated_manifest_bytes"]["esc50"]
+    )
+    with pytest.raises(ValueError, match="raw content SHA 불일치"):
+        validate_manifest_generation(
+            manifest_dir,
+            required_tags={"esc50"},
+            repo_root=root,
+        )
+
+
+def test_noise_pool_rejects_raw_retarget_after_generation_validation(
+    tmp_path, monkeypatch
+):
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+    from deep_anc.data.noise_pool import NoisePool
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0},
+    )
+    assert _run(module, root, monkeypatch) == 0
+    snapshot = validate_manifest_generation(
+        root / "data/manifests", required_tags={"esc50"}, repo_root=root
+    )
+    entry = dict(snapshot["_validated_entries"]["esc50"][0])
+    entry["split"] = "train"
+    pool = NoisePool([], "train", FS, seed=1, validated_entries=[entry])
+
+    audio_path = Path(entry["path"])
+    audio, rate = sf.read(audio_path, dtype="float32")
+    sf.write(audio_path, audio * 0.5, rate)
+    with pytest.raises(RuntimeError, match="변경/retarget"):
+        pool.sample_segment(1024)
+
+
+def test_noise_pool_rejects_raw_root_symlink_after_validation(tmp_path, monkeypatch):
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+    from deep_anc.data.noise_pool import NoisePool
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0},
+    )
+    assert _run(module, root, monkeypatch) == 0
+    snapshot = validate_manifest_generation(
+        root / "data/manifests", required_tags={"esc50"}, repo_root=root
+    )
+    entry = dict(snapshot["_validated_entries"]["esc50"][0])
+    entry["split"] = "train"
+    pool = NoisePool([], "train", FS, seed=1, validated_entries=[entry])
+
+    raw_root = root / "data/raw"
+    moved = root / "data/raw-original"
+    raw_root.rename(moved)
+    raw_root.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symlink"):
+        pool.sample_segment(1024)
+
+
+def test_rollback_continues_after_one_restore_failure_and_preserves_both_errors(
+    tmp_path, monkeypatch
+):
+    module = _load_script()
+    root = tmp_path
+    monkeypatch.setattr(module, "REPO_ROOT", root)
+    config = root / "configs/data_sim.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("source_mix_ratio: {}\n", encoding="utf-8")
+    out = root / "data/manifests"
+    out.mkdir(parents=True)
+    old = _seed_old_generation(root, ("esc50", "speech"))
+    prepared = {
+        tag: (
+            [
+                {
+                    "path": f"/{tag}.wav",
+                    "duration_s": 1.0,
+                    "sample_rate": FS,
+                    "channels": 1,
+                    "tag": tag,
+                    "split": "train",
+                    "content_sha256": "a" * 64,
+                }
+            ],
+            0,
+            [],
+        )
+        for tag in ("esc50", "speech")
+    }
+    real_replace = os.replace
+    installs = 0
+
+    def fail_commit_then_one_rollback(source, target):
+        nonlocal installs
+        source_path = Path(source)
+        if source_path.parent.name == "new":
+            installs += 1
+            if installs == 3:
+                raise OSError("original commit failure")
+        if source_path.parent.name == "old" and source_path.name == "speech.jsonl":
+            raise OSError("injected speech rollback failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", fail_commit_then_one_rollback)
+    with pytest.raises(module.ManifestTransactionError) as captured:
+        module.write_generation_transactionally(
+            prepared,
+            out_dir=out,
+            data_config=config,
+            holdout_path=None,
+            seed=1,
+            training_eligible=False,
+        )
+    error = captured.value
+    assert "original commit failure" in str(error)
+    assert "injected speech rollback failure" in str(error)
+    assert len(error.rollback_errors) == 1
+    # speech 복구 실패 뒤에도 esc50 복구를 계속했다.
+    assert (out / "esc50.jsonl").read_bytes() == old["esc50.jsonl"]
+    assert error.recovery_dir.is_dir()
 
 
 def test_the_gate_is_declared_in_the_registry():
@@ -121,18 +720,23 @@ def test_the_gate_is_declared_in_the_registry():
     from deep_anc.ops.gate_registry import gates_for_owner
 
     declared = gates_for_owner("scripts/data/prepare_noise_pool.py")
-    assert [gate.gate_id for gate in declared] == ["noise_pool_declared_tags_exist"]
-    gate = declared[0]
-    assert gate.negative_fixture.startswith("tests/test_prepare_noise_pool.py::")
-    assert gate.positive_fixture.startswith("tests/test_prepare_noise_pool.py::")
+    assert [gate.gate_id for gate in declared] == [
+        "noise_pool_declared_tags_exist",
+        "noise_pool_recorded_holdout_required",
+    ]
+    assert all(
+        gate.negative_fixture.startswith("tests/test_prepare_noise_pool.py::")
+        and gate.positive_fixture.startswith("tests/test_prepare_noise_pool.py::")
+        for gate in declared
+    )
 
 
-def test_the_shipped_config_still_declares_tags_whose_sources_are_missing():
-    """출하 상태를 못 박는다 — 이 게이트는 지금 **실패하는 것이 정답**이다.
+def test_the_shipped_config_declares_a_nonempty_public_pool_contract():
+    """출하 config의 계약만 검사하고 ignored ``data/raw`` host 상태는 가정하지 않는다.
 
-    ``dns_fullband``/``demand``/``machine`` 원본은 실제로 유실됐다. 있는 척하지
-    않는다. 사람이 (원본 재수집) 또는 (혼합비에서 태그 제거) 중 하나를 선언해야
-    하고, 그때 이 테스트가 먼저 깨져서 결정이 눈에 띈다.
+    결손/완전 동작은 위의 독립 tmp fixture가 각각 고정한다. Elice bootstrap이 공개
+    코퍼스를 모두 받은 뒤에도 저장소 전체 pytest가 성공해야 하므로, 실제 머신에
+    적어도 하나가 없기를 요구하는 테스트는 빌드 완료와 모순이다.
     """
 
     from deep_anc.config import REPO_ROOT
@@ -141,10 +745,6 @@ def test_the_shipped_config_still_declares_tags_whose_sources_are_missing():
     pools = module.declared_pools(REPO_ROOT / "configs/data_sim.yaml")
     required = set(module.PoolPlan(pools=pools, roots=("data/raw",)).required_tags())
 
-    found = module.discover_tag_dirs(REPO_ROOT / "data/raw", frozenset(required))
-    if not (REPO_ROOT / "data/raw").is_dir():
-        pytest.skip("data/raw 가 없는 트리입니다 (.gitignore 대상)")
-    assert required - set(found), (
-        "선언 태그의 원본이 전부 생겼습니다 — prepare_noise_pool 이 이제 통과합니다. "
-        "이 테스트를 지우고 HANDOFF 의 '원본 유실' 항목을 닫으세요"
-    )
+    assert required
+    assert "synthetic" not in required
+    assert required <= {pool.tag for pool in pools}

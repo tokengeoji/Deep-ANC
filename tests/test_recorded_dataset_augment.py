@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+from deep_anc.config import REPO_ROOT, load_yaml
 from deep_anc.data.recorded_dataset import (
     RecordedANCDataset,
     RecordedAugmentConfig,
@@ -21,6 +22,7 @@ from deep_anc.data.recorded_dataset import (
     apply_same_fir,
     common_eq_kernel,
 )
+from deep_anc.dsp.timing import PlantDelays, TrainingTimingContract
 
 FS = 48000
 SEGMENT_SECONDS = 0.25
@@ -90,6 +92,21 @@ def _cfg(**overrides) -> dict:
         "closed_loop": {"feedback_delay_samples": [512, 1024]},
     }
     cfg.update(overrides)
+    if cfg.get("recorded_lead_mode") == "timeline" and "d_noise_delay_samples" in cfg:
+        # 실제 measured P fixture처럼 compact FIR의 최대 탭이 bulk 뒤 247에 있다.
+        fir = np.zeros(256, dtype=np.float32)
+        fir[247] = 1.0
+        primary_delay = int(cfg["d_noise_delay_samples"])
+        lead = int(cfg["digital_reference_lead_samples"])
+        cfg["training_timing_contract"] = TrainingTimingContract.derive(
+            primary_fir=fir,
+            plant_delays=PlantDelays(
+                primary_delay_samples=primary_delay,
+                secondary_delay_samples=primary_delay + lead,
+                handoff_samples=0,
+                sample_rate=FS,
+            ),
+        ).model_dump()
     return cfg
 
 
@@ -151,7 +168,11 @@ def test_timeline_lead_mode_refuses_sessions_without_measured_timeline(tmp_path)
     entry = _write_session(root, "20260806_000002_file")
     dataset = RecordedANCDataset(
         _manifest(tmp_path, [entry]),
-        _cfg(recorded_lead_mode="timeline", d_noise_delay_samples=1602),
+        _cfg(
+            recorded_lead_mode="timeline",
+            d_noise_delay_samples=1602,
+            recorded_augment={"enabled": True, "lead_jitter_samples": 0.0},
+        ),
         split="train",
     )
     with pytest.raises(ValueError, match="aligned_lag_median_samples"):
@@ -175,8 +196,10 @@ def test_timeline_lead_mode_derives_the_lead_from_the_session(tmp_path):
     )
     plan = dataset.lead_plan(0)
     assert plan.mode == "timeline"
-    assert plan.lead_samples == 1602 + 116 - 143  # = 1575
+    assert plan.lead_samples == 1602 + 247 + 116 - 143  # = 1822
     assert plan.recorded_delay_samples == pytest.approx(142.7)
+    assert plan.jitter_sigma_samples == 0.0
+    assert dataset.total_advance_samples == 1_965
 
 
 def test_default_lead_mode_keeps_the_configured_constant(tmp_path):
@@ -303,3 +326,111 @@ def test_session_cache_is_bounded(tmp_path):
     for index in range(5):
         dataset._session(index)
     assert len(dataset._cache) == 2
+
+
+def test_family_group_session_sampler_balances_each_hierarchy_level(tmp_path):
+    """세션 수가 9:1이어도 family가 9:1로 뽑히지 않는다."""
+
+    entries: list[dict] = []
+    for index in range(9):
+        entries.append(
+            {
+                "path": str(tmp_path / f"machine-{index}"),
+                "split": "train",
+                "session_id": f"machine-{index}",
+                "group_id": "machine-large" if index < 8 else "machine-small",
+                "source_family": "machine",
+            }
+        )
+    entries.append(
+        {
+            "path": str(tmp_path / "speech-0"),
+            "split": "train",
+            "session_id": "speech-0",
+            "group_id": "speech-only",
+            "source_family": "speech",
+        }
+    )
+    dataset = RecordedANCDataset(
+        _manifest(tmp_path, entries),
+        _cfg(recorded_sampling="family_group_session_balanced"),
+        split="train",
+        seed=20260803,
+    )
+    rng = dataset._worker_rng(0)
+    counts = {"machine": 0, "speech": 0}
+    machine_groups = {"machine-large": 0, "machine-small": 0}
+    for _ in range(20_000):
+        entry = dataset.entries[dataset._sample_session_index(rng)]
+        counts[entry["source_family"]] += 1
+        if entry["source_family"] == "machine":
+            machine_groups[entry["group_id"]] += 1
+    assert counts["machine"] / sum(counts.values()) == pytest.approx(0.5, abs=0.02)
+    assert machine_groups["machine-large"] / sum(machine_groups.values()) == pytest.approx(
+        0.5, abs=0.02
+    )
+
+
+def test_balanced_sampler_requires_family_and_group_and_is_worker_deterministic(tmp_path):
+    entry = {
+        "path": str(tmp_path / "session"),
+        "split": "train",
+        "session_id": "session",
+        "group_id": "group",
+        "source_family": "speech",
+    }
+    manifest = _manifest(tmp_path, [entry])
+    cfg = _cfg(recorded_sampling="family_group_session_balanced")
+    left = RecordedANCDataset(manifest, cfg, split="train", seed=77)
+    right = RecordedANCDataset(manifest, cfg, split="train", seed=77)
+    for worker_id in (0, 1, 3):
+        left_rng = left._worker_rng(worker_id)
+        right_rng = right._worker_rng(worker_id)
+        assert [left._sample_session_index(left_rng) for _ in range(20)] == [
+            right._sample_session_index(right_rng) for _ in range(20)
+        ]
+
+    broken = dict(entry)
+    broken.pop("group_id")
+    (tmp_path / "broken").mkdir()
+    with pytest.raises(ValueError, match="source_family/group_id"):
+        RecordedANCDataset(
+            _manifest(tmp_path / "broken", [broken]), cfg, split="train"
+        )
+
+
+def test_lineage_sampler_rejects_legacy_group_id_and_accepts_regrouped_manifest(tmp_path):
+    legacy = {
+        "path": str(tmp_path / "session"),
+        "split": "train",
+        "session_id": "session",
+        "group_id": "original-pool-group",
+        "source_family": "speech",
+    }
+    cfg = _cfg(recorded_sampling="family_lineage_session_balanced")
+    with pytest.raises(ValueError, match="source_pool_group_id"):
+        RecordedANCDataset(_manifest(tmp_path, [legacy]), cfg, split="train")
+
+    regrouped = {
+        **legacy,
+        "source_pool_group_id": "original-pool-group",
+        "group_id": "speech-lineage-component-0001",
+    }
+    accepted_dir = tmp_path / "accepted"
+    accepted_dir.mkdir()
+    dataset = RecordedANCDataset(
+        _manifest(accepted_dir, [regrouped]), cfg, split="train"
+    )
+    assert dataset.sampling_mode == "family_lineage_session_balanced"
+
+
+def test_shipped_recorded_augmentation_contract_is_safe_first_stage():
+    data = load_yaml(REPO_ROOT / "configs/data_sim.yaml")
+    assert data["recorded_sampling"] == "family_lineage_session_balanced"
+    augment = RecordedAugmentConfig.from_data_config(data)
+    assert augment.enabled
+    assert augment.polarity_flip
+    assert augment.eq_tilt_db > 0.0 and augment.eq_band_db > 0.0
+    assert augment.mic_noise_snr_db == (12.0, 40.0)
+    assert augment.mix_probability == 0.0
+    assert augment.lead_jitter_samples == 0.0

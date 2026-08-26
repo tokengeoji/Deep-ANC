@@ -72,6 +72,7 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
 PRECONDITION_CALLS = frozenset(
     {
         "assert_measurement_preconditions",
+        "assert_live_pcm_clock_preconditions",
         "input_rail_gate",  # 레일 게이트를 직접 부르는 진입점
     }
 )
@@ -331,3 +332,28 @@ def test_precondition_accepts_a_healthy_quiet_room():
     finally:
         audio_io.resolve_alsa_portaudio_device = original
     assert max(ratios) == 0.0
+
+
+def test_precondition_checks_both_pcm_endpoints_before_recording(monkeypatch):
+    """별도 USB 출력 PCM 점유도 입력 probe 전에 fail-closed여야 한다."""
+
+    import deep_anc.audio_io as audio_io
+
+    hardware = {
+        "sample_rate": 48_000,
+        "input": {"card": "APE", "pcm": 1},
+        "output": {"card": "Audio", "pcm": 0},
+    }
+
+    class _MustNotRecord:
+        def rec(self, *_args, **_kwargs):
+            raise AssertionError("PCM 무점유 확인 전에 rec를 열면 안 됩니다")
+
+    monkeypatch.setattr(
+        audio_io,
+        "assert_measurement_pcm_unoccupied",
+        lambda _hardware: (_ for _ in ()).throw(RuntimeError("output PCM busy")),
+    )
+
+    with pytest.raises(RuntimeError, match="output PCM busy"):
+        audio_io.assert_measurement_preconditions(_MustNotRecord(), hardware)

@@ -3,9 +3,11 @@
 
 왜 필요한가
 ----------
-측정 후처리 결함(2026-08-05 결함 1)은 원시 캡처가 남아 있으면 재생 없이 고칠 수
-있다. 실측: ``20260804_235822_03f4c088`` 를 재분석하면 150-1600Hz 반복 일관성이
-P 0.9797→0.9994, S 0.9689→0.9991 로 올라가고 lead 가 113→116 으로 바뀐다.
+측정 후처리 결함은 immutable 원시 캡처가 남아 있으면 재생 없이 진단할 수 있다. 다만
+옛 캡처처럼 실제 제출 PCM 관측값이나 q+joint-LS provenance가 없는 자료는
+``derived_not_observed`` 진단 결과일 뿐 official 승격이나 training-ready 근거가 될 수 없다.
+새 캡처만 actual int16 DAC 명령, time-domain clock witness, joint-LS 및 cubic crosscheck를
+모두 보존하며, ``--write``도 그 엄격한 schema를 만족할 때만 official pair를 만든다.
 
 무엇을 하지 않는가
 ----------------
@@ -23,8 +25,8 @@ P 0.9797→0.9994, S 0.9689→0.9991 로 올라가고 lead 가 113→116 으로 
 
   .venv/bin/python scripts/data/reanalyse_paths_interleaved.py \\
       results/calibration_interleaved/20260804_235822_03f4c088 --write \\
-      --primary-out assets/measured/primary_path_il.npz \\
-      --secondary-out assets/measured/secondary_path_il.npz
+      --primary-out assets/measured/primary_path_il_strict_<capture-id>.npz \\
+      --secondary-out assets/measured/secondary_path_il_strict_<capture-id>.npz
 """
 
 from __future__ import annotations
@@ -32,8 +34,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import io
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +107,34 @@ def reject_loosening(args: argparse.Namespace) -> None:
     이 함수가 없으면 게이트 전체가 무의미해진다.
     """
 
+    numeric = {
+        "fit-band": args.fit_band,
+        "consistency-band": args.consistency_band,
+        "required-band": args.required_band,
+        "min-alignment-score": [args.min_alignment_score],
+        "max-relative-tau-samples": [args.max_relative_tau_samples],
+        "max-drift-deviation-samples": [args.max_drift_deviation_samples],
+        "max-delay-jitter-ms": [args.max_delay_jitter_ms],
+        "max-delay-ms": [args.max_delay_ms],
+    }
+    for name, values in numeric.items():
+        array = np.asarray(values, dtype=np.float64).reshape(-1)
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{name}에 NaN/Inf를 쓸 수 없습니다")
+    for name, values in (
+        ("fit-band", args.fit_band),
+        ("consistency-band", args.consistency_band),
+        ("required-band", args.required_band),
+    ):
+        if len(values) != 2 or not 0.0 < float(values[0]) < float(values[1]):
+            raise ValueError(f"{name}은 증가하는 양의 [lo, hi]여야 합니다")
+    if int(args.fir_length) <= 0 or int(args.pre_roll) < 0:
+        raise ValueError("fir-length는 양수이고 pre-roll은 음수가 아니어야 합니다")
+    if int(args.pre_roll) >= int(args.fir_length):
+        raise ValueError("pre-roll은 fir-length보다 작아야 합니다")
+    if float(args.max_delay_ms) <= 0.0:
+        raise ValueError("max-delay-ms는 양수여야 합니다")
+
     checks = [
         (args.min_alignment_score < mpi.DEFAULT_MIN_ALIGNMENT_SCORE,
          "min-alignment-score"),
@@ -127,23 +159,62 @@ def load_capture(session: Path) -> dict[str, Any]:
     """
 
     npz_path = session / "raw_measurement.npz"
-    digest = hashlib.sha256(npz_path.read_bytes()).hexdigest()
-    with np.load(npz_path, allow_pickle=False) as data:
+    # 한 번 읽은 immutable byte snapshot으로 SHA와 np.load를 모두 수행한다. path를
+    # 두 번 열면 그 사이 rename/swap으로 "검사한 bytes != 분석한 bytes"가 될 수 있다.
+    raw_bytes = npz_path.read_bytes()
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    with np.load(io.BytesIO(raw_bytes), allow_pickle=False) as data:
         meta = json.loads(str(data["metadata_json"]))
-        recorded_raw = np.asarray(data["input_raw_int32"], dtype=np.int32)
-        preflight_raw = np.asarray(data["preflight_raw_int32"], dtype=np.int32)
-        playback = np.asarray(data["output"], dtype=np.float64)
+        recorded_raw = np.asarray(data["input_raw_int32"])
+        preflight_raw = np.asarray(data["preflight_raw_int32"])
+        stored_playback = np.asarray(data["output"])
+        stored_err = np.asarray(data["err"]) if "err" in data.files else None
+        stored_ref = np.asarray(data["ref"]) if "ref" in data.files else None
+        stored_output_pcm = (
+            np.asarray(data["output_pcm_int16"])
+            if "output_pcm_int16" in data.files
+            else None
+        )
 
-    # metadata.json 과 NPZ 안 사본이 일치해야 한다(둘 중 하나만 손댄 캡처 차단).
-    on_disk = json.loads((session / "metadata.json").read_text(encoding="utf-8"))
-    if json.dumps(on_disk, sort_keys=True) != json.dumps(meta, sort_keys=True):
-        raise ValueError("metadata.json 과 NPZ 내부 metadata_json 이 다릅니다")
+    # NPZ 내부 metadata_json이 canonical recovery source다. raw NPZ 승격 뒤 sidecar
+    # rename만 실패할 수 있으므로 sidecar 부재는 embedded metadata로 읽기 전용 복구한다.
+    # sidecar가 존재한다면 둘 중 하나만 손댄 위조는 계속 실패-폐쇄한다.
+    metadata_path = session / "metadata.json"
+    metadata_sidecar_recovered = not metadata_path.is_file()
+    if not metadata_sidecar_recovered:
+        on_disk = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if json.dumps(on_disk, sort_keys=True) != json.dumps(meta, sort_keys=True):
+            raise ValueError("metadata.json 과 NPZ 내부 metadata_json 이 다릅니다")
     if meta.get("invalid_reasons"):
         raise ValueError(f"캡처 자체가 결함입니다: {meta['invalid_reasons']}")
     if int(meta.get("telemetry", {}).get("xrun_count", 0)) != 0:
         raise ValueError("xrun 이 있는 캡처는 재분석해도 official 이 될 수 없습니다")
+    if int(meta.get("telemetry", {}).get("unexpected_status_count", 0)) != 0:
+        raise ValueError(
+            "unexpected callback status가 있는 캡처는 재분석해도 official 이 될 수 없습니다"
+        )
+    if meta.get("telemetry", {}).get("callback_error"):
+        raise ValueError(
+            "callback error가 있는 캡처는 재분석해도 official 이 될 수 없습니다"
+        )
+    if not bool(meta.get("telemetry", {}).get("completed", False)):
+        raise ValueError("완료되지 않은 캡처는 재분석해도 official 이 될 수 없습니다")
 
     fs = int(meta["sample_rate"])
+    channel_map = dict(meta.get("channel_map", mpi.OFFICIAL_CHANNEL_MAP))
+    if meta.get("raw_capture_schema") == mpi.RAW_CAPTURE_SCHEMA:
+        if fs != mpi.OFFICIAL_SAMPLE_RATE:
+            raise ValueError(
+                f"strict raw sample_rate={fs}; {mpi.OFFICIAL_SAMPLE_RATE}여야 합니다"
+            )
+        if meta.get("channel_map") != mpi.OFFICIAL_CHANNEL_MAP:
+            raise ValueError("strict raw channel_map이 official 0/1 계약과 다릅니다")
+        if meta.get("operator_confirmations") != {
+            "user_present": True,
+            "volume_minimum": True,
+            "routing_and_geometry": True,
+        }:
+            raise ValueError("strict raw operator confirmations가 없습니다")
     probe = build_interleaved_probe(
         sample_rate=fs, period_seconds=float(meta["period_seconds"]),
         band_hz=tuple(meta["design_band_hz"]), amplitude=float(meta["amplitude"]),
@@ -165,7 +236,80 @@ def load_capture(session: Path) -> dict[str, Any]:
     if recon != stored:
         raise ValueError(f"프로브 재구성 실패: channel_band_hz {recon} != {stored}")
 
-    err = pcm_int32_to_float32(recorded_raw)[:, 0].astype(np.float64)
+    # raw가 주장하는 ideal probe와 실제 callback에 제출한 int16 command를 모두
+    # metadata만으로 재구성한다. 어느 하나라도 없거나 한 code라도 다르면 다른 자극의
+    # 응답을 분석할 수 있으므로 fail-closed한다.
+    lead_in = int(meta.get("lead_in_samples", fs // 2))
+    total_periods = int(meta["warmup_periods"]) + int(meta["repeats"])
+    expected_playback = np.zeros(
+        (lead_in + total_periods * probe.period_samples, 2), dtype=np.float32
+    )
+    expected_playback[lead_in:, channel_map["noise_out"]] = np.tile(
+        probe.noise_signal, total_periods
+    )
+    expected_playback[lead_in:, channel_map["cancel_out"]] = np.tile(
+        probe.cancel_signal, total_periods
+    )
+    expected_frames = int(expected_playback.shape[0])
+    if recorded_raw.dtype != np.int32 or recorded_raw.shape != (expected_frames, 2):
+        raise ValueError(
+            f"input_raw_int32 dtype/shape 계약 위반: "
+            f"{recorded_raw.dtype} {recorded_raw.shape} != int32 {(expected_frames, 2)}"
+        )
+    if preflight_raw.dtype != np.int32 or preflight_raw.ndim != 2 or preflight_raw.shape[1] != 2:
+        raise ValueError("preflight_raw_int32은 [frames,2] int32여야 합니다")
+    telemetry = meta.get("telemetry", {})
+    if int(telemetry.get("captured_frames", expected_frames)) != expected_frames:
+        raise ValueError("telemetry.captured_frames가 expected playback frames와 다릅니다")
+    if stored_playback.dtype != np.float32 or not np.array_equal(
+        stored_playback, expected_playback
+    ):
+        raise ValueError("stored ideal output이 metadata로 재구성한 probe와 다릅니다")
+    expected_output_pcm = cw.float32_to_pcm_int16(expected_playback)
+    if stored_output_pcm is None:
+        # 구 캡처는 callback에 제출한 PCM 자체를 저장하지 않았다. ideal float가 exact인
+        # 경우에만 분석용으로 결정론적으로 복원하되, 관측 provenance로 승격하지 않는다.
+        output_pcm_provenance = mpi.OUTPUT_PCM_PROVENANCE_DERIVED
+    else:
+        if stored_output_pcm.dtype != np.int16 or not np.array_equal(
+            stored_output_pcm, expected_output_pcm
+        ):
+            raise ValueError("stored actual output_pcm_int16이 ideal probe 양자화와 다릅니다")
+        output_pcm_provenance = mpi.OUTPUT_PCM_PROVENANCE_OBSERVED
+    playback = stored_playback.astype(np.float64)
+
+    recorded = pcm_int32_to_float32(recorded_raw)
+    expected_err = recorded[:, channel_map["error_mic"]].astype(np.float32)
+    expected_ref = recorded[:, channel_map["reference_mic"]].astype(np.float32)
+    if stored_err is not None and (
+        stored_err.dtype != np.float32 or not np.array_equal(stored_err, expected_err)
+    ):
+        raise ValueError("stored err float32가 input_raw_int32 변환과 다릅니다")
+    if stored_ref is not None and (
+        stored_ref.dtype != np.float32 or not np.array_equal(stored_ref, expected_ref)
+    ):
+        raise ValueError("stored ref float32가 input_raw_int32 변환과 다릅니다")
+
+    recomputed_measurement = cw.analyze_int32_input_probe(recorded_raw)
+    if "measurement" in meta and json.dumps(
+        cw._json_safe(recomputed_measurement), sort_keys=True
+    ) != json.dumps(cw._json_safe(meta["measurement"]), sort_keys=True):
+        raise ValueError("measurement report가 input_raw_int32 재계산과 다릅니다")
+    channels = recomputed_measurement.get("channels", [])
+    if len(channels) < 2 or not all(bool(item.get("valid")) for item in channels[:2]):
+        raise ValueError("input_raw_int32 ERR/REF channel이 유효하지 않습니다")
+    recomputed_preflight = cw.analyze_int32_input_probe(preflight_raw)
+    stored_preflight = meta.get("preflight", {})
+    for key in ("frames", "channels"):
+        if json.dumps(
+            cw._json_safe(recomputed_preflight.get(key)), sort_keys=True
+        ) != json.dumps(cw._json_safe(stored_preflight.get(key)), sort_keys=True):
+            raise ValueError(f"preflight report {key}가 raw 재계산과 다릅니다")
+    if int(stored_preflight.get("sample_rate", fs)) != fs:
+        raise ValueError("preflight sample_rate가 capture sample_rate와 다릅니다")
+
+    err = recorded[:, channel_map["error_mic"]].astype(np.float64)
+    ref = recorded[:, channel_map["reference_mic"]].astype(np.float64)
     if meta.get("warp", {}).get("applied"):
         mono = playback[:, 0] + playback[:, 1]
         centres, delays, peaks = track_warp(
@@ -175,7 +319,6 @@ def load_capture(session: Path) -> dict[str, Any]:
 
     # lead_in 은 2026-08-05 이전 캡처에 기록돼 있지 않다. 그 시절 코드가 쓴 값이
     # fs//2 하나뿐이므로 그것을 기본값으로 쓰되, 기록이 있으면 기록을 따른다.
-    lead_in = int(meta.get("lead_in_samples", fs // 2))
     starts = [
         lead_in + (int(meta["warmup_periods"]) + k) * probe.period_samples
         for k in range(int(meta["repeats"]))
@@ -185,7 +328,9 @@ def load_capture(session: Path) -> dict[str, Any]:
             f"녹음이 짧아 마지막 주기를 자를 수 없습니다: {err.size} 샘플"
         )
 
-    preflight_err = pcm_int32_to_float32(preflight_raw)[:, 0].astype(np.float64)
+    preflight_err = pcm_int32_to_float32(preflight_raw)[
+        :, channel_map["error_mic"]
+    ].astype(np.float64)
     if preflight_err.size < probe.period_samples:
         preflight_err = np.pad(
             preflight_err, (0, probe.period_samples - preflight_err.size)
@@ -196,13 +341,128 @@ def load_capture(session: Path) -> dict[str, Any]:
     return {
         "meta": meta,
         "sha256": digest,
+        "metadata_sidecar_recovered": metadata_sidecar_recovered,
+        "output_pcm_provenance": output_pcm_provenance,
         "fs": fs,
         "probe": probe,
         "err": err,
+        "ref": ref,
+        "output_pcm_int16": (
+            expected_output_pcm
+            if stored_output_pcm is None
+            else stored_output_pcm.astype(np.int16, copy=False)
+        ),
         "period_starts": starts,
         "lead_in": lead_in,
         "snr_spectra": (signal_spectrum, noise_spectrum),
     }
+
+
+def require_observed_output_pcm_for_official(capture: dict[str, Any]) -> None:
+    """legacy 파생 PCM은 진단 분석만 허용하고 official 승격은 막는다."""
+
+    provenance = capture.get("output_pcm_provenance")
+    if provenance != mpi.OUTPUT_PCM_PROVENANCE_OBSERVED:
+        raise ValueError(
+            "official 저장에는 캡처 당시 관측한 output_pcm_int16이 필요합니다; "
+            f"provenance={provenance!r}"
+        )
+    meta = capture.get("meta", {})
+    if meta.get("raw_capture_schema") != mpi.RAW_CAPTURE_SCHEMA:
+        raise ValueError(
+            f"official 저장에는 strict raw schema {mpi.RAW_CAPTURE_SCHEMA!r}가 필요합니다"
+        )
+    if int(meta.get("sample_rate", -1)) != mpi.OFFICIAL_SAMPLE_RATE:
+        raise ValueError(
+            f"official 저장에는 sample_rate={mpi.OFFICIAL_SAMPLE_RATE}가 필요합니다"
+        )
+    if meta.get("channel_map") != mpi.OFFICIAL_CHANNEL_MAP:
+        raise ValueError(
+            f"official 저장에는 exact channel map {mpi.OFFICIAL_CHANNEL_MAP}가 필요합니다"
+        )
+    if meta.get("operator_confirmations") != {
+        "user_present": True,
+        "volume_minimum": True,
+        "routing_and_geometry": True,
+    }:
+        raise ValueError("official 저장에는 세 operator confirmation이 모두 필요합니다")
+    if bool(meta.get("warp", {}).get("applied", False)):
+        raise ValueError("legacy dewarp/warp 적용 캡처는 diagnostic-only이며 official이 될 수 없습니다")
+
+
+def require_official_analysis_contract(
+    capture: dict[str, Any], args: argparse.Namespace
+) -> None:
+    """official 재분석은 immutable raw에 캡처 전에 박힌 분석 계약과 exact해야 한다."""
+
+    meta = capture.get("meta", {})
+    contract = meta.get("analysis_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("strict raw analysis_contract가 없어 official 재분석할 수 없습니다")
+    fs = int(capture["fs"])
+    requested = {
+        "fit_band_hz": [float(v) for v in args.fit_band],
+        "consistency_band_hz": [float(v) for v in args.consistency_band],
+        "required_band_hz": [float(v) for v in args.required_band],
+        "fir_length": int(args.fir_length),
+        "pre_roll_samples": int(args.pre_roll),
+        "max_delay_samples": int(round(float(args.max_delay_ms) / 1000.0 * fs)),
+        "min_alignment_score": float(args.min_alignment_score),
+        "min_kept_repeats": int(args.min_kept_repeats),
+        "max_relative_tau_samples": float(args.max_relative_tau_samples),
+        "max_drift_deviation_samples": float(args.max_drift_deviation_samples),
+        "max_delay_jitter_samples": int(
+            round(float(args.max_delay_jitter_ms) / 1000.0 * fs)
+        ),
+    }
+    for key, value in requested.items():
+        stored = contract.get(key)
+        if isinstance(value, list):
+            equal = (
+                isinstance(stored, list)
+                and len(stored) == len(value)
+                and np.array_equal(
+                    np.asarray(stored, dtype=np.float64),
+                    np.asarray(value, dtype=np.float64),
+                )
+            )
+        elif isinstance(value, float):
+            equal = np.isfinite(value) and float(stored) == value
+        else:
+            equal = stored == value
+        if not equal:
+            raise ValueError(
+                f"official reanalysis parameter {key}={value!r}가 "
+                f"raw canonical {stored!r}와 다릅니다"
+            )
+    fixed = {
+        "clock_band_hz": list(mpi.CLOCK_BAND_HZ),
+        "clock_min_adjacent_score": mpi.CLOCK_MIN_ADJACENT_SCORE,
+        "clock_max_err_ref_delta_samples": mpi.CLOCK_MAX_ERR_REF_DELTA_SAMPLES,
+        "clock_max_subwindow_spread_samples": (
+            mpi.CLOCK_MAX_SUBWINDOW_SPREAD_SAMPLES
+        ),
+        "clock_max_adjacent_change_samples": mpi.CLOCK_MAX_ADJACENT_CHANGE_SAMPLES,
+        "clock_max_abs_period_delta_samples": (
+            mpi.CLOCK_MAX_ABS_PERIOD_DELTA_SAMPLES
+        ),
+        "separation_algorithm": mpi.SEPARATION_ALGORITHM,
+        "separation_algorithm_version": mpi.SEPARATION_ALGORITHM_VERSION,
+    }
+    for key, expected in fixed.items():
+        if contract.get(key) != expected:
+            raise ValueError(
+                f"raw analysis_contract {key}={contract.get(key)!r}; "
+                f"required={expected!r}"
+            )
+    unambiguous = int(capture["probe"].period_samples) // int(
+        capture["probe"].bin_step("noise")
+    )
+    if not (
+        0 <= requested["pre_roll_samples"] < requested["fir_length"] <= unambiguous
+        and requested["pre_roll_samples"] < requested["max_delay_samples"]
+    ):
+        raise ValueError("raw canonical FIR/pre-roll/max-delay sparse alias 계약 위반")
 
 
 def _backup_and_replace(path: Path, arrays: dict[str, Any], *, overwrite: bool) -> str:
@@ -240,6 +500,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     meta, fs, probe = capture["meta"], capture["fs"], capture["probe"]
+    if write:
+        try:
+            require_observed_output_pcm_for_official(capture)
+            require_official_analysis_contract(capture, args)
+        except ValueError as exc:
+            print(f"[중단] {exc}", file=sys.stderr)
+            return 2
     fit_band = (float(args.fit_band[0]), float(args.fit_band[1]))
     consistency_band = (
         float(args.consistency_band[0]), float(args.consistency_band[1])
@@ -249,7 +516,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         results, report = mpi.analyse_capture(
-            err=capture["err"], probe=probe,
+            err=capture["err"],
+            ref=capture["ref"],
+            output_pcm_int16=capture["output_pcm_int16"],
+            probe=probe,
             period_starts=capture["period_starts"],
             snr_spectra=capture["snr_spectra"],
             fir_length=int(args.fir_length), pre_roll=int(args.pre_roll),
@@ -309,7 +579,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    [미달] {', '.join(results[drive]['reasons'])}")
 
     valid = not results["noise"]["reasons"] and not results["cancel"]["reasons"]
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     params = {
         "min_alignment_score": float(args.min_alignment_score),
         "max_relative_tau_samples": float(args.max_relative_tau_samples),
@@ -327,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
         "source_capture_dir": str(session.relative_to(REPO_ROOT)),
         "source_capture_id": str(meta["capture_id"]),
         "source_npz_sha256": capture["sha256"],
+        "output_pcm_provenance": capture["output_pcm_provenance"],
         "params": params,
         "valid": bool(valid),
         "anchor_repeat": anchor,
@@ -375,16 +645,41 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
-    out_dir = session / f"reanalysis_{stamp}"
-    out_dir.mkdir(parents=True, exist_ok=False)
+    if args.overwrite:
+        print(
+            "[중단] pair-atomic official은 기존 파일을 in-place 교체하지 않습니다; "
+            "새 P/S 경로를 지정하세요",
+            file=sys.stderr,
+        )
+        return 2
     channel_band = {k: tuple(map(float, v)) for k, v in meta["channel_band_hz"].items()}
     try:
         primary_out = cw._repo_path(args.primary_out)
         secondary_out = cw._repo_path(args.secondary_out)
         if primary_out == secondary_out:
             raise ValueError("P 와 S 는 다른 파일이어야 합니다")
-        notes = {}
-        for drive, out_path in (("noise", primary_out), ("cancel", secondary_out)):
+        analysis_suffix = (
+            ".reanalysis_"
+            + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ_")
+            + uuid.uuid4().hex[:8]
+        )
+        summary["intended_primary_out"] = str(primary_out)
+        summary["intended_secondary_out"] = str(secondary_out)
+        analysis_paths = mpi.write_analysis_outputs_atomic(
+            session,
+            metadata=summary,
+            arrays=mpi.analysis_provenance_arrays(results, report),
+            suffix=analysis_suffix,
+        )
+        source_raw_path = str((session / "raw_measurement.npz").relative_to(REPO_ROOT))
+        source_analysis_path = str(
+            analysis_paths["results"].relative_to(REPO_ROOT)
+        )
+        source_analysis_sha256 = hashlib.sha256(
+            analysis_paths["results"].read_bytes()
+        ).hexdigest()
+        official: dict[str, dict[str, Any]] = {}
+        for drive in ("noise", "cancel"):
             item = results[drive]
             arrays = mpi._official_arrays(
                 model=item["model"],
@@ -395,6 +690,8 @@ def main(argv: list[str] | None = None) -> int:
                 amplitude=float(meta["amplitude"]),
                 block_size=int(meta["block_size"]),
                 latency=str(meta["latency"]),
+                channel_map=dict(meta["channel_map"]),
+                operator_confirmations=dict(meta["operator_confirmations"]),
                 output_channel=item["output_channel"],
                 repeats=int(keep.sum()),
                 xrun_count=int(meta["telemetry"].get("xrun_count", 0)),
@@ -404,7 +701,17 @@ def main(argv: list[str] | None = None) -> int:
                 probe=probe, drive=drive, snr_db=item["snr_db"],
                 period_seconds=float(meta["period_seconds"]),
                 drift_samples_per_period=float(report["drift_samples_per_period"]),
+                max_drift_deviation_samples=float(
+                    args.max_drift_deviation_samples
+                ),
                 relative_tau_max_abs=float(report["relative_tau_max_abs"]),
+                source_raw_npz_path=source_raw_path,
+                source_raw_npz_sha256=capture["sha256"],
+                source_analysis_npz_path=source_analysis_path,
+                source_analysis_npz_sha256=source_analysis_sha256,
+                output_pcm_provenance=capture["output_pcm_provenance"],
+                separation=report["separation"],
+                separation_crosscheck=report["separation_crosscheck"],
             )
             arrays["consistency_band_hz"] = np.asarray(consistency_band, np.float64)
             arrays["reanalysed"] = np.bool_(True)
@@ -413,32 +720,27 @@ def main(argv: list[str] | None = None) -> int:
             arrays["reanalysis_params_json"] = np.str_(
                 json.dumps(params, sort_keys=True)
             )
-            notes[drive] = _backup_and_replace(
-                out_path, arrays, overwrite=bool(args.overwrite)
-            )
+            official[drive] = arrays
+        mpi.write_official_pair_atomic(
+            primary_out,
+            official["noise"],
+            secondary_out,
+            official["cancel"],
+        )
     except (OSError, ValueError, FileExistsError) as exc:
-        print(f"[중단] 저장 실패: {exc}", file=sys.stderr)
-        (out_dir / "report.json").write_text(
-            json.dumps(cw._json_safe(summary), ensure_ascii=False, indent=2,
-                       sort_keys=True) + "\n",
-            encoding="utf-8",
+        print(
+            f"[중단] 저장 실패: {exc}. immutable raw 및 완성된 versioned analysis는 "
+            "삭제하지 않았습니다",
+            file=sys.stderr,
         )
         return 2
 
-    summary["primary_out"] = str(primary_out.relative_to(REPO_ROOT))
-    summary["secondary_out"] = str(secondary_out.relative_to(REPO_ROOT))
-    (out_dir / "report.json").write_text(
-        json.dumps(cw._json_safe(summary), ensure_ascii=False, indent=2, sort_keys=True)
-        + "\n",
-        encoding="utf-8",
-    )
     print(
-        f"\n[성공] P {primary_out.relative_to(REPO_ROOT)} ({notes['noise']})\n"
-        f"       S {secondary_out.relative_to(REPO_ROOT)} ({notes['cancel']})\n"
-        f"       리포트 {(out_dir / 'report.json').relative_to(REPO_ROOT)}\n\n"
-        f"duct.yaml: d_noise_delay_samples: {p_delay}\n"
-        f"data_sim.yaml: digital_reference_lead_samples: {lead} "
-        f"(= S {s_delay} + handoff {handoff} − P {p_delay})"
+        mpi.official_pair_success_message(
+            primary_out,
+            secondary_out,
+            repository_root=REPO_ROOT,
+        )
     )
     return 0
 

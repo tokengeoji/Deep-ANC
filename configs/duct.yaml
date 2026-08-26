@@ -59,21 +59,9 @@ secondary_path:                 # 학습·런타임·평가가 공용하는 단�
   handoff_extra_samples: 256
 
 digital_reference:
-  # noise 출력→error mic ESS 측정 compact FIR+순수지연 NPZ. 측정 전에는 null이며,
-  # data_sim.digital_primary_path_mode=measured일 때만 필수로 로드한다.
+  # noise 출력→error mic의 compact FIR+순수지연 단일 출처. measured는 FIR+delay를,
+  # canonical secondary_surrogate는 delay를 이 NPZ에서 직접 읽는다. 절대 지연을
+  # YAML 숫자로 복사하면 같은 캡처의 P/S 관계가 깨지므로 별도 delay 키는 두지 않는다.
   primary_path_npz: assets/measured/primary_path_il.npz
-  # digital-ref 모드의 1차경로 순수지연(소음 ch0 출력 → 에러마이크 도달까지의 "총" 지연).
-  # scripts/data/calibrate_wideband.py --output-channel noise 로 실측 후 그 값을 그대로 기입. [교차검증 C2]
-  # 주의: 시뮬 RIR(p_err)에는 음향 온셋 t_ac(NS→ERR)가 이미 포함되어 있어, 코드가
-  # RIR 과 결합할 때 t_ac 를 자동으로 빼고 전기/버퍼 성분만 적용한다 (이중 계상 방지).
-  #
-  # 주의: 이 절대 지연은 **캡처 간에 재현되지 않는다**. 재생/녹음 클록이 364~729ppm
-  # 어긋나 캡처 안에서도 주기당 2.2~4.4샘플 흐르고, 값 자체가 정렬 앵커 선택에
-  # 의존한다(03f4c088: 앵커 0 → 1608, 앵커 6 → 1646). 캡처 간 편차는 latency=low
-  # 1565~1659 / latency=high 2858~2888 다.
-  # 재현되는 물리량은 **P−S = 140 샘플**(유효 캡처 9건에서 139~141)과
-  # **lead = 116**(115~117)뿐이며, 그래서 이 값은 S 와 **같은 캡처·같은 앵커**에서
-  # 나온 것만 함께 써야 한다. 아래는 225546_f7b0fecd 재분석(앵커 13) 값이다.
-  d_noise_delay_samples: 1602
 
 # 입출력 정규화 스케일은 모델 설정(model_*.yaml io_scale)이 단일 출처다 (감사 M8)

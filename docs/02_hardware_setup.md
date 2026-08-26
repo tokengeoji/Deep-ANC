@@ -142,6 +142,67 @@ probe를 다시 실행한다. 이 결과를 이유로 Jetson 시스템 설정을
 probe는 raw code 다양성, float 변환 RMS, peak, clipping을 함께 검사한다. 19:29 기준 두 채널
 모두 PASS했지만 출력 직전마다 다시 확인하고, 실패 시 `--force`나 재생으로 우회하지 않는다.
 
+### Official P/S 연결 창 순서
+
+긴 녹음은 선행하지 않는다. 먼저 전체 pytest, 장치 무점유 확인, 입력 probe와 아래 무음
+dry-run을 끝낸다. 그 뒤 사용자 입회와 볼륨 최소 상태에서만 연속 운영 절차를 시작한다.
+meter는 input-only preflight 1.5초 뒤 nominal **20.0초**/hard-max **21.0초**, strict P/S는
+input-only preflight 총 3.0초 뒤 nominal **12.5초**/hard-max **13.5초**다. nominal audible
+합계는 **32.5초**지만 장치 기동·명령 인계·분리/재연결을 포함한 wall-clock 시간은 고정값이
+아니다. 각 출력 close 안내 즉시 물리 분리하고, 앰프 노브는 바꾸지 않은 채 다음 명령 직전에만
+다시 연결한다. 분석 중에는 스피커가 필요 없다.
+
+최초 1회에는 paired evidence가 아직 없으므로 정상 live gate가 `BLOCKED`인 것이 맞다. 이를
+우회하는 일반 옵션은 없고, 아래의 명시적 bootstrap 두 명령만 허용된다. 첫 명령이 fresh
+meter raw+SHA receipt를 새 경로에 보존하고, 두 번째 명령이 그 경로·10분 freshness·동일
+logical hardware/channel과 ALSA physical fingerprint(`/proc/asound` PCM info, sysfs
+realpath/uevent/안정 속성), recipe/status/target 및 운영자의 같은 노브 확인을 검증한다.
+이 fingerprint를 live에서 수집할 수 없거나 evidence/meter/strict 중 하나와 다르면 출력 전에
+실패한다. 이어서 **추가 자극 없이**
+기존 12.5초 strict raw를 interleaved half로 사용해
+`assets/measured/measurement_level_evidence.json`을 원자 생성·재검증한 뒤에만 P/S 분석과
+official NPZ 승격으로 간다.
+
+```bash
+# 1) 소리 없음: 코드와 exact official 파라미터/출력 경로 검증
+.venv/bin/python -m pytest -q
+.venv/bin/python scripts/data/measure_paths_interleaved.py --dry-run \
+    --primary-out results/path_measurement_next/p.npz \
+    --secondary-out results/path_measurement_next/s.npz
+
+# 2) 최초 1회 bootstrap: 사용자 입회·시작 전 볼륨 최소(출력 20초)
+.venv/bin/python scripts/data/set_amp_level.py --bootstrap-level-evidence \
+    --confirm-speaker --confirm-user-present --confirm-volume-minimum
+
+# 위 명령이 출력한 meter_raw.npz 상대경로를 그대로 복사한다. 노브를 바꾸지 않는다.
+METER_RAW=results/calibration_interleaved/level_bootstrap/<session>/meter_raw.npz
+
+# 3) 같은 노브 확인 후 strict P/S(출력 스트림 12.5초, 별도 level probe 없음)
+.venv/bin/python scripts/data/measure_paths_interleaved.py \
+    --bootstrap-level-evidence --meter-raw "$METER_RAW" \
+    --confirm-same-amplifier-setting --confirm-user-present \
+    --confirm-volume-minimum \
+    --confirm-routing-and-geometry \
+    --primary-out assets/measured/primary_path_il_strict_<capture-id>.npz \
+    --secondary-out assets/measured/secondary_path_il_strict_<capture-id>.npz
+```
+
+meter PASS가 출력한 fresh raw 경로와 충돌 없는 `<capture-id>` 출력명을 포함한 **strict 명령
+전체를 그대로 복사**한다. meter 세션에는 `meter_raw.npz`와 `meter_raw.receipt.json`, strict
+세션에는 `raw_measurement.npz`, `metadata.json`, `analysis_results.npz`,
+`analysis_metadata.json`이 생긴다. 최초 bootstrap PASS 때만 paired evidence JSON이 생기고,
+모든 분석 gate PASS 뒤 새 P/S NPZ가 no-replace로 승격된다. 기존 legacy P/S는 덮어쓰지 않는다.
+canonical evidence가 이미 있는 이후에도 모든 strict live는 fresh meter가 필수다.
+`set_amp_level.py`를 bootstrap 옵션 없이 같은 세 confirmation으로 실행하고, 출력된
+`--meter-raw` strict 명령(bootstrap 옵션 없음)을 그대로 쓴다. 영구 evidence는 calibration
+근거일 뿐 현재 앰프 노브 증거가 아니다.
+
+`[스피커 출력 종료]`가 표시되는 즉시 스피커/앰프를 분리한다. meter→strict 시작 간격은
+10분 이하여야 하며 receipt/SHA, 장치/채널, exact peak 0.003 recipe, xrun/close/완료 상태,
+meter 목표와 strict ERR noise-bin 중 하나라도 어긋나면 raw만 보존하고 승격하지 않는다.
+실패했더라도 보존 raw를 오프라인 분석하기 전에는 재측정하지 않는다. strict P/S 전 항목이
+PASS하기 전에는 기존 82세션을 대체하는 장시간 재녹음을 시작하지 않는다.
+
 입력 복구 전에도 noise speaker ch0의 출력 채널·누설·주관적 공진만 확인하려면, 사용자 입회와
 앰프 볼륨 최저를 실제로 확인한 뒤 다음 정성 진단을 사용할 수 있다.
 
@@ -161,22 +222,32 @@ probe는 raw code 다양성, float 변환 RMS, peak, clipping을 함께 검사�
 
 ## 4. 2차경로 S(z) 보정
 
-### 현재 자산 (assets/measured/)
+### 역사적 자산 (assets/measured/, 현재 training-ready 아님)
 
 | 파일 | delay | 검증 대역 | 그 대역 일관성 | 전대역 | 유지/전체 | 방식 | 비고 |
 |---|---:|---|---:|---:|---:|---|---|
-| `primary_path_il.npz` | **1602** | 150–1600Hz | **0.9993** | **0.9988** | 18/48 | interleaved | **채택 P(z)** (재발행 2026-08-05) |
-| `secondary_path_il.npz` | **1462** | 150–1600Hz | **0.9990** | **0.9984** | 18/48 | interleaved | **채택 S(z)** — P 와 같은 capture·앵커 |
+| `primary_path_il.npz` | **1602** | 150–1600Hz | **0.9993** | **0.9988** | 18/48 | interleaved | legacy diagnostic P(z), 재사용 금지 |
+| `secondary_path_il.npz` | **1462** | 150–1600Hz | **0.9990** | **0.9984** | 18/48 | interleaved | legacy diagnostic S(z), 재사용 금지 |
 | `*_il.npz.orig` | 1608 / 1465 | 150–600Hz | 0.973 / 0.956 | 0.920 / **0.781** | 16/16 | interleaved | **오염본 백업** (아래 경고) |
 | `secondary_path_4s.npz` | 1342 | 150–600Hz | 0.40 | — | — | 순차 ESS | 폐기 (2026-08-05) |
 | `secondary_path_legacy_512high.npz` | 2613 | — | 0.27 | — | — | 순차 ESS | 구버전 기록용 (block 512/high) |
 
-`P − S = 140`, `lead = 116`, 앵커 반복 13, `capture_id = f7b0fecd…`.
-채택본 두 개는 **한 번의 재생으로 동시에** 측정했고 `capture_id` 가 일치한다. 순차 ESS 는
+`P − S = 140`, `lead = 116`, 앵커 반복 13, `capture_id = f7b0fecd…`는 역사적 진단값이다.
+두 파일은 한 번의 재생에서 나왔지만, 그것만으로 현재 official 계약을 충족하지 않는다.
+순차 ESS 는
 두 측정 사이에 일어난 **출력 버퍼 프레임 슬립**이 P/S 상대 지연에 실려 lead 를 틀리게
-만든다 — **클록 드리프트가 아니다.** 두 클록의 상대 드리프트는 **+0.4 ppm**(10분에 12샘플)
-으로 lead(116샘플)를 틀리게 만들 크기가 아니며, 둘 다 +17 ppm 으로 같은 Tegra 발진기를
-공유한다(USB 싱크 ADAPTIVE).
+만들 수 있다. 여기에 더해 USB DAC와 Tegra I²S ADC는 비동기다. 보존된 interleaved raw A의
+adjacent-cycle 시간영역 관측은 주기당 약 **+620 ppm**을 보였고, 1600 Hz 톤을 약 0.124 bin
+옮겨 guard=1 정수 FFT의 1--1.6 kHz P/S 교차성분을 약 15%까지 만들었다. 따라서 새 official
+측정은 ERR/REF 공통 ``q`` 관측, 실제 제출 int16 PCM 기반 fractional-frequency joint LS,
+cubic playback-grid 교차검증을 모두 통과해야 한다. ``+0.4 ppm/같은 Tegra 발진기``라는 이전
+결론은 이 raw 증거와 모순되어 폐기한다.
+
+현재 training-ready P/S는 **없다**. 새 측정은 48k/256/low, ERR0/REF1/NS0/CS1을 고정하고
+운영자가 볼륨 최저와 배선/기하를 각각 확인해야 한다. raw에는 실제 submitted int16 PCM과
+두 확인을 저장하고, q+joint-LS+cubic gate와 immutable raw/analysis SHA가 모두 통과해야 한다.
+옛 raw를 `--dry-run`으로 분석하는 것은 진단만 가능하며 `derived_not_observed` 결과나 누락된
+provenance를 official로 승격할 수 없다.
 
 > [!CAUTION]
 > **`.orig` 백업본(전대역 S 0.781 / P 0.920)은 오염된 반복 5개를 포함한 값이다.**
@@ -190,7 +261,7 @@ probe는 raw code 다양성, float 변환 RMS, peak, clipping을 함께 검사�
 > **→ "600 Hz 위는 스피커 물리 한계" 는 틀렸다. 진짜 한계는 80–150Hz 뿐이다**
 > (클린 후에도 S 0.706~0.758). 상세: [docs/12 §2.3](12_system_summary.md#23-실측-경로-자산).
 >
-> 스피커를 울리지 않고 저장된 캡처를 재분석하려면:
+> 스피커를 울리지 않고 저장된 legacy 캡처를 **진단용으로만** 재분석하려면:
 > `.venv/bin/python scripts/data/reanalyse_paths_interleaved.py <세션 디렉터리> --dry-run`
 
 `excitation_band_hz` 는 **두 경로가 다르다** — 인터리브라 두 채널이 인접 FFT 빈을 번갈아
@@ -212,8 +283,8 @@ gradient 를 지배해 신뢰 구간 성능까지 잃는다.
 # digital-ref 1차경로 지연 실측: 소음 스피커(ch0) → 에러 마이크
 .venv/bin/python scripts/data/calibrate_wideband.py --output-channel noise \
     --out assets/measured/primary_path_wb.npz
-# → duct.yaml digital_reference.primary_path_npz에 위 NPZ 경로,
-#   d_noise_delay_samples에 출력된 delay를 함께 기입
+# → 새 strict primary/secondary NPZ 경로만 고정한다. 지연/lead는 NPZ provenance를 읽는
+#   TrainingTimingContract가 유도하며 duct.yaml에 숫자를 손으로 옮기지 않는다.
 ```
 
 ## 5. 안전 수칙

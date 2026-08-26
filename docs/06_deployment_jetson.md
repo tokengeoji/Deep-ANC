@@ -1,5 +1,9 @@
 # 06. Jetson AGX Orin 배포
 
+> **진입 조건:** ONNX/TensorRT export와 실제 ANC ON 실행은 canonical recorded test G4와
+> 별도 natural-crest challenge가 모두 PASS한 뒤에만 진행한다. 기존 corrected checkpoint와
+> ONNX는 diagnostic artifact이며 새 배포 후보가 아니다.
+
 ## 1. 환경 (구축 완료 상태 기록)
 
 | 항목 | 값 |

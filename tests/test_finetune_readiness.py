@@ -3,15 +3,37 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile as sf
 import torch
+import yaml
 
-from deep_anc.config import REPO_ROOT, load_yaml
+from deep_anc.config import REPO_ROOT, load_train_config, load_yaml
 from deep_anc.data.manifest import read_manifest, write_manifest
+from deep_anc.data.public_lineage import (
+    PUBLIC_LINEAGE_SCHEMA,
+    canonical_json_sha256,
+    validate_public_manifest_lineage,
+)
+from deep_anc.train import finetune_readiness as readiness
+from deep_anc.train.completion_receipt import write_completion_receipt
+from deep_anc.train.evaluation_contract import (
+    canonical_test_ledger_paths,
+    classify_recorded_val_metrics,
+    complete_test_evaluation,
+    consume_test_capability,
+    issue_test_capability,
+    snapshot_regular_file,
+    write_json_exclusive,
+)
+from deep_anc.train.experiment_contract import stamp_experiment_contract
+from deep_anc.dsp.timing import PlantDelays, TrainingTimingContract
 from deep_anc.train.finetune_readiness import (
     MAX_RELATIVE_DELAY_SPREAD_SAMPLES,
     achievable_cancellation_ceiling_db,
@@ -25,7 +47,18 @@ from deep_anc.train.finetune_readiness import (
 
 
 FS = 8_000
+INTERLEAVED_FS = 48_000
+INTERLEAVED_PERIOD_SECONDS = 0.125
 FAMILIES = ("speech", "music", "environment", "machine")
+_INTERLEAVED_SOURCE_FIXTURE_ROOT = (
+    REPO_ROOT / "results" / ".pytest_finetune_readiness_sources"
+)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_interleaved_source_fixtures():
+    yield
+    shutil.rmtree(_INTERLEAVED_SOURCE_FIXTURE_ROOT, ignore_errors=True)
 
 
 def _official_path(
@@ -39,32 +72,416 @@ def _official_path(
     interleaved: dict | None = None,
 ) -> None:
     extra: dict = {}
+    artifact_rate = INTERLEAVED_FS if method == "interleaved_multitone" else FS
+    fir = np.asarray([0.5, -0.1, 0.02], dtype=np.float32)
     if method == "interleaved_multitone":
+        requested = interleaved or {}
+        capture_id = str(np.asarray(requested.get("capture_id", "cap-1")).reshape(-1)[0])
+        pre_roll = 2
+        bulk_delay = int(delay) + pre_roll
+        probe_fixture = readiness.build_interleaved_probe(
+            sample_rate=artifact_rate,
+            period_seconds=INTERLEAVED_PERIOD_SECONDS,
+            band_hz=(60.0, 1_650.0),
+            amplitude=float(amplitude),
+            tone_spacing_hz=None,
+        )
+        noise_frequencies = (
+            probe_fixture.noise_bins * artifact_rate / probe_fixture.period_samples
+        ).astype(np.float64)
+        cancel_frequencies = (
+            probe_fixture.cancel_bins * artifact_rate / probe_fixture.period_samples
+        ).astype(np.float64)
+        tone_frequencies = (
+            noise_frequencies if channel == "noise" else cancel_frequencies
+        )
+        indices = np.arange(fir.size, dtype=np.float64) + float(delay)
+        aligned_transfer = np.exp(
+            -2j * np.pi * np.outer(tone_frequencies, indices) / float(artifact_rate)
+        ) @ fir.astype(np.float64)
+        compact = readiness._compact_transfer_metrics(
+            tone_frequencies,
+            aligned_transfer,
+            fir,
+            delay_samples=delay,
+            sample_rate=artifact_rate,
+            band_hz=(150.0, 1_600.0),
+        )
+        overall = compact["overall"]
+        compact_subbands = compact["subbands"]
+        source_token = hashlib.sha256(str(path.parent).encode()).hexdigest()[:16]
+        source_dir = _INTERLEAVED_SOURCE_FIXTURE_ROOT / source_token / capture_id
+        source_dir.mkdir(parents=True, exist_ok=True)
+        raw_source = source_dir / "raw_measurement.npz"
+        analysis_source = source_dir / "analysis_results.npz"
+
+        alignment_count = 16
+        valid_mask = np.zeros(alignment_count, dtype=np.bool_)
+        valid_mask[:15] = True
+        clock_indices = np.flatnonzero(valid_mask)
+        err_delay_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        ref_delay_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        err_score_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        ref_score_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        err_spread_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        ref_spread_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        common_delay_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        q_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        delta_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        joint_rank_full = np.zeros(alignment_count, dtype=np.int64)
+        joint_condition_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        residual_full = np.full(alignment_count, np.nan, dtype=np.float64)
+        err_delay_full[valid_mask] = 0.21
+        ref_delay_full[valid_mask] = 0.19
+        err_score_full[valid_mask] = 0.9998
+        ref_score_full[valid_mask] = 0.9996
+        err_spread_full[valid_mask] = 0.05
+        ref_spread_full[valid_mask] = 0.06
+        common_delay_full[valid_mask] = (
+            err_delay_full[valid_mask] * err_score_full[valid_mask]
+            + ref_delay_full[valid_mask] * ref_score_full[valid_mask]
+        ) / (err_score_full[valid_mask] + ref_score_full[valid_mask])
+        period_samples = int(round(artifact_rate * INTERLEAVED_PERIOD_SECONDS))
+        q_full[valid_mask] = period_samples / (
+            period_samples + common_delay_full[valid_mask]
+        )
+        delta_full[valid_mask] = np.abs(
+            err_delay_full[valid_mask] - ref_delay_full[valid_mask]
+        )
+        expected_rank = 2 * (noise_frequencies.size + cancel_frequencies.size)
+        joint_rank_full[valid_mask] = expected_rank
+        joint_condition_full[valid_mask] = 1.10
+        residual_full[valid_mask] = 0.01
+        base_tau = np.linspace(-0.05, 0.05, alignment_count, dtype=np.float64)
+        common_tau_full = base_tau.copy()
+        noise_tau_full = base_tau + 0.10
+        cancel_tau_full = base_tau - 0.10
+        row_phase = np.arange(alignment_count, dtype=np.float64)[:, None] * 0.01
+        noise_phase = np.exp(
+            1j * (row_phase + noise_frequencies[None, :] / 10_000.0)
+        )
+        cancel_phase = np.exp(
+            1j * (row_phase + cancel_frequencies[None, :] / 10_000.0)
+        )
+        noise_transfers = (
+            1.0 + noise_frequencies[None, :] / 20_000.0
+        ) * noise_phase
+        cancel_transfers = (
+            0.7 + cancel_frequencies[None, :] / 30_000.0
+        ) * cancel_phase
+
+        if not raw_source.exists():
+            raw_repeats = alignment_count
+            output = np.zeros(
+                (raw_repeats * probe_fixture.period_samples, 2), dtype=np.float32
+            )
+            output[:, 0] = np.tile(probe_fixture.noise_signal, raw_repeats)
+            output[:, 1] = np.tile(probe_fixture.cancel_signal, raw_repeats)
+            output_pcm = np.rint(
+                np.clip(output, -1.0, 1.0) * np.float32(np.iinfo(np.int16).max)
+            ).astype(np.int16)
+            measurement_index = np.arange(output.shape[0], dtype=np.float64)
+            input_raw = np.stack(
+                (
+                    np.rint(1_000_000.0 * np.sin(0.011 * measurement_index)),
+                    np.rint(800_000.0 * np.cos(0.013 * measurement_index)),
+                ),
+                axis=1,
+            ).astype(np.int32)
+            preflight_index = np.arange(256, dtype=np.float64)
+            preflight_raw = np.stack(
+                (
+                    np.rint(900_000.0 * np.sin(0.071 * preflight_index)),
+                    np.rint(700_000.0 * np.cos(0.053 * preflight_index)),
+                ),
+                axis=1,
+            ).astype(np.int32)
+            measurement_report = readiness.analyze_int32_input_probe(input_raw)
+            preflight_report = readiness.analyze_int32_input_probe(preflight_raw)
+            preflight_report["sample_rate"] = artifact_rate
+            raw_metadata = {
+                "capture_id": capture_id,
+                "method": "interleaved_multitone",
+                "raw_capture_schema": readiness.INTERLEAVED_RAW_CAPTURE_SCHEMA,
+                "sample_rate": artifact_rate,
+                "block_size": 256,
+                "latency": "low",
+                "channel_map": {
+                    logical_name: expected_index
+                    for _, (logical_name, expected_index) in (
+                        readiness.INTERLEAVED_CHANNEL_MAP_FIELDS.items()
+                    )
+                },
+                "operator_confirmations": {
+                    "user_present": True,
+                    "volume_minimum": True,
+                    "routing_and_geometry": True,
+                },
+                "amplitude": float(amplitude),
+                "period_seconds": INTERLEAVED_PERIOD_SECONDS,
+                "warmup_periods": 0,
+                "repeats": raw_repeats,
+                "lead_in_samples": 0,
+                "guard_bins": 1,
+                "design_band_hz": [60.0, 1_650.0],
+                "channel_band_hz": {
+                    drive: [
+                        float(value)
+                        for value in (
+                            probe_fixture.bins_for(drive)[[0, -1]]
+                            * artifact_rate
+                            / probe_fixture.period_samples
+                        )
+                    ]
+                    for drive in ("noise", "cancel")
+                },
+                "crest_db": {
+                    "noise": float(probe_fixture.crest_db()[0]),
+                    "cancel": float(probe_fixture.crest_db()[1]),
+                },
+                "invalid_reasons": [],
+                "warp": {"applied": False},
+                "analysis_contract": {
+                    "clock_band_hz": list(readiness.INTERLEAVED_CLOCK_BAND_HZ),
+                    "clock_min_adjacent_score": readiness.INTERLEAVED_CLOCK_MIN_SCORE,
+                    "clock_max_err_ref_delta_samples": (
+                        readiness.INTERLEAVED_CLOCK_MAX_ERR_REF_DELTA
+                    ),
+                    "clock_max_subwindow_spread_samples": (
+                        readiness.INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD
+                    ),
+                    "clock_max_adjacent_change_samples": (
+                        readiness.INTERLEAVED_CLOCK_MAX_ADJACENT_CHANGE
+                    ),
+                    "clock_max_abs_period_delta_samples": (
+                        readiness.INTERLEAVED_CLOCK_MAX_ABS_PERIOD_DELTA
+                    ),
+                    "separation_algorithm": (
+                        readiness.INTERLEAVED_SEPARATION_ALGORITHM
+                    ),
+                    "separation_algorithm_version": (
+                        readiness.INTERLEAVED_SEPARATION_ALGORITHM_VERSION
+                    ),
+                    "max_drift_deviation_samples": 2.0,
+                },
+                "telemetry": {
+                    "completed": True,
+                    "captured_frames": int(output.shape[0]),
+                    "xrun_count": 0,
+                    "unexpected_status_count": 0,
+                    "callback_error": None,
+                },
+                "measurement": measurement_report,
+                "preflight": preflight_report,
+            }
+            np.savez(
+                raw_source,
+                metadata_json=np.asarray(json.dumps(raw_metadata, sort_keys=True)),
+                output=output,
+                output_pcm_int16=output_pcm,
+                input_raw_int32=input_raw,
+                preflight_raw_int32=preflight_raw,
+            )
+        if not analysis_source.exists():
+            np.savez(
+                analysis_source,
+                noise_transfers=noise_transfers.astype(np.complex128),
+                cancel_transfers=cancel_transfers.astype(np.complex128),
+                noise_frequencies_hz=noise_frequencies,
+                cancel_frequencies_hz=cancel_frequencies,
+                noise_cubic_crosscheck_transfers=noise_transfers.astype(np.complex128),
+                cancel_cubic_crosscheck_transfers=cancel_transfers.astype(np.complex128),
+                clock_valid_mask=valid_mask,
+                clock_q_ratio=q_full,
+                clock_period_delta_samples=common_delay_full,
+                clock_err_delay_samples=err_delay_full,
+                clock_ref_delay_samples=ref_delay_full,
+                clock_err_score=err_score_full,
+                clock_ref_score=ref_score_full,
+                clock_err_subwindow_spread_samples=err_spread_full,
+                clock_ref_subwindow_spread_samples=ref_spread_full,
+                clock_err_ref_delta_samples=delta_full,
+                joint_ls_rank=joint_rank_full,
+                joint_ls_condition=joint_condition_full,
+                joint_ls_reconstruction_relative_error=residual_full,
+                common_alignment_tau_samples=common_tau_full,
+                noise_provisional_tau_samples=noise_tau_full,
+                cancel_provisional_tau_samples=cancel_tau_full,
+            )
+        raw_relative = raw_source.relative_to(REPO_ROOT)
+        analysis_relative = analysis_source.relative_to(REPO_ROOT)
+        kept = np.arange(12, dtype=np.int64)
+        requested_kept = np.asarray(
+            requested.get("kept_repeat_indices", kept)
+        )
+        if (
+            requested_kept.ndim == 1
+            and requested_kept.dtype.kind in "iu"
+            and requested_kept.size == kept.size
+            and np.all((requested_kept >= 0) & (requested_kept < alignment_count))
+        ):
+            kept = requested_kept.astype(np.int64)
+        provisional_kept = (
+            noise_tau_full if channel == "noise" else cancel_tau_full
+        )[kept]
+        common_kept = common_tau_full[kept]
         defaults = {
-            "capture_id": np.asarray("cap-1"),
+            "capture_id": np.asarray(capture_id),
             "interleave_guard_bins": np.asarray(1, dtype=np.int64),
-            "analysis_period_seconds": np.asarray(1.0),
-            "tone_count": np.asarray(771, dtype=np.int64),
-            "tone_snr_median_db": np.asarray(24.0),
+            "analysis_period_seconds": np.asarray(INTERLEAVED_PERIOD_SECONDS),
+            "tone_count": np.asarray(tone_frequencies.size, dtype=np.int64),
+            "tone_snr_median_db": np.asarray(35.0),
             "tone_snr_min_db": np.asarray(14.0),
             "consistency_band_hz": np.asarray([100.0, 1_000.0]),
+            "excitation_band_hz": np.asarray([100.0, 1_800.0]),
+            "anchor_repeat": np.asarray(3, dtype=np.int64),
+            "kept_repeat_indices": kept,
+            "alignment_scores": np.full(alignment_count, 0.999, dtype=np.float64),
             # 최악 부대역 게이트가 판정할 배열. 총계 하나로는 약한 대역을 숨길 수
             # 있으므로 게이트가 요구 대역 안 모든 부대역을 따로 본다.
-            "band_consistency": np.asarray([0.99, 0.98, 0.97]),
+            "band_consistency": np.asarray([0.99, 0.98, 0.97, 0.96]),
             "band_consistency_hz": np.asarray(
-                [[100.0, 300.0], [300.0, 600.0], [600.0, 1_000.0]]
+                [
+                    [150.0, 300.0],
+                    [300.0, 600.0],
+                    [600.0, 1_000.0],
+                    [1_000.0, 1_600.0],
+                ]
             ),
+            "bulk_delay_samples": np.asarray(bulk_delay, dtype=np.int64),
+            "pre_roll_samples": np.asarray(pre_roll, dtype=np.int64),
+            "delay_semantics": np.asarray(readiness.INTERLEAVED_DELAY_SEMANTICS),
+            "tone_frequencies_hz": tone_frequencies,
+            "aligned_mean_transfer_real": aligned_transfer.real,
+            "aligned_mean_transfer_imag": aligned_transfer.imag,
+            "aligned_mean_transfer_sha256": np.asarray(
+                readiness._aligned_transfer_sha256(
+                    tone_frequencies, aligned_transfer.real, aligned_transfer.imag
+                )
+            ),
+            "compact_transfer_band_hz": np.asarray([150.0, 1_600.0]),
+            "compact_transfer_tone_count": np.asarray(
+                overall["tone_count"], dtype=np.int64
+            ),
+            "compact_transfer_complex_agreement": np.asarray(
+                overall["complex_agreement"]
+            ),
+            "compact_transfer_relative_error": np.asarray(overall["relative_error"]),
+            "minimum_compact_transfer_agreement": np.asarray(
+                readiness.INTERLEAVED_MIN_COMPACT_TRANSFER_AGREEMENT
+            ),
+            "maximum_compact_transfer_relative_error": np.asarray(
+                readiness.INTERLEAVED_MAX_COMPACT_TRANSFER_RELATIVE_ERROR
+            ),
+            "compact_transfer_subband_hz": np.asarray(
+                [row["band_hz"] for row in compact_subbands]
+            ),
+            "compact_transfer_subband_tone_count": np.asarray(
+                [row["tone_count"] for row in compact_subbands], dtype=np.int64
+            ),
+            "compact_transfer_subband_complex_agreement": np.asarray(
+                [row["complex_agreement"] for row in compact_subbands]
+            ),
+            "compact_transfer_subband_relative_error": np.asarray(
+                [row["relative_error"] for row in compact_subbands]
+            ),
+            "output_pcm_provenance": np.asarray(
+                readiness.INTERLEAVED_OUTPUT_PCM_PROVENANCE
+            ),
+            "source_raw_npz_path": np.asarray(str(raw_relative)),
+            "source_raw_npz_sha256": np.asarray(sha256_file(raw_source)),
+            "source_analysis_npz_path": np.asarray(str(analysis_relative)),
+            "source_analysis_npz_sha256": np.asarray(sha256_file(analysis_source)),
+            "error_mic_channel": np.asarray(0, dtype=np.int64),
+            "reference_mic_channel": np.asarray(1, dtype=np.int64),
+            "noise_output_channel": np.asarray(0, dtype=np.int64),
+            "cancel_output_channel": np.asarray(1, dtype=np.int64),
+            "operator_confirmed_volume_minimum": np.asarray(True),
+            "operator_confirmed_routing_and_geometry": np.asarray(True),
+            "operator_confirmed_user_present": np.asarray(True),
+            "separation_algorithm": np.asarray(
+                readiness.INTERLEAVED_SEPARATION_ALGORITHM
+            ),
+            "separation_algorithm_version": np.asarray(
+                readiness.INTERLEAVED_SEPARATION_ALGORITHM_VERSION, dtype=np.int64
+            ),
+            "clock_estimator": np.asarray(readiness.INTERLEAVED_CLOCK_ESTIMATOR),
+            "clock_sample_rate": np.asarray(artifact_rate, dtype=np.int64),
+            "clock_band_hz": np.asarray(readiness.INTERLEAVED_CLOCK_BAND_HZ),
+            "clock_min_adjacent_score": np.asarray(
+                readiness.INTERLEAVED_CLOCK_MIN_SCORE
+            ),
+            "clock_max_err_ref_delta_samples": np.asarray(
+                readiness.INTERLEAVED_CLOCK_MAX_ERR_REF_DELTA
+            ),
+            "clock_max_subwindow_spread_samples": np.asarray(
+                readiness.INTERLEAVED_CLOCK_MAX_SUBWINDOW_SPREAD
+            ),
+            "clock_max_adjacent_change_samples": np.asarray(
+                readiness.INTERLEAVED_CLOCK_MAX_ADJACENT_CHANGE
+            ),
+            "clock_max_abs_period_delta_samples": np.asarray(
+                readiness.INTERLEAVED_CLOCK_MAX_ABS_PERIOD_DELTA
+            ),
+            "clock_max_drift_deviation_samples": np.asarray(2.0),
+            "clock_observation_repeat_indices": clock_indices,
+            "clock_period_delta_samples": common_delay_full[valid_mask],
+            "clock_q_ratio": q_full[valid_mask],
+            "clock_err_delay_samples": err_delay_full[valid_mask],
+            "clock_ref_delay_samples": ref_delay_full[valid_mask],
+            "clock_err_score": err_score_full[valid_mask],
+            "clock_ref_score": ref_score_full[valid_mask],
+            "clock_err_subwindow_spread_samples": err_spread_full[valid_mask],
+            "clock_ref_subwindow_spread_samples": ref_spread_full[valid_mask],
+            "clock_err_ref_delta_samples": delta_full[valid_mask],
+            "joint_ls_expected_rank": np.asarray(expected_rank, dtype=np.int64),
+            "joint_ls_rank": joint_rank_full[valid_mask],
+            "joint_ls_condition": joint_condition_full[valid_mask],
+            "joint_ls_max_condition": np.asarray(
+                readiness.INTERLEAVED_JOINT_LS_MAX_CONDITION
+            ),
+            "joint_ls_reconstruction_relative_error": residual_full[valid_mask],
+            "joint_ls_reconstruction_relative_error_p95": np.asarray(0.01),
+            "joint_ls_max_reconstruction_relative_error_p95": np.asarray(
+                readiness.INTERLEAVED_JOINT_LS_MAX_RESIDUAL_P95
+            ),
+            "separation_crosscheck_band_hz": np.asarray(
+                readiness.INTERLEAVED_CLOCK_BAND_HZ
+            ),
+            "separation_crosscheck_complex_agreement": np.asarray(1.0),
+            "separation_crosscheck_relative_error": np.asarray(0.0),
+            "separation_crosscheck_subband_hz": np.asarray(
+                readiness.INTERLEAVED_COMPACT_TRANSFER_SUB_BANDS_HZ
+            ),
+            "separation_crosscheck_subband_complex_agreement": np.ones(4),
+            "separation_crosscheck_subband_relative_error": np.zeros(4),
+            "minimum_separation_crosscheck_agreement": np.asarray(
+                readiness.INTERLEAVED_SEPARATION_MIN_AGREEMENT
+            ),
+            "maximum_separation_crosscheck_relative_error": np.asarray(
+                readiness.INTERLEAVED_SEPARATION_MAX_RELATIVE_ERROR
+            ),
+            "repeat_tau_samples": provisional_kept,
+            "provisional_repeat_tau_samples": provisional_kept,
+            "common_alignment_tau_samples": common_kept,
+            "drift_samples_per_period": np.asarray(
+                float(np.median(common_delay_full[valid_mask]))
+            ),
+            "relative_tau_max_abs_samples": np.asarray(0.0),
+            "delay_spread_samples": np.asarray(0, dtype=np.int64),
         }
         extra = defaults
     arrays = {
-        "fir": np.asarray([0.5, -0.1, 0.02], dtype=np.float32),
+        "fir": fir,
         "delay_samples": np.asarray(delay, dtype=np.int64),
-        "sample_rate": np.asarray(FS, dtype=np.int64),
+        "sample_rate": np.asarray(artifact_rate, dtype=np.int64),
         "fit_improvement_db": np.asarray(np.nan),
         "coherence_median": np.asarray(consistency),
-        "excitation_band_hz": np.asarray([100.0, 1_000.0]),
+        "excitation_band_hz": np.asarray([100.0, 1_800.0]),
         "calibration_block_size": np.asarray(256, dtype=np.int64),
-        "calibration_latency": np.asarray("high"),
+        "calibration_latency": np.asarray(
+            "low" if method == "interleaved_multitone" else "high"
+        ),
         "output_channel": np.asarray(channel),
         "method": np.asarray(method),
         # 유지 반복 수. MIN_KEPT_REPEATS=8 이 하한이다 — 기각을 많이 한 것은 문제가
@@ -118,13 +535,12 @@ PRIMARY_DELAY_SAMPLES = 4
 ERR_MIC_DELAY_SAMPLES = PRIMARY_DELAY_SAMPLES
 REF_MIC_DELAY_SAMPLES = 2
 
-PRETRAIN_TRUSTED_BAND_HZ = (100.0, 1_000.0)
+PRETRAIN_TRUSTED_BAND_HZ = (150.0, 1_600.0)
 """픽스처 init checkpoint 가 학습된 대역.
 
 실제 사고와 같은 축이다: ``runs/pretrain_{base,tiny}_corrected`` 는 [150,600] 으로
 학습됐는데 파인튜닝이 유도하는 대역은 [150,1600] 이다. 여기서는 픽스처 S(z) 의
-신뢰대역( ``excitation_band_hz`` [100,1000] )과 기본 목표대역 [80,1000] 의 교집합이
-파인튜닝 대역이므로 checkpoint 도 같은 [100,1000] 이어야 통과한다.
+현행 절대목표 대역은 [150,1600] 이며 positive fixture도 그 대역을 그대로 덮어야 한다.
 """
 
 
@@ -268,8 +684,120 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
         }
         for name in music_paths
     ]
+    for entry in speech_entries + music_entries:
+        raw_path = Path(entry["path"])
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_bytes(f"fixture-audio:{raw_path.name}\n".encode())
+        entry["content_sha256"] = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+        entry["content_size"] = raw_path.stat().st_size
+        entry["lineage_schema"] = PUBLIC_LINEAGE_SCHEMA
+        entry["lineage_keys"] = [
+            f"fixture:{entry['tag']}:{raw_path.stem.casefold()}"
+        ]
+        entry["group_id"] = "public-lineage-" + canonical_json_sha256(
+            {
+                "lineage_keys": entry["lineage_keys"],
+                "content_sha256": [entry["content_sha256"]],
+            }
+        )
     write_manifest(speech_entries, manifest_dir / "speech.jsonl")
     write_manifest(music_entries, manifest_dir / "music.jsonl")
+
+    # prepare_noise_pool의 세대 sidecar를 축소 재현한다. JSONL 두 개가 서로 다른
+    # holdout/config 세대에서 온 혼합 상태면 corpus_disjoint가 PASS하면 안 된다.
+    data_config = root / "fixture_data_config.json"
+    data_config.write_text('{"source_mix_ratio":{"music":0.5,"speech":0.5}}\n')
+    lineage_metadata = root / "fixture_public_lineage_metadata.txt"
+    lineage_metadata.write_text("fixture authoritative lineage\n")
+    metadata_evidence = {
+        "path": str(lineage_metadata),
+        "sha256": hashlib.sha256(lineage_metadata.read_bytes()).hexdigest(),
+        "size": lineage_metadata.stat().st_size,
+    }
+    holdout_clip = {
+        "family": "fixture",
+        "clip": "heldout-fixture.wav",
+        "content_sha256": hashlib.sha256(b"heldout-fixture").hexdigest(),
+        "lineage_keys": ["fixture:holdout:one"],
+    }
+    holdout_clips = [holdout_clip]
+    holdout_lineage = {
+        "schema_version": 1,
+        "metadata": {
+            "librispeech_chapters": {
+                "path": "data/raw/speech/LibriSpeech/CHAPTERS.TXT",
+                "sha256": "1" * 64,
+                "size": 1,
+            },
+            "fma_tracks": {
+                "path": "data/raw/music/fma_metadata/tracks.csv",
+                "sha256": "2" * 64,
+                "size": 1,
+            },
+            "esc50": {
+                "path": "data/raw/noise/esc50/ESC-50-master/meta/esc50.csv",
+                "sha256": "3" * 64,
+                "size": 1,
+            },
+        },
+        "clips": holdout_clips,
+        "clips_sha256": canonical_json_sha256(holdout_clips),
+    }
+    holdout = root / "fixture_recorded_holdout.json"
+    holdout.write_text(
+        json.dumps(
+            {
+                "families": {"fixture": ["heldout-fixture.wav"]},
+                "clip_lineage": holdout_lineage,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    manifests = {}
+    for tag in ("music", "speech"):
+        path = manifest_dir / f"{tag}.jsonl"
+        manifests[tag] = {
+            "file": path.name,
+            "entries": sum(1 for line in path.read_text().splitlines() if line),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    entries_by_tag = {
+        "music": music_entries,
+        "speech": speech_entries,
+    }
+    manifest_lineage = validate_public_manifest_lineage(entries_by_tag)
+    components = manifest_lineage["components"]
+    generation = {
+        "schema_version": 3,
+        "training_eligible": True,
+        "seed": 20260802,
+        "data_config": str(data_config),
+        "data_config_sha256": hashlib.sha256(data_config.read_bytes()).hexdigest(),
+        "holdout": str(holdout),
+        "holdout_sha256": hashlib.sha256(holdout.read_bytes()).hexdigest(),
+        "raw_roots": [str(root / "raw")],
+        "manifests": manifests,
+        "public_lineage": {
+            "schema_version": 1,
+            "lineage_schema": PUBLIC_LINEAGE_SCHEMA,
+            "metadata": {"fixture": metadata_evidence},
+            "component_count": len(components),
+            "component_membership_sha256": canonical_json_sha256(components),
+            "components": components,
+            "manifest_component_count": manifest_lineage["component_count"],
+            "manifest_component_membership_sha256": manifest_lineage[
+                "component_membership_sha256"
+            ],
+            "holdout_clips_sha256": holdout_lineage["clips_sha256"],
+        },
+    }
+    canonical = (json.dumps(generation, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
+    generation["build_id"] = hashlib.sha256(canonical).hexdigest()
+    generation["created_at"] = "2026-08-26T00:00:00+00:00"
+    (manifest_dir / "manifest_generation.json").write_text(
+        json.dumps(generation, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    )
     return csv_path, manifest_dir
 
 
@@ -282,15 +810,31 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
         manifest = _recorded_manifest(tmp_path / "data")
     source_csv, synth_dir = _corpus_fixture(tmp_path / "data", leak=leak)
     model_cfg = {"name": "test-model", "hop": 4}
+    timing = TrainingTimingContract.derive(
+        primary_fir=np.asarray([0.5, -0.1, 0.02], dtype=np.float32),
+        plant_delays=PlantDelays(
+            primary_delay_samples=PRIMARY_DELAY_SAMPLES,
+            secondary_delay_samples=5,
+            handoff_samples=2,
+            sample_rate=FS,
+        ),
+    )
     pretrain_cfg = {
         "model": model_cfg,
-        "data": {"digital_reference_lead_samples": 3},
-        "digital_reference_lead_samples": 3,
+        "data": {
+            "digital_reference_lead_samples": int(
+                timing.digital_reference_lead_samples
+            ),
+            "training_timing_contract": timing.model_dump(),
+        },
+        "digital_reference_lead_samples": int(
+            timing.digital_reference_lead_samples
+        ),
         "physics_status": "secondary_surrogate_representation_pretrain",
         "schedule": {"total_steps": 10},
         # 어느 대역에서 벌점을 받았는가. trainer 가 resolved cfg 에 저장하는 값이고
         # ``completed_init_checkpoint`` 게이트가 파인튜닝 대역과 대조한다.
-        # 픽스처 S(z) 의 신뢰대역 [100,1000] ∩ 기본 목표대역 [80,1000] = [100,1000].
+        # 현행 절대목표와 같은 [150,1600].
         "trusted_band_hz": list(PRETRAIN_TRUSTED_BAND_HZ),
     }
     init_best = tmp_path / "pretrain" / "ckpt" / "best.pt"
@@ -305,10 +849,12 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
             "segment_seconds": 0.01,
             "reference_mode": "digital",
             "digital_primary_path_mode": "measured",
-            "digital_reference_lead_samples": 3,
+            "digital_reference_lead_samples": int(
+                timing.digital_reference_lead_samples
+            ),
+            "training_timing_contract": timing.model_dump(),
             # 두 브랜치의 총 선행량을 맞추는 구성 — 출하 설정과 같다.
             # constant 면 합성 D_noise+K 와 실측 잔여+K 가 어긋난다(실측 1460 샘플).
-            "d_noise_delay_samples": 100,
             "recorded_lead_mode": "timeline",
             "closed_loop": {
                 "feedback_delay_samples": [4, 8],
@@ -319,13 +865,13 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
             "source_mix_ratio": {"speech": 0.5, "music": 0.5},
         },
         "duct": {
+            "acoustics": {"realistic_target_band_hz": [150, 1_600]},
             "secondary_path": {
                 "npz": str(secondary),
                 "handoff_extra_samples": 2,
             },
             "digital_reference": {
                 "primary_path_npz": str(primary),
-                "d_noise_delay_samples": 4,
             },
         },
         "require_measured_primary_path": True,
@@ -337,7 +883,7 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
         "schedule": {"total_steps": 6},
         "ckpt_dir": str(tmp_path / "finetune"),
         "readiness": {
-            "required_path_band_hz": [100, 1_000],
+            "required_path_band_hz": [150, 1_600],
             "min_path_consistency": 0.9,
             "required_recorded_ratio": 0.7,
             "min_recorded_sessions": 12,
@@ -356,12 +902,36 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
             # 픽스처 플랜트의 재계산 상한: 최악 옥타브 125 Hz 21.03 dB.
             # 21.0 은 그 안쪽이면서, 경계 테스트가 미는 target+margin(약 10.9)보다 크다 —
             # 이 값이 구속하면 다른 게이트의 경계를 시험할 수 없다.
-            "measured_design_ceiling_db": 21.0,
-            "measured_design_ceiling_band_hz": [100, 1000],
+            "measured_design_ceiling_db": 7.590811495963479,
+            "measured_design_ceiling_band_hz": [150, 1600],
             "min_delay_crosscheck_sessions": 8,
             "max_measured_delay_mismatch_samples": 8.0,
         },
     }
+
+
+def _refresh_timing_contract(cfg: dict) -> TrainingTimingContract:
+    primary_path = Path(cfg["duct"]["digital_reference"]["primary_path_npz"])
+    secondary_path = Path(cfg["duct"]["secondary_path"]["npz"])
+    with np.load(primary_path, allow_pickle=False) as primary, np.load(
+        secondary_path, allow_pickle=False
+    ) as secondary:
+        contract = TrainingTimingContract.derive(
+            primary_fir=np.asarray(primary["fir"], dtype=np.float32),
+            plant_delays=PlantDelays(
+                primary_delay_samples=int(primary["delay_samples"]),
+                secondary_delay_samples=int(secondary["delay_samples"]),
+                handoff_samples=int(
+                    cfg["duct"]["secondary_path"]["handoff_extra_samples"]
+                ),
+                sample_rate=int(cfg["data"]["sample_rate"]),
+            ),
+        )
+    cfg["data"]["training_timing_contract"] = contract.model_dump()
+    cfg["data"]["digital_reference_lead_samples"] = int(
+        contract.digital_reference_lead_samples
+    )
+    return contract
 
 
 def _plant_fingerprint_payload(**overrides) -> str:
@@ -374,7 +944,7 @@ def _plant_fingerprint_payload(**overrides) -> str:
         "lead_samples": 3,
         "sample_rate": FS,
         "physics_status": "measured_primary_path",
-        "optimize_band_hz": [100.0, 1_000.0],
+        "optimize_band_hz": [150.0, 1_600.0],
         "secondary_sha256": None,
         "primary_sha256": None,
         "capture_id": None,
@@ -401,6 +971,13 @@ def _g4_metrics(
     worst_octave_center_hz: float = 500.0,
     worst_octave_worst10_db: float = 3.0,
     fingerprint: str | None = None,
+    experiment_contract_sha256: str = "",
+    selection_sha256: str = "",
+    test_capability_sha256: str = "",
+    test_consumed_marker_sha256: str = "",
+    timing_contract_sha256: str = "",
+    recorded_lead_samples: int = 3,
+    recorded_delay_samples: float = 2.0,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -409,12 +986,31 @@ def _g4_metrics(
         "allow_surrogate": np.asarray(False),
         "checkpoint_sha256": np.asarray(sha256_file(checkpoint)),
         "manifest_sha256": np.asarray(sha256_file(manifest)),
+        "experiment_contract_sha256": np.asarray(experiment_contract_sha256),
+        "selection_sha256": np.asarray(selection_sha256),
+        "test_capability_sha256": np.asarray(test_capability_sha256),
+        "test_consumed_marker_sha256": np.asarray(
+            test_consumed_marker_sha256
+        ),
         "g4_trusted_pass": np.asarray(True),
         "g4_fullband_pass": np.asarray(True),
         "g4_pass": np.asarray(bool(source_pass)),
+        "nmse_trusted_mean_db": np.asarray(-2.0),
+        "nmse_fullband_mean_db": np.asarray(-2.0),
+        "nmse_trusted_worst10_mean_db": np.asarray(-1.5),
         "source_family": np.asarray(FAMILIES),
         "n_sessions": np.asarray(4, dtype=np.int64),
         "n_segments": np.asarray(16, dtype=np.int64),
+        "segment_recorded_lead_samples": np.full(
+            16, recorded_lead_samples, dtype=np.int64
+        ),
+        "segment_recorded_delay_samples": np.full(
+            16, recorded_delay_samples, dtype=np.float64
+        ),
+        "segment_timing_contract_sha256": np.asarray(
+            [timing_contract_sha256] * 16
+        ),
+        "segment_source_timeline": np.asarray(["source_aligned.wav"] * 16),
     }
     if include_source_fields:
         # 기능 2(모든 소리 제거)는 소스별 최악값 판정이다 — 평균만 담은 옛 형식은
@@ -435,6 +1031,8 @@ def _g4_metrics(
             g4_ci_pass=np.asarray(bool(ci_pass)),
             g4_worst_octave_center_hz=np.asarray(float(worst_octave_center_hz)),
             g4_worst_octave_worst10_db=np.asarray(float(worst_octave_worst10_db)),
+            g4_max_out_of_band_amplification_db=np.asarray(1.0),
+            source_trusted_ci_hi_db=np.full(len(FAMILIES), -0.5),
             plant_fingerprint_json=np.asarray(
                 fingerprint if fingerprint is not None else _plant_fingerprint_payload()
             ),
@@ -471,6 +1069,7 @@ def test_readiness_passes_only_with_official_paths_completed_init_and_full_recor
     assert report["ok"], report
     assert {item["id"] for item in report["checks"]} == {
         "config_fail_closed_flags",
+        "absolute_objective_scope",
         "measured_primary_mode",
         "recorded_mix_ratio",
         "official_secondary_path",
@@ -490,7 +1089,9 @@ def test_readiness_passes_only_with_official_paths_completed_init_and_full_recor
     }
     assert require_finetune_readiness(cfg)["ok"]
 
-    cfg["duct"]["digital_reference"]["d_noise_delay_samples"] = 5
+    cfg["data"]["training_timing_contract"][
+        "primary_zeros_before_fir_samples"
+    ] = PRIMARY_DELAY_SAMPLES + 1
     failed = audit_finetune_readiness(cfg)
     assert not failed["ok"]
     assert not next(
@@ -562,6 +1163,190 @@ def test_completion_requires_same_checkpoint_and_manifest_sha_for_val_and_test(t
     assert "SHA-256" in next(
         item for item in failed["checks"] if item["id"] == "recorded_test_g4"
     )["message"]
+
+
+def test_canonical_completion_verifies_selection_capability_marker_metrics_chain(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    (source_root / "src").mkdir(parents=True)
+    (source_root / "src" / "training.py").write_text("VALUE = 1\n")
+    manifest = source_root / "data" / "manifests" / "recorded_regrouped.jsonl"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{"split":"val"}\n{"split":"test"}\n')
+    (source_root / ".gitignore").write_text("/results/\n")
+    subprocess.run(["git", "init", "-q"], cwd=source_root, check=True)
+    subprocess.run(
+        ["git", "add", "src", "data", ".gitignore"], cwd=source_root, check=True
+    )
+    subprocess.run(
+        [
+            "git", "-c", "user.name=tests", "-c",
+            "user.email=tests@example.invalid", "commit", "-qm", "source",
+        ],
+        cwd=source_root,
+        check=True,
+    )
+    import deep_anc.config as config_module
+    import deep_anc.data.transfer_contract as transfer_contract_module
+
+    monkeypatch.setattr(config_module, "REPO_ROOT", source_root)
+    monkeypatch.setattr(readiness, "REPO_ROOT", source_root)
+    monkeypatch.setattr(
+        transfer_contract_module,
+        "bind_recorded_transfer_config",
+        lambda data, repo_root: data.update(
+            transfer_manifest="data/manifests/elice_transfer_manifest.json",
+            transfer_manifest_sha256="b" * 64,
+            recorded_transfer_aggregate_sha256="c" * 64,
+        ),
+    )
+    cfg = load_train_config(
+        REPO_ROOT / "configs/train_finetune.yaml",
+        [
+            "data.digital_primary_path_mode=measured",
+            f"data.bootstrap_receipt_sha256={'a' * 64}",
+        ],
+    )
+    timing = TrainingTimingContract.from_data_config(cfg["data"])
+    run = tmp_path / "canonical"
+    best = run / "ckpt" / "best.pt"
+    last = best.parent / "last.pt"
+    _checkpoint(best, cfg=cfg, step=1_000)
+    _checkpoint(last, cfg=cfg, step=50_000)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+        capture_output=True, text=True,
+    ).stdout
+    (run / "config_snapshot.yaml").write_text(
+        yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+    )
+    (run / "git_rev.txt").write_text(commit)
+    (run / "pip_freeze.txt").write_text("fixture==1\n")
+    (run / "environment.json").write_text(
+        json.dumps(
+            {
+                "python": "fixture",
+                "torch": "fixture",
+                "cuda_available": False,
+                "device_count": 0,
+                "devices": [],
+                "deterministic_algorithms": True,
+                "cudnn_benchmark": False,
+                "cudnn_deterministic": True,
+                "cublas_workspace_config": None,
+            }
+        )
+        + "\n"
+    )
+    write_completion_receipt(best.parent)
+
+    val_metrics = run / "eval_recorded_val" / "metrics.npz"
+    contract_sha = cfg["experiment_contract_sha256"]
+    _g4_metrics(
+        val_metrics,
+        split="val",
+        checkpoint=best,
+        manifest=manifest,
+        experiment_contract_sha256=contract_sha,
+        timing_contract_sha256=timing.digest(),
+        recorded_lead_samples=timing.digital_reference_lead_samples,
+        recorded_delay_samples=timing.primary_effective_delay_samples,
+    )
+    val_decision = classify_recorded_val_metrics(val_metrics.read_bytes())
+    selection_path = tmp_path / "selection.json"
+    selection = {
+        "schema_version": 1,
+        "selection_split": "val",
+        "manifest": str(manifest),
+        "manifest_sha256": sha256_file(manifest),
+        "experiment_contract_sha256": contract_sha,
+        "seed_neutral_campaign_sha256": "c" * 64,
+        "seed": 20260803,
+        "decision": val_decision,
+        "selected": {
+            "checkpoint": str(best),
+            "checkpoint_sha256": sha256_file(best),
+            "evaluation_dir": str(val_metrics.parent),
+            "metrics_sha256": sha256_file(val_metrics),
+            "seed": 20260803,
+            "decision": val_decision,
+        },
+        "candidates": [],
+    }
+    write_json_exclusive(selection_path, selection)
+    capability_path, consumed_path = canonical_test_ledger_paths(
+        selection_path, repo_root=source_root
+    )
+    token = issue_test_capability(
+        selection_path=selection_path,
+        capability_path=capability_path,
+        repo_root=source_root,
+    )
+    _, _, consumed = consume_test_capability(
+        selection_path=selection_path,
+        capability_path=capability_path,
+        consumed_marker_path=consumed_path,
+        token=token,
+        checkpoint_path=best,
+        manifest_path=manifest,
+        repo_root=source_root,
+    )
+    test_metrics = run / "eval_recorded_test" / "metrics.npz"
+    _g4_metrics(
+        test_metrics,
+        split="test",
+        checkpoint=best,
+        manifest=manifest,
+        experiment_contract_sha256=contract_sha,
+        timing_contract_sha256=timing.digest(),
+        selection_sha256=consumed["selection_sha256"],
+        test_capability_sha256=consumed["capability_sha256"],
+        test_consumed_marker_sha256=snapshot_regular_file(consumed_path).sha256,
+        recorded_lead_samples=timing.digital_reference_lead_samples,
+        recorded_delay_samples=timing.primary_effective_delay_samples,
+    )
+    (test_metrics.parent / "metrics.md").write_text("fixture\n")
+    complete_test_evaluation(
+        selection_path=selection_path,
+        capability_path=capability_path,
+        consumed_marker_path=consumed_path,
+        output_dir=test_metrics.parent,
+        repo_root=source_root,
+    )
+    monkeypatch.setattr(
+        readiness,
+        "audit_finetune_readiness",
+        lambda cfg, full_recorded_qa=True: {"ok": True, "checks": []},
+    )
+    passed = audit_finetune_completion(
+        cfg,
+        checkpoint=best,
+        val_metrics=val_metrics,
+        test_metrics=test_metrics,
+        selection=selection_path,
+        test_capability=capability_path,
+        test_consumed_marker=consumed_path,
+    )
+    assert passed["ok"], passed
+
+    selection_path.write_text(selection_path.read_text() + " ")
+    attacked = audit_finetune_completion(
+        cfg,
+        checkpoint=best,
+        val_metrics=val_metrics,
+        test_metrics=test_metrics,
+        selection=selection_path,
+        test_capability=capability_path,
+        test_consumed_marker=consumed_path,
+    )
+    assert not attacked["ok"]
+    chain_gate = next(
+        item
+        for item in attacked["checks"]
+        if item["id"] == "recorded_selection_test_once_chain"
+    )
+    assert not chain_gate["ok"]
 
 
 def _completion_setup(tmp_path):
@@ -651,7 +1436,7 @@ def test_interleaved_method_is_accepted_with_full_metadata(tmp_path):
     path = tmp_path / "primary.npz"
     _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
     report = audit_official_path_model(
-        path, expected_output_channel="noise", sample_rate=FS,
+        path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
         required_band_hz=(100.0, 1_000.0),
     )
     assert report["method"] == "interleaved_multitone"
@@ -667,7 +1452,112 @@ def test_interleaved_without_extra_metadata_is_rejected(tmp_path):
     np.savez(path, **arrays)
     with pytest.raises(ValueError, match="interleaved 측정 메타데이터가 없습니다"):
         audit_official_path_model(
-            path, expected_output_channel="noise", sample_rate=FS,
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def _rewrite_npz(path: Path, *, drop: set[str] = frozenset(), **updates) -> None:
+    with np.load(path, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files if key not in drop}
+    arrays.update({key: np.asarray(value) for key, value in updates.items()})
+    np.savez(path, **arrays)
+
+
+def _source_path_from_official(path: Path, field: str) -> Path:
+    with np.load(path, allow_pickle=False) as data:
+        relative = str(np.asarray(data[field]).reshape(-1)[0])
+    return REPO_ROOT / relative
+
+
+def _rewrite_source_and_refresh_hash(
+    official_paths: list[Path], *, source_field: str, sha_field: str, **updates
+) -> Path:
+    source = _source_path_from_official(official_paths[0], source_field)
+    with np.load(source, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+    arrays.update({key: np.asarray(value) for key, value in updates.items()})
+    np.savez(source, **arrays)
+    digest = sha256_file(source)
+    for official in official_paths:
+        _rewrite_npz(official, **{sha_field: np.asarray(digest)})
+    return source
+
+
+def test_interleaved_delay_semantics_is_required(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    _rewrite_npz(path, drop={"delay_semantics"})
+
+    with pytest.raises(ValueError, match="delay_semantics"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_effective_bulk_preroll_relation_is_enforced(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    _rewrite_npz(path, bulk_delay_samples=np.int64(999))
+
+    with pytest.raises(ValueError, match="delay 계약 위반"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_source_digest_is_recomputed(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    with np.load(path, allow_pickle=False) as data:
+        real = np.asarray(data["aligned_mean_transfer_real"]).copy()
+    real[10] += 0.25
+    _rewrite_npz(path, aligned_mean_transfer_real=real)
+
+    with pytest.raises(ValueError, match="SHA256"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_fir_is_independently_reaudited(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    _rewrite_npz(path, fir=np.asarray([0.5, 0.4, -0.3], dtype=np.float32))
+
+    with pytest.raises(ValueError, match="compact"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_weak_compact_subband_is_rejected_after_valid_digest(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    with np.load(path, allow_pickle=False) as data:
+        frequencies = np.asarray(data["tone_frequencies_hz"]).copy()
+        values = np.asarray(data["aligned_mean_transfer_real"]) + 1j * np.asarray(
+            data["aligned_mean_transfer_imag"]
+        )
+    mask = (frequencies >= 1_000.0) & (frequencies <= 1_600.0)
+    values[mask] *= np.exp(1j * np.linspace(0.0, np.pi, int(mask.sum())))
+    digest = readiness._aligned_transfer_sha256(
+        frequencies, values.real, values.imag
+    )
+    _rewrite_npz(
+        path,
+        aligned_mean_transfer_real=values.real,
+        aligned_mean_transfer_imag=values.imag,
+        aligned_mean_transfer_sha256=np.asarray(digest),
+    )
+
+    with pytest.raises(ValueError, match="1000-1600Hz compact"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
             required_band_hz=(100.0, 1_000.0),
         )
 
@@ -681,6 +1571,19 @@ def test_interleaved_without_extra_metadata_is_rejected(tmp_path):
         ({"tone_snr_median_db": 6.0}, "tone_snr_median_db"),
         ({"capture_id": ""}, "capture_id"),
         ({"consistency_band_hz": [300.0, 500.0]}, "일관성 측정 대역"),
+        ({"calibration_block_size": 512}, "block_size"),
+        ({"calibration_latency": "high"}, "latency"),
+        ({"sample_rate": 8_000}, "sample_rate"),
+        ({"error_mic_channel": 1}, "error_mic_channel"),
+        (
+            {"operator_confirmed_routing_and_geometry": False},
+            "operator_confirmed_routing_and_geometry",
+        ),
+        ({"coherence_median": 0.949999}, "반복 일관성"),
+        (
+            {"band_consistency": [0.99, 0.99, 0.949999, 0.99]},
+            "600-1000Hz 일관성",
+        ),
     ],
 )
 def test_interleaved_quality_fields_are_enforced(tmp_path, override, pattern):
@@ -691,9 +1594,233 @@ def test_interleaved_quality_fields_are_enforced(tmp_path, override, pattern):
     )
     with pytest.raises(ValueError, match=pattern):
         audit_official_path_model(
-            path, expected_output_channel="noise", sample_rate=FS,
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
             required_band_hz=(100.0, 1_000.0),
         )
+
+
+@pytest.mark.parametrize(
+    ("override", "pattern"),
+    [
+        ({"repeats": 11}, "repeats=11"),
+        ({"kept_repeat_indices": [0, 1, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11]},
+         "strictly sorted unique"),
+        ({"kept_repeat_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16]},
+         "alignment_scores 범위"),
+        ({"anchor_repeat": 15}, "anchor_repeat가 kept_repeat_indices"),
+        ({"alignment_scores": np.ones((4, 4))}, "alignment_scores는"),
+    ],
+)
+def test_interleaved_repeat_provenance_is_enforced(tmp_path, override, pattern):
+    path = tmp_path / "primary.npz"
+    _official_path(
+        path, channel="noise", delay=4,
+        method="interleaved_multitone", interleaved=override,
+    )
+
+    with pytest.raises(ValueError, match=pattern):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "pattern"),
+    [
+        ({"output_pcm_provenance": "derived_not_observed"}, "output_pcm_provenance"),
+        ({"clock_sample_rate": INTERLEAVED_FS + 1}, "clock_sample_rate"),
+        ({"clock_max_drift_deviation_samples": 2.1}, "drift_deviation"),
+        ({"clock_q_ratio": np.ones(15)}, "clock_q_ratio"),
+        ({"clock_err_score": np.full(15, 0.90)}, "correlation score"),
+        ({"clock_err_subwindow_spread_samples": np.full(15, -0.01)}, "음수"),
+        ({"clock_observation_repeat_indices": np.arange(1, 16)}, "원본 반복 범위"),
+        ({"joint_ls_condition": np.full(15, 0.9)}, "condition은 1 미만"),
+        ({"joint_ls_condition": np.full(15, 1.3)}, "condition이 공식 상한"),
+        ({"joint_ls_reconstruction_relative_error": np.full(15, -0.01)}, "residual은 음수"),
+        ({"separation_crosscheck_complex_agreement": 0.998}, "crosscheck"),
+        ({"relative_tau_max_abs_samples": 1.01}, "relative_tau_max_abs"),
+        ({"repeat_tau_samples": np.linspace(0.0, 1.0, 12)}, "repeat_tau_samples"),
+        ({"clock_min_adjacent_score": 0.90}, "공식 고정값"),
+    ],
+)
+def test_interleaved_fractional_separation_tamper_fails_closed(
+    tmp_path, override, pattern
+):
+    path = tmp_path / "primary.npz"
+    _official_path(
+        path,
+        channel="noise",
+        delay=4,
+        method="interleaved_multitone",
+        interleaved=override,
+    )
+
+    with pytest.raises(ValueError, match=pattern):
+        audit_official_path_model(
+            path,
+            expected_output_channel="noise",
+            sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_source_raw_sha_is_recomputed(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    raw_source = _source_path_from_official(path, "source_raw_npz_path")
+    raw_source.write_bytes(raw_source.read_bytes() + b"tamper")
+
+    with pytest.raises(ValueError, match="source_raw_npz_sha256 불일치"):
+        audit_official_path_model(
+            path,
+            expected_output_channel="noise",
+            sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_source_analysis_version_name_is_tightly_anchored(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    _rewrite_npz(
+        path,
+        source_analysis_npz_path=np.asarray(
+            "results/session/analysis_results.reanalysis_untrusted.npz"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="source_analysis_npz_path basename"):
+        audit_official_path_model(
+            path,
+            expected_output_channel="noise",
+            sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_raw_channel_map_must_match_official_and_fixed_routing(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    raw_source = _source_path_from_official(path, "source_raw_npz_path")
+    with np.load(raw_source, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+        metadata = json.loads(str(data["metadata_json"]))
+    metadata["channel_map"]["error_mic"] = 1
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez(raw_source, **arrays)
+    _rewrite_npz(path, source_raw_npz_sha256=np.asarray(sha256_file(raw_source)))
+
+    with pytest.raises(ValueError, match="source raw channel_map"):
+        audit_official_path_model(
+            path,
+            expected_output_channel="noise",
+            sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_dead_measurement_raw_is_rejected_even_with_matching_report(
+    tmp_path,
+):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    raw_source = _source_path_from_official(path, "source_raw_npz_path")
+    with np.load(raw_source, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+        metadata = json.loads(str(data["metadata_json"]))
+    dead = np.zeros_like(arrays["input_raw_int32"])
+    metadata["measurement"] = readiness.analyze_int32_input_probe(dead)
+    arrays["input_raw_int32"] = dead
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez(raw_source, **arrays)
+    _rewrite_npz(path, source_raw_npz_sha256=np.asarray(sha256_file(raw_source)))
+
+    with pytest.raises(ValueError, match="measurement ERR/REF channel이 유효하지"):
+        audit_official_path_model(
+            path,
+            expected_output_channel="noise",
+            sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_raw_playback_must_equal_reconstructed_probe(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    raw_source = _source_path_from_official(path, "source_raw_npz_path")
+    with np.load(raw_source, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+    output = np.asarray(arrays["output"]).copy()
+    output[0, 0] += np.float32(1e-4)
+    arrays["output"] = output
+    arrays["output_pcm_int16"] = np.rint(
+        np.clip(output, -1.0, 1.0) * np.float32(np.iinfo(np.int16).max)
+    ).astype(np.int16)
+    np.savez(raw_source, **arrays)
+    _rewrite_npz(path, source_raw_npz_sha256=np.asarray(sha256_file(raw_source)))
+
+    with pytest.raises(ValueError, match="probe 재구성과 다릅니다"):
+        audit_official_path_model(
+            path,
+            expected_output_channel="noise",
+            sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_interleaved_source_clock_valid_mask_is_independently_recomputed(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+    source = _source_path_from_official(path, "source_analysis_npz_path")
+    with np.load(source, allow_pickle=False) as data:
+        mask = np.asarray(data["clock_valid_mask"]).copy()
+    mask[0] = False
+    _rewrite_source_and_refresh_hash(
+        [path],
+        source_field="source_analysis_npz_path",
+        sha_field="source_analysis_npz_sha256",
+        clock_valid_mask=mask,
+    )
+
+    with pytest.raises(ValueError, match="clock_valid_mask.*재계산"):
+        audit_official_path_model(
+            path,
+            expected_output_channel="noise",
+            sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 1_000.0),
+        )
+
+
+def test_readiness_clock_mask_uses_same_final_median_fixed_point_contract():
+    common = np.asarray([0.0] * 5 + [2.0] + [4.0] * 5 + [np.nan])
+    base_valid = np.isfinite(common)
+    adjacent = np.full(common.size, np.nan, dtype=np.float64)
+    adjacent[1:-1] = np.abs(np.diff(common[:-1]))
+
+    with pytest.raises(ValueError, match="final-median fixed-point.*8개 미만"):
+        readiness._fixed_point_clock_valid_mask(
+            base_valid=base_valid,
+            common_delay_samples=common,
+            adjacent_change_samples=adjacent,
+            max_drift_deviation_samples=2.0,
+            max_adjacent_change_samples=0.5,
+            min_valid_periods=8,
+        )
+
+
+def test_interleaved_direct_official_passes_fixed_point_clock_reaudit(tmp_path):
+    path = tmp_path / "primary.npz"
+    _official_path(path, channel="noise", delay=4, method="interleaved_multitone")
+
+    report = audit_official_path_model(
+        path,
+        expected_output_channel="noise",
+        sample_rate=INTERLEAVED_FS,
+        required_band_hz=(100.0, 1_000.0),
+    )
+
+    assert report["method"] == "interleaved_multitone"
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +1843,7 @@ def test_artifact_cannot_declare_its_own_delay_jitter_allowance(tmp_path):
     )
     with pytest.raises(ValueError, match="상대 τ spread 32 > 허용 3"):
         audit_official_path_model(
-            path, expected_output_channel="noise", sample_rate=FS,
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
             required_band_hz=(100.0, 1_000.0),
         )
 
@@ -734,7 +1861,7 @@ def test_missing_sub_band_consistency_is_rejected(tmp_path):
     np.savez(path, **arrays)
     with pytest.raises(ValueError, match="band_consistency"):
         audit_official_path_model(
-            path, expected_output_channel="noise", sample_rate=FS,
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
             required_band_hz=(100.0, 1_000.0),
         )
 
@@ -747,28 +1874,53 @@ def test_weak_sub_band_is_rejected_even_when_the_total_passes(tmp_path):
         path, channel="noise", delay=4, consistency=0.99,
         method="interleaved_multitone",
         # 총계 0.99 는 통과하지만 600-1000Hz 부대역만 0.73 이다(출하본 실측값).
-        interleaved={"band_consistency": [0.99, 0.99, 0.73]},
+        interleaved={"band_consistency": [0.99, 0.99, 0.73, 0.99]},
     )
     with pytest.raises(ValueError, match="부대역 600-1000Hz 일관성 0.7300"):
         audit_official_path_model(
-            path, expected_output_channel="noise", sample_rate=FS,
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
             required_band_hz=(100.0, 1_000.0),
         )
 
 
-def test_weak_sub_band_outside_the_required_band_is_not_judged(tmp_path):
-    """필수 대역 밖은 판정하지 않는다 — 그래야 하한 150Hz 규약이 영구 FAIL 을 안 만든다."""
+def test_canonical_sub_band_is_judged_even_outside_requested_band(tmp_path):
+    """설정으로 required band를 좁혀 canonical 4개 중 하나를 숨길 수 없다."""
 
     path = tmp_path / "primary.npz"
     _official_path(
         path, channel="noise", delay=4, method="interleaved_multitone",
-        interleaved={"band_consistency": [0.99, 0.99, 0.40]},
+        interleaved={"band_consistency": [0.99, 0.99, 0.99, 0.40]},
     )
-    report = audit_official_path_model(
-        path, expected_output_channel="noise", sample_rate=FS,
-        required_band_hz=(100.0, 600.0),   # 600-1000Hz 부대역이 요구 대역 밖
+    with pytest.raises(ValueError, match="canonical 부대역 1000-1600Hz"):
+        audit_official_path_model(
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
+            required_band_hz=(100.0, 600.0),
+        )
+
+
+def test_all_canonical_sub_bands_pass_at_the_required_boundary(tmp_path):
+    """canonical 4개 부대역이 하한 0.9406에 정확히 붙어도 통과한다."""
+
+    path = tmp_path / "primary.npz"
+    _official_path(
+        path,
+        channel="noise",
+        delay=4,
+        method="interleaved_multitone",
+        consistency=0.95,
+        interleaved={
+            "consistency_band_hz": [150.0, 1_600.0],
+            "band_consistency": [0.95, 0.95, 0.95, 0.95],
+        },
     )
-    assert report["interleaved"]["band_consistency"][-1] == pytest.approx(0.40)
+    model = audit_official_path_model(
+        path,
+        expected_output_channel="noise",
+        sample_rate=INTERLEAVED_FS,
+        required_band_hz=(150.0, 1_600.0),
+        min_consistency=0.95,
+    )
+    assert model["consistency"] == pytest.approx(0.95)
 
 
 @pytest.mark.parametrize(
@@ -802,7 +1954,7 @@ def test_reanalysis_parameter_envelope_is_enforced(tmp_path, params, pattern):
     )
     with pytest.raises(ValueError, match=pattern):
         audit_official_path_model(
-            path, expected_output_channel="noise", sample_rate=FS,
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
             required_band_hz=(100.0, 1_000.0),
         )
 
@@ -824,43 +1976,28 @@ def test_reanalysis_inside_the_envelope_is_accepted(tmp_path):
         },
     )
     report = audit_official_path_model(
-        path, expected_output_channel="noise", sample_rate=FS,
+        path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
         required_band_hz=(100.0, 1_000.0),
     )
     assert report["interleaved"]["reanalysis_params"]["min_kept_repeats"] == 8
 
 
-def test_shipped_official_artifacts_pass_the_new_gates():
-    """저장소의 현행 P/S 가 실제로 새 게이트를 통과하는지 — 설정과 아티팩트의 정합."""
+def test_legacy_shipped_interleaved_artifacts_fail_closed():
+    """새 delay/source 계약이 없는 과거 interleaved NPZ는 재사용할 수 없다."""
 
     duct = load_yaml(REPO_ROOT / "configs/duct.yaml")
     finetune = load_yaml(REPO_ROOT / "configs/train_finetune.yaml")
     band = tuple(float(v) for v in finetune["readiness"]["required_path_band_hz"])
-    reports = {}
     for key, channel in (
         (duct["digital_reference"]["primary_path_npz"], "noise"),
         (duct["secondary_path"]["npz"], "cancel"),
     ):
-        reports[channel] = audit_official_path_model(
-            REPO_ROOT / key, expected_output_channel=channel,
-            sample_rate=48_000, required_band_hz=band,
-            min_consistency=float(finetune["readiness"]["min_path_consistency"]),
-        )
-    # 같은 캡처·같은 반복 집합에서 나왔어야 lead 가 물리량이다.
-    assert (
-        reports["noise"]["interleaved"]["capture_id"]
-        == reports["cancel"]["interleaved"]["capture_id"]
-    )
-    p_delay = reports["noise"]["delay_samples"]
-    s_delay = reports["cancel"]["delay_samples"]
-    # P−S 는 이 측정 방식의 유일한 물리 불변량 — 유효 캡처 9건에서 139~141 이다.
-    assert 139 <= p_delay - s_delay <= 141
-    assert int(duct["digital_reference"]["d_noise_delay_samples"]) == p_delay
-    handoff = int(duct["secondary_path"]["handoff_extra_samples"])
-    data_sim = load_yaml(REPO_ROOT / "configs/data_sim.yaml")
-    assert int(data_sim["digital_reference_lead_samples"]) == (
-        s_delay + handoff - p_delay
-    )
+        with pytest.raises(ValueError, match="interleaved 측정 메타데이터가 없습니다"):
+            audit_official_path_model(
+                REPO_ROOT / key, expected_output_channel=channel,
+                sample_rate=48_000, required_band_hz=band,
+                min_consistency=float(finetune["readiness"]["min_path_consistency"]),
+            )
 
 
 def test_unknown_method_is_still_rejected(tmp_path):
@@ -868,9 +2005,29 @@ def test_unknown_method_is_still_rejected(tmp_path):
     _official_path(path, channel="noise", delay=4, method="white_noise")
     with pytest.raises(ValueError, match="허용 method"):
         audit_official_path_model(
-            path, expected_output_channel="noise", sample_rate=FS,
+            path, expected_output_channel="noise", sample_rate=INTERLEAVED_FS,
             required_band_hz=(100.0, 1_000.0),
         )
+
+
+def _official_current_interleaved_path(
+    path: Path,
+    *,
+    channel: str,
+    delay: int,
+    interleaved: dict | None = None,
+) -> None:
+    """Current fine-tune의 절대 대역 150–1600 Hz를 덮는 pair fixture."""
+
+    metadata = {"consistency_band_hz": [150.0, 1_600.0]}
+    metadata.update(interleaved or {})
+    _official_path(
+        path,
+        channel=channel,
+        delay=delay,
+        method="interleaved_multitone",
+        interleaved=metadata,
+    )
 
 
 def test_interleaved_pair_from_different_captures_fails_matched_conditions(tmp_path):
@@ -882,17 +2039,16 @@ def test_interleaved_pair_from_different_captures_fails_matched_conditions(tmp_p
     """
 
     cfg = _ready_config(tmp_path)
+    cfg["data"]["sample_rate"] = INTERLEAVED_FS
     primary = Path(cfg["duct"]["digital_reference"]["primary_path_npz"])
     secondary = Path(cfg["duct"]["secondary_path"]["npz"])
     primary.unlink()
     secondary.unlink()
-    _official_path(
-        primary, channel="noise", delay=4, method="interleaved_multitone",
-        interleaved={"capture_id": "cap-A"},
+    _official_current_interleaved_path(
+        primary, channel="noise", delay=4, interleaved={"capture_id": "cap-A"}
     )
-    _official_path(
-        secondary, channel="cancel", delay=5, method="interleaved_multitone",
-        interleaved={"capture_id": "cap-B"},
+    _official_current_interleaved_path(
+        secondary, channel="cancel", delay=5, interleaved={"capture_id": "cap-B"}
     )
     report = audit_finetune_readiness(cfg, full_recorded_qa=False)
     matched = _check(report, "matched_path_measurement_conditions")
@@ -902,22 +2058,117 @@ def test_interleaved_pair_from_different_captures_fails_matched_conditions(tmp_p
 
 def test_interleaved_pair_from_one_capture_passes_matched_conditions(tmp_path):
     cfg = _ready_config(tmp_path)
+    cfg["data"]["sample_rate"] = INTERLEAVED_FS
     primary = Path(cfg["duct"]["digital_reference"]["primary_path_npz"])
     secondary = Path(cfg["duct"]["secondary_path"]["npz"])
     primary.unlink()
     secondary.unlink()
-    _official_path(primary, channel="noise", delay=4, method="interleaved_multitone")
-    _official_path(secondary, channel="cancel", delay=5, method="interleaved_multitone")
+    _official_current_interleaved_path(primary, channel="noise", delay=4)
+    _official_current_interleaved_path(secondary, channel="cancel", delay=5)
     report = audit_finetune_readiness(cfg, full_recorded_qa=False)
     matched = _check(report, "matched_path_measurement_conditions")
     assert matched["ok"], matched["message"]
 
 
+def test_interleaved_pair_common_tau_is_recomputed_from_channel_scores(tmp_path):
+    cfg = _ready_config(tmp_path)
+    cfg["data"]["sample_rate"] = INTERLEAVED_FS
+    primary = Path(cfg["duct"]["digital_reference"]["primary_path_npz"])
+    secondary = Path(cfg["duct"]["secondary_path"]["npz"])
+    primary.unlink()
+    secondary.unlink()
+    _official_current_interleaved_path(primary, channel="noise", delay=4)
+    _official_current_interleaved_path(secondary, channel="cancel", delay=5)
+    source = _source_path_from_official(primary, "source_analysis_npz_path")
+    with np.load(source, allow_pickle=False) as data:
+        shifted_full = np.asarray(data["common_alignment_tau_samples"]) + 0.02
+    _rewrite_source_and_refresh_hash(
+        [primary, secondary],
+        source_field="source_analysis_npz_path",
+        sha_field="source_analysis_npz_sha256",
+        common_alignment_tau_samples=shifted_full,
+    )
+    with np.load(primary, allow_pickle=False) as data:
+        kept = np.asarray(data["kept_repeat_indices"], dtype=np.int64)
+    shifted_kept = shifted_full[kept]
+    _rewrite_npz(primary, common_alignment_tau_samples=shifted_kept)
+    _rewrite_npz(secondary, common_alignment_tau_samples=shifted_kept)
+
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+    matched = _check(report, "matched_path_measurement_conditions")
+    assert not matched["ok"]
+    assert "score 가중평균" in matched["message"]
+
+
+@pytest.mark.parametrize(
+    ("override", "pattern"),
+    [
+        ({"relative_tau_max_abs_samples": 0.5}, "relative_tau_max_abs_samples 저장값"),
+        ({"delay_spread_samples": 1}, "delay_spread_samples 저장값"),
+    ],
+)
+def test_interleaved_pair_relative_tau_scalars_are_independently_recomputed(
+    tmp_path, override, pattern
+):
+    cfg = _ready_config(tmp_path)
+    cfg["data"]["sample_rate"] = INTERLEAVED_FS
+    primary = Path(cfg["duct"]["digital_reference"]["primary_path_npz"])
+    secondary = Path(cfg["duct"]["secondary_path"]["npz"])
+    primary.unlink()
+    secondary.unlink()
+    _official_current_interleaved_path(
+        primary, channel="noise", delay=4, interleaved=override
+    )
+    _official_current_interleaved_path(
+        secondary, channel="cancel", delay=5, interleaved=override
+    )
+
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+    matched = _check(report, "matched_path_measurement_conditions")
+    assert not matched["ok"]
+    assert pattern in matched["message"]
+
+
+@pytest.mark.parametrize(
+    ("secondary_override", "pattern"),
+    [
+        ({"anchor_repeat": 4}, "anchor_repeat 불일치"),
+        (
+            {"kept_repeat_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]},
+            "kept_repeat_indices 불일치",
+        ),
+    ],
+)
+def test_interleaved_pair_requires_same_anchor_and_kept_repeats(
+    tmp_path, secondary_override, pattern
+):
+    cfg = _ready_config(tmp_path)
+    cfg["data"]["sample_rate"] = INTERLEAVED_FS
+    primary = Path(cfg["duct"]["digital_reference"]["primary_path_npz"])
+    secondary = Path(cfg["duct"]["secondary_path"]["npz"])
+    primary.unlink()
+    secondary.unlink()
+    _official_current_interleaved_path(primary, channel="noise", delay=4)
+    _official_current_interleaved_path(
+        secondary, channel="cancel", delay=5, interleaved=secondary_override
+    )
+
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+    matched = _check(report, "matched_path_measurement_conditions")
+    assert not matched["ok"]
+    assert pattern in matched["message"]
+
+
 def test_mixed_methods_are_rejected(tmp_path):
     cfg = _ready_config(tmp_path)
+    primary = Path(cfg["duct"]["digital_reference"]["primary_path_npz"])
     secondary = Path(cfg["duct"]["secondary_path"]["npz"])
+    # interleaved physical artifacts are fixed at 48 kHz. Keep the ESS side valid at
+    # the same runtime rate so this test reaches the intended method-mismatch gate.
+    _rewrite_npz(primary, sample_rate=np.asarray(INTERLEAVED_FS, dtype=np.int64))
+    cfg["data"]["sample_rate"] = INTERLEAVED_FS
     secondary.unlink()
-    _official_path(secondary, channel="cancel", delay=5, method="interleaved_multitone")
+    _official_current_interleaved_path(secondary, channel="cancel", delay=5)
     report = audit_finetune_readiness(cfg, full_recorded_qa=False)
     matched = _check(report, "matched_path_measurement_conditions")
     assert not matched["ok"]
@@ -928,8 +2179,8 @@ def test_init_lead_mismatch_is_rejected_by_default(tmp_path):
     """기본값은 정확히 일치다 — 허용치는 설정에 명시해야만 열린다."""
 
     cfg = _ready_config(tmp_path)
-    cfg["data"]["digital_reference_lead_samples"] = 4      # checkpoint 는 3
     cfg["duct"]["secondary_path"]["handoff_extra_samples"] = 3
+    _refresh_timing_contract(cfg)  # official contract lead=4, checkpoint lead=3
     report = audit_finetune_readiness(cfg, full_recorded_qa=False)
     check = _check(report, "completed_init_checkpoint")
     assert not check["ok"]
@@ -938,8 +2189,8 @@ def test_init_lead_mismatch_is_rejected_by_default(tmp_path):
 
 def test_init_lead_mismatch_within_declared_tolerance_passes(tmp_path):
     cfg = _ready_config(tmp_path)
-    cfg["data"]["digital_reference_lead_samples"] = 4
     cfg["duct"]["secondary_path"]["handoff_extra_samples"] = 3
+    _refresh_timing_contract(cfg)
     cfg["readiness"]["max_init_lead_mismatch_samples"] = 2
     report = audit_finetune_readiness(cfg, full_recorded_qa=False)
     assert _check(report, "completed_init_checkpoint")["ok"]
@@ -1112,6 +2363,20 @@ def test_readiness_refuses_when_only_some_declared_tags_have_a_manifest(tmp_path
     assert "manifest 가 없는" in gate["message"]
 
 
+def test_readiness_rejects_manifest_bytes_from_a_mixed_generation(tmp_path):
+    """sidecar 이후 JSONL 하나만 바뀌면 누수가 0이어도 학습을 시작하지 않는다."""
+
+    cfg = _ready_config(tmp_path)
+    manifest = Path(cfg["data"]["noise_manifest_dir"]) / "speech.jsonl"
+    manifest.write_text(manifest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    report = audit_finetune_readiness(cfg)
+
+    gate = _gate(report, "corpus_disjoint")
+    assert not gate["ok"]
+    assert "speech SHA 불일치" in gate["message"]
+
+
 # ---- G1c 달성 가능 상한 ---------------------------------------------------------------
 def test_readiness_rejects_a_target_above_the_achievable_ceiling(tmp_path):
     """플랜트가 허용하는 상한을 넘는 목표는 **학습 시작 전에** 막는다."""
@@ -1125,7 +2390,9 @@ def test_readiness_rejects_a_target_above_the_achievable_ceiling(tmp_path):
     gate = _gate(report, "plant_confidence_ceiling")
     assert not gate["ok"]
     assert "재측정" in gate["message"]
-    assert gate["details"]["binding_constraint"] == "플랜트 일관성"
+    # 현행 fixture는 재계산한 정규방정식 상한(7.59 dB)이 γ 상한보다
+    # 더 작다. 더 느슨한 상한을 기대하는 예전 fixture가 아니라 실제 구속 조건을 본다.
+    assert gate["details"]["binding_constraint"] == "정규방정식 설계 상한"
 
 
 def test_readiness_uses_the_tighter_of_the_two_ceilings(tmp_path):
@@ -1137,17 +2404,18 @@ def test_readiness_uses_the_tighter_of_the_two_ceilings(tmp_path):
     """
 
     cfg = _ready_config(tmp_path)
-    cfg["readiness"]["target_cancellation_db"] = 3.0
-    cfg["readiness"]["measured_design_ceiling_db"] = 4.0  # γ 상한(12.1)보다 훨씬 작다
-    # 상한은 대역이 붙어야 숫자다. 요구 대역 [100, 1000] 을 덮게 선언한다.
-    cfg["readiness"]["measured_design_ceiling_band_hz"] = [100, 1_000]
+    cfg["readiness"]["target_cancellation_db"] = 5.0
+    # 설계 상한은 아티팩트에서 다시 계산되므로 임의의 낮은 숫자를
+    # 적어 자기증명하지 않는다. fixture의 재계산값 그대로 선언한다.
+    cfg["readiness"]["measured_design_ceiling_db"] = 7.590811495963479
+    cfg["readiness"]["measured_design_ceiling_band_hz"] = [150, 1_600]
 
     report = audit_finetune_readiness(cfg)
 
     gate = _gate(report, "plant_confidence_ceiling")
     assert not gate["ok"]
     assert gate["details"]["binding_constraint"] == "정규방정식 설계 상한"
-    assert gate["details"]["binding_ceiling_db"] == 4.0
+    assert gate["details"]["binding_ceiling_db"] == pytest.approx(7.590811495963479)
     assert gate["details"]["gamma_ceiling_db"] > 10.0
 
 
@@ -1526,12 +2794,15 @@ def _boundary_config(tmp_path: Path) -> dict:
         )
         np.savez(path, **arrays)
 
-    ceiling = achievable_cancellation_ceiling_db(consistency, consistency)
+    ceiling = min(
+        achievable_cancellation_ceiling_db(consistency, consistency),
+        float(cfg["readiness"]["measured_design_ceiling_db"]),
+    )
     margin = 3.0
     cfg["readiness"].update(
         {
-            # 대역: 아티팩트가 실제로 구동한 **양 끝**을 그대로 요구한다.
-            "required_path_band_hz": excitation,
+            # 대역: 사용자 절대목표의 **양 끝**을 그대로 요구한다.
+            "required_path_band_hz": [150.0, 1_600.0],
             "min_path_consistency": consistency,          # 여유 0
             "required_recorded_ratio": float(cfg["recorded_ratio"]),
             "min_recorded_sessions": sessions,            # 여유 0
@@ -1552,7 +2823,7 @@ def test_every_entry_gate_passes_at_its_declared_boundary(tmp_path):
 
     몰아본 경계 (전부 여유 0 또는 한계의 90%):
       · 세션 수 = 최소 세션 수 (48)             · 분량 = 최소 분량
-      · 반복 일관성 = min_path_consistency      · 요구 대역 = 구동 대역 양 끝 100/1000Hz
+      · 반복 일관성 = min_path_consistency      · 요구 대역 = 절대목표 양 끝 150/1600Hz
       · P−S 상대 τ spread = 허용 최대 3 샘플    · 계열당 그룹 = 하한 4
       · source→ERR 지연 어긋남 7 = 허용 8.0 의 90%
       · 목표 + 여유 = 달성 가능 상한의 90%
@@ -1683,7 +2954,7 @@ def test_init_checkpoint_without_a_recorded_band_is_rejected(tmp_path):
 def test_init_checkpoint_band_exactly_equal_to_the_finetune_band_passes(tmp_path):
     """경계: checkpoint 대역이 파인튜닝 대역과 **정확히 같을 때** 통과한다.
 
-    100.0/1000.0 Hz 양 끝이 한 눈금도 어긋나지 않은 상태 — 여유 0 이다.
+    150.0/1600.0 Hz 양 끝이 한 눈금도 어긋나지 않은 상태 — 여유 0 이다.
     더 넓은 대역에서 온 것도 통과해야 한다(벌점을 받아 본 구간이 더 넓다).
     """
 
@@ -1691,8 +2962,8 @@ def test_init_checkpoint_band_exactly_equal_to_the_finetune_band_passes(tmp_path
     report = audit_finetune_readiness(cfg, full_recorded_qa=False)
     check = _check(report, "completed_init_checkpoint")
     assert check["ok"], check
-    assert check["details"]["checkpoint"]["trusted_band_hz"] == [100.0, 1_000.0]
-    assert check["details"]["checkpoint"]["expected_trusted_band_hz"] == [100.0, 1_000.0]
+    assert check["details"]["checkpoint"]["trusted_band_hz"] == [150.0, 1_600.0]
+    assert check["details"]["checkpoint"]["expected_trusted_band_hz"] == [150.0, 1_600.0]
 
     init = Path(cfg["init_ckpt"])
     wider = {
@@ -1824,21 +3095,49 @@ def test_the_two_training_branches_must_give_the_same_total_advance():
     from deep_anc.train.finetune_readiness import _Audit, _audit_measured_source_delay
 
     primary = {"path": "assets/measured/primary_path_il.npz", "delay_samples": 1_602}
+    primary_fir = np.zeros(248, dtype=np.float32)
+    primary_fir[-1] = 1.0
+    timing = TrainingTimingContract.derive(
+        primary_fir=primary_fir,
+        plant_delays=PlantDelays(
+            primary_delay_samples=1_602,
+            secondary_delay_samples=1_462,
+            handoff_samples=256,
+            sample_rate=48_000,
+        ),
+    )
 
     def _run(residual: float, lead_mode: str, sessions: int = 10) -> dict:
         audit = _Audit("t")
         report = {
             "sessions": [
-                {"alignment": {"source_err_delay_median_samples": residual}}
+                {
+                    "alignment": {
+                        "source_err_delay_median_samples": residual,
+                        "raw_source_err_delay_median_samples": 1_849.0,
+                    }
+                }
                 for _ in range(sessions)
             ]
         }
         data_cfg = {
-            "d_noise_delay_samples": 1_602,
-            "digital_reference_lead_samples": 116,
+            "sample_rate": 48_000,
+            "digital_reference_lead_samples": int(
+                timing.digital_reference_lead_samples
+            ),
+            "training_timing_contract": timing.model_dump(),
             "recorded_lead_mode": lead_mode,
         }
-        _audit_measured_source_delay(audit, {}, primary, report, data_cfg)
+        _audit_measured_source_delay(
+            audit,
+            {},
+            primary,
+            report,
+            data_cfg,
+            secondary={"delay_samples": 1_462},
+            duct_cfg={"secondary_path": {"handoff_extra_samples": 256}},
+            timing_contract=timing,
+        )
         return next(
             item
             for item in audit.report()["checks"]
@@ -1849,14 +3148,14 @@ def test_the_two_training_branches_must_give_the_same_total_advance():
     constant = _run(142.5, "constant")
     assert not constant["ok"]
     assert "총 선행량" in constant["message"]
-    assert "1459" in constant["message"], constant["message"]
+    assert "1706" in constant["message"], constant["message"]
     assert "timeline" in constant["message"]  # 처방을 함께 말한다
 
     # (b) timeline 모드 — 같은 데이터에서 통과한다. 즉 게이트가 항상 실패하지 않는다.
     timeline = _run(142.5, "timeline")
     assert timeline["ok"], timeline
-    assert timeline["details"]["synthetic_advance_samples"] == 1_718.0
-    assert timeline["details"]["recorded_advance_samples"] == pytest.approx(1_718.0, abs=1.0)
+    assert timeline["details"]["synthetic_advance_samples"] == 1_965.0
+    assert timeline["details"]["recorded_advance_samples"] == pytest.approx(1_965.0, abs=1.0)
 
     # (c) 표본이 모자라면 판정하지 않는다 — 없는 것을 통과로 세지 않는다.
     thin = _run(142.5, "timeline", sessions=3)
@@ -1865,7 +3164,7 @@ def test_the_two_training_branches_must_give_the_same_total_advance():
 
 
 def test_the_gate_refuses_when_the_synthetic_advance_is_unknown():
-    """``d_noise_delay_samples`` 가 없으면 두 브랜치를 맞출 수 없다 — 추측하지 않는다."""
+    """TrainingTimingContract가 없으면 두 브랜치를 맞출 수 없다 — 추측하지 않는다."""
 
     from deep_anc.train.finetune_readiness import _Audit, _audit_measured_source_delay
 
@@ -1881,6 +3180,8 @@ def test_the_gate_refuses_when_the_synthetic_advance_is_unknown():
         {"path": "assets/measured/primary_path_il.npz", "delay_samples": 1_602},
         report,
         {"digital_reference_lead_samples": 116},
+        secondary={"delay_samples": 1_462},
+        duct_cfg={"secondary_path": {"handoff_extra_samples": 256}},
     )
     gate = next(
         item
@@ -1888,7 +3189,7 @@ def test_the_gate_refuses_when_the_synthetic_advance_is_unknown():
         if item["id"] == "measured_source_delay_agreement"
     )
     assert not gate["ok"]
-    assert "d_noise_delay_samples" in gate["message"]
+    assert "TrainingTimingContract" in gate["message"]
 
 
 def test_readiness_rejects_a_pool_the_sessions_did_not_actually_play(tmp_path):

@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""실측 재생에 쓴 원본 클립 목록을 뽑아 **합성 풀에서 제외할 held-out 목록**을 만든다.
+"""실측 source CSV에서 held-out 후보를 보는 **진단 전용** 도구.
 
-  .venv/bin/python scripts/data/make_recorded_holdout.py
-  .venv/bin/python scripts/data/make_recorded_holdout.py --out data/manifests/recorded_holdout.json
+  .venv/bin/python scripts/data/make_recorded_holdout.py --diagnostic-only
+
+학습이 소비하는 canonical ``data/manifests/recorded_holdout.json``은 이 도구로 만들지
+않는다. 그 파일에는 historical builder/PCM 재현, active 82세션, source CSV SHA와
+provenance report 교차검증이 필요하다. 권위 복구는 다음 명령 하나뿐이다::
+
+  .venv/bin/python scripts/data/repair_source_pool_provenance.py \
+      --repair-csv --write-active-holdout --require-downstream-gates
 
 왜 필요한가 (D1 — 코퍼스 누수)
 -----------------------------
@@ -20,9 +26,8 @@
 분포를 바꾼다. 원인이 아닌 것을 바꿔서 증상을 덮는 쪽이고, 나중에 실측 계열이
 늘어나면 또 재분배해야 한다. **정확히 겹치는 것만 빼는 (a)가 원인 수정이다.**
 
-이 목록은 ``prepare_noise_pool.py --holdout`` 이 소비해 합성 manifest 를
-**구성 단계에서** 겹치지 않게 만든다. 사후 검사(``check_corpus_disjoint``)는 그
-구성이 실제로 지켜졌는지 반증하는 쪽이고, 둘 다 있어야 한다.
+이 진단 출력은 ``results/diagnostics`` 밖으로 쓸 수 없고 학습 도구가 소비하지 않는다.
+CSV만 읽어 만든 목록을 canonical provenance로 승격시키는 우회 경로를 없애기 위함이다.
 """
 
 import argparse
@@ -57,12 +62,26 @@ def collect(sources_csv: Path) -> dict[str, list[str]]:
                 clips = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{sources_csv}: clips 열을 읽을 수 없습니다: {exc}") from exc
+            # 잘린 기록으로 holdout 을 만들면 **빼야 할 클립을 빼지 않는다.**
+            # 2026-08-07: used[:12] 절단으로 256 placement 가 누락돼 있었다.
+            declared = row.get("clip_count")
+            if declared not in (None, "") and int(declared) > len(clips):
+                raise ValueError(
+                    f"{sources_csv}: 재생 기록이 잘려 있습니다 — "
+                    f"{row.get('path', '?')} clip_count={int(declared)} vs "
+                    f"clips {len(clips)}개. holdout 이 불완전해집니다"
+                )
             families.setdefault(family, set()).update(clip_key(item) for item in clips)
     return {family: sorted(values) for family, values in sorted(families.items())}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--diagnostic-only",
+        action="store_true",
+        help="비권위 후보 목록임을 명시한다. 없으면 아무 파일도 쓰지 않고 실패",
+    )
     parser.add_argument(
         "--sources",
         action="append",
@@ -72,13 +91,35 @@ def main() -> int:
             "재녹음이라면 **양쪽을 다 지정해야** held-out 이 실제 재생분을 덮는다"
         ),
     )
-    parser.add_argument("--out", default="data/manifests/recorded_holdout.json")
+    parser.add_argument(
+        "--out",
+        default="results/diagnostics/recorded_holdout.diagnostic.json",
+    )
     parser.add_argument(
         "--synthetic-root",
         default="data/raw",
         help="겹침 비율을 실제로 세기 위한 합성 풀 루트 (있으면)",
     )
     args = parser.parse_args()
+
+    if not args.diagnostic_only:
+        print(
+            "[중단] 이 도구는 canonical holdout을 만들 수 없습니다. 권위 복구는 "
+            "repair_source_pool_provenance.py --repair-csv --write-active-holdout을 "
+            "사용하세요. 후보만 보려면 --diagnostic-only를 명시하세요.",
+            file=sys.stderr,
+        )
+        return 2
+    out_path = (REPO_ROOT / args.out).resolve()
+    diagnostic_root = (REPO_ROOT / "results/diagnostics").resolve()
+    try:
+        out_path.relative_to(diagnostic_root)
+    except ValueError:
+        print("[중단] 진단 출력은 results/diagnostics 아래만 허용됩니다", file=sys.stderr)
+        return 2
+    if not out_path.name.endswith(".diagnostic.json"):
+        print("[중단] 진단 출력 파일명은 .diagnostic.json으로 끝나야 합니다", file=sys.stderr)
+        return 2
 
     # 세션이 **실제로 재생한** 풀을 단일 출처로 본다. 설정을 v1 로 둔 채 v2 로 녹음하면
     # held-out 이 실제 재생분을 못 덮고, 누수 게이트가 PASS 하면서 100% 누수를 통과시킨다
@@ -124,16 +165,13 @@ def main() -> int:
             }
 
     payload = {
-        "purpose": (
-            "실측 재생에 쓴 원본. 합성 노이즈 풀 manifest 를 만들 때 이 목록을 제외해 "
-            "두 브랜치가 같은 오디오를 보지 않게 한다 (D1 코퍼스 누수)."
-        ),
+        "authoritative": False,
+        "purpose": "CSV 기반 held-out 후보 진단. 학습 manifest 구성에 사용 금지.",
         "sources_csv": [str(p.relative_to(REPO_ROOT)) for p in csv_paths],
         "families": families,
         "total_clips": sum(len(values) for values in families.values()),
         "overlap_with_synthetic_pool": overlap,
     }
-    out_path = REPO_ROOT / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
