@@ -1080,7 +1080,9 @@ if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bun
   exit 1
 fi
 "$VENV_PYTHON" scripts/data/prepare_noise_pool.py \
-  --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256"
+  --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
+  --recorded-source-pool-csv data/source_pool_v2/sources.csv \
+  --recorded-source-pool-csv data/source_pool/sources.csv
 if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle; then
   echo "[오류] manifest 준비 종료 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1

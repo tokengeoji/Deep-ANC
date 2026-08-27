@@ -541,12 +541,26 @@ def build_public_lineage(
     tag_roots: Mapping[str, Sequence[str | Path]],
     repo_root: str | Path,
     holdout_lineage: Mapping[str, Any],
+    extra_excluded_basenames: Iterable[str] = (),
 ) -> PublicLineageBuild:
-    """모든 public tag를 한 DSU로 묶고 holdout component 전체를 제외한다."""
+    """모든 public tag를 한 DSU로 묶고 제외 component 전체를 제외한다.
+
+    ``holdout_lineage``는 recorded 평가 holdout의 권위 계보다. 그러나 실제 녹음에
+    사용한 source-pool CSV에는 holdout 세션 외의 예약/활성 clip도 남을 수 있다. 그
+    clip이 합성 manifest에 들어가면 readiness가 basename 교집합을 검출한다. 따라서
+    producer가 source-pool 전체 basename을 추가 exclusion으로 전달할 수 있게 하되,
+    lineage component 단위 원자성은 그대로 유지한다.
+    """
 
     root = Path(os.path.abspath(Path(repo_root)))
     holdout = validate_recorded_clip_lineage(holdout_lineage)
     holdout_basenames = {item["clip"] for item in holdout}
+    extra_basenames = {
+        str(item).strip().replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        for item in extra_excluded_basenames
+        if str(item).strip()
+    }
+    excluded_basenames = holdout_basenames | extra_basenames
     holdout_content = {item["content_sha256"] for item in holdout}
     holdout_keys = {
         str(key) for item in holdout for key in item.get("lineage_keys", [])
@@ -681,7 +695,7 @@ def build_public_lineage(
         basis = {"lineage_keys": keys, "content_sha256": contents}
         group_id = "public-lineage-" + canonical_json_sha256(basis)
         overlap = {
-            "basename": sorted(set(basenames).intersection(holdout_basenames)),
+            "basename": sorted(set(basenames).intersection(excluded_basenames)),
             "content_sha256": sorted(set(contents).intersection(holdout_content)),
             "lineage_keys": sorted(set(keys).intersection(holdout_keys)),
         }

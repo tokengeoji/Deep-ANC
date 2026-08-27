@@ -29,6 +29,7 @@ speech 0.15 / music 0.10 을 선언해도 실제로는 그 0.25 가 전부 synth
 """
 
 import argparse
+import csv
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -140,6 +141,74 @@ def _bind_audio_content_hashes(
         item["content_size"] = snapshot.size
         bound.append(item)
     return bound
+
+
+def _recorded_source_pool_exclusion(
+    values: list[str],
+) -> tuple[set[str], list[dict[str, object]]]:
+    """실측에 사용한 source-pool CSV의 clip basename을 exclusion set으로 읽는다.
+
+    canonical holdout은 평가용 component를 보존하지만, source-pool CSV에는 실제 녹음
+    세션 외에 예약된 clip도 함께 남을 수 있다. 이 목록을 manifest 생성 시점에 같이
+    제외하지 않으면 readiness의 corpus-disjoint 게이트가 뒤늦게 실패한다. CSV bytes와
+    basename digest를 generation sidecar에 남겨 어떤 pool 세대가 사용됐는지 추적한다.
+    """
+
+    basenames: set[str] = set()
+    evidence: list[dict[str, object]] = []
+    for value in values:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        snapshot = read_regular_file_snapshot(
+            path,
+            root=REPO_ROOT,
+            label=f"recorded source-pool CSV {path}",
+            capture_bytes=True,
+        )
+        if snapshot.data is None:
+            raise OSError(f"recorded source-pool CSV bytes를 읽지 못했습니다: {path}")
+        try:
+            text = snapshot.data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"recorded source-pool CSV UTF-8 오류: {path}") from exc
+        reader = csv.DictReader(text.splitlines())
+        required = {"source_family", "path", "clips"}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            raise ValueError(
+                f"recorded source-pool CSV 필드가 불완전합니다: {path} "
+                f"(required={sorted(required)})"
+            )
+        file_basenames: set[str] = set()
+        for number, row in enumerate(reader, start=2):
+            raw_clips = str(row.get("clips") or "")
+            try:
+                clips = json.loads(raw_clips)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"recorded source-pool CSV clips JSON 오류: {path}:{number}"
+                ) from exc
+            if not isinstance(clips, list):
+                raise ValueError(
+                    f"recorded source-pool CSV clips가 목록이 아닙니다: {path}:{number}"
+                )
+            for clip in clips:
+                item = str(clip).strip().replace("\\", "/")
+                if not item:
+                    raise ValueError(
+                        f"recorded source-pool CSV 빈 clip: {path}:{number}"
+                    )
+                file_basenames.add(item.rsplit("/", 1)[-1].casefold())
+        basenames.update(file_basenames)
+        evidence.append(
+            {
+                "path": str(path.relative_to(REPO_ROOT)),
+                "sha256": snapshot.sha256,
+                "size": int(snapshot.size),
+                "basename_count": len(file_basenames),
+            }
+        )
+    return basenames, evidence
 
 
 @contextmanager
@@ -651,6 +720,15 @@ def main() -> int:
         action="store_true",
         help="held-out 제외를 끈다. 진단 전용이며 학습 manifest 를 만들 때 쓰면 안 된다",
     )
+    parser.add_argument(
+        "--recorded-source-pool-csv",
+        action="append",
+        default=[],
+        help=(
+            "실측에 사용한 source-pool CSV(반복 지정 가능). 모든 clip basename을 "
+            "합성 manifest에서 추가 제외해 예약/활성 원본 누수를 막는다"
+        ),
+    )
     args = parser.parse_args()
 
     plan = PoolPlan(
@@ -778,6 +856,21 @@ def main() -> int:
             f"sha256={holdout_summary['sha256']})"
         )
 
+    extra_excluded_basenames: set[str] = set()
+    source_pool_exclusion_evidence: list[dict[str, object]] = []
+    if not args.allow_corpus_leak and args.recorded_source_pool_csv:
+        try:
+            extra_excluded_basenames, source_pool_exclusion_evidence = (
+                _recorded_source_pool_exclusion(args.recorded_source_pool_csv)
+            )
+        except (OSError, ValueError) as exc:
+            print(f"[실패] recorded source-pool exclusion 읽기 실패: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"recorded source-pool basename {len(extra_excluded_basenames)}개를 "
+            "합성 manifest에서 추가 제외합니다"
+        )
+
     # 모든 필수 태그를 먼저 메모리에서 준비한 뒤 한꺼번에 쓴다. 태그 하나가 없는데
     # 앞쪽 manifest만 새 버전으로 덮이면 디렉터리가 서로 다른 holdout 세대를 섞게 된다.
     # 실패 실행은 기존 manifest를 한 바이트도 바꾸지 않아야 한다.
@@ -815,11 +908,17 @@ def main() -> int:
             )
             return 1
         try:
+            lineage_kwargs: dict[str, object] = {}
+            # 기존 fixture/diagnostic 호출은 인자를 주지 않아도 동작해야 한다. 실제
+            # training 세대에서만 source-pool 추가 exclusion을 전달한다.
+            if extra_excluded_basenames:
+                lineage_kwargs["extra_excluded_basenames"] = extra_excluded_basenames
             lineage_build = build_public_lineage(
                 hashed_by_tag,
                 tag_roots=sources_by_tag,
                 repo_root=REPO_ROOT,
                 holdout_lineage=clip_lineage,
+                **lineage_kwargs,
             )
             # transitive component가 tag를 가로지를 수 있으므로 모든 tag를 한 번에
             # 분할한다. tag별 shuffle은 같은 component를 서로 다른 split에 넣을 수 있다.
@@ -862,6 +961,13 @@ def main() -> int:
                 ],
             }
         )
+        if source_pool_exclusion_evidence:
+            ordered = sorted(extra_excluded_basenames)
+            public_lineage_evidence["recorded_source_pool_exclusion"] = {
+                "files": source_pool_exclusion_evidence,
+                "basename_count": len(ordered),
+                "basename_sha256": canonical_json_sha256(ordered),
+            }
 
     # ---- 선언했는데 못 만든 태그 = 조용한 폴백의 씨앗 -----------------------------
     # 여기서 멈추지 않으면 synth_dataset 이 그 태그를 합성원으로 **로그 없이** 대체하고,

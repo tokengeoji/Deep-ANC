@@ -173,6 +173,24 @@ def test_public_dsu_keeps_independent_component_and_assigns_one_group(tmp_path: 
     assert kept[0]["lineage_schema"] == PUBLIC_LINEAGE_SCHEMA
 
 
+def test_public_dsu_excludes_recorded_source_pool_basename(tmp_path: Path) -> None:
+    _write_fma(tmp_path)
+    music_root = tmp_path / "data/raw/music"
+    entries = {
+        "music": [
+            {"path": str(music_root / "fma_small/000/000003.mp3"), "content_sha256": "3" * 64},
+        ]
+    }
+    with pytest.raises(PublicLineageBlocked, match="모든 component"):
+        build_public_lineage(
+            entries,
+            tag_roots={"music": [music_root]},
+            repo_root=tmp_path,
+            holdout_lineage=_holdout(family="music", keys=["unrelated:source"]),
+            extra_excluded_basenames=["000003.mp3"],
+        )
+
+
 def test_dns_speech_uses_explicit_namespace_without_crosswalk(tmp_path: Path) -> None:
     root = tmp_path / "data/raw/noise/speech"
     root.mkdir(parents=True)
