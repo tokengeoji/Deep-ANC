@@ -330,7 +330,10 @@ PY
   then
     return 1
   fi
-  filesystem_stats=$(df -PB1 --output=size,avail "$REPO" | awk 'NR==2 {print $1, $2}')
+  # GNU df는 --output과 -P를 함께 지정하면 상호 배타적으로 거부하는
+  # 배포판이 있다(Elice 이미지 포함). --output이 헤더/행 형식을 고정하므로
+  # -P는 불필요하며, -B1만 사용해 바이트 단위를 유지한다.
+  filesystem_stats=$(df -B1 --output=size,avail "$REPO" | awk 'NR==2 {print $1, $2}')
   read -r total_bytes available_bytes <<<"$filesystem_stats"
   if [[ ! "$total_bytes" =~ ^[0-9]+$ ]] || [ "$total_bytes" -lt "$minimum_total_bytes" ]; then
     echo "[오류] 학습/코퍼스 대상 filesystem total capacity가 128 GiB 미만입니다: ${total_bytes:-unknown} bytes" >&2
