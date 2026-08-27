@@ -39,9 +39,14 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   pytest는 0 FAIL이며 receipt SHA는
   `f56c3d1042211112627380f74315d5949f05bcf274bdcf3fefc588ea3d3caa7e`다.
 - 현재 Elice에서 seed `20260803`의 승인 loss grid 4개(각 20k surrogate pilot)를
-  순차 실행 중이다. 첫 후보 `alpha=0.7, lambda_frame=0.5`가 3.3 step/s로 진행 중이며,
-  후보 checkpoint는 init으로 승격하지 않는다. pilot·gradient·G0·measured probe·A100
-  resume 증거를 ledger로 묶은 뒤에만 canonical 100k를 연다.
+  순차 실행 중이다. 2026-08-27 마지막 확인 시 `alpha=0.7, lambda_frame=0.5`,
+  `alpha=0.7, lambda_frame=0.2`, `alpha=1.0, lambda_frame=0.5`는 20k를 완료했고,
+  앞의 두 후보는 val CVaR가 각각 +0.02/+0.00 dB, alpha 1.0/frame 0.5는
+  +0.20 dB(최악 +3.07 dB)로 불안정했다. 네 번째 `alpha=1.0, lambda_frame=0.2`는
+  약 6.1k/20k에서 진행 중이었다. 모든 후보 checkpoint는 init으로 승격하지 않는다.
+  현재 Elice checkout은 실행 중단을 피하기 위해 `2d19f140…`에 남겨 두었으며, pilot·
+  decoder warning 점검·gradient·G0·measured probe·A100 resume 증거를 ledger로 묶은
+  뒤 canonical 기준선 `c21fe1a`로 맞춘다.
 - canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
@@ -63,7 +68,7 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   §3.1`에 기록했고 기준선 commit `98df0b0`으로 push했다. 현재 Level 5(모델 선택 후 실제
   덕트 새 녹음) raw/session artifact는 아직 없으므로 현장 OOD 일반화는 `Not yet
   demonstrated`이다. 이 challenge는 학습·val 선택·test에 재사용하지 않는다.
-- 현재 기준선 `17eb809`에서 전체 pytest는 **0 FAIL**(경고는 로컬에 없는 downstream public
+- 현재 기준선 `c21fe1a`에서 전체 pytest는 **0 FAIL**(경고는 로컬에 없는 downstream public
   manifest를 진단 fixture가 알리는 것), `bash -n`과 `git diff --check`도 통과했다. Elice의
   canonical 실행 전에는 detached checkout `2d19f140a66e3d0264694e8f2e2941bce4fbd3bc`를
   기준선 전체 SHA로 다시 맞춘다.
@@ -267,3 +272,16 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
 - G4 PASS 뒤 natural-crest challenge 녹음·평가
 
 이 항목들은 코드로 우회하거나 legacy artifact로 대체하지 않는다.
+
+## 7. 외부 폴더 감사 및 저장소 정리(2026-08-27)
+
+- `/home/capston/DeepANC_CRN_n_codex/duct_cnn_anc`는 읽기 전용으로 전수 감사했다.
+  논문형 3,232-parameter 모델과 Primary 진단 raw는 있었지만 checkpoint/학습/ONNX가
+  없고, Secondary는 전기적 speaker-input이 없는 proxy와 입력 프레임 불일치로
+  `Invalid experiment`이다. 현행 P/S·lead·학습 계약은 변경하지 않는다.
+- 외부 감사 상세와 재사용/차단 목록은 `docs/11_external_duct_cnn_audit.md`에 기록했다.
+- 명백한 임시 readiness snapshot 두 디렉터리, 종료된 PID의 stale audio lock, 저장소
+  Python/test cache는 휴지통으로 이동했다. 데이터·raw·RIR·checkpoint·legacy 결과는
+  보존했다. 삭제/보존 목록과 SHA는 `docs/13_repository_cleanup_20260827.md`에 있다.
+- 현재 branch HEAD는 외부 감사 기록과 후속 정리 변경을 포함한 최신 commit이다. Elice의
+  진행 중 pilot은 중단하지 않고 종료 뒤 이 branch의 exact commit으로 동기화한다.
