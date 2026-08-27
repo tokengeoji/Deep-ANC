@@ -46,8 +46,9 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
 - QA 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`, strict 자산 승격 커밋
-  `4c55386`, Elice 이관 상태 문서 커밋 `86c5c45`가 원격 브랜치에 push 완료됐다.
-  현재 HEAD는 `86c5c458fbc0ffe586cdde31a3c9a82a9cb06a82`이다.
+  `4c55386`, Elice 이관 상태 문서 커밋 `86c5c45`, 데이터/손실 안정화 커밋
+  `2d19f14`, 예산 근거·진행 문서 커밋 `bd2a0cf`/`43563be`가 모두 원격 브랜치에
+  push 완료됐다. 현재 HEAD는 `43563be`다.
 - Elice receipt가 생긴 뒤 `check_finetune.py`의 외부 입력 차단은 해소됐지만, canonical
   init checkpoint·campaign ledger가 아직 없어 readiness는 의도적으로 15/15가 아니다.
 
