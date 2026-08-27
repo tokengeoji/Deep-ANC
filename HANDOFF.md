@@ -1,7 +1,7 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-26. 작업 브랜치: `fix/finetune-readiness-repair`.
+> 최종 갱신: 2026-08-27. 작업 브랜치: `fix/finetune-readiness-repair`.
 
 ## 0. 현재 결론
 
@@ -18,6 +18,16 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
 
 이 복구 작업에서 아직 스피커 출력이나 녹음을 실행하지 않았다. 라이브 측정은 전체 테스트,
 clean exact commit, push, 무음 dry-run과 장치 점유 확인 뒤 사용자 입회 아래 별도 단계로 한다.
+
+2026-08-27 확인 결과:
+
+- 입력 전용 2초 점검은 ERR/REF 두 채널 모두 무클리핑으로 통과했다. 스피커 출력은 하지 않았다.
+- canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
+  불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
+  QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
+- 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`은 원격 브랜치에 push 완료했다.
+- `check_finetune.py`는 외부 Elice `bootstrap_receipt`가 없어 의도적으로 중단된다. strict P/S
+  공식 캡처와 Elice corpus/receipt 없이는 readiness를 통과시킬 수 없다.
 
 ## 1. 구현된 계약
 
