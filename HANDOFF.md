@@ -36,7 +36,8 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
 - canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
-- 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`은 원격 브랜치에 push 완료했다.
+- QA 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`과 strict 자산 승격 커밋
+  `4c55386`은 원격 브랜치에 push 완료했다. 현재 HEAD는 `4c55386`이다.
 - `check_finetune.py`는 외부 Elice `bootstrap_receipt`가 없어 의도적으로 중단된다. strict P/S와
   로컬 계보는 통과했지만, Elice corpus/receipt 없이는 readiness를 통과시킬 수 없다.
 
