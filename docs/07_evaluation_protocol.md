@@ -92,6 +92,40 @@ selection을 재검증해 발급한 campaign capability를 정확히 한 번 소
 완성한 결과를 no-replace로 원자 출판한다. 1시드 clear PASS 또는 검증된 2시드 final selection이
 아니면 capability가 발급되지 않는다.
 
+### 3.1 처음 듣는 소리(OOD) 검증 — 최종 목표의 필수 게이트
+
+validation/test에 들어 있지 않은 소리를 재생해 본 결과만으로는 충분하지 않다. 다음 다섯
+수준을 구분해 기록하며, **Level 5를 통과하기 전에는 새 소리에 대한 ANC 일반화를 주장하지
+않는다.**
+
+| 수준 | 미사용 조건 | 의미 |
+|---|---|---|
+| Level 1 | 같은 원본 계열의 학습 제외 파일 | 파일 단위 일반화 |
+| Level 2 | 새 화자·아티스트·앨범·기계의 독립 component | 계보 밖 개체 일반화 |
+| Level 3 | 학습에 없던 dataset의 source | dataset 이동 |
+| Level 4 | 학습에 없던 source category/자연음 | category 이동 |
+| **Level 5** | 모델 선택·계약 고정 뒤 Jetson 실제 덕트에서 새로 녹음한 speech/music/environment/machine | **현장 OOD·quiet-zone 검증** |
+
+Level 1–4의 source SHA·artist/album·speaker/book·machine/session lineage가 train/val/test와
+교집합 0인지 먼저 검사한다. Level 5는 어떤 manifest에도 넣지 않고, 모델 선택에 사용하지
+않으며, 녹음 직후 immutable raw WAV/NPZ와 source SHA를 보존한다. 각 수준에서 125, 250, 500,
+1000, 1600, 2000, 4000, 8000Hz 옥타브별 OFF/ON 전력비를 계산하고 평균·최악 10%·family별
+cluster-bootstrap CI·latency/deadline/xrun을 함께 남긴다. `attenuation > 0`만 감쇠이며 음수는
+증폭이다.
+
+최종 OOD PASS 조건은 다음을 모두 만족해야 한다.
+
+1. trusted 150–1600Hz 평균과 모든 family 최악 10%가 0dB 미만이고, fullband 평균이 0dB
+   이하이다.
+2. 2/4/8kHz는 `trusted=False`로 숨기지 않고 별도 표에 싣는다. high-band P/S가 유효한
+   경우 평균 감쇠가 양수이고, 어떤 경우에도 최악 10% 증폭이 1dB를 넘지 않아야 한다.
+3. 48kHz/256-sample 실시간에서 P99가 deadline(5.333ms)을 넘지 않고 deadline miss와 xrun이
+   0이다.
+
+raw/session artifact가 없거나 high-band clock/P/S가 무효이면 해당 수준은 **Not yet
+demonstrated/INCONCLUSIVE**로 판정한다. challenge 결과를 학습 데이터로 되돌려 넣지 않으며,
+실패할 때만 원인을 수정한 뒤 별도 재수집·재학습 루프로 돌아간다.
+
 ## 4. 실기 평가 (덕트, 사용자 입회)
 
 ```bash
