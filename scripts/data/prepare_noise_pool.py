@@ -67,11 +67,14 @@ from deep_anc.data.manifest_contract import (                  # noqa: E402
     CANONICAL_MANIFEST_SCHEMA_VERSION,
     DECODER_AUDIT_FILE,
     decoder_audit_binding,
+    derive_decoder_rejected_members_by_tag,
     read_decoder_audit,
+    validate_decoder_audit_dns_marker_partition,
     validate_decoder_audit_binding,
     validate_decoder_audit_manifest_entry,
 )
 from deep_anc.data.public_lineage import (                      # noqa: E402
+    DNS_MARKER_TAG_ROOTS,
     PublicLineageError,
     build_public_lineage,
     canonical_json_sha256,
@@ -382,6 +385,20 @@ def _verify_committed_generation(
         lineage = contract.get("public_lineage")
         if not isinstance(lineage, dict):
             raise RuntimeError("committed 학습 세대에 public_lineage가 없습니다")
+        if committed_decoder_audit is None:
+            raise RuntimeError("committed 학습 세대에 decoder audit가 없습니다")
+        try:
+            validate_decoder_audit_dns_marker_partition(
+                lineage,
+                committed_entries,
+                committed_decoder_audit,
+                repo_root=REPO_ROOT,
+                label="committed decoder audit DNS marker partition",
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"committed decoder audit DNS marker partition이 깨졌습니다: {exc}"
+            ) from exc
         summary = validate_public_manifest_lineage(committed_entries)
         if (
             summary["component_count"] != lineage.get("manifest_component_count")
@@ -942,6 +959,37 @@ def main() -> int:
         print(f"[실패] raw tree 안전 검사 실패: {exc}", file=sys.stderr)
         return 1
 
+    # scan_wavs가 decoder가 열지 못한 파일을 건너뛰더라도, DNS official archive
+    # marker와의 complete partition에는 그 audit-reject member가 반드시 남아야 한다.
+    # 이 projection은 accepted scan 결과가 아니라 audit inventory 전체에서 만든다.
+    decoder_rejected_marker_members: dict[str, tuple[str, ...]] | None = None
+    if decoder_audit_evidence is not None:
+        marker_tag_roots: dict[str, list[Path]] = {}
+        for tag, relative in DNS_MARKER_TAG_ROOTS.items():
+            expected = Path(os.path.abspath(REPO_ROOT / relative))
+            # ``speech`` tag에는 DNS read_speech와 LibriSpeech tree가 함께 있을 수
+            # 있다. marker projection은 official DNS archive root 하나만 대상으로
+            # 하고, LibriSpeech reject는 일반 public lineage에만 남긴다.
+            marker_tag_roots[tag] = [
+                path
+                for path in tag_dirs.get(tag, [])
+                if Path(os.path.abspath(path)) == expected
+            ]
+        try:
+            decoder_rejected_marker_members = derive_decoder_rejected_members_by_tag(
+                decoder_audit_evidence,
+                tag_roots=marker_tag_roots,
+                repo_root=REPO_ROOT,
+                label="prepare decoder audit DNS marker projection",
+            )
+        except ValueError as exc:
+            print(
+                f"[BLOCKED] decoder audit DNS marker projection 검증 실패: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        _progress("decoder audit DNS marker reject projection 완료")
+
     # ---- 실측과 겹치는 원본 제외 (D1) -------------------------------------------
     # 같은 오디오가 두 브랜치에 동시에 들어가면 모델은 같은 입력에 **상충하는 정답**을
     # 받는다. 합성은 이상적 P/S 라 −18 dB 까지 가능하고 실측은 실제 플랜트라 천장이
@@ -1042,6 +1090,9 @@ def main() -> int:
     for pool in plan.pools:
         _progress(f"{pool.tag}: raw scan 시작")
         sources = tag_dirs.get(pool.tag, [])
+        # marker partition은 scan 결과가 0이어도 tag root 자체를 알아야 한다. 이후
+        # missing required tag gate는 accepted 항목 0을 별도로 fail-closed 처리한다.
+        sources_by_tag[pool.tag] = sources
         entries: list[dict] = []
         for src in sources:
             entries.extend(scan_wavs(src, pool.tag))
@@ -1131,10 +1182,17 @@ def main() -> int:
             # training 세대에서만 source-pool 추가 exclusion을 전달한다.
             if extra_excluded_basenames:
                 lineage_kwargs["extra_excluded_basenames"] = extra_excluded_basenames
+            if decoder_rejected_marker_members is not None:
+                lineage_kwargs["decoder_rejected_members_by_tag"] = (
+                    decoder_rejected_marker_members
+                )
+                lineage_kwargs["decoder_audit_inventory_sha256"] = str(
+                    decoder_audit_evidence["inventory_sha256"]
+                )
             _progress("public lineage component 구성 시작")
             lineage_build = build_public_lineage(
                 hashed_by_tag,
-                tag_roots=sources_by_tag,
+                tag_roots=tag_dirs,
                 repo_root=REPO_ROOT,
                 holdout_lineage=clip_lineage,
                 **lineage_kwargs,

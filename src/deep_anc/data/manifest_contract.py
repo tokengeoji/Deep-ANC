@@ -13,7 +13,7 @@ import json
 import os
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 from ..config import REPO_ROOT
 from .decoder_audit import (
@@ -29,8 +29,11 @@ from .decoder_audit import (
 from .holdout_contract import read_regular_file_snapshot, reject_symlink_components
 from .manifest import read_manifest_bytes
 from .public_lineage import (
+    DNS_MARKER_TAG_ROOTS,
     PUBLIC_LINEAGE_SCHEMA,
+    PublicLineageError,
     canonical_json_sha256,
+    validate_dns_marker_partition,
     validate_public_manifest_lineage,
     validate_recorded_clip_lineage,
 )
@@ -284,6 +287,258 @@ def read_decoder_audit(
         if row["decision"] == "reject"
     }
     return result
+
+
+def _derive_decoder_audit_members_by_tag(
+    audit: Mapping[str, Any],
+    *,
+    tag_roots: Mapping[str, Sequence[str | Path]],
+    decision: str,
+    repo_root: str | Path = REPO_ROOT,
+    label: str = "decoder audit reject member projection",
+) -> dict[str, tuple[str, ...]]:
+    """audit inventory 전체의 한 decision 행을 tag-root-relative member로 투영한다.
+
+    ``scan_wavs``는 decoder가 열지 못하는 파일을 의도적으로 건너뛴다. 따라서 scan
+    결과만으로 DNS archive marker를 검증하면 broken raw member가 사라지는 fail-open
+    경로가 생긴다. 이 함수는 **모든** audit inventory 행을 직접 보고, DNS marker
+    tag root 아래의 member만 portable POSIX path로 만든다.
+
+    반환값에는 absolute path/content SHA를 넣지 않는다. bytes identity는 audit
+    inventory와 그 SHA binding이 맡고, public-lineage evidence에는 tag root 기준
+    member 목록만 남긴다.
+    """
+
+    if decision not in {"accept", "reject"}:
+        raise ValueError(f"{label} decision은 accept/reject여야 합니다")
+    if not isinstance(audit, Mapping):
+        raise ValueError(f"{label} audit가 mapping이 아닙니다")
+    rows = audit.get("inventory")
+    if not isinstance(rows, list):
+        raise ValueError(f"{label} inventory가 없습니다")
+    _require_sha256(audit.get("inventory_sha256"), field=f"{label} inventory")
+    if not isinstance(tag_roots, Mapping):
+        raise ValueError(f"{label} tag_roots가 mapping이 아닙니다")
+    root = Path(os.path.abspath(repo_root))
+    roots_by_tag: dict[str, tuple[Path, ...]] = {}
+    for raw_tag, raw_values in sorted(tag_roots.items(), key=lambda item: str(item[0])):
+        tag = str(raw_tag)
+        if not tag:
+            raise ValueError(f"{label} tag 이름이 비었습니다")
+        if isinstance(raw_values, (str, bytes)) or not isinstance(raw_values, Sequence):
+            raise ValueError(f"{label} {tag} tag root 목록이 유효하지 않습니다")
+        roots: list[Path] = []
+        for index, value in enumerate(raw_values):
+            try:
+                candidate = Path(value)
+            except TypeError as exc:
+                raise ValueError(
+                    f"{label} {tag} tag root #{index}가 path가 아닙니다"
+                ) from exc
+            absolute = Path(
+                os.path.abspath(candidate if candidate.is_absolute() else root / candidate)
+            )
+            try:
+                absolute.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{label} {tag} tag root가 repository 밖입니다: {absolute}"
+                ) from exc
+            try:
+                reject_symlink_components(absolute, root=root)
+            except Exception as exc:
+                raise ValueError(
+                    f"{label} {tag} tag root 경로 계약 위반: {absolute}: {exc}"
+                ) from exc
+            if not absolute.is_dir():
+                raise ValueError(f"{label} {tag} tag root가 directory가 아닙니다: {absolute}")
+            roots.append(absolute)
+        if len({str(item) for item in roots}) != len(roots):
+            raise ValueError(f"{label} {tag} tag root에 alias/중복이 있습니다")
+        if roots:
+            roots_by_tag[tag] = tuple(roots)
+
+    projected: dict[str, list[str]] = {tag: [] for tag in sorted(roots_by_tag)}
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"{label} inventory #{index}가 mapping이 아닙니다")
+        if row.get("decision") != decision:
+            continue
+        relative = _decoder_audit_relative_path(
+            row.get("relative_path"), field=f"{label} inventory #{index}.relative_path"
+        )
+        absolute = Path(os.path.abspath(root / Path(relative)))
+        candidates: list[tuple[str, Path]] = []
+        for tag, roots in roots_by_tag.items():
+            for tag_root in roots:
+                if tag_root in absolute.parents:
+                    candidates.append((tag, tag_root))
+        if not candidates:
+            continue
+        candidate_tags = {tag for tag, _ in candidates}
+        if len(candidate_tags) != 1:
+            raise ValueError(
+                f"{label} {decision} raw가 여러 tag root에 겹칩니다: {relative}: "
+                f"{sorted(candidate_tags)}"
+            )
+        # 한 tag 안에 nested roots가 있다면 가장 깊은 root만 member 기준으로 쓴다.
+        # marker tag는 public-lineage가 정확히 하나의 root를 다시 요구한다.
+        tag, tag_root = max(candidates, key=lambda item: len(item[1].parts))
+        try:
+            reject_symlink_components(absolute, root=tag_root)
+        except Exception as exc:
+            raise ValueError(
+                f"{label} {decision} raw path 경로 계약 위반: {relative}: {exc}"
+            ) from exc
+        member = absolute.relative_to(tag_root).as_posix()
+        # member의 POSIX syntax는 raw-audit repository path 검증과 별개다. 여기서는
+        # tag root 기준으로 다시 같은 strictness를 적용해 basename-only alias를 막는다.
+        member_path = PurePosixPath(member)
+        if (
+            member_path.is_absolute()
+            or any(part in {"", ".", ".."} for part in member_path.parts)
+            or member_path.as_posix() != member
+        ):
+            raise ValueError(
+                f"{label} {decision} member가 canonical POSIX path가 아닙니다: {member!r}"
+            )
+        projected[tag].append(member)
+
+    result: dict[str, tuple[str, ...]] = {}
+    for tag, members in sorted(projected.items()):
+        ordered = tuple(sorted(members))
+        if len(set(ordered)) != len(ordered):
+            raise ValueError(f"{label} {tag} {decision} member가 중복됩니다")
+        folded: dict[str, str] = {}
+        for member in ordered:
+            previous = folded.setdefault(member.casefold(), member)
+            if previous != member:
+                raise ValueError(
+                    f"{label} {tag} {decision} member에 case-variant alias가 있습니다: "
+                    f"{previous!r}, {member!r}"
+                )
+        result[tag] = ordered
+    return result
+
+
+def derive_decoder_rejected_members_by_tag(
+    audit: Mapping[str, Any],
+    *,
+    tag_roots: Mapping[str, Sequence[str | Path]],
+    repo_root: str | Path = REPO_ROOT,
+    label: str = "decoder audit reject member projection",
+) -> dict[str, tuple[str, ...]]:
+    """모든 decoder-audit reject를 DNS marker tag-root member로 투영한다."""
+
+    return _derive_decoder_audit_members_by_tag(
+        audit,
+        tag_roots=tag_roots,
+        decision="reject",
+        repo_root=repo_root,
+        label=label,
+    )
+
+
+def derive_decoder_accepted_members_by_tag(
+    audit: Mapping[str, Any],
+    *,
+    tag_roots: Mapping[str, Sequence[str | Path]],
+    repo_root: str | Path = REPO_ROOT,
+    label: str = "decoder audit accept member projection",
+) -> dict[str, tuple[str, ...]]:
+    """모든 decoder-audit accept를 DNS marker tag-root member로 투영한다.
+
+    postcommit/consumer validation은 holdout 때문에 final JSONL에서 빠진 accept row도
+    marker completeness에서 잃지 않도록 이 projection을 사용한다.
+    """
+
+    return _derive_decoder_audit_members_by_tag(
+        audit,
+        tag_roots=tag_roots,
+        decision="accept",
+        repo_root=repo_root,
+        label=label,
+    )
+
+
+def validate_decoder_audit_dns_marker_partition(
+    lineage: object,
+    entries_by_tag: Mapping[str, Sequence[Mapping[str, Any]]],
+    decoder_audit: Mapping[str, Any],
+    *,
+    repo_root: str | Path = REPO_ROOT,
+    label: str = "decoder audit DNS marker partition",
+) -> dict[str, Any] | None:
+    """committed public-lineage evidence를 copied audit+manifest로 독립 재검증한다.
+
+    sidecar의 ``build_id``를 다시 계산해도, reject decision/path 또는 marker evidence를
+    바꿔서는 canonical generation을 통과할 수 없어야 한다. stored evidence의 root
+    projection을 입력으로 쓰되, reject member는 copied audit inventory에서 다시
+    유도하고 exact equality를 요구한다.
+    """
+
+    if not isinstance(lineage, Mapping):
+        raise ValueError(f"{label} public_lineage가 mapping이 아닙니다")
+    stored = lineage.get("decoder_rejected_marker_partition")
+    root = Path(os.path.abspath(repo_root))
+    has_dns_entries = False
+    for tag, relative_root in DNS_MARKER_TAG_ROOTS.items():
+        marker_root = Path(os.path.abspath(root / relative_root))
+        for entry in entries_by_tag.get(tag, ()):
+            absolute = Path(os.path.abspath(Path(str(entry.get("path") or ""))))
+            if marker_root in absolute.parents:
+                has_dns_entries = True
+                break
+        if has_dns_entries:
+            break
+    if stored is None:
+        if has_dns_entries:
+            raise ValueError(f"{label} evidence가 없습니다")
+        return None
+    if not isinstance(stored, Mapping):
+        raise ValueError(f"{label} evidence가 mapping이 아닙니다")
+    stored_tags = stored.get("tags")
+    if not isinstance(stored_tags, Mapping) or not stored_tags:
+        raise ValueError(f"{label} evidence.tags가 비었거나 mapping이 아닙니다")
+    tag_roots: dict[str, Sequence[str | Path]] = {}
+    for tag, evidence in sorted(stored_tags.items(), key=lambda item: str(item[0])):
+        if str(tag) not in {"dns_fullband", "speech"}:
+            raise ValueError(f"{label}에 지원하지 않는 tag가 있습니다: {tag!r}")
+        if not isinstance(evidence, Mapping):
+            raise ValueError(f"{label} {tag} evidence가 mapping이 아닙니다")
+        roots = evidence.get("tag_roots")
+        if isinstance(roots, (str, bytes)) or not isinstance(roots, Sequence):
+            raise ValueError(f"{label} {tag}.tag_roots가 목록이 아닙니다")
+        tag_roots[str(tag)] = roots
+    actual_rejected = derive_decoder_rejected_members_by_tag(
+        decoder_audit,
+        tag_roots=tag_roots,
+        repo_root=repo_root,
+        label=label,
+    )
+    actual_accepted = derive_decoder_accepted_members_by_tag(
+        decoder_audit,
+        tag_roots=tag_roots,
+        repo_root=repo_root,
+        label=label,
+    )
+    inventory_sha = _require_sha256(
+        decoder_audit.get("inventory_sha256"), field=f"{label} inventory"
+    )
+    try:
+        actual = validate_dns_marker_partition(
+            entries_by_tag,
+            tag_roots=tag_roots,
+            repo_root=repo_root,
+            decoder_rejected_members_by_tag=actual_rejected,
+            decoder_accepted_members_by_tag=actual_accepted,
+            decoder_audit_inventory_sha256=inventory_sha,
+        )
+    except PublicLineageError as exc:
+        raise ValueError(f"{label} exact partition 검증 실패: {exc}") from exc
+    if actual != stored:
+        raise ValueError(f"{label} evidence가 copied audit/manifest 재계산 결과와 다릅니다")
+    return actual
 
 
 def decoder_audit_binding(audit: dict[str, Any]) -> dict[str, Any]:
@@ -887,6 +1142,14 @@ def validate_manifest_generation(
     ):
         raise ValueError("public_lineage 전체 component membership digest 불일치")
 
+    validate_decoder_audit_dns_marker_partition(
+        lineage,
+        validated_entries,
+        decoder_audit,
+        repo_root=contract_root,
+        label="manifest generation decoder audit DNS marker partition",
+    )
+
     manifest_lineage = validate_public_manifest_lineage(validated_entries)
     if (
         lineage.get("manifest_component_count")
@@ -957,8 +1220,11 @@ __all__ = [
     "DECODER_AUDIT_SCHEMA_VERSION",
     "MANIFEST_GENERATION_FILE",
     "decoder_audit_binding",
+    "derive_decoder_accepted_members_by_tag",
+    "derive_decoder_rejected_members_by_tag",
     "read_decoder_audit",
     "sha256_file",
+    "validate_decoder_audit_dns_marker_partition",
     "validate_decoder_audit_binding",
     "validate_decoder_audit_manifest_entry",
     "validate_manifest_generation",

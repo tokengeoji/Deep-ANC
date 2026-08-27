@@ -149,6 +149,28 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   재현할 수 있었지만, component의 members·identity digest·분할 의미는 root 이름이 아니라
   canonicalized data로 결정되므로 이 변경은 계보 의미를 바꾸지 않고 대형 corpus chain을
   안전하게 닫는다.
+- 2026-08-28 exact SHA `70483599c3d2d8f98fe8b36cfbe3a068fa1aa43a`의 Elice v7
+  audit-reuse bootstrap은 DNS official marker 대조에서 의도적으로 exit 1로 멈췄다
+  (status SHA `37e2617b61f07482be7dd74bfb831861ee2491bbe8adcfd3ea173824f4bc0f85`,
+  log SHA `93371453b3e30cafa8c48bb0f0a5711a6345ded3be127ec47a83c7fc23a39d69`).
+  원인은 raw 손상이 아니라 구 검증이 `scan_wavs`의 accept 집합만 official archive marker와
+  같아야 한다고 가정한 것이다. 실제 decoder audit은 DNS fullband accept/reject
+  `15,553/447`, DNS speech `7,971/94`를 기록했고, reject member는 의도적으로 scan에서
+  빠지므로 marker의 missing으로 오인됐다. 원격 raw에서 marker의 실제 canonical root가
+  `data/raw/noise/dns_fullband`, `data/raw/noise/speech`임을 read-only로 재확인했다.
+- 다음 commit 후보는 marker를 **audit accept ∪ audit reject의 exact partition**으로
+  검증한다. `speech` tag에 함께 존재할 수 있는 `data/raw/speech/LibriSpeech`는 일반
+  lineage/DSU에 계속 포함하되 DNS marker partition에서는 제외한다. transaction
+  postcommit도 copied decoder audit에서 accept/reject projection과 marker evidence를
+  다시 만들고 exact equality를 요구하므로, sidecar만 바꿔서 raw 누락·reject 누수를
+  통과시키지 못한다.
+- 같은 작업에서 decoder audit의 raw snapshot은 정상 read가 갱신할 수 있는 `atime`까지
+  전체 stat로 비교해 false reject를 만들 수 있음을 재현했다. 동일 raw identity는
+  device/inode/size/mtime/ctime과 regular-file mode로만 비교하도록 고쳤다. byte 변경
+  탐지는 유지하며, 새 regression과 임시 audit 100회 반복이 통과했다. 이 marker/atime
+  변경 후 로컬 전체 pytest도 0 FAIL(로컬 public manifest 부재를 알리는 diagnostic
+  warning만 2건), shell 문법·`py_compile`·`git diff --check`도 통과했다. commit/push
+  뒤에만 Elice v8 preflight와 full bootstrap을 다시 시작한다.
 - 2026-08-28 구 `5632c08` Elice bootstrap은 stage 4에서 약 3시간 54분 동안 user CPU만
   증가하고 raw I/O·staging·canonical_v4·로그 진행이 없었다. raw 변경 0, tracked 변경 0,
   staging 0을 재확인한 뒤 worker 하나에만 TERM을 보내 `exit_code=143` receipt를 남겼고,

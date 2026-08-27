@@ -255,7 +255,23 @@ def _file_snapshot(path: Path) -> tuple[dict[str, int], str]:
         int(after.st_mtime_ns),
         int(after.st_ctime_ns),
     )
-    if after_open != opened or after_identity != before_identity:
+    # ``os.stat_result`` 전체 비교에는 atime이 들어간다. 일반 read 자체가 relatime
+    # mount에서 atime을 갱신할 수 있으므로, 이를 raw replacement로 오인하면 같은
+    # untouched WAV audit이 accept/reject 사이에서 비결정적으로 흔들린다. raw bytes
+    # identity에 필요한 device/inode/size/mtime/ctime만 (hash 시작 전과 같은 방식으로)
+    # 비교한다. mode가 regular인지도 다시 확인해 retarget을 막는다.
+    after_open_identity = (
+        int(after_open.st_dev),
+        int(after_open.st_ino),
+        int(after_open.st_size),
+        int(after_open.st_mtime_ns),
+        int(after_open.st_ctime_ns),
+    )
+    if (
+        not stat.S_ISREG(after_open.st_mode)
+        or after_open_identity != before_identity
+        or after_identity != before_identity
+    ):
         raise RuntimeError("hash 중 raw inode/stat가 변경됐습니다")
     return (
         {

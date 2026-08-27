@@ -38,13 +38,18 @@ from deep_anc.data.decoder_audit import (
     decoder_fingerprint,
 )
 from deep_anc.data.public_lineage import (
+    DNS_MARKER_TAG_ROOTS,
+    DNS_NOISE_MARKERS,
+    DNS_SPEECH_MARKER,
     ESC50_METADATA,
     FMA_TRACKS,
     LIBRISPEECH_CHAPTERS,
     PUBLIC_LINEAGE_SCHEMA,
     PublicLineageBuild,
     canonical_json_sha256,
+    validate_dns_marker_partition,
 )
+from deep_anc.data.manifest import scan_wavs
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/data/prepare_noise_pool.py"
 FS = 48_000
@@ -247,7 +252,14 @@ def _run(
             "clip_lineage": payload["clip_lineage"],
         }
 
-    def fixture_public_lineage(entries_by_tag, *, tag_roots, repo_root, holdout_lineage):
+    def fixture_public_lineage(
+        entries_by_tag,
+        *,
+        tag_roots,
+        repo_root,
+        holdout_lineage,
+        **lineage_kwargs,
+    ):
         rows_by_tag = {}
         components = {}
         for tag, entries in sorted(entries_by_tag.items()):
@@ -307,6 +319,55 @@ def _run(
             "holdout_clips_sha256": holdout_lineage["clips_sha256"],
             "excluded_by_tag": {tag: 0 for tag in sorted(entries_by_tag)},
         }
+        # 실제 public lineage parser를 쓰지 않는 이 fixture도 canonical v4의 DNS
+        # marker partition/postcommit 경계를 통과해야 한다. marker member는 raw
+        # source tag root 기준으로 만들며, rejected member는 caller가 audit inventory
+        # 전체에서 투영한 값만 사용한다.
+        rejected_members = lineage_kwargs.get("decoder_rejected_members_by_tag")
+        inventory_sha = lineage_kwargs.get("decoder_audit_inventory_sha256")
+        dns_tags = {
+            tag
+            for tag, relative in DNS_MARKER_TAG_ROOTS.items()
+            if any(
+                Path(item) == repo_root / relative
+                for item in tag_roots.get(tag, [])
+            )
+            or isinstance(rejected_members, dict) and tag in rejected_members
+        }
+        if dns_tags:
+            for tag in sorted(dns_tags):
+                source_root = repo_root / DNS_MARKER_TAG_ROOTS[tag]
+                assert source_root in [Path(item) for item in tag_roots.get(tag, [])]
+                accepted = {
+                    Path(item["path"]).relative_to(source_root).as_posix()
+                    for item in entries_by_tag.get(tag, [])
+                    if source_root in Path(item["path"]).parents
+                }
+                rejected = set((rejected_members or {}).get(tag, ()))
+                members = sorted(accepted | rejected)
+                if tag == "speech":
+                    marker = repo_root / DNS_SPEECH_MARKER
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text("\n".join(members) + "\n", encoding="utf-8")
+                else:
+                    # tiny fixture에는 single shard만 쓰되 public checker의 two-marker
+                    # layout을 그대로 만든다.
+                    for index, relative in enumerate(DNS_NOISE_MARKERS):
+                        marker = repo_root / relative
+                        marker.parent.mkdir(parents=True, exist_ok=True)
+                        marker.write_text(
+                            ("\n".join(members) + "\n") if index == 0 else "",
+                            encoding="utf-8",
+                        )
+            partition = validate_dns_marker_partition(
+                entries_by_tag,
+                tag_roots=tag_roots,
+                repo_root=repo_root,
+                decoder_rejected_members_by_tag=rejected_members,
+                decoder_audit_inventory_sha256=inventory_sha,
+            )
+            assert partition is not None
+            evidence["decoder_rejected_marker_partition"] = partition
         return PublicLineageBuild(
             rows_by_tag,
             {tag: 0 for tag in sorted(entries_by_tag)},
@@ -510,6 +571,137 @@ def test_decoder_reject_rows_are_excluded_and_copied_audit_is_bound(
             for row in json.loads(copied.read_text(encoding="utf-8"))["inventory"]
             if row["decision"] == "accept"
         ]
+    )
+
+
+def test_decoder_reject_marker_projection_uses_full_audit_not_scan_results(tmp_path):
+    """sf.info가 못 여는 WAV도 audit reject면 DNS marker partition에 남아야 한다."""
+
+    root = tmp_path
+    source = root / "data/raw/noise/speech"
+    _write_clips(source, 1)
+    accepted_path = source / "book_12_chp_3_reader_4.wav"
+    (source / "clip_000.wav").rename(accepted_path)
+    rejected_member = "nested/book_13_chp_4_reader_5.wav"
+    rejected_path = source / rejected_member
+    rejected_path.parent.mkdir(parents=True)
+    # 확장자는 WAV이지만 soundfile metadata를 읽을 수 없는 raw — scan_wavs가 생략한다.
+    rejected_path.write_bytes(b"not a decodable wav")
+    audit_path = _write_decoder_audit(
+        root,
+        decisions={rejected_path.relative_to(root).as_posix(): "reject"},
+    )
+    audit = manifest_contract.read_decoder_audit(
+        root / audit_path,
+        repo_root=root,
+        label="broken DNS marker fixture audit",
+    )
+    scanned = scan_wavs(source, "speech")
+    assert [Path(entry["path"]).name for entry in scanned] == [accepted_path.name]
+    projection = manifest_contract.derive_decoder_rejected_members_by_tag(
+        audit,
+        tag_roots={"speech": [source]},
+        repo_root=root,
+        label="broken DNS marker fixture projection",
+    )
+    assert projection == {"speech": (rejected_member,)}
+    marker = root / DNS_SPEECH_MARKER
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{accepted_path.name}\n{rejected_member}\n", encoding="utf-8")
+    partition = validate_dns_marker_partition(
+        {"speech": scanned},
+        tag_roots={"speech": [source]},
+        repo_root=root,
+        decoder_rejected_members_by_tag=projection,
+        decoder_audit_inventory_sha256=audit["inventory_sha256"],
+    )
+    assert partition is not None
+    assert partition["tags"]["speech"]["rejected_members"] == [rejected_member]
+
+
+def test_prepare_binds_scan_skipped_dns_reject_to_generation_partition(
+    tmp_path, monkeypatch
+):
+    """producer가 scan 결과가 아닌 audit inventory projection을 build evidence로 넘긴다."""
+
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"speech": 1.0},
+        ratios={"speech": 1.0},
+    )
+    generic_source = root / "data/raw/speech_family/speech"
+    source = root / "data/raw/noise/speech"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    generic_source.rename(source)
+    rejected_member = "nested/undecodable.wav"
+    rejected = source / rejected_member
+    rejected.parent.mkdir(parents=True)
+    rejected.write_bytes(b"not a decodable wav")
+    audit = _write_decoder_audit(
+        root,
+        decisions={rejected.relative_to(root).as_posix(): "reject"},
+    )
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 0
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    partition = sidecar["public_lineage"]["decoder_rejected_marker_partition"]
+    assert partition["tags"]["speech"]["rejected_members"] == [rejected_member]
+    validate_manifest_generation(
+        root / "data/manifests",
+        required_tags={"speech"},
+        repo_root=root,
+    )
+
+
+def test_prepare_keeps_librispeech_out_of_dns_marker_reject_partition(
+    tmp_path, monkeypatch
+):
+    """Elice처럼 DNS와 LibriSpeech root가 같이 있어도 DNS marker만 exact partition한다."""
+
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"speech": 1.0},
+        ratios={"speech": 1.0},
+    )
+    generic_source = root / "data/raw/speech_family/speech"
+    dns_source = root / "data/raw/noise/speech"
+    dns_source.parent.mkdir(parents=True, exist_ok=True)
+    generic_source.rename(dns_source)
+    libri_source = root / "data/raw/speech/LibriSpeech"
+    _write_clips(libri_source, 1)
+    dns_rejected_member = "nested/dns-undecodable.wav"
+    dns_rejected = dns_source / dns_rejected_member
+    dns_rejected.parent.mkdir(parents=True)
+    dns_rejected.write_bytes(b"not a decodable wav")
+    libri_rejected = libri_source / "libri-undecodable.wav"
+    libri_rejected.write_bytes(b"not a decodable wav")
+    audit = _write_decoder_audit(
+        root,
+        decisions={
+            dns_rejected.relative_to(root).as_posix(): "reject",
+            libri_rejected.relative_to(root).as_posix(): "reject",
+        },
+    )
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 0
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    partition = sidecar["public_lineage"]["decoder_rejected_marker_partition"]
+    assert partition["tags"]["speech"]["tag_roots"] == ["data/raw/noise/speech"]
+    assert partition["tags"]["speech"]["rejected_members"] == [dns_rejected_member]
+    validate_manifest_generation(
+        root / "data/manifests",
+        required_tags={"speech"},
+        repo_root=root,
     )
 
 
@@ -985,6 +1177,56 @@ def test_generation_binds_raw_audio_content_and_returns_one_read_snapshot(
         validate_manifest_generation(
             manifest_dir,
             required_tags={"esc50"},
+            repo_root=root,
+        )
+
+
+def test_manifest_validator_rederives_dns_reject_partition_after_sidecar_tamper(
+    tmp_path, monkeypatch
+):
+    """build_id를 다시 계산해도 forged marker reject evidence는 통과하면 안 된다."""
+
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"speech": 1.0},
+        ratios={"speech": 1.0},
+    )
+    generic_source = root / "data/raw/speech_family/speech"
+    dns_source = root / "data/raw/noise/speech"
+    dns_source.parent.mkdir(parents=True, exist_ok=True)
+    generic_source.rename(dns_source)
+    assert _run(module, root, monkeypatch) == 0
+    manifest_dir = root / "data/manifests"
+    validate_manifest_generation(
+        manifest_dir,
+        required_tags={"speech"},
+        repo_root=root,
+    )
+    sidecar_path = manifest_dir / "manifest_generation.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    partition = sidecar["public_lineage"]["decoder_rejected_marker_partition"]
+    partition["tags"]["speech"]["rejected_members"] = ["forged/missing.wav"]
+    partition["tags"]["speech"]["rejected_member_count"] = 1
+    partition["tags"]["speech"]["rejected_members_sha256"] = canonical_json_sha256(
+        ["forged/missing.wav"]
+    )
+    basis = {
+        key: value
+        for key, value in sidecar.items()
+        if key not in {"build_id", "created_at"}
+    }
+    sidecar["build_id"] = hashlib.sha256(
+        manifest_contract._canonical_json_bytes(basis)
+    ).hexdigest()
+    sidecar_path.write_bytes(manifest_contract._canonical_json_bytes(sidecar))
+
+    with pytest.raises(ValueError, match="marker partition.*재계산 결과"):
+        validate_manifest_generation(
+            manifest_dir,
+            required_tags={"speech"},
             repo_root=root,
         )
 

@@ -27,6 +27,7 @@ from deep_anc.data.public_lineage import (
     parse_esc50_metadata_bytes,
     parse_fma_tracks_bytes,
     parse_librispeech_chapters_bytes,
+    validate_dns_marker_partition,
     validate_public_manifest_lineage,
 )
 
@@ -231,6 +232,190 @@ def test_dns_speech_uses_explicit_namespace_without_crosswalk(tmp_path: Path) ->
         "dns_read_speech_to_librispeech": "namespace_disjoint_no_official_crosswalk",
         "cross_namespace_overlap_checks": ["content_sha256", "basename"],
     }
+
+
+def test_dns_marker_exact_partition_keeps_decoder_reject_out_of_lineage(
+    tmp_path: Path,
+) -> None:
+    """broken audit-reject member는 marker 근거에는 남고 accepted DSU에는 들어가지 않는다."""
+
+    root = tmp_path / "data/raw/noise/speech"
+    root.mkdir(parents=True)
+    accepted = "book_12_chp_3_reader_4.wav"
+    rejected = "nested/book_13_chp_4_reader_5.wav"
+    (root / accepted).write_bytes(b"accepted")
+    (root / rejected).parent.mkdir(parents=True)
+    (root / rejected).write_bytes(b"broken")
+    marker = tmp_path / "data/raw/noise/speech000.tar.bz2.extracted"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{accepted}\n{rejected}\n", encoding="utf-8")
+
+    built = build_public_lineage(
+        {
+            "speech": [
+                {"path": str(root / accepted), "content_sha256": "1" * 64},
+            ]
+        },
+        tag_roots={"speech": [root]},
+        repo_root=tmp_path,
+        holdout_lineage=_holdout(family="speech"),
+        decoder_rejected_members_by_tag={"speech": (rejected,)},
+        decoder_audit_inventory_sha256="a" * 64,
+    )
+    assert len(built.entries_by_tag["speech"]) == 1
+    partition = built.evidence["decoder_rejected_marker_partition"]
+    assert partition["decoder_audit_inventory_sha256"] == "a" * 64
+    assert partition["tags"]["speech"] == {
+        "tag_roots": ["data/raw/noise/speech"],
+        "accepted_members": [accepted],
+        "accepted_member_count": 1,
+        "accepted_members_sha256": canonical_json_sha256([accepted]),
+        "rejected_members": [rejected],
+        "rejected_member_count": 1,
+        "rejected_members_sha256": canonical_json_sha256([rejected]),
+    }
+
+
+def test_dns_marker_partition_ignores_librispeech_entries_in_same_speech_tag(
+    tmp_path: Path,
+) -> None:
+    """DNS marker는 `speech` tag의 DNS source root에만 적용해야 한다."""
+
+    dns_root = tmp_path / "data/raw/noise/speech"
+    libri_root = tmp_path / "data/raw/speech"
+    dns_root.mkdir(parents=True)
+    (libri_root / "LibriSpeech").mkdir(parents=True)
+    dns_clip = "book_12_chp_3_reader_4.wav"
+    libri_clip = "2277-149897-0001.wav"
+    (dns_root / dns_clip).write_bytes(b"dns")
+    libri_path = libri_root / "LibriSpeech" / libri_clip
+    libri_path.write_bytes(b"libri")
+    chapters = tmp_path / LIBRISPEECH_CHAPTERS
+    chapters.parent.mkdir(parents=True, exist_ok=True)
+    chapters.write_text(
+        "149897 | 2277 | 12.3 | train-clean-100 | 999 | 5267\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "data/raw/noise/speech000.tar.bz2.extracted"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{dns_clip}\n", encoding="utf-8")
+
+    built = build_public_lineage(
+        {
+            "speech": [
+                {"path": str(dns_root / dns_clip), "content_sha256": "1" * 64},
+                {"path": str(libri_path), "content_sha256": "2" * 64},
+            ]
+        },
+        tag_roots={"speech": [dns_root, libri_root]},
+        repo_root=tmp_path,
+        holdout_lineage=_holdout(family="speech"),
+        decoder_rejected_members_by_tag={"speech": ()},
+        decoder_audit_inventory_sha256="a" * 64,
+    )
+    assert len(built.entries_by_tag["speech"]) == 2
+    partition = built.evidence["decoder_rejected_marker_partition"]
+    assert partition["tags"]["speech"]["tag_roots"] == ["data/raw/noise/speech"]
+    assert partition["tags"]["speech"]["accepted_member_count"] == 1
+
+
+def test_dns_marker_postcommit_uses_audit_accept_projection_before_holdout_exclusion(
+    tmp_path: Path,
+) -> None:
+    """final manifest에서 holdout 제외된 accepted raw가 marker missing이 되면 안 된다."""
+
+    root = tmp_path / "data/raw/noise/speech"
+    root.mkdir(parents=True)
+    remaining = "book_12_chp_3_reader_4.wav"
+    excluded = "book_13_chp_4_reader_5.wav"
+    marker = tmp_path / "data/raw/noise/speech000.tar.bz2.extracted"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{remaining}\n{excluded}\n", encoding="utf-8")
+    for member in (remaining, excluded):
+        (root / member).write_bytes(member.encode("utf-8"))
+
+    partition = validate_dns_marker_partition(
+        {"speech": [{"path": str(root / remaining), "content_sha256": "1" * 64}]},
+        tag_roots={"speech": [root]},
+        repo_root=tmp_path,
+        decoder_rejected_members_by_tag={"speech": ()},
+        decoder_accepted_members_by_tag={"speech": (remaining, excluded)},
+        decoder_audit_inventory_sha256="c" * 64,
+    )
+    assert partition is not None
+    assert partition["tags"]["speech"]["accepted_members"] == [remaining, excluded]
+
+
+def test_dns_noise_two_shard_marker_partition_accepts_audit_reject(tmp_path: Path) -> None:
+    root = tmp_path / "data/raw/noise/dns_fullband"
+    root.mkdir(parents=True)
+    accepted = "first/AbCdEf_123-.wav"
+    rejected = "second/ZyXwVu_987-.wav"
+    (root / accepted).parent.mkdir(parents=True)
+    (root / rejected).parent.mkdir(parents=True)
+    (root / accepted).write_bytes(b"accepted")
+    (root / rejected).write_bytes(b"rejected")
+    for relative, member in zip(
+        public_lineage.DNS_NOISE_MARKERS, (accepted, rejected), strict=True
+    ):
+        marker = tmp_path / relative
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{member}\n", encoding="utf-8")
+
+    built = build_public_lineage(
+        {"dns_fullband": [{"path": str(root / accepted), "content_sha256": "1" * 64}]},
+        tag_roots={"dns_fullband": [root]},
+        repo_root=tmp_path,
+        holdout_lineage=_holdout(),
+        decoder_rejected_members_by_tag={"dns_fullband": (rejected,)},
+        decoder_audit_inventory_sha256="b" * 64,
+    )
+    assert built.evidence["decoder_rejected_marker_partition"]["tags"]["dns_fullband"][
+        "rejected_members"
+    ] == [rejected]
+
+
+@pytest.mark.parametrize(
+    ("rejected", "message"),
+    [
+        (("book_12_chp_3_reader_4.wav",), "overlap"),
+        (("outside/book_99_chp_1_reader_9.wav",), "marker missing"),
+        ((), "marker missing"),
+        (("../book_13_chp_4_reader_5.wav",), "상위"),
+        (
+            (
+                "nested/BOOK_13_chp_4_reader_5.wav",
+                "nested/book_13_chp_4_reader_5.wav",
+            ),
+            "case-variant",
+        ),
+    ],
+)
+def test_dns_marker_partition_rejects_missing_outside_overlap_and_aliases(
+    tmp_path: Path,
+    rejected: tuple[str, ...],
+    message: str,
+) -> None:
+    root = tmp_path / "data/raw/noise/speech"
+    root.mkdir(parents=True)
+    accepted = "book_12_chp_3_reader_4.wav"
+    expected_rejected = "nested/book_13_chp_4_reader_5.wav"
+    marker = tmp_path / "data/raw/noise/speech000.tar.bz2.extracted"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{accepted}\n{expected_rejected}\n", encoding="utf-8")
+
+    with pytest.raises(PublicLineageError, match=message):
+        validate_dns_marker_partition(
+            {
+                "speech": [
+                    {"path": str(root / accepted), "content_sha256": "1" * 64},
+                ]
+            },
+            tag_roots={"speech": [root]},
+            repo_root=tmp_path,
+            decoder_rejected_members_by_tag={"speech": rejected},
+            decoder_audit_inventory_sha256="a" * 64,
+        )
 
 
 def test_missing_authoritative_metadata_is_blocked(tmp_path: Path) -> None:

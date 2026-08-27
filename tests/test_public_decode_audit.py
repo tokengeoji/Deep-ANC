@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import warnings
 
 import numpy as np
@@ -31,6 +32,37 @@ FS = 48_000
 def _write_audio(path: Path, data: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(path, data, FS, subtype="FLOAT")
+
+
+def test_raw_snapshot_ignores_read_only_atime_change(tmp_path, monkeypatch):
+    """읽기 자체가 바꿀 수 있는 atime은 raw replacement 증거가 아니다."""
+
+    path = tmp_path / "fixture.wav"
+    _write_audio(path, np.full(FS, 0.05, dtype=np.float32))
+    original_fstat = decoder_audit.os.fstat
+    calls = 0
+
+    def atime_changed_fstat(descriptor):
+        nonlocal calls
+        calls += 1
+        result = original_fstat(descriptor)
+        if calls != 2:
+            return result
+        # atime만 달라진 stat object: raw identity fields are unchanged.
+        return SimpleNamespace(
+            st_mode=result.st_mode,
+            st_dev=result.st_dev,
+            st_ino=result.st_ino,
+            st_size=result.st_size,
+            st_mtime_ns=result.st_mtime_ns,
+            st_ctime_ns=result.st_ctime_ns,
+            st_atime=result.st_atime + 1.0,
+        )
+
+    monkeypatch.setattr(decoder_audit.os, "fstat", atime_changed_fstat)
+    snapshot, content_sha = decoder_audit._file_snapshot(path)
+    assert snapshot["size"] == path.stat().st_size
+    assert content_sha == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _load_script():
