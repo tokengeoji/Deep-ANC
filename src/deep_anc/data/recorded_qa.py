@@ -445,10 +445,20 @@ def _validate_session_metadata(
         except ValueError as exc:
             _append_error(result, f"session.json: {exc}")
             continue
-        if entry.get(key) != value:
+        # canonical regrouped manifest는 split 누수를 막기 위해 ``group_id``를
+        # lineage component ID로 재작성한다. 원본 session.json은 불변으로
+        # 보존하므로, 그 안의 legacy pool group은 manifest의
+        # ``source_pool_group_id``와 대조해야 한다. canonical ID와 직접 대조하면
+        # 정상적으로 재그룹화된 82세션이 전부 거부된다.
+        expected = (
+            entry.get("source_pool_group_id")
+            if key == "group_id" and "source_pool_group_id" in entry
+            else entry.get(key)
+        )
+        if expected != value:
             _append_error(
                 result,
-                f"session.json {key}({value!r})와 manifest({entry.get(key)!r}) 불일치",
+                f"session.json {key}({value!r})와 manifest({key}={expected!r}) 불일치",
             )
 
     # 현재 수집 포맷은 session_id를 디렉터리/manifest가 소유한다. 향후 JSON에도

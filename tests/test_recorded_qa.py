@@ -197,6 +197,43 @@ def test_recorded_qa_consumes_resolved_manifest_paths_and_streams_all_blocks(tmp
     assert "Source-family 커버리지" in markdown
 
 
+def test_recorded_qa_accepts_immutable_session_metadata_with_regrouped_lineage(
+    tmp_path,
+):
+    """canonical regrouping은 session.json의 원본 group_id를 바꾸지 않는다."""
+
+    session_id = "regrouped-session"
+    entry = _write_session(
+        tmp_path / "recorded" / session_id,
+        session_id=session_id,
+        group_id="lineage-component-0001",
+    )
+    # _write_session이 만든 JSON은 원본 pool group을 소유한다고 가정한다.
+    metadata_path = tmp_path / "recorded" / session_id / "session.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["group_id"] = "original-pool-group"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    entry.update(
+        {
+            "path": str(tmp_path / "recorded" / session_id),
+            "split": "train",
+            "source_pool_group_id": "original-pool-group",
+            "group_id": "lineage-component-0001",
+        }
+    )
+
+    settings = RecordedQASettings(
+        sample_rate=FS,
+        segment_samples=512,
+        digital_reference_lead_samples=7,
+        block_frames=127,
+        required_splits=(),
+    )
+    report = validate_recorded_sessions([entry], settings)
+
+    assert report["ok"], report
+
+
 def test_group_split_leak_is_a_fatal_global_error(tmp_path):
     first = _write_session(
         tmp_path / "session-a",
