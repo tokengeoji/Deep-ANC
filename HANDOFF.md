@@ -285,3 +285,9 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
   보존했다. 삭제/보존 목록과 SHA는 `docs/13_repository_cleanup_20260827.md`에 있다.
 - 현재 branch HEAD는 외부 감사 기록과 후속 정리 변경을 포함한 최신 commit이다. Elice의
   진행 중 pilot은 중단하지 않고 종료 뒤 이 branch의 exact commit으로 동기화한다.
+- 2026-08-27 21:59 KST read-only poll에서 Elice pilot parent PID 58467과 네 번째
+  `alpha=1.0, lambda_frame=0.2` worker가 살아 있었고 로그는 약 8.5k/20k까지 진행됐다.
+  A100 80GB는 GPU 45%, VRAM 6.6/81.9 GiB, Elice 디스크는 80 GiB 여유였다. 세 완료
+  후보와 진행 후보 모두 `libmpg123`의 MP3 dequantization/illegal-header 경고를
+  남기고 있으므로, 경고가 발생한 원본을 decoder audit로 분류하기 전에는 어떤 pilot도
+  canonical init이나 최종 성능 근거로 승격하지 않는다. 실행 프로세스는 중단하지 않았다.
