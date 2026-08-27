@@ -22,17 +22,27 @@
 
 ## 실행 상태
 
-처음 실행한 전체 `data` 복사는 하위 디렉터리 전용 복사와 겹쳐 중복 객체가 생길
-수 있어 중단했다. 이후 다음 네 경로만 단일 목적지의 같은 상대경로로 복사한다.
+처음 실행한 전체 `data` 복사는 하위 디렉터리 전용 복사와 겹치고 Google Drive
+요청률 제한을 일으킬 수 있어 중단했다. 하위 경로를 병렬로 재개한 시도에서도
+`RATE_LIMIT_EXCEEDED`가 관찰되어 해당 작업을 중단하고, 이미 올라간 객체를
+그대로 둔 채 `setsid`로 분리한 저요청률 순차 복사를 재개했다. 현재 순차 작업은
+다음 경로를 정확한 동일 목적지에 차례로 복사한다.
 
 ```text
-data/raw
+data/raw/music
+data/raw/noise
+data/raw/speech
 data/recorded
 data/recorded_broken
+data/source_pool
 data/source_pool_v2
+data/manifests
+data/rir_bank
 ```
 
-명령은 `rclone copy`이며 `sync`, `move`, 원본 삭제 옵션을 사용하지 않는다. 따라서
+현재 작업은 `--fast-list`, `--checkers 2`, `--transfers 2`, `--tpslimit 4`,
+`--drive-pacer-min-sleep 250ms`를 사용한다. 명령은 `rclone copy`이며 `sync`,
+`move`, 원본 삭제 옵션을 사용하지 않는다. 따라서
 현재는 원본과 이미 올라간 원격 파일 모두 보존된다. 업로드가 끝난 뒤에만 다음을
 실행한다.
 
