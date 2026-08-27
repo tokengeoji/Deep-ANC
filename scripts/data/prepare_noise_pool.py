@@ -65,6 +65,7 @@ from deep_anc.data.manifest import (                            # noqa: E402
 from deep_anc.data.public_lineage import (                      # noqa: E402
     PublicLineageError,
     build_public_lineage,
+    canonical_json_sha256,
     validate_public_manifest_lineage,
 )
 
