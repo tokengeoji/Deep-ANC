@@ -144,6 +144,11 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   검증을 병렬화할 수 있다. 기본값은 1이고 1~32만 허용한다. executor는 입력 순서대로
   결과·예외를 회수하므로 manifest bytes·identity와 첫 실패 경로는 바뀌지 않으며,
   transaction 후 audit inventory와 committed manifest raw 전체를 다시 검증한다.
+- public corpus lineage의 DSU는 iterative path compression과 union-by-size를 사용한다.
+  이전 lexical-root 재귀 구현은 adversarial reverse merge 2,048개에서 `RecursionError`를
+  재현할 수 있었지만, component의 members·identity digest·분할 의미는 root 이름이 아니라
+  canonicalized data로 결정되므로 이 변경은 계보 의미를 바꾸지 않고 대형 corpus chain을
+  안전하게 닫는다.
 
 ## 1. 구현된 계약
 

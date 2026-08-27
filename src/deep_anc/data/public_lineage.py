@@ -74,19 +74,43 @@ class PublicLineageBuild:
 
 
 class _DisjointSet:
+    """계보 component용 결정론적·비재귀 union-find.
+
+    이전 구현은 root 이름의 lexical 최소값만 부모로 골랐다. component의 의미는
+    맞지만, identity가 역순으로 이어지는 입력에서는 parent chain이 길어지고
+    재귀 ``find``가 Python recursion limit에 걸릴 수 있었다. root 이름은 공개
+    artifact에 포함되지 않으며 members/identity digest가 component를 정의한다.
+    따라서 size 우선(동률만 lexical tie-break)과 반복 path compression으로
+    의미·결정성을 유지하면서 최악 입력도 안전하게 처리한다.
+    """
+
     def __init__(self, values: Iterable[str]) -> None:
         self.parent = {str(value): str(value) for value in values}
+        self.size = {str(value): 1 for value in values}
 
     def find(self, value: str) -> str:
-        parent = self.parent[value]
-        if parent != value:
-            self.parent[value] = self.find(parent)
-        return self.parent[value]
+        current = str(value)
+        root = current
+        while self.parent[root] != root:
+            root = self.parent[root]
+        # recursion을 쓰지 않아 adversarial component chain에서도 stack을 소비하지
+        # 않는다. 모든 방문 node를 같은 root에 직접 연결한다.
+        while current != root:
+            parent = self.parent[current]
+            self.parent[current] = root
+            current = parent
+        return root
 
     def union(self, left: str, right: str) -> None:
         a, b = self.find(left), self.find(right)
-        if a != b:
-            self.parent[max(a, b)] = min(a, b)
+        if a == b:
+            return
+        # union-by-size는 find depth를 log 수준으로 제한한다. 같은 size일 때만
+        # lexical 순서를 사용하므로 같은 입력의 parent forest도 결정론적이다.
+        if self.size[a] < self.size[b] or (self.size[a] == self.size[b] and a > b):
+            a, b = b, a
+        self.parent[b] = a
+        self.size[a] += self.size[b]
 
 
 def canonical_json_sha256(value: object) -> str:

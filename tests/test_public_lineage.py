@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import deep_anc.data.public_lineage as public_lineage
+
 from deep_anc.data.public_lineage import (
     ESC50_METADATA,
     FMA_TRACKS,
@@ -77,6 +79,18 @@ def test_librispeech_chapters_uses_reader_and_gutenberg_book_not_chapter() -> No
     )
     with pytest.raises(PublicLineageError, match="speaker.*reader"):
         librispeech_lineage_keys("9999-149897-0001.flac", chapters)
+
+
+def test_public_dsu_handles_adversarial_reverse_merge_chain_without_recursion() -> None:
+    """identity merge 순서가 역순이어도 large component를 안전하게 닫는다."""
+
+    values = [f"node-{index:05d}" for index in range(2_048)]
+    dsu = public_lineage._DisjointSet(values)
+    for index in range(len(values) - 1, 0, -1):
+        dsu.union(values[index], values[index - 1])
+
+    # 구 구현은 마지막 find에서 재귀 깊이가 1,000을 넘어 RecursionError가 났다.
+    assert {dsu.find(value) for value in values} == {dsu.find(values[0])}
 
 
 def test_fma_and_esc_metadata_parsers_expose_official_source_relationships() -> None:
