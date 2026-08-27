@@ -226,6 +226,7 @@ def _run(
     monkeypatch,
     *,
     decoder_audit: str | None = "auto",
+    hash_workers: int = 1,
 ) -> int:
     monkeypatch.setattr(module, "REPO_ROOT", root)
     holdout = root / "data/manifests/recorded_holdout.json"
@@ -318,6 +319,8 @@ def _run(
         "data/manifests",
         "--expected-holdout-sha256",
         expected,
+        "--hash-workers",
+        str(hash_workers),
     ]
     if decoder_audit is not None:
         argv.extend(["--decoder-audit", decoder_audit])
@@ -399,6 +402,43 @@ def test_every_declared_tag_present_builds_all_manifests(tmp_path, monkeypatch, 
     assert audit_binding["size"] == copied_audit.stat().st_size
     # 비율 0 인 태그는 만들지도, 요구하지도 않는다.
     assert not (root / "data/manifests/demand.jsonl").exists()
+
+
+def test_parallel_raw_hash_workers_preserve_a_canonical_generation(
+    tmp_path, monkeypatch, capsys
+):
+    """병렬 SHA도 transaction postcondition까지 통과해야만 사용할 수 있다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 0.5, "speech": 0.5},
+        ratios={"esc50": 0.5, "speech": 0.5, "synthetic": 0.1},
+    )
+
+    assert _run(module, root, monkeypatch, hash_workers=2) == 0
+    capsys.readouterr()
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["schema_version"] == 4
+    assert sidecar["training_eligible"] is True
+    assert set(sidecar["manifests"]) == {"esc50", "speech"}
+
+
+def test_hash_workers_outside_the_bounded_range_fail_before_manifest_write(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+
+    assert _run(module, root, monkeypatch, hash_workers=0) == 2
+    assert "--hash-workers" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
 
 
 def test_missing_holdout_fails_before_writing_any_manifest(tmp_path, monkeypatch, capsys):

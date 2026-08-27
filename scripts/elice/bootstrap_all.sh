@@ -31,6 +31,8 @@ EXPECTED_HOLDOUT_SHA256=""
 EXPECTED_HOLDOUT_SHA256_SEEN=0
 EXPECTED_TRANSFER_MANIFEST_SHA256=""
 EXPECTED_TRANSFER_MANIFEST_SHA256_SEEN=0
+RAW_HASH_WORKERS=1
+RAW_HASH_WORKERS_SEEN=0
 REUSE_DECODER_AUDIT=0
 EXPECTED_DECODER_AUDIT_SHA256=""
 EXPECTED_DECODER_AUDIT_SHA256_SEEN=0
@@ -109,6 +111,27 @@ while [ "$#" -gt 0 ]; do
       fi
       EXPECTED_TRANSFER_MANIFEST_SHA256_SEEN=1
       EXPECTED_TRANSFER_MANIFEST_SHA256=${1#*=}
+      ;;
+    --raw-hash-workers)
+      if [ "$RAW_HASH_WORKERS_SEEN" -ne 0 ]; then
+        echo "[오류] --raw-hash-workers는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      RAW_HASH_WORKERS_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --raw-hash-workers 뒤에 1~32 정수가 필요합니다." >&2
+        exit 2
+      fi
+      RAW_HASH_WORKERS=$1
+      ;;
+    --raw-hash-workers=*)
+      if [ "$RAW_HASH_WORKERS_SEEN" -ne 0 ]; then
+        echo "[오류] --raw-hash-workers는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      RAW_HASH_WORKERS_SEEN=1
+      RAW_HASH_WORKERS=${1#*=}
       ;;
     --reuse-decoder-audit)
       if [ "$REUSE_DECODER_AUDIT" -ne 0 ]; then
@@ -197,6 +220,10 @@ elif [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ] || [ "$EXPECTED_DECODER_AUD
 fi
 if [ "$NO_UPDATE_SEEN" -ne 1 ]; then
   echo "[오류] --no-update는 필수입니다. exact checkout에서 다시 실행하세요." >&2
+  exit 2
+fi
+if [[ ! "$RAW_HASH_WORKERS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
+  echo "[오류] --raw-hash-workers는 1~32 정수여야 합니다." >&2
   exit 2
 fi
 
@@ -1167,7 +1194,8 @@ if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then
     --audit "$DECODER_AUDIT_REPORT" \
     --scan-root data/raw \
     --expected-audit-sha256 "$EXPECTED_DECODER_AUDIT_SHA256" \
-    --expected-file-sha256 "$EXPECTED_DECODER_AUDIT_FILE_SHA256"
+    --expected-file-sha256 "$EXPECTED_DECODER_AUDIT_FILE_SHA256" \
+    --hash-workers "$RAW_HASH_WORKERS"
 else
   "$VENV_PYTHON" scripts/data/audit_decoder_eligibility.py \
     --root . \
@@ -1180,7 +1208,8 @@ fi
   --recorded-source-pool-csv data/source_pool_v2/sources.csv \
   --recorded-source-pool-csv data/source_pool/sources.csv \
   --out "$CANONICAL_MANIFEST_DIR" \
-  --decoder-audit "$DECODER_AUDIT_REPORT"
+  --decoder-audit "$DECODER_AUDIT_REPORT" \
+  --hash-workers "$RAW_HASH_WORKERS"
 if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle; then
   echo "[오류] manifest 준비 종료 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1

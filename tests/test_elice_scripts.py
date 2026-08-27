@@ -88,6 +88,7 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert "--expected-decoder-audit-sha256" in text
     assert "--expected-decoder-audit-file-sha256" in text
     assert "verify_decoder_audit_reuse.py" in text
+    assert "--raw-hash-workers" in text
     assert '--expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256"' in text
     assert "--expected-transfer-manifest-sha256" in text
     assert 'TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"' in text
@@ -664,6 +665,39 @@ def test_bootstrap_requires_explicit_no_update_before_setup(tmp_path: Path):
     assert "--no-update는 필수" in result.stderr
     assert not (root / "data").exists()
     assert not (root / ".venv").exists()
+
+
+def test_bootstrap_rejects_invalid_or_duplicate_raw_hash_worker_setting_before_setup(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    invalid = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--raw-hash-workers",
+        "0",
+        "--no-update",
+    )
+    duplicate = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--raw-hash-workers",
+        "8",
+        "--raw-hash-workers=8",
+        "--no-update",
+    )
+
+    assert invalid.returncode == 2
+    assert duplicate.returncode == 2
+    assert "--raw-hash-workers" in invalid.stderr
+    assert "한 번만 지정" in duplicate.stderr
+    assert not (root / "data").exists()
 
 
 def test_bootstrap_reuse_decoder_audit_requires_both_external_sha_anchors_before_setup(

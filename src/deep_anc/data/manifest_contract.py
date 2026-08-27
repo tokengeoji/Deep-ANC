@@ -7,6 +7,7 @@ JSONL 파일 하나씩의 존재만 확인하면 중단된 빌드가 서로 다�
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -350,12 +351,27 @@ def _decoder_audit_index(
     return result
 
 
+def _raw_inventory_workers(value: int) -> int:
+    """raw byte 재대조의 명시적 worker 수를 보수적으로 검증한다.
+
+    이 검증은 manifest identity를 바꾸지 않는다. 다만 무제한 thread를 허용하면
+    shared storage를 과도하게 압박해 오히려 시간이 늘고, 운영자가 예상하지 못한
+    자원 사용을 만들 수 있다. bootstrap은 A100 노드에서만 별도 값(현재 8)을
+    명시하고, 라이브러리 기본값은 순차 실행으로 유지한다.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 32:
+        raise ValueError("raw inventory workers는 1 이상 32 이하 정수여야 합니다")
+    return value
+
+
 def validate_decoder_audit_raw_inventory(
     audit: dict[str, Any],
     *,
     repo_root: Path,
     raw_roots: Iterable[Path],
     label: str,
+    workers: int = 1,
 ) -> dict[str, dict[str, Any]]:
     """audit inventory가 현재 선언 raw tree 전체와 여전히 같은지 검증한다.
 
@@ -364,6 +380,7 @@ def validate_decoder_audit_raw_inventory(
     경로 집합과 모든 후보의 SHA/size를 audit snapshot과 대조한다.
     """
 
+    worker_count = _raw_inventory_workers(workers)
     roots = [Path(os.path.abspath(root)) for root in raw_roots]
     index = _decoder_audit_index(
         audit,
@@ -382,7 +399,10 @@ def validate_decoder_audit_raw_inventory(
         if added:
             detail.append(f"audit 뒤 추가된 raw {len(added)}개 ({added[0]})")
         raise ValueError(f"{label} raw inventory가 audit와 다릅니다: {'; '.join(detail)}")
-    for absolute_text, path in sorted(current_by_path.items()):
+    ordered_paths = sorted(current_by_path.items())
+
+    def _verify_one(item: tuple[str, Path]) -> None:
+        absolute_text, path = item
         row = index[absolute_text]
         allowed = next(
             (root for root in roots if Path(absolute_text) == root or root in Path(absolute_text).parents),
@@ -406,6 +426,16 @@ def validate_decoder_audit_raw_inventory(
             raise ValueError(
                 f"{label} raw inventory SHA/size가 audit와 다릅니다: {row['relative_path']}"
             )
+
+    # executor.map은 입력 순서대로 예외/결과를 전달한다. 따라서 병렬 I/O·SHA 계산을
+    # 쓰더라도 어떤 raw가 먼저 실패로 보고되는지는 순차 실행과 같은 stable order다.
+    if worker_count == 1:
+        for item in ordered_paths:
+            _verify_one(item)
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for _ in executor.map(_verify_one, ordered_paths):
+                pass
     return index
 
 
@@ -415,6 +445,7 @@ def validate_decoder_audit_binding(
     manifest_dir: str | Path,
     repo_root: str | Path,
     raw_roots: Iterable[Path],
+    raw_inventory_workers: int = 1,
 ) -> dict[str, Any]:
     """generation sidecar가 transaction으로 복사한 audit와 정확히 결속됐는지 확인한다."""
 
@@ -468,6 +499,7 @@ def validate_decoder_audit_binding(
         repo_root=root,
         raw_roots=raw_roots,
         label="canonical decoder audit",
+        workers=raw_inventory_workers,
     )
     return audit
 

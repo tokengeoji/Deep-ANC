@@ -79,6 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="decoder audit JSON file bytes의 외부 trust anchor",
     )
+    parser.add_argument(
+        "--hash-workers",
+        type=int,
+        default=1,
+        help=(
+            "raw SHA-256 재대조 worker 수(기본 1, 1~32). 결과와 실패 순서는 "
+            "입력 경로 순서를 보존한다"
+        ),
+    )
     return parser
 
 
@@ -104,6 +113,12 @@ def main(argv: list[str] | None = None) -> int:
         expected_file_sha = _sha256_argument(
             args.expected_file_sha256, field="--expected-file-sha256"
         )
+        if (
+            isinstance(args.hash_workers, bool)
+            or not isinstance(args.hash_workers, int)
+            or not 1 <= args.hash_workers <= 32
+        ):
+            raise ValueError("--hash-workers는 1 이상 32 이하 정수여야 합니다")
 
         file_snapshot = read_regular_file_snapshot(
             audit_path,
@@ -140,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
             repo_root=root,
             raw_roots=raw_roots,
             label="재사용 decoder audit report",
+            workers=args.hash_workers,
         )
     except (OSError, ValueError) as exc:
         print(f"[실패] decoder audit 재사용 검증 실패: {exc}", file=sys.stderr)

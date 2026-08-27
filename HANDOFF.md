@@ -139,6 +139,11 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   넣어 target/contract에 결속한다(특히 `1.0`을 정수 `1`로 바꾸지 않는다). 따라서 기본
   alpha=0.7 smoke receipt를 0.85/1.0 canonical에 재사용할 수 없고, 선택된 alpha가
   달라지면 그 값으로 새 smoke를 실행한다.
+- Elice의 decoder audit 뒤 raw SHA 재대조는 생략하지 않는다. 다만 다음 exact bootstrap에는
+  `--raw-hash-workers 8`을 명시해 16 vCore A100 노드에서 independent same-FD SHA/size
+  검증을 병렬화할 수 있다. 기본값은 1이고 1~32만 허용한다. executor는 입력 순서대로
+  결과·예외를 회수하므로 manifest bytes·identity와 첫 실패 경로는 바뀌지 않으며,
+  transaction 후 audit inventory와 committed manifest raw 전체를 다시 검증한다.
 
 ## 1. 구현된 계약
 

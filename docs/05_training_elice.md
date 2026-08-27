@@ -84,6 +84,7 @@ bash scripts/elice/bootstrap_all.sh \
   --expected-commit "$EXPECTED_COMMIT" \
   --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
   --expected-transfer-manifest-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
+  --raw-hash-workers 8 \
   --no-update
 ```
 
@@ -98,6 +99,12 @@ bash scripts/elice/bootstrap_all.sh \
 
 긴 다운로드의 직전과 직후에도 code와 transfer bundle을 다시 검증한다. bootstrap 잠금은 동시
 데이터 준비를 차단하며, 실행 중인 `train.py`가 있으면 manifest를 건드리지 않는다.
+
+`--raw-hash-workers 8`은 A100 80GB/16 vCore 인스턴스에서 **이미 완료된 decoder audit의
+원본 SHA-256·size 재대조와 manifest transaction postcondition**만 병렬화한다. PCM decoder
+audit 자체, 입력 순서, manifest bytes, 첫 실패 보고 순서는 바꾸지 않는다. 이 값은 검증을
+생략하는 옵션이 아니며 1~32만 허용한다. vCPU·스토리지 병목이 확인되지 않은 환경은 기본값
+`1`을 유지한다.
 
 ## 4. public raw와 manifest
 

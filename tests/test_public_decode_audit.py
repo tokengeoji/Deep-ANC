@@ -230,6 +230,8 @@ def test_reuse_cli_requires_external_file_and_semantic_sha_then_rehashes_raw(
             report["audit_sha256"],
             "--expected-file-sha256",
             report_file_sha,
+            "--hash-workers",
+            "2",
         ]
     )
     assert result == 0
@@ -254,11 +256,46 @@ def test_reuse_cli_requires_external_file_and_semantic_sha_then_rehashes_raw(
                 report["audit_sha256"],
                 "--expected-file-sha256",
                 report_file_sha,
+                "--hash-workers",
+                "2",
             ]
         )
         == 1
     )
     assert "raw inventory" in capsys.readouterr().err
+
+
+def test_reuse_cli_rejects_out_of_range_parallel_hash_worker_count(
+    tmp_path, monkeypatch, capsys
+):
+    root = tmp_path / "repo"
+    _write_audio(root / "data/raw/fixture.wav", np.full(FS, 0.05, dtype=np.float32))
+    report = audit_audio_tree(root, root_label=".")
+    report_path = root / "results/provenance/decoder_audit.json"
+    write_audit_report(report, report_path)
+
+    cli = _load_reuse_script()
+    monkeypatch.setattr(cli, "REPO_ROOT", root)
+    assert (
+        cli.main(
+            [
+                "--root",
+                ".",
+                "--audit",
+                "results/provenance/decoder_audit.json",
+                "--scan-root",
+                "data/raw",
+                "--expected-audit-sha256",
+                report["audit_sha256"],
+                "--expected-file-sha256",
+                hashlib.sha256(report_path.read_bytes()).hexdigest(),
+                "--hash-workers",
+                "33",
+            ]
+        )
+        == 1
+    )
+    assert "--hash-workers" in capsys.readouterr().err
 
 
 def test_reuse_cli_rejects_invalid_report_self_digest_even_when_file_sha_is_anchored(
