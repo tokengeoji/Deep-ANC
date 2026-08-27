@@ -90,3 +90,21 @@ results/provenance/<content-addressed-name>.<sha256>.json
   경고 원인 확인 전에는 canonical 학습으로 승격하지 않는다.
 - 오디오 장치는 확인 시점에 PulseAudio control 장치만 점유했고 PCM 스트림 점유는 없었다.
   이번 정리에서는 스피커 출력·마이크 녹음·시스템 설정 변경을 수행하지 않았다.
+
+## 브랜치 정리 원칙
+
+현재 작업 브랜치는 `fix/finetune-readiness-repair` 하나로 고정하고, 원격과 동일한
+`f299c31ee11a1e34fd7b09c5323f3cc2b2268c65`에 맞춘다. 다른 브랜치는 내용을 섞거나
+삭제하지 않고 용도를 보존한다.
+
+| 브랜치 | 현재 역할 | 처리 |
+|---|---|---|
+| `main` | 공개 기본선 | 변경하지 않음 |
+| `fix/finetune-readiness-repair` | 현 감사·readiness 복구·Elice 인수인계 | 현재 작업·push 대상 |
+| `work/canonical-training` | canonical 학습 코드·계약 작업선 | pilot 종료 후 필요한 변경만 선별 |
+| `work/high-frequency-validation` | 고주파 측정 진단 작업선 | strict 증거가 생길 때까지 독립 보존 |
+| `archive/*` | 역사적 분석/사전 rewrite 기록 | 삭제하지 않음 |
+
+브랜치 간 cherry-pick/merge는 pilot이 끝나고 decoder audit 및 계약 SHA를 검토한 뒤
+정확한 커밋 단위로 수행한다. 따라서 현재는 브랜치 파일을 임의로 합치거나 과거
+결과를 canonical 결과로 재분류하지 않는다.
