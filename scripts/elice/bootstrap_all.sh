@@ -288,7 +288,11 @@ verify_transfer_bundle() {
 
 hardware_storage_preflight() {
   local gpu_inventory filesystem_stats total_bytes available_bytes minimum_total_bytes minimum_available_bytes
-  minimum_total_bytes=$((128 * 1024 * 1024 * 1024))
+  # Elice의 nominal 128GiB overlay는 파일시스템 메타데이터 예약으로
+  # df 총량이 최대 128MiB 정도 작게 보일 수 있다. nominal 계약을
+  # 유지하되 이 예약분만 허용하고, 실제 작업공간은 별도로 96GiB를
+  # 엄격히 요구한다.
+  minimum_total_bytes=$((128 * 1024 * 1024 * 1024 - 128 * 1024 * 1024))
   # 시작 시 free 예산: untouched/extracted public corpus 약 58GiB + archive/staging
   # peak 24GiB + transferred inputs 5GiB + venv/checkpoint/headroom 9GiB = 96GiB.
   # volume 용량 계약(128GiB)과 FS overhead 뒤 실제 free 계약을 분리한다.
