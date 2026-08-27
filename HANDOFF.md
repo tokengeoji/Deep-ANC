@@ -33,11 +33,17 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
 - strict raw/analysis와 P/S를 묶은 로컬 transfer manifest를 생성했다
   (SHA-256 `39dc271672ac2916840a9919baaf7de5bdf078d228a68457f15096d433a76b4d`,
   344 files/82 sessions).
+- Elice `~/Deep_ANC`에 transfer bundle을 전송하고 exact checkout/holdout/strict P·S
+  SHA를 원격에서 대조했다. 그러나 2026-08-27 bootstrap hardware preflight에서
+  `nvidia-smi -L`가 `NVIDIA A100 80GB PCIe`의 `MIG 1g.10gb`만 노출해 A100 80GB
+  계약을 충족하지 못했고, 환경 설치·public raw 다운로드·학습은 시작하지 않았다.
+  full A100 80GB(또는 MIG가 해제된 동일 GPU) 인스턴스로 교체한 뒤 같은 명령을 재실행한다.
 - canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
-- QA 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`과 strict 자산 승격 커밋
-  `4c55386`은 원격 브랜치에 push 완료했다. 현재 HEAD는 `4c55386`이다.
+- QA 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`, strict 자산 승격 커밋
+  `4c55386`, Elice 이관 상태 문서 커밋 `86c5c45`가 원격 브랜치에 push 완료됐다.
+  현재 HEAD는 `86c5c458fbc0ffe586cdde31a3c9a82a9cb06a82`이다.
 - `check_finetune.py`는 외부 Elice `bootstrap_receipt`가 없어 의도적으로 중단된다. strict P/S와
   로컬 계보는 통과했지만, Elice corpus/receipt 없이는 readiness를 통과시킬 수 없다.
 
@@ -232,7 +238,8 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
 
 ## 6. 아직 외부에서 필요한 것
 
-- 현재 접근 가능한 Elice A100 80GB 인스턴스와 128GiB 저장공간
+- 현재 접근 가능한 **full** Elice A100 80GB 인스턴스(현 인스턴스는 MIG 1g.10gb라 불충족)와
+  128GiB 저장공간
 - strict P/S 라이브 측정 시 사용자의 현장 입회와 배선/노브 확인
 - public raw corpus 다운로드(로컬 디스크에는 staging하지 않음)
 - canonical 100k+50k 학습 시간
