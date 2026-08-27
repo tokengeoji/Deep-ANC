@@ -922,18 +922,37 @@ def main() -> int:
                 **lineage_kwargs,
             )
             # transitive component가 tag를 가로지를 수 있으므로 모든 tag를 한 번에
-            # 분할한다. tag별 shuffle은 같은 component를 서로 다른 split에 넣을 수 있다.
+            # 분할하되, 각 public tag 안에도 val/test가 생기게 계층화한다. 단일
+            # global 비율만 사용하면 MIMII fan처럼 component가 3개뿐인 태그가
+            # 우연히 train에만 배정되어 SynthANCDataset의 검증 경로가 막힌다.
+            # group_id가 strata를 넘지 않는지는 assign_splits가 보장하고, 최종
+            # validate_public_manifest_lineage가 교차 태그 누수를 재검증한다.
             combined: list[dict] = []
             for tag, entries in sorted(lineage_build.entries_by_tag.items()):
                 for entry in entries:
                     item = dict(entry)
                     item["_public_lineage_tag"] = tag
                     combined.append(item)
+            # 실제 공개 corpus에서는 태그 간 component가 없지만, 원본 SHA가
+            # 여러 태그로 연결되는 입력은 계층화하면 하나의 group_id를 서로
+            # 다른 split으로 나누게 된다. 그런 경우에는 전역 group 분할로
+            # 되돌려 누수 방지 불변식을 우선한다.
+            group_tags: dict[str, set[str]] = {}
+            for item in combined:
+                group_tags.setdefault(str(item["group_id"]), set()).add(
+                    str(item["_public_lineage_tag"])
+                )
+            stratify_tag = (
+                "_public_lineage_tag"
+                if all(len(tags) == 1 for tags in group_tags.values())
+                else None
+            )
             assigned_all = assign_splits(
                 combined,
                 {"train": 0.9, "val": 0.05},
                 seed=args.seed,
                 group_key="group_id",
+                stratify_key=stratify_tag,
             )
             assigned_by_tag: dict[str, list[dict]] = {
                 tag: [] for tag in hashed_by_tag
