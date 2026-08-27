@@ -1,7 +1,7 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-27. 작업 브랜치: `fix/finetune-readiness-repair`.
+> 최종 갱신: 2026-08-28. 작업 브랜치: `fix/finetune-readiness-repair`.
 
 ## 0. 현재 결론
 
@@ -39,14 +39,25 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   pytest는 0 FAIL이며 receipt SHA는
   `f56c3d1042211112627380f74315d5949f05bcf274bdcf3fefc588ea3d3caa7e`다.
 - 기존 Elice loss grid 4개(각 20k surrogate pilot)는 폐기된 `lambda_dnh=0.00025`로
-  실행되어 모두 diagnostic-only다. strict-S fixture를 재측정한 결과 이 값의 gradient
-  비중은 0.088로 승인 하한에 못 미쳤고, 현행 `lambda_dnh=0.00075`에서 0.264가 된다.
-  따라서 기존 후보를 init이나 최종 성능 근거로 승격하지 않는다. 2026-08-27 23:33 KST,
-  exact commit `1aaece892ee1ab7bc5f6a224fb1b4f29171019c0`에서 같은
-  `alpha∈{0.7,1.0} × lambda_frame∈{0.5,0.2}` grid를 새 run 디렉터리로 순차 재실행했다.
-  첫 후보 `alpha=0.7, lambda_frame=0.5`가 약 1.6k/20k에서 진행 중이며, 모든 후보는
-  init 자격을 갖지 않는다. 새 후보·decoder 경고·gradient·G0·measured probe·A100
-  resume 증거를 ledger로 묶기 전에는 canonical pretrain을 열지 않는다.
+  실행되어 모두 diagnostic-only다. 새 `lambda_dnh=0.00075` pilot의 첫 후보도 약
+  8.5k/20k에서 `y_rms≈2.2e−5`, trusted NMSE≈0 dB로 영출력 붕괴해 중단·보존했다.
+  같은 strict P/S·lead=115 고정 batch에서 NMSE-only는 −12.03 dB, frame-off는
+  500 step −8.54 dB, 반면 full loss와 `lambda_frame=0.2`는 각각 약 0 dB로 붕괴했다.
+  따라서 signed frame-CVaR 0.5/0.2는 canonical 후보가 아니며, v1은
+  `lambda_frame=0` metric-only로 alpha만 비교한다. DNH는 대역 밖 고주파 악화 금지
+  장치이므로 끄지 않는다. one-sided/item-wise frame guard v2는 별도 evidence 뒤에만
+  도입한다.
+- 과거 strict-S gradient budget `0.264`는 `loss_start_sample=0` 측정값이었다.
+  실제 Trainer의 strict S + 3549-sample 절단 fixture는 0.130이다. `gradient_budget`과
+  campaign ledger는 이제 같은 loss_start_sample을 결속하며, 실제 A100 모델/배치의
+  0.2–0.4 증거 없이는 canonical을 fail-closed한다.
+- Elice music manifest 전체 6,356개 full-decode audit는 접근 방식에 따라 결과가 달라지는
+  decoder 결함을 확인했다. 65,536-frame 순차 전수 검사에서는 train의 고유 38개(경고 34,
+  실제 read error 3, peak>2 4; 범주는 중복 가능), 262,144-frame 검사에서는 21개가
+  검출됐다. val 234개/test 357개는 두 검사에서 0건이지만, 단일 접근 방식만으로 나머지의
+  적격성을 주장할 수 없다. `NoisePool`의 retry는 문제 파일을 조용히 다른 파일로
+  대체하므로 적격 manifest 증거가 아니다. raw는 불변으로 보존하고, 복수 접근 방식의
+  전수 decoder audit에 결속한 신규 manifest 재생성·QA가 끝날 때까지 canonical을 열지 않는다.
 - canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
@@ -75,9 +86,11 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   detached checkout에 남겨 두었다. pilot 종료 뒤 ledger/canonical에 사용할 exact SHA를
   한 번 더 명시적으로 고정한다.
 
-- strict-S gradient budget 재교정 커밋 `1aaece892ee1ab7bc5f6a224fb1b4f29171019c0`을
-  원격 브랜치에 push했고, 로컬 전체 pytest도 `/dev/shm` basetemp에서 0 FAIL로 재확인했다.
-  현행 설정은 `lambda_dnh=0.00075`이며 새 pilot만 이 설정을 사용한다.
+- strict-S gradient budget의 정착 절단/ledger 결속 보강 커밋
+  `a37ebf53a0e2173745fff5937f6aa6768bbb2179`을 원격 브랜치에 push했고, 로컬 전체 pytest도
+  `/dev/shm` basetemp에서 0 FAIL로 재확인했다. 이 commit은 frame=0 metric-only 후보의
+  policy 변경 전 기준이며, 진행 중인 Elice diagnostic은 기존 `5979491` detached checkout에
+  보존한다.
 
 ## 1. 구현된 계약
 
@@ -245,9 +258,12 @@ metadata를 검증하고 manifest 6종을 untouched raw에서 재생성한다. n
    noise를 사용한다. session mixing과 lead jitter는 0이다.
 2. strict S로 `lambda_dnh` gradient 비중 0.2–0.4를 확인한다.
 3. 고정 batch G0에서 trusted NMSE < −6 dB와 lead metadata를 확인한다.
-4. seed `20260803`, `alpha∈{0.7,1.0} × lambda_frame∈{0.5,0.2}`의 20k surrogate +
-   5k measured probe를 recorded val로만 비교한다. 0.2 dB 이내 동률/불안정이면 alpha 0.85를
-   추가하고, 계속 동률이면 alpha 0.7을 택한다. pilot checkpoint는 init 자격이 없다.
+4. seed `20260803`, frame-metric-only(`lambda_frame=0`)의 `alpha∈{0.7,1.0}`을 20k
+   surrogate + 5k measured probe로 recorded val만 사용해 비교한다. 0.2 dB 이내
+   동률/alpha 1.0 불안정이면 alpha 0.85를 추가하고, 계속 동률이면 alpha 0.7을 택한다.
+   170ms frame metric은 candidate마다 기록해 비교·원인 분석에 사용한다. 고정 local
+   pass threshold가 생기기 전에는 이 metric으로 성능 PASS를 주장하지 않는다. pilot checkpoint는
+   init 자격이 없다.
 5. 선택 계약의 tiny를 새 run에서 100k 처음부터 사전학습한다. 200–500 step smoke에서 VRAM,
    처리량/ETA, 중단·재개 등가를 먼저 확인한다.
 6. canonical init 지정 뒤 readiness 15/15를 확인하고 open-loop, recorded 70% + synthetic 30%,

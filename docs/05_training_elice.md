@@ -134,14 +134,20 @@ gain/polarity/EQ와 input-only mic noise만 켜고, 1차 실행의 session mixin
 
 1. strict S로 `lambda_dnh`의 gradient 비중이 주 NMSE의 0.2–0.4인지 측정한다.
 2. 고정 batch G0에서 trusted NMSE < −6 dB와 timing metadata를 확인한다.
-3. seed `20260803`으로 다음 4개를 20k surrogate-pretrain + 5k measured probe한다.
+3. seed `20260803`으로 frame-metric-only 상태에서 다음 2개를 20k surrogate-pretrain
+   + 5k measured probe한다. signed frame-CVaR는 λ=0.5와 0.2가 모두 fixed-batch
+   control에서 영출력 붕괴를 재현해 후보에서 제외한다.
 
 ```text
-alpha ∈ {0.7, 1.0} × lambda_frame ∈ {0.5, 0.2}
+alpha ∈ {0.7, 1.0}, lambda_frame = 0.0
 ```
 
 test는 열지 않고 recorded val만 사용한다. 차이가 0.2 dB 이내거나 alpha 1.0이 불안정하면
-alpha 0.85를 추가한다. 계속 동률이면 단순한 alpha 0.7을 선택한다. pilot/probe checkpoint는
+alpha 0.85(`lambda_frame=0`)를 추가한다. 계속 동률이면 단순한 alpha 0.7을 선택한다.
+frame은 170 ms metric으로 계속 기록해 후보 비교·원인 분석에 사용한다. 고정 local pass
+threshold는 아직 증거가 없으므로 성능 주장에는 쓰지 않으며, signed frame gradient를
+되살리려면 one-sided/item-wise v2 guard와 별도 control evidence가 필요하다.
+pilot/probe checkpoint는
 `init_eligible=false`라 canonical init이 될 수 없다.
 
 선택 계약을 campaign prerequisite ledger로 고정한 뒤 tiny 100k를 처음부터 실행한다.

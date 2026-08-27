@@ -18,6 +18,7 @@ nominal plant에서는 손실이 내려가는지, 관측 불가능한 plant 증�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -49,6 +50,38 @@ _LOSS_TERM_FIELDS = {
     "sat": "lambda_sat",
     "pow": "lambda_pow",
 }
+
+
+def resolved_config_sha256(cfg: dict) -> str:
+    """진단 로그가 서로 다른 seed/config를 같은 control로 오인하지 않게 한다."""
+
+    payload = json.dumps(
+        cfg,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def fixed_batch_sha256(batch: dict[str, torch.Tensor]) -> str:
+    """고정-batch 진단의 실제 입력 바이트를 이름·dtype·shape와 함께 결속한다."""
+
+    digest = hashlib.sha256()
+    for name in sorted(batch):
+        value = batch[name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"G0 batch.{name}가 Tensor가 아닙니다: {type(value).__name__}")
+        cpu = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(cpu.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(json.dumps(list(cpu.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(cpu.numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _warned_keys(loss_cfg: dict) -> tuple[str, ...]:
@@ -283,6 +316,17 @@ def main() -> int:
     optimizer = trainer.optimizer
     batch = next(trainer.train_iter)
     batch = {k: v.clone() for k, v in batch.items()}
+    print(
+        "[diagnostic contract] "
+        f"config={Path(args.config).as_posix()} "
+        f"resolved_config_sha256={resolved_config_sha256(cfg)} "
+        f"seed={cfg.get('seed')} "
+        f"role={cfg.get('experiment_role')} "
+        f"loss_start_sample={trainer.loss_start_sample} "
+        f"batch_sha256={fixed_batch_sha256(batch)} "
+        f"deterministic_algorithms={torch.are_deterministic_algorithms_enabled()}",
+        flush=True,
+    )
 
     model.train()
     if args.mode == "nominal":

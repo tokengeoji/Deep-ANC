@@ -112,7 +112,7 @@ git diff --check
 
 - [ ] strict S 기준 `lambda_dnh` gradient 비중 0.2–0.4
 - [ ] G0 trusted NMSE < −6 dB
-- [ ] 4개 20k+5k loss 후보와 필요 시 alpha 0.85를 val-only로 선택
+- [ ] frame-metric-only 2개 alpha 20k+5k 후보와 필요 시 alpha 0.85를 val-only로 선택
 - [ ] A100 200–500 smoke와 중단/재개 등가 receipt
 - [ ] 선택 tiny 계약의 새 100k canonical pretrain
 - [ ] readiness 15/15 뒤 open-loop 50k fine-tune

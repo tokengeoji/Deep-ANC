@@ -13,11 +13,13 @@ from .evaluation_contract import FileSnapshot, snapshot_regular_file
 from .experiment_contract import validate_embedded_experiment_contract
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CANONICAL_PATH = "results/training_prerequisites/canonical_pretrain.json"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_BASE_PILOTS = {(0.7, 0.5), (0.7, 0.2), (1.0, 0.5), (1.0, 0.2)}
-_ALPHA_085 = {(0.85, 0.5), (0.85, 0.2)}
+# signed frame-CVaR는 λ=0.5와 0.2에서 모두 영출력 붕괴를 재현했다. v1은 frame
+# metric-only(λ=0)로 고정하고 alpha만 비교한다. frame-v2는 별도 계약이 필요하다.
+_BASE_PILOTS = {(0.7, 0.0), (1.0, 0.0)}
+_ALPHA_085 = {(0.85, 0.0)}
 
 
 def _exact_keys(value: object, expected: set[str], *, label: str) -> dict[str, Any]:
@@ -200,7 +202,7 @@ def validate_canonical_pretrain_prerequisites(
     conditional = pilot["conditional_alpha_085_triggered"] is True
     expected_pairs = _BASE_PILOTS | (_ALPHA_085 if conditional else set())
     if pairs != expected_pairs or len(rows) != len(expected_pairs):
-        raise ValueError("4개 승인 pilot/조건부 alpha=0.85 후보 집합이 다릅니다")
+        raise ValueError("frame-metric-only 승인 pilot/조건부 alpha=0.85 후보 집합이 다릅니다")
     winner = _exact_keys(
         pilot["winner"], {"alpha", "lambda_frame"}, label="loss pilot winner"
     )

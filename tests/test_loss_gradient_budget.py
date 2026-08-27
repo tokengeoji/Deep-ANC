@@ -179,8 +179,9 @@ def test_shipped_lambda_dnh_is_a_nonzero_non_swamping_smoke_value() -> None:
 def test_the_nmse_term_is_the_denominator_and_is_alive() -> None:
     budget = _budget(0.001)
     assert budget["nmse"] == pytest.approx(1.0)
-    # 보조항이 전부 죽어 있으면 예산 자체가 무의미하다.
-    assert budget["mrstft"] > 0.0 and budget["frame"] > 0.0
+    # frame은 metric-only지만 MR-STFT와 DNH는 여전히 목적함수에 살아 있어야 한다.
+    assert budget["mrstft"] > 0.0 and budget["dnh"] > 0.0
+    assert budget["frame"] == 0.0
 
 
 def test_other_terms_are_recorded_so_a_silent_drift_is_visible() -> None:
@@ -191,11 +192,11 @@ def test_other_terms_are_recorded_so_a_silent_drift_is_visible() -> None:
     """
 
     budget = _budget(0.001)
-    for name in ("mrstft", "frame", "sat"):
+    for name in ("mrstft", "sat"):
         assert budget[name] < 3.0, (
             f"{name} 항의 몫이 {budget[name]:.2f} 입니다 — 목적함수를 덮습니다"
         )
-    assert budget["frame"] > 0.0
+    assert budget["frame"] == 0.0
 
 
 # --------------------------------------------------------------------------- 음성 대조

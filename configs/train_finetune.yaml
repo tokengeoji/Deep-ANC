@@ -337,8 +337,10 @@ loss:
   dnh_weight_above: 2.0
 
   # --- 시간 국소성 (절대목표 2 의 시간축) ---
-  # 1.5초 한 FFT 로 최악 아이템이 +0.00 dB 여도 0.17초 프레임으로 보면 +10.82 dB 였다.
-  lambda_frame: 0.5
+  # 170ms frame metric은 항상 기록한다. signed frame-CVaR는 λ=0.5와 0.2에서 모두
+  # 영출력 붕괴를 재현했으므로 v1 gradient에는 넣지 않는다. one-sided/item-wise v2
+  # guard의 별도 evidence 없이는 이 값을 올리지 않는다.
+  lambda_frame: 0.0
   nmse_frame_samples: 8192
   nmse_frame_silence_db: -40.0
 

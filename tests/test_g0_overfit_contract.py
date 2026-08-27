@@ -58,6 +58,19 @@ def test_g0_can_ablate_one_auxiliary_loss_without_claiming_nmse_only():
     assert "loss.lambda_frame=0.0" in overrides
 
 
+def test_g0_contract_and_fixed_batch_hashes_are_stable_and_content_addressed():
+    module = _module()
+    first = {"x": torch.tensor([[1.0, 2.0]]), "d": torch.tensor([[3.0, 4.0]])}
+    reordered = {"d": torch.tensor([[3.0, 4.0]]), "x": torch.tensor([[1.0, 2.0]])}
+    changed = {"x": torch.tensor([[1.0, 2.0]]), "d": torch.tensor([[3.0, 4.1]])}
+
+    assert module.fixed_batch_sha256(first) == module.fixed_batch_sha256(reordered)
+    assert module.fixed_batch_sha256(first) != module.fixed_batch_sha256(changed)
+    assert module.resolved_config_sha256({"seed": 1, "loss": {"a": 2}}) == (
+        module.resolved_config_sha256({"loss": {"a": 2}, "seed": 1})
+    )
+
+
 def test_g0_canonical_input_is_resolved_as_noneligible_diagnostic(tmp_path):
     module = _module()
     args = module.build_parser().parse_args(

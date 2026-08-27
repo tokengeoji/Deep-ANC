@@ -438,28 +438,27 @@ def test_canonical_config_requires_bootstrap_and_prerequisite_anchors_before_sta
             )
 
 
-def test_approved_alpha_frame_pilot_grid_has_distinct_20k_contracts():
+def test_approved_frame_metric_only_alpha_pilots_have_distinct_20k_contracts():
     base = _load_bound_canonical(REPO_ROOT / "configs/train_pretrain_tiny.yaml")
     run_dirs = set()
     for alpha in (0.7, 1.0):
-        for frame in (0.5, 0.2):
-            pilot = load_train_config(
-                REPO_ROOT / "configs/train_pretrain_tiny.yaml",
-                [
-                    "experiment_role=loss_pilot",
-                    "init_eligible=false",
-                    f"loss.nmse_cvar_alpha={alpha}",
-                    f"loss.lambda_frame={frame}",
-                    "run_until_step=20000",
-                ],
-            )
-            assert pilot["loss"]["nmse_cvar_alpha"] == alpha
-            assert pilot["loss"]["lambda_frame"] == frame
-            assert pilot["experiment_role"] == "loss_pilot"
-            assert pilot["init_eligible"] is False
-            assert pilot["run_until_step"] == 20_000
-            run_dirs.add(pilot["ckpt_dir"])
-    assert len(run_dirs) == 4
+        pilot = load_train_config(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            [
+                "experiment_role=loss_pilot",
+                "init_eligible=false",
+                f"loss.nmse_cvar_alpha={alpha}",
+                "loss.lambda_frame=0.0",
+                "run_until_step=20000",
+            ],
+        )
+        assert pilot["loss"]["nmse_cvar_alpha"] == alpha
+        assert pilot["loss"]["lambda_frame"] == 0.0
+        assert pilot["experiment_role"] == "loss_pilot"
+        assert pilot["init_eligible"] is False
+        assert pilot["run_until_step"] == 20_000
+        run_dirs.add(pilot["ckpt_dir"])
+    assert len(run_dirs) == 2
     assert base["ckpt_dir"] not in run_dirs
 
 
@@ -698,10 +697,8 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
     artifacts = provisional["experiment_contract"]["artifacts"]
     candidates = []
     for alpha, frame, score in (
-        (0.7, 0.5, -4.0),
-        (0.7, 0.2, -3.0),
-        (1.0, 0.5, -2.0),
-        (1.0, 0.2, -1.0),
+        (0.7, 0.0, -4.0),
+        (1.0, 0.0, -2.0),
     ):
         candidates.append(
             {
@@ -715,7 +712,7 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
             }
         )
     ledger = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source": {
             "git_commit": source["git_commit"],
             "source_tree_sha256": source["source_tree_sha256"],
@@ -740,7 +737,7 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
             "selection_rule": "minimum_recorded_val_score_db",
             "conditional_alpha_085_triggered": False,
             "candidates": candidates,
-            "winner": {"alpha": 0.7, "lambda_frame": 0.5},
+            "winner": {"alpha": 0.7, "lambda_frame": 0.0},
         },
         "measured_probe": {
             "evidence": evidence_ref,
@@ -750,7 +747,7 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
             "strict_ps": True,
             "passed": True,
             "alpha": 0.7,
-            "lambda_frame": 0.5,
+            "lambda_frame": 0.0,
         },
         "a100_smoke_resume": {
             "evidence": evidence_ref,

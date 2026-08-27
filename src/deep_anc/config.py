@@ -56,12 +56,12 @@ CANONICAL_LOSS_BASELINE = {
 }
 CANONICAL_LOSS_GRID = frozenset(
     {
-        (0.7, 0.5),
-        (0.7, 0.2),
-        (1.0, 0.5),
-        (1.0, 0.2),
-        (0.85, 0.5),
-        (0.85, 0.2),
+        # signed frame-CVaR는 λ=0.5와 0.2 모두 fixed-batch control에서 y→0으로
+        # 붕괴했다. v1 canonical은 frame을 metric-only로 두고, alpha만 비교한다.
+        # frame gradient 재도입은 one-sided/item-wise v2 guard와 별도 evidence 뒤에만 한다.
+        (0.7, 0.0),
+        (1.0, 0.0),
+        (0.85, 0.0),
     }
 )
 CANONICAL_OPTIMIZER_PRETRAIN = {

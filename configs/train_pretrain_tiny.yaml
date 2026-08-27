@@ -35,7 +35,9 @@ loss:
   lambda_dnh: 0.00075
   dnh_weight_below: 1.0
   dnh_weight_above: 2.0
-  lambda_frame: 0.5
+  # frame metric은 유지하지만 signed frame-CVaR는 λ=0.5/0.2 모두 영출력 붕괴를
+  # 재현했다. canonical v1은 DNH를 유지한 frame-metric-only 계약으로 시작한다.
+  lambda_frame: 0.0
   nmse_frame_samples: 8192
   nmse_frame_silence_db: -40.0
   mrstft_ffts: [256, 512, 1024, 2048]
@@ -61,9 +63,10 @@ ckpt_dir: runs
 resume: null
 seed: 20260803
 
-# pilot alpha×frame 계약은 별도 파일을 복사하지 않고 resolved override로
-# 표현한다. 승인 grid는 alpha∈{0.7,1.0} × lambda_frame∈{0.5,0.2}이고,
-# 필요할 때만 alpha=0.85를 추가한다. 각 후보는 100k schedule을 바꾸지 않고
+# pilot은 frame-metric-only(lambda_frame=0)로 고정하고 alpha∈{0.7,1.0}를 비교한다.
+# 차이가 0.2dB 이내이거나 alpha=1.0이 불안정할 때만 alpha=0.85를 추가한다. signed
+# frame-CVaR 0.5/0.2는 fixed-batch control에서 영출력 붕괴를 재현해 승인 후보가 아니다.
+# 각 후보는 100k schedule을 바꾸지 않고
 # `--set experiment_role=loss_pilot --set init_eligible=false \
 # --set run_until_step=20000`으로 같은 초반 곡선을 비교한다. role과 두 loss
 # 값은 contract SHA/run dir에 포함되고, run_until은 같은 run의 재개를 위해 제외된다.

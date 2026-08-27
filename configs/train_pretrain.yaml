@@ -66,9 +66,11 @@ loss:
   dnh_weight_above: 2.0         # 신뢰대역 위 (결함 3 진원지, 1633-6000Hz 최악 +19.9 dB)
 
   # --- 시간 국소성 ---
-  # 1.5초 한 FFT 로는 최악 아이템이 +0.00 dB 인데 같은 배치를 0.125초 프레임으로 보면
-  # 최악 프레임이 +10.82 dB, 증폭 프레임 12.2% 다. 8192 = 48kHz 에서 170 ms.
-  lambda_frame: 0.5
+  # 170ms frame metric은 항상 기록한다. 그러나 signed frame-CVaR는 λ=0.5와 0.2 모두
+  # fixed-batch control에서 영출력 붕괴를 일으켜 v1 gradient에서는 끈다. trusted NMSE와
+  # MR-STFT가 상쇄를, strict DNH가 1.6kHz 밖 악화 금지를 담당한다. one-sided/item-wise
+  # frame guard v2를 별도 검증하기 전까지 이 값을 올리지 않는다.
+  lambda_frame: 0.0
   nmse_frame_samples: 8192
   nmse_frame_silence_db: -40.0  # 무음 프레임이 CVaR 을 먹는 것을 막는다
 
