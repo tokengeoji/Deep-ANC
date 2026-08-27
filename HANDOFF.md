@@ -53,6 +53,20 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   `git rev-parse HEAD`로 확인한다. 브랜치별 범위는 `docs/08_dev_workflow.md §7`에 고정했다.
 - Elice receipt가 생긴 뒤 `check_finetune.py`의 외부 입력 차단은 해소됐지만, canonical
   init checkpoint·campaign ledger가 아직 없어 readiness는 의도적으로 15/15가 아니다.
+- 2026-08-27 고주파 진단 캡처는 공식 자산과 분리해 수행했지만 유효한 clock witness를
+  만들지 못했다. `results/experimental_high_band/20260827_fullband/20260827_203328_1b24d0c2/`
+  의 immutable raw에서 ERR/REF 공통 clock 유효 주기가 0개(최소 8, score≥0.995)로 판정되어
+  `Invalid experiment`이다. xrun/clip은 0이지만 P/S NPZ를 만들지 않았고 2/4/8kHz 성능
+  숫자로 사용하지 않는다. 고주파 재측정은 자극을 좁은 대역으로 재설계한 뒤 별도 dry-run과
+  사용자 입회 절차를 통과해야 한다.
+- 처음 듣는 소리 검증을 Level 1–5로 고정한 OOD 게이트를 `docs/07_evaluation_protocol.md
+  §3.1`에 기록했고 기준선 commit `98df0b0`으로 push했다. 현재 Level 5(모델 선택 후 실제
+  덕트 새 녹음) raw/session artifact는 아직 없으므로 현장 OOD 일반화는 `Not yet
+  demonstrated`이다. 이 challenge는 학습·val 선택·test에 재사용하지 않는다.
+- 기준선 `98df0b0`에서 전체 pytest는 **0 FAIL**(경고는 로컬에 없는 downstream public
+  manifest를 진단 fixture가 알리는 것), `bash -n`과 `git diff --check`도 통과했다. Elice의
+  canonical 실행 전에는 detached checkout `2d19f140a66e3d0264694e8f2e2941bce4fbd3bc`를
+  기준선 전체 SHA로 다시 맞춘다.
 
 ## 1. 구현된 계약
 
