@@ -24,8 +24,9 @@
 | 고주파 | 1,000 Hz 이상 자극·검증 없음 | 1,600 Hz까지 P/S 신뢰대역, 1,633 Hz 위는 do-no-harm | 외부 결과로 고주파 ANC를 주장할 수 없음 |
 | 지연 | 모델/loopback/음향을 분리하지만 end-to-end artifact 없음 | `TrainingTimingContract`, `PlantDelays.lead()` 단일 출처 | 외부 숫자로 lead를 덮어쓰지 않음 |
 
-현재 현행 저장소 기준선은 branch `fix/finetune-readiness-repair`, commit
-`d269699`이다. strict P/S 공식 artifact는 `capture_id=5ac1313488c8434bb4d672a36503df59`,
+감사 시점의 strict 기준선은 branch `fix/finetune-readiness-repair`, commit
+`d269699`였고, 이 감사 기록을 포함한 현재 HEAD는 `6473b27`이다. strict P/S 공식
+artifact는 `capture_id=5ac1313488c8434bb4d672a36503df59`,
 P effective delay 1386, S effective delay 1245, handoff 256, 따라서
 `PlantDelays.lead() = 115`이다. 외부 자료를 읽었다고 canonical readiness나
 파인튜닝 완료로 판정하지 않는다.
