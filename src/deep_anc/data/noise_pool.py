@@ -13,6 +13,13 @@ from scipy import signal
 from .holdout_contract import reject_symlink_components
 from .manifest import read_manifest
 
+# soundfile/libmpg123 may emit a decoder warning yet return a numerically corrupt
+# MP3 segment.  Such a segment can be normalized to an enormous value and make one
+# training batch dominate the loss.  PCM decoded from the public corpus is expected
+# to lie near [-1, 1]; keep a small headroom and reject silent/corrupt blocks.
+MAX_DECODED_PCM_ABS = 2.0
+MIN_DECODED_RMS = 1e-8
+
 
 class NoisePool:
     def __init__(
@@ -165,6 +172,18 @@ class NoisePool:
                 mono = data.mean(axis=1)
                 if mono.size == 0 or not np.isfinite(mono).all():
                     raise RuntimeError("비어 있거나 유한하지 않은 오디오")
+                decoded_peak = float(np.max(np.abs(mono)))
+                decoded_rms = float(np.sqrt(np.mean(mono * mono)))
+                if decoded_peak > MAX_DECODED_PCM_ABS:
+                    raise RuntimeError(
+                        "decoder가 PCM 범위를 벗어난 값을 반환했습니다: "
+                        f"peak={decoded_peak:.6g} > {MAX_DECODED_PCM_ABS}"
+                    )
+                if decoded_rms <= MIN_DECODED_RMS:
+                    raise RuntimeError(
+                        "decoder segment가 무음/퇴화했습니다: "
+                        f"rms={decoded_rms:.6g} <= {MIN_DECODED_RMS}"
+                    )
 
                 if file_sr != self.sample_rate:
                     from math import gcd

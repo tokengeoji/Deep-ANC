@@ -198,6 +198,56 @@ def test_noise_pool_excludes_decode_failure_and_retries(tmp_path, monkeypatch):
     assert pool._active_weights[0] == 0.0
 
 
+def test_noise_pool_rejects_corrupt_out_of_range_pcm_and_retries(tmp_path, monkeypatch):
+    """decoder 경고 없이 비정상 peak를 돌려주는 MP3도 학습을 오염시키지 않는다."""
+
+    manifest = tmp_path / "music.jsonl"
+    corrupt = tmp_path / "corrupt.mp3"
+    healthy = tmp_path / "healthy.mp3"
+    write_manifest(
+        [
+            {
+                "path": str(path),
+                "duration_s": 1.0,
+                "sample_rate": 48_000,
+                "channels": 1,
+                "tag": "music",
+                "split": "train",
+            }
+            for path in (corrupt, healthy)
+        ],
+        manifest,
+    )
+
+    class DeterministicRng:
+        def __init__(self):
+            self.indices = iter((0, 1))
+
+        def choice(self, *_args, **_kwargs):
+            return next(self.indices)
+
+        def integers(self, *_args, **_kwargs):
+            return 0
+
+    monkeypatch.setattr(
+        "deep_anc.data.noise_pool.sf.info",
+        lambda _path: SimpleNamespace(frames=128, samplerate=48_000, channels=1),
+    )
+
+    def fake_read(path, **_kwargs):
+        if Path(path) == corrupt:
+            return np.full((128, 1), 20.0, dtype=np.float32), 48_000
+        return np.ones((128, 1), dtype=np.float32), 48_000
+
+    monkeypatch.setattr("deep_anc.data.noise_pool.sf.read", fake_read)
+    pool = NoisePool([manifest], split="train", sample_rate=48_000, seed=1)
+    pool.rng = DeterministicRng()
+    segment = pool.sample_segment(64)
+
+    assert np.all(segment == 1.0)
+    assert pool._active_weights[0] == 0.0
+
+
 def test_indexed_noise_pool_decode_retry_does_not_leak_state_between_items(
     tmp_path, monkeypatch
 ):
