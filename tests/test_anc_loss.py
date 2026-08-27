@@ -512,6 +512,31 @@ def test_frame_aggregation_sees_the_burst_that_the_segment_fft_hides() -> None:
     assert quiet["frame"] < metrics["frame"]
 
 
+def test_frame_metric_remains_visible_when_its_training_weight_is_zero() -> None:
+    """안정화 후보가 frame gradient를 끄더라도 국소 증폭 증거는 남겨야 한다."""
+
+    samples = 8192
+    d = _tone(300.0, samples).view(1, 1, -1)
+    y = (-0.99 * d).clone()
+    y[..., 2560:3584] = d[..., 2560:3584]
+    criterion = ANCLoss(
+        _identity_plant(),
+        _loss_cfg(
+            "trusted_band",
+            lambda_frame=0.0,
+            nmse_frame_samples=2048,
+            nmse_frame_hop=1024,
+        ),
+        FS,
+        trusted_band_hz=(150.0, 600.0),
+    ).eval()
+
+    _, metrics = criterion(y, d, perturb={"jitter": 0})
+    assert metrics["frame_worst_db"] > 0.0
+    assert metrics["frame_valid_count"] > 0.0
+    assert np.isfinite(metrics["frame"])
+
+
 def test_silent_frames_do_not_hijack_the_frame_cvar() -> None:
     """무음 프레임은 마이크 자기잡음이 지배해 CVaR 이 의미 없는 곳을 고른다."""
 

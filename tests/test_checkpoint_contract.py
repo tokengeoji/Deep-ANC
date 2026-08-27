@@ -715,7 +715,7 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
             }
         )
     ledger = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": {
             "git_commit": source["git_commit"],
             "source_tree_sha256": source["source_tree_sha256"],
@@ -734,6 +734,7 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
             "strict_ps": True,
             "lambda_dnh": cfg["loss"]["lambda_dnh"],
             "gradient_share": gradient_share,
+            "loss_start_sample": cfg["loss_start_sample"],
         },
         "loss_pilot_selection": {
             "selection_rule": "minimum_recorded_val_score_db",

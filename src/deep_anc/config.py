@@ -37,10 +37,11 @@ CANONICAL_LOSS_BASELINE = {
     "nmse_objective": "trusted_band",
     "nmse_cvar_q": 0.25,
     "nmse_cvar_min_k": 4,
-    # strict S fixture의 실제 그래디언트 예산을 다시 측정했다. λ=0.00025에서는
-    # dnh/nmse 비가 0.088로 승인 하한(0.2)에 못 미쳤고, 선형 재교정 λ=0.00075에서
-    # 0.264가 되어 0.2–0.4 중앙 구간에 들어온다. 정확한 실행 증거는 campaign
-    # prerequisite ledger의 gradient_budget에 고정한다.
+    # 과거 0.264는 strict S라도 loss_start_sample=0으로 계산한 값이라 실제 Trainer
+    # 목적함수의 증거가 아니다. 현행 strict S + 3549-sample 정착 절단 고정 fixture는
+    # 0.130이지만, 이 값도 실제 A100 모델/배치를 대표하지 않는다. canonical 전에는
+    # 같은 loss_start_sample을 결속한 campaign prerequisite ledger의 0.2–0.4 증거가
+    # 있어야 하며, 그 전에는 이 baseline을 승인값으로 해석하지 않는다.
     "lambda_dnh": 0.00075,
     "dnh_weight_below": 1.0,
     "dnh_weight_above": 2.0,

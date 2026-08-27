@@ -13,7 +13,7 @@ from .evaluation_contract import FileSnapshot, snapshot_regular_file
 from .experiment_contract import validate_embedded_experiment_contract
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CANONICAL_PATH = "results/training_prerequisites/canonical_pretrain.json"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _BASE_PILOTS = {(0.7, 0.5), (0.7, 0.2), (1.0, 0.5), (1.0, 0.2)}
@@ -146,7 +146,13 @@ def validate_canonical_pretrain_prerequisites(
 
     gradient = _exact_keys(
         ledger["gradient_budget"],
-        {"evidence", "strict_ps", "lambda_dnh", "gradient_share"},
+        {
+            "evidence",
+            "strict_ps",
+            "lambda_dnh",
+            "gradient_share",
+            "loss_start_sample",
+        },
         label="gradient budget",
     )
     _evidence_snapshot(root, gradient["evidence"], label="gradient budget evidence")
@@ -154,10 +160,13 @@ def validate_canonical_pretrain_prerequisites(
     if (
         gradient["strict_ps"] is not True
         or float(gradient["lambda_dnh"]) != float((cfg.get("loss") or {}).get("lambda_dnh"))
+        or int(gradient["loss_start_sample"]) != int(cfg.get("loss_start_sample", -1))
         or not math.isfinite(share)
         or not 0.2 <= share <= 0.4
     ):
-        raise ValueError("strict-S lambda_dnh gradient share가 승인 범위 0.2–0.4가 아닙니다")
+        raise ValueError(
+            "strict-S lambda_dnh gradient share(0.2–0.4) 또는 loss_start_sample이 승인 계약과 다릅니다"
+        )
 
     pilot = _exact_keys(
         ledger["loss_pilot_selection"],
