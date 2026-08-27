@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -113,8 +114,54 @@ def test_the_band_matters_and_is_carried_with_the_number() -> None:
     assert narrow.band_hz != wide.band_hz
 
 
+def test_design_ceiling_cache_never_defaults_next_to_measurements(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """감사는 측정 자산을 읽기만 한다 — 캐시는 반드시 호출자가 명시한다."""
+
+    from deep_anc.dsp import design_ceiling as ceiling_module
+    from deep_anc.dsp.design_ceiling import DesignCeiling
+
+    primary = tmp_path / "primary.npz"
+    secondary = tmp_path / "secondary.npz"
+    primary.write_bytes(b"primary fixture")
+    secondary.write_bytes(b"secondary fixture")
+    calls: list[object] = []
+
+    monkeypatch.setattr(
+        "deep_anc.dsp.secondary_path.load_secondary_path",
+        lambda _path: SimpleNamespace(fir=np.asarray([1.0], dtype=np.float64)),
+    )
+
+    def fake_solve(*_args, **_kwargs) -> DesignCeiling:
+        calls.append(object())
+        return DesignCeiling(
+            ceiling_db=4.0,
+            band_hz=BAND,
+            taps=64,
+            lead_samples=116,
+            regularisation=1.0e-6,
+            condition_number=1.0,
+            max_tap=1.0,
+            stable_over_regularisation=True,
+        )
+
+    monkeypatch.setattr(ceiling_module, "design_ceiling_db", fake_solve)
+    kwargs = dict(lead_samples=116, band_hz=BAND, sample_rate=float(FS), taps=64)
+
+    ceiling_module.cached_design_ceiling_db(primary, secondary, **kwargs)
+    assert not (tmp_path / ".design_ceiling_cache.json").exists()
+
+    cache_path = tmp_path / "results" / "design_ceiling.json"
+    ceiling_module.cached_design_ceiling_db(primary, secondary, cache_path=cache_path, **kwargs)
+    ceiling_module.cached_design_ceiling_db(primary, secondary, cache_path=cache_path, **kwargs)
+    assert cache_path.is_file()
+    # 기본 계산 1회 + 명시적 캐시의 miss 1회. 마지막 호출은 cache hit 여야 한다.
+    assert len(calls) == 2
+
+
 # ------------------------------------------------------- 실측 아티팩트에서의 재현
-def test_shipped_declaration_matches_the_recomputation() -> None:
+def test_shipped_declaration_matches_the_recomputation(tmp_path) -> None:
     """출하 설정의 선언값이 실측 아티팩트 재계산과 맞는지 — 이것이 게이트의 본체다."""
 
     import yaml
@@ -160,11 +207,22 @@ def test_shipped_declaration_matches_the_recomputation() -> None:
 
     from deep_anc.dsp.design_ceiling import worst_octave_ceiling_db
 
+    cache_path = tmp_path / "design_ceiling.json"
     band_solved = cached_design_ceiling_db(
-        primary, secondary, lead_samples=lead, band_hz=band, sample_rate=float(FS)
+        primary,
+        secondary,
+        lead_samples=lead,
+        band_hz=band,
+        sample_rate=float(FS),
+        cache_path=cache_path,
     )
     worst_db, worst_hz = worst_octave_ceiling_db(
-        primary, secondary, lead_samples=lead, band_hz=band, sample_rate=float(FS)
+        primary,
+        secondary,
+        lead_samples=lead,
+        band_hz=band,
+        sample_rate=float(FS),
+        cache_path=cache_path,
     )
     # **구속하는 것은 옥타브별 최악값이다.** 대역평균은 저역의 큰 여유가 중역의
     # 병목을 가린다 — 실측: 전대역 4.83 dB 인데 옥타브 500 은 2.16 dB 뿐이다.
