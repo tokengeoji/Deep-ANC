@@ -91,6 +91,7 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert "minimum_mib = 79 * 1024" in text
     assert "minimum_total_bytes=$((128 * 1024 * 1024 * 1024 - 128 * 1024 * 1024))" in text
     assert "minimum_available_bytes=$((96 * 1024 * 1024 * 1024))" in text
+    assert "public corpus가 이미 완전하므로 재개 시 96GiB staging 예산 검사를 건너뜁니다" in text
     assert 'df -B1 --output=size,avail "$REPO"' in text
     assert 'str(torch.__version__) != "2.5.1+cu121"' in text
     assert 'str(torch.version.cuda) != "12.1"' in text

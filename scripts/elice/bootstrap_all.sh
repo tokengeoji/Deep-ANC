@@ -343,9 +343,30 @@ PY
     echo "[오류] 학습/코퍼스 대상 filesystem total capacity가 128 GiB 미만입니다: ${total_bytes:-unknown} bytes" >&2
     return 1
   fi
-  if [[ ! "$available_bytes" =~ ^[0-9]+$ ]] || [ "$available_bytes" -lt "$minimum_available_bytes" ]; then
-    echo "[오류] archive+staging+corpus 시작 가용공간이 96 GiB 미만입니다: ${available_bytes:-unknown} bytes" >&2
+  if [[ ! "$available_bytes" =~ ^[0-9]+$ ]]; then
+    echo "[오류] filesystem 가용공간을 읽을 수 없습니다: ${available_bytes:-unknown}" >&2
     return 1
+  fi
+  if [ "$available_bytes" -lt "$minimum_available_bytes" ]; then
+    # 중단 후 재실행에서는 public corpus가 이미 완전히 materialize되어
+    # archive/staging 예산이 더 이상 필요하지 않을 수 있다. 수량·metadata를
+    # 모두 확인한 경우에만 초기 96GiB 조건을 재적용하지 않는다. 불완전한
+    # 첫 실행은 기존과 동일하게 즉시 실패한다.
+    local dns_count speech_count esc_count demand_count machine_count fma_count
+    dns_count=$(find "$REPO/data/raw/noise/dns_fullband" -type f -iname '*.wav' -print 2>/dev/null | wc -l)
+    speech_count=$(find "$REPO/data/raw/noise/speech" -type f -iname '*.wav' -print 2>/dev/null | wc -l)
+    esc_count=$(find "$REPO/data/raw/noise/esc50/ESC-50-master/audio" -type f -iname '*.wav' -print 2>/dev/null | wc -l)
+    demand_count=$(find "$REPO/data/raw/noise/demand" -type f -iname '*.wav' -print 2>/dev/null | wc -l)
+    machine_count=$(find "$REPO/data/raw/noise/machine" -type f -iname '*.wav' -print 2>/dev/null | wc -l)
+    fma_count=$(find "$REPO/data/raw/music/fma_small" -type f -iname '*.mp3' -print 2>/dev/null | wc -l)
+    if [ "$dns_count" -ne 16000 ] || [ "$speech_count" -ne 8065 ] ||
+       [ "$esc_count" -ne 2000 ] || [ "$demand_count" -ne 96 ] ||
+       [ "$machine_count" -ne 3600 ] || [ "$fma_count" -ne 8000 ] ||
+       [ ! -s "$REPO/data/raw/music/fma_metadata/tracks.csv" ]; then
+      echo "[오류] archive+staging+corpus 시작 가용공간이 96 GiB 미만입니다: ${available_bytes:-unknown} bytes" >&2
+      return 1
+    fi
+    echo "[hardware] public corpus가 이미 완전하므로 재개 시 96GiB staging 예산 검사를 건너뜁니다 (available_bytes=$available_bytes)"
   fi
   echo "[hardware] filesystem total_bytes=$total_bytes (minimum=$minimum_total_bytes), available_bytes=$available_bytes (minimum=$minimum_available_bytes)"
 }
