@@ -292,3 +292,9 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
   남기고 있다(완료 로그 각 159건, 진행 로그 76건 이상). 경고가 발생한 원본을 decoder
   audit로 분류하기 전에는 어떤 pilot도 canonical init이나 최종 성능 근거로 승격하지
   않는다. 실행 프로세스는 중단하지 않았다.
+- 2026-08-27 22:25 KST 재확인에서 같은 worker가 약 13.8k/20k, 3.4 step/s로 진행 중이었다.
+  단순 속도 외삽상 네 번째 pilot 자체는 약 30–35분 뒤 종료 예상이지만, 이는 decoder
+  audit·winner 선택·measured probe·resume smoke를 포함하지 않은 추정이다. Elice에는
+  `data/raw` 34 GiB, manifest 31 MiB, `runs` 110 MiB가 있고 전체 디스크 여유는 약
+  80 GiB다. 현재 데이터는 이미 Elice에 있으므로 Jetson 용량 부족을 해소하기 위해
+  같은 corpus를 다시 외부 저장소에서 중복 다운로드할 필요가 없다.
