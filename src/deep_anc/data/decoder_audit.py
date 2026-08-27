@@ -60,6 +60,34 @@ def canonical_json_sha256(payload: object) -> str:
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
+def validate_audit_report_self_digest(report: object) -> str:
+    """완료 report의 자기 digest를 다시 계산해 검증한다.
+
+    ``audit_sha256``은 파일 byte SHA와 별개로, report의 나머지 canonical JSON을
+    고정한다. 재사용 경로는 외부 file SHA와 이 semantic digest를 모두 요구해
+    오래된 audit 파일을 단순히 "존재한다"는 이유로 신뢰하지 않는다.
+    """
+
+    if not isinstance(report, dict):
+        raise ValueError("decoder audit report 최상위는 object여야 합니다")
+    expected = report.get("audit_sha256")
+    if (
+        not isinstance(expected, str)
+        or len(expected) != 64
+        or any(character not in "0123456789abcdef" for character in expected)
+    ):
+        raise ValueError("decoder audit report audit_sha256가 유효하지 않습니다")
+    actual = canonical_json_sha256(
+        {key: value for key, value in report.items() if key != "audit_sha256"}
+    )
+    if actual != expected:
+        raise ValueError(
+            "decoder audit report audit_sha256가 실제 canonical report와 다릅니다: "
+            f"expected={expected}, actual={actual}"
+        )
+    return actual
+
+
 def _libmpg123_fingerprint() -> dict[str, str | None]:
     """현재 process가 찾을 수 있는 libmpg123 식별자를 best-effort로 읽는다.
 
@@ -755,5 +783,6 @@ __all__ = [
     "canonical_json_sha256",
     "decoder_fingerprint",
     "discover_audio_files",
+    "validate_audit_report_self_digest",
     "write_audit_report",
 ]

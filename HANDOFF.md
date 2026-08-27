@@ -114,6 +114,14 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   현재 raw 재대조와 `canonical_v4` manifest transaction이 실행 중이므로, bootstrap의
   exit 0·QA·pytest·readiness receipt가 생기기 전에는 이 수치를 readiness PASS로 승격하지
   않는다.
+- 현재 실행 중인 full audit은 중단하지 않는다. 완료 뒤 새 exact source commit에서 같은
+  raw·decoder 환경을 다시 사용할 때만 `bootstrap_all.sh --reuse-decoder-audit`를 명시할 수
+  있다. 이 경로는 외부 전달한 report **file SHA**와 report 내부 `audit_sha256`, canonical
+  full-scan recipe, 현재 decoder fingerprint, accepted/rejected를 포함한 raw 전체
+  path/SHA/size를 먼저 대조하고, `prepare_noise_pool.py` transaction이 그 전수 대조를
+  다시 수행한다. 어느 하나라도 불일치하면 fresh audit으로 자동 fallback하지 않고
+  실패한다. 기본값은 새 full decode audit이며, local 전체 pytest 0 FAIL과 shell 문법
+  검증을 통과했다.
 - 현장 evaluator는 새 source-energy 계약으로 보강했다. OFF/ON은 source를 끄는 것이 아니라
   ANC control만 OFF→ON→OFF로 바꾸며, raw NPZ에는 요청 상태를 저장한다. 각 octave는 OFF
   source의 폭 정규화 PSD 비율이 충분할 때만 감쇠를 발행하고, 그렇지 않으면 `NaN/무효`와

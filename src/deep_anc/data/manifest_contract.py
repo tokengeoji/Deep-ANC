@@ -350,7 +350,7 @@ def _decoder_audit_index(
     return result
 
 
-def _validate_decoder_audit_raw_inventory(
+def validate_decoder_audit_raw_inventory(
     audit: dict[str, Any],
     *,
     repo_root: Path,
@@ -463,7 +463,7 @@ def validate_decoder_audit_binding(
             raise ValueError(f"manifest generation decoder_audit {field} 불일치")
     if binding.get("decoder_fingerprint") != audit.get("decoder_fingerprint"):
         raise ValueError("manifest generation decoder_audit decoder_fingerprint 불일치")
-    audit["_index_by_raw_path"] = _validate_decoder_audit_raw_inventory(
+    audit["_index_by_raw_path"] = validate_decoder_audit_raw_inventory(
         audit,
         repo_root=root,
         raw_roots=raw_roots,

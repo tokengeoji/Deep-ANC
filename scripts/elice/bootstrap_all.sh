@@ -31,6 +31,11 @@ EXPECTED_HOLDOUT_SHA256=""
 EXPECTED_HOLDOUT_SHA256_SEEN=0
 EXPECTED_TRANSFER_MANIFEST_SHA256=""
 EXPECTED_TRANSFER_MANIFEST_SHA256_SEEN=0
+REUSE_DECODER_AUDIT=0
+EXPECTED_DECODER_AUDIT_SHA256=""
+EXPECTED_DECODER_AUDIT_SHA256_SEEN=0
+EXPECTED_DECODER_AUDIT_FILE_SHA256=""
+EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN=0
 NO_UPDATE_SEEN=0
 PREFLIGHT_ONLY=0
 while [ "$#" -gt 0 ]; do
@@ -105,6 +110,55 @@ while [ "$#" -gt 0 ]; do
       EXPECTED_TRANSFER_MANIFEST_SHA256_SEEN=1
       EXPECTED_TRANSFER_MANIFEST_SHA256=${1#*=}
       ;;
+    --reuse-decoder-audit)
+      if [ "$REUSE_DECODER_AUDIT" -ne 0 ]; then
+        echo "[오류] --reuse-decoder-audit은 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      REUSE_DECODER_AUDIT=1
+      ;;
+    --expected-decoder-audit-sha256)
+      if [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-decoder-audit-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_SHA256_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --expected-decoder-audit-sha256 뒤에 64자리 SHA-256이 필요합니다." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_SHA256=$1
+      ;;
+    --expected-decoder-audit-sha256=*)
+      if [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-decoder-audit-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_SHA256_SEEN=1
+      EXPECTED_DECODER_AUDIT_SHA256=${1#*=}
+      ;;
+    --expected-decoder-audit-file-sha256)
+      if [ "$EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-decoder-audit-file-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --expected-decoder-audit-file-sha256 뒤에 64자리 SHA-256이 필요합니다." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_FILE_SHA256=$1
+      ;;
+    --expected-decoder-audit-file-sha256=*)
+      if [ "$EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-decoder-audit-file-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN=1
+      EXPECTED_DECODER_AUDIT_FILE_SHA256=${1#*=}
+      ;;
     --preflight-only)
       PREFLIGHT_ONLY=1
       ;;
@@ -126,6 +180,21 @@ if [[ ! "$EXPECTED_HOLDOUT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
   exit 2
 fi
 EXPECTED_HOLDOUT_SHA256=${EXPECTED_HOLDOUT_SHA256,,}
+if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then
+  if [[ ! "$EXPECTED_DECODER_AUDIT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[오류] audit 재사용에는 --expected-decoder-audit-sha256가 필요합니다." >&2
+    exit 2
+  fi
+  if [[ ! "$EXPECTED_DECODER_AUDIT_FILE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[오류] audit 재사용에는 --expected-decoder-audit-file-sha256가 필요합니다." >&2
+    exit 2
+  fi
+  EXPECTED_DECODER_AUDIT_SHA256=${EXPECTED_DECODER_AUDIT_SHA256,,}
+  EXPECTED_DECODER_AUDIT_FILE_SHA256=${EXPECTED_DECODER_AUDIT_FILE_SHA256,,}
+elif [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ] || [ "$EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN" -ne 0 ]; then
+  echo "[오류] decoder audit SHA 인자는 --reuse-decoder-audit과 함께만 지정할 수 있습니다." >&2
+  exit 2
+fi
 if [ "$NO_UPDATE_SEEN" -ne 1 ]; then
   echo "[오류] --no-update는 필수입니다. exact checkout에서 다시 실행하세요." >&2
   exit 2
@@ -1087,12 +1156,25 @@ fi
 # MP3 등의 header/일부 seek만 정상인 raw를 NoisePool retry가 다른 파일로 조용히
 # 대체하지 못하게, 모든 공개 raw를 복수 접근 방식으로 먼저 전수 decode한다. reject는
 # forensic evidence로 report에 남기되, --allow-rejections으로 audit 자체는 성공시켜
-# prepare가 audit의 accepted inventory만 canonical v4 세대에 넣도록 한다.
-"$VENV_PYTHON" scripts/data/audit_decoder_eligibility.py \
-  --root . \
-  --scan-root data/raw \
-  --out "$DECODER_AUDIT_REPORT" \
-  --allow-rejections
+# prepare가 audit의 accepted inventory만 canonical v4 세대에 넣도록 한다. 이미 끝난
+# audit을 재사용하려면 파일/semantic SHA, 현재 decoder fingerprint, raw 전체
+# SHA/size를 먼저 fail-closed로 대조해야 하며, 다음 prepare transaction도 같은
+# raw 재대조를 다시 수행한다. 재사용 실패 시 새 audit으로 자동 fallback하지 않는다.
+if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then
+  echo "[decoder audit] 외부 SHA로 고정한 완료 audit을 재사용 전 전수 검증합니다."
+  "$VENV_PYTHON" scripts/data/verify_decoder_audit_reuse.py \
+    --root . \
+    --audit "$DECODER_AUDIT_REPORT" \
+    --scan-root data/raw \
+    --expected-audit-sha256 "$EXPECTED_DECODER_AUDIT_SHA256" \
+    --expected-file-sha256 "$EXPECTED_DECODER_AUDIT_FILE_SHA256"
+else
+  "$VENV_PYTHON" scripts/data/audit_decoder_eligibility.py \
+    --root . \
+    --scan-root data/raw \
+    --out "$DECODER_AUDIT_REPORT" \
+    --allow-rejections
+fi
 "$VENV_PYTHON" scripts/data/prepare_noise_pool.py \
   --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
   --recorded-source-pool-csv data/source_pool_v2/sources.csv \

@@ -84,6 +84,10 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert text.count("verify_exact_checkout") >= 3
     assert '["git", "ls-tree", "-r", "-z", "--full-tree", commit]' in text
     assert "prepare_noise_pool.py" in text
+    assert "--reuse-decoder-audit" in text
+    assert "--expected-decoder-audit-sha256" in text
+    assert "--expected-decoder-audit-file-sha256" in text
+    assert "verify_decoder_audit_reuse.py" in text
     assert '--expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256"' in text
     assert "--expected-transfer-manifest-sha256" in text
     assert 'TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"' in text
@@ -149,6 +153,8 @@ def test_bootstrap_binds_full_decoder_audit_to_canonical_v4_manifest_generation(
     assert '--decoder-audit "$DECODER_AUDIT_REPORT"' in bootstrap[prepare_call:validate_call]
     assert '--manifest-dir "$CANONICAL_MANIFEST_DIR"' in bootstrap[validate_call:]
     assert '--out "$CANONICAL_MANIFEST_DIR/dataset_qa.md"' in bootstrap[validate_call:]
+    assert 'if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then' in bootstrap[audit_call - 1800:prepare_call]
+    assert "재사용 실패 시 새 audit으로 자동 fallback하지 않는다" in bootstrap
 
 
 def test_setup_env_requires_exact_torch_cuda_and_writes_freeze_receipt():
@@ -656,6 +662,39 @@ def test_bootstrap_requires_explicit_no_update_before_setup(tmp_path: Path):
 
     assert result.returncode == 2
     assert "--no-update는 필수" in result.stderr
+    assert not (root / "data").exists()
+    assert not (root / ".venv").exists()
+
+
+def test_bootstrap_reuse_decoder_audit_requires_both_external_sha_anchors_before_setup(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+
+    missing = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--reuse-decoder-audit",
+        "--no-update",
+    )
+    orphan = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--expected-decoder-audit-sha256",
+        "b" * 64,
+        "--no-update",
+    )
+
+    assert missing.returncode == 2
+    assert orphan.returncode == 2
+    assert "--expected-decoder-audit-sha256" in missing.stderr
+    assert "--reuse-decoder-audit" in orphan.stderr
     assert not (root / "data").exists()
     assert not (root / ".venv").exists()
 
