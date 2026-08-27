@@ -45,6 +45,12 @@ _DNS_SPEECH_RE = re.compile(
 )
 _AUDIOSET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _MIMII_ID_RE = re.compile(r"^id_(\d+)$", re.IGNORECASE)
+_MIMII_DG_FILE_RE = re.compile(
+    r"^section_(?P<section>\d+)_(?P<domain>source|target)_"
+    r"(?P<split>train|test)_(?P<condition>normal|anomaly)_"
+    r"(?P<index>\d+)(?:_(?P<attribute>[A-Za-z0-9_-]+))?$",
+    re.IGNORECASE,
+)
 _DEMAND_ENVIRONMENTS = frozenset(
     {"DKITCHEN", "DWASHING", "OOFFICE", "OHALLWAY", "TMETRO", "TCAR"}
 )
@@ -306,12 +312,24 @@ def mimii_lineage_keys(path: str | Path, *, tag_root: Path) -> tuple[str, ...]:
         for part in relative.parts
         if (match := _MIMII_ID_RE.fullmatch(part)) is not None
     ]
-    if len(set(identifiers)) != 1:
-        raise PublicLineageBlocked(
-            f"MIMII fan physical machine id를 official path에서 파싱할 수 없습니다: {relative}"
-        )
-    # 같은 physical machine의 SNR/normal/abnormal/take를 전부 한 component로 묶는다.
-    return (f"mimii_fan_machine:{identifiers[0]}",)
+    if len(set(identifiers)) == 1:
+        # 기존 MIMII 경로(id_00/normal 등)는 같은 physical machine의
+        # SNR/normal/abnormal/take를 전부 한 component로 묶는다.
+        return (f"mimii_fan_machine:{identifiers[0]}",)
+
+    # MIMII-DG official fan.zip은 id_XX 디렉터리를 사용하지 않고,
+    # section/domain/condition/attribute를 파일명에 기록한다. 여기의
+    # ``m-n_W`` 같은 suffix는 domain-shift attribute이지 physical machine
+    # ID가 아니다. 공식 파일명에 physical machine crosswalk가 없으므로
+    # 누수를 놓치지 않도록 같은 section의 source/target/train/test 및
+    # normal/anomaly를 하나의 보수적 component로 묶는다.
+    match = _MIMII_DG_FILE_RE.fullmatch(relative.stem)
+    if match is not None:
+        return (f"mimii_dg_fan_section:{int(match.group('section')):02d}",)
+
+    raise PublicLineageBlocked(
+        f"MIMII fan physical machine/official DG section을 파싱할 수 없습니다: {relative}"
+    )
 
 
 def _marker_members(snapshot: FileSnapshot) -> set[str]:

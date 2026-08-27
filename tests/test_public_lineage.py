@@ -108,6 +108,14 @@ def test_demand_mimii_and_dns_path_parsers_are_strict(tmp_path: Path) -> None:
     assert mimii_lineage_keys(
         machine / "6_dB/fan/id_00/normal/00000000.wav", tag_root=machine
     ) == ("mimii_fan_machine:00",)
+    assert mimii_lineage_keys(
+        machine / "fan/test/section_00_source_test_anomaly_0000_m-n_W.wav",
+        tag_root=machine,
+    ) == ("mimii_dg_fan_section:00",)
+    assert mimii_lineage_keys(
+        machine / "fan/train/section_00_target_train_normal_0001_m-n_Z.wav",
+        tag_root=machine,
+    ) == ("mimii_dg_fan_section:00",)
     with pytest.raises(PublicLineageBlocked):
         mimii_lineage_keys(machine / "6_dB/fan/normal.wav", tag_root=machine)
 
