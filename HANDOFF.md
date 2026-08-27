@@ -171,6 +171,21 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   변경 후 로컬 전체 pytest도 0 FAIL(로컬 public manifest 부재를 알리는 diagnostic
   warning만 2건), shell 문법·`py_compile`·`git diff --check`도 통과했다. commit/push
   뒤에만 Elice v8 preflight와 full bootstrap을 다시 시작한다.
+- Elice v8은 marker 검증을 통과해 canonical_v4를 atomic publish했다
+  (build ID `893136241cded3b835daeceafedd43863b8c8a7ecfdcde7e7f29fc5495336707`,
+  raw mtime 변경 0, staging 잔재 0). 그러나 [5/6] pytest에서 기존 runtime test 하나가
+  실패했다. Elice의 `runs/`에는 학습 log/config snapshot만 있고 Jetson legacy runtime의
+  active artifact `runs/pretrain_base_corrected/ckpt/best.pt`,
+  `runs/export/tiny_corrected.onnx`는 의도적으로 없는데, test가 `runs/` directory 존재만으로
+  artifact가 fetched됐다고 오인했다. v8 log SHA는
+  `5b8ad3ea059af82c677946ef6180b0ac02156267b3242d55aca894310e33981c`, status SHA는
+  `45d873985c93d13033163f25b882af2974c5242022445f71f27f7428e5b4c760`이다. 이는 data/P/S
+  failure가 아니며 bootstrap receipt가 없으므로 published manifest도 아직 학습에 쓰지 않는다.
+  다음 commit은 runtime artifact cohort(ONNX/plan 또는 legacy checkpoint)가 실제로 있는지로
+  판정하게 고친다. cohort 안에 한 파일이라도 있으면 기존처럼 config path 누락을
+  fail-closed하고, A100의 일반 `runs` log만 있는 상태는 unfetched로 skip한다. 해당 Elice
+  상태를 재현한 회귀와 로컬 전체 pytest 0 FAIL을 확인한 뒤에만 같은 immutable raw와
+  canonical_v4 transaction을 다시 검증한다.
 - 2026-08-28 구 `5632c08` Elice bootstrap은 stage 4에서 약 3시간 54분 동안 user CPU만
   증가하고 raw I/O·staging·canonical_v4·로그 진행이 없었다. raw 변경 0, tracked 변경 0,
   staging 0을 재확인한 뒤 worker 하나에만 TERM을 보내 `exit_code=143` receipt를 남겼고,
