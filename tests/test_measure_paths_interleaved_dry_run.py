@@ -14,6 +14,21 @@ from scripts.data import measure_paths_interleaved as mpi
 from scripts.data import reanalyse_paths_interleaved as rpi
 
 
+def _portaudio_available() -> bool:
+    """Elice 학습 노드처럼 PortAudio가 없는 환경에서는 실기 경로만 건너뛴다."""
+
+    try:
+        import sounddevice  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+requires_portaudio = pytest.mark.skipif(
+    not _portaudio_available(), reason="PortAudio가 없는 학습 노드에서는 실기 캡처를 실행하지 않음"
+)
+
+
 def _hardware() -> dict:
     return {
         "audio": {
@@ -346,6 +361,7 @@ def test_actual_measurement_requires_paired_level_raw_before_session_or_audio(
     assert list(tmp_path.iterdir()) == []
 
 
+@requires_portaudio
 def test_strict_rechecks_physical_fingerprint_after_input_preflight_before_output(
     tmp_path, monkeypatch, capsys
 ):
@@ -531,6 +547,7 @@ def test_bootstrap_dry_run_opens_no_audio_and_validates_no_raw(
     assert list(tmp_path.iterdir()) == []
 
 
+@requires_portaudio
 def test_bootstrap_evidence_failure_blocks_all_postprocessing_and_official_outputs(
     tmp_path, monkeypatch
 ):
@@ -1029,6 +1046,7 @@ def test_interleaved_close_failure_is_not_swallowed_and_requires_physical_discon
     assert events == [False]
 
 
+@requires_portaudio
 def test_main_partial_capture_writes_invalid_immutable_raw_and_reanalysis_rejects(
     tmp_path, monkeypatch
 ):
@@ -1126,6 +1144,7 @@ def test_main_partial_capture_writes_invalid_immutable_raw_and_reanalysis_reject
         ("analyze", KeyboardInterrupt()),
     ],
 )
+@requires_portaudio
 def test_completed_capture_is_durable_before_any_postprocessing_fault(
     tmp_path, monkeypatch, fault_site, fault
 ):

@@ -874,7 +874,14 @@ def test_real_v1_v2_selection_matches_every_shipped_csv_prefix(provenance) -> No
         REPO_ROOT / "data/raw/speech",
         REPO_ROOT / "data/raw/music",
     ]
-    if not all(path.exists() for path in required):
+    # Elice bootstrap에는 transferred holdout와 public raw만 있고, historical source
+    # pool의 LibriSpeech/FMA audio 전체는 없다. metadata directory만 존재하는 경우도
+    # 있으므로 실제 source 파일까지 확인한 뒤에만 이 무거운 historical 검증을 연다.
+    has_historical_audio = (
+        any((REPO_ROOT / "data/raw/speech/LibriSpeech").rglob("*.flac"))
+        and any((REPO_ROOT / "data/raw/music").rglob("*.mp3"))
+    )
+    if not all(path.exists() for path in required) or not has_historical_audio:
         pytest.skip("historical source-pool raw corpus가 없는 환경")
     plans, evidence = provenance.reconstruct_plans(REPO_ROOT)
     assert evidence["counts"]["v1_placements"] == 983

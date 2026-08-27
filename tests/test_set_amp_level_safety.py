@@ -14,6 +14,21 @@ from deep_anc.dsp.measurement_level import ALSA_PHYSICAL_FINGERPRINT_SCHEMA
 from scripts.data import set_amp_level as meter
 
 
+def _portaudio_available() -> bool:
+    """PortAudio가 없는 Elice 학습 노드에서는 실제 stream 테스트를 건너뛴다."""
+
+    try:
+        import sounddevice  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+requires_portaudio = pytest.mark.skipif(
+    not _portaudio_available(), reason="PortAudio가 없는 학습 노드에서는 실기 meter를 실행하지 않음"
+)
+
+
 def _physical_fingerprint() -> dict:
     def endpoint(card_id: str, pcm: int, stream: str, realpath: str) -> dict:
         return {
@@ -258,6 +273,7 @@ def test_official_meter_duration_cannot_be_overridden(monkeypatch, capsys):
     assert "정확히 20초" in capsys.readouterr().err
 
 
+@requires_portaudio
 def test_live_meter_stops_before_hardware_when_paired_raw_evidence_is_missing(
     monkeypatch, capsys
 ):
@@ -356,6 +372,7 @@ def test_explicit_bootstrap_mode_reaches_measure_without_existing_evidence(
     assert observed == {"bootstrap": True, "user": True, "volume": True}
 
 
+@requires_portaudio
 def test_normal_meter_uses_permanent_evidence_but_always_emits_fresh_raw(
     tmp_path, monkeypatch, capsys
 ):
