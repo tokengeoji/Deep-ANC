@@ -38,15 +38,15 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   public raw 6종을 untouched 상태로 다운로드·manifest 재생성·QA했다. bootstrap 전체
   pytest는 0 FAIL이며 receipt SHA는
   `f56c3d1042211112627380f74315d5949f05bcf274bdcf3fefc588ea3d3caa7e`다.
-- 현재 Elice에서 seed `20260803`의 승인 loss grid 4개(각 20k surrogate pilot)를
-  순차 실행 중이다. 2026-08-27 마지막 확인 시 `alpha=0.7, lambda_frame=0.5`,
-  `alpha=0.7, lambda_frame=0.2`, `alpha=1.0, lambda_frame=0.5`는 20k를 완료했고,
-  앞의 두 후보는 val CVaR가 각각 +0.02/+0.00 dB, alpha 1.0/frame 0.5는
-  +0.20 dB(최악 +3.07 dB)로 불안정했다. 네 번째 `alpha=1.0, lambda_frame=0.2`는
-  약 6.1k/20k에서 진행 중이었다. 모든 후보 checkpoint는 init으로 승격하지 않는다.
-  현재 Elice checkout은 실행 중단을 피하기 위해 `2d19f140…`에 남겨 두었으며, pilot·
-  decoder warning 점검·gradient·G0·measured probe·A100 resume 증거를 ledger로 묶은
-  뒤 canonical 기준선 `c21fe1a`로 맞춘다.
+- 기존 Elice loss grid 4개(각 20k surrogate pilot)는 폐기된 `lambda_dnh=0.00025`로
+  실행되어 모두 diagnostic-only다. strict-S fixture를 재측정한 결과 이 값의 gradient
+  비중은 0.088로 승인 하한에 못 미쳤고, 현행 `lambda_dnh=0.00075`에서 0.264가 된다.
+  따라서 기존 후보를 init이나 최종 성능 근거로 승격하지 않는다. 2026-08-27 23:33 KST,
+  exact commit `1aaece892ee1ab7bc5f6a224fb1b4f29171019c0`에서 같은
+  `alpha∈{0.7,1.0} × lambda_frame∈{0.5,0.2}` grid를 새 run 디렉터리로 순차 재실행했다.
+  첫 후보 `alpha=0.7, lambda_frame=0.5`가 약 1.6k/20k에서 진행 중이며, 모든 후보는
+  init 자격을 갖지 않는다. 새 후보·decoder 경고·gradient·G0·measured probe·A100
+  resume 증거를 ledger로 묶기 전에는 canonical pretrain을 열지 않는다.
 - canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
@@ -68,10 +68,13 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   §3.1`에 기록했고 기준선 commit `98df0b0`으로 push했다. 현재 Level 5(모델 선택 후 실제
   덕트 새 녹음) raw/session artifact는 아직 없으므로 현장 OOD 일반화는 `Not yet
   demonstrated`이다. 이 challenge는 학습·val 선택·test에 재사용하지 않는다.
-- 현재 기준선 `c21fe1a`에서 전체 pytest는 **0 FAIL**(경고는 로컬에 없는 downstream public
-  manifest를 진단 fixture가 알리는 것), `bash -n`과 `git diff --check`도 통과했다. Elice의
-  canonical 실행 전에는 detached checkout `2d19f140a66e3d0264694e8f2e2941bce4fbd3bc`를
-  기준선 전체 SHA로 다시 맞춘다.
+- 현재 exact commit `1aaece892ee1ab7bc5f6a224fb1b4f29171019c0`에서 전체 pytest는
+  **0 FAIL**(경고는 로컬에 없는 downstream public manifest를 진단 fixture가 알리는 것),
+  `bash -n`과 `git diff --check`도 통과했다. Elice checkout도 같은 SHA의 detached 상태다.
+
+- strict-S gradient budget 재교정 커밋 `1aaece892ee1ab7bc5f6a224fb1b4f29171019c0`을
+  원격 브랜치에 push했고, 로컬 전체 pytest도 `/dev/shm` basetemp에서 0 FAIL로 재확인했다.
+  현행 설정은 `lambda_dnh=0.00075`이며 새 pilot만 이 설정을 사용한다.
 
 ## 1. 구현된 계약
 
@@ -302,3 +305,11 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
   `data/raw` 34 GiB, manifest 31 MiB, `runs` 110 MiB가 있고 전체 디스크 여유는 약
   80 GiB다. 현재 데이터는 이미 Elice에 있으므로 Jetson 용량 부족을 해소하기 위해
   같은 corpus를 다시 외부 저장소에서 중복 다운로드할 필요가 없다.
+
+- Jetson `data/` 백업은 Google Drive `gdrive:DeepANC/jetson_data_backup_20260827/data`로
+  진행 중이다. 13,428개/17,441,317,063바이트 고정 목록의 SHA는
+  `1dd9fef8d796cc1f27fbf5d434d640c8b80554e16f04b6bfac0d3403c748bea2`이며 Drive에 올린
+  manifest SHA와 일치했다. 겹치는 전체 복사 프로세스는 중단하고 `raw`, `recorded`,
+  `recorded_broken`, `source_pool_v2` 전용 `rclone copy`만 유지한다. 원격 파일 수·바이트와
+  `rclone check`가 고정 목록과 일치하기 전에는 원본을 삭제하지 않는다. 백업 절차와 보존/
+  삭제 범위는 `docs/15_jetson_drive_backup_20260827.md`에 기록했다.
