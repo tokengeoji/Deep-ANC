@@ -35,9 +35,11 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   344 files/82 sessions).
 - Elice `~/Deep_ANC`에 transfer bundle을 전송하고 exact checkout/holdout/strict P·S
   SHA를 원격에서 대조했다. 이후 full `NVIDIA A100 80GB PCIe`(world-size 1)를 확인하고
-  public raw 6종을 untouched 상태로 다운로드·manifest 재생성·QA했다. bootstrap 전체
-  pytest는 0 FAIL이며 receipt SHA는
-  `f56c3d1042211112627380f74315d5949f05bcf274bdcf3fefc588ea3d3caa7e`다.
+  public raw 6종을 untouched 상태로 다운로드·manifest 재생성·QA했다. 이때의 bootstrap
+  전체 pytest 0 FAIL receipt SHA는
+  `f56c3d1042211112627380f74315d5949f05bcf274bdcf3fefc588ea3d3caa7e`다. **이는
+  decoder-audit 결속 이전 schema v3 자료의 receipt이므로 diagnostic-only이며,
+  canonical v4 readiness나 학습 개시 근거가 아니다.**
 - 기존 Elice loss grid 4개(각 20k surrogate pilot)는 폐기된 `lambda_dnh=0.00025`로
   실행되어 모두 diagnostic-only다. 새 `lambda_dnh=0.00075` pilot의 첫 후보도 약
   8.5k/20k에서 `y_rms≈2.2e−5`, trusted NMSE≈0 dB로 영출력 붕괴해 중단·보존했다.
