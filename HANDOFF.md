@@ -283,6 +283,10 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
 - 명백한 임시 readiness snapshot 두 디렉터리, 종료된 PID의 stale audio lock, 저장소
   Python/test cache는 휴지통으로 이동했다. 데이터·raw·RIR·checkpoint·legacy 결과는
   보존했다. 삭제/보존 목록과 SHA는 `docs/13_repository_cleanup_20260827.md`에 있다.
+- Jetson 용량 부족을 이유로 public corpus를 중복 복제하지 않도록 Kaggle/Google Drive를
+  사용할 때의 임시 staging·비밀정보·SHA·manifest 재검증 절차를 `docs/14_elice_external_data_staging.md`
+  에 기록했다. 현재 Elice raw가 이미 정상적으로 있으므로 pilot 중에는 downloader를
+  실행하지 않는다.
 - 현재 branch HEAD는 외부 감사 기록과 후속 정리 변경을 포함한 최신 commit이다. Elice의
   진행 중 pilot은 중단하지 않고 종료 뒤 이 branch의 exact commit으로 동기화한다.
 - 2026-08-27 22:03 KST read-only poll에서 Elice pilot parent PID 58467과 네 번째
