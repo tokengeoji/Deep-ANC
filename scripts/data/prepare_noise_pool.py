@@ -114,6 +114,17 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _progress(message: str) -> None:
+    """장시간 canonical manifest 준비의 phase를 즉시 로그로 남긴다.
+
+    이 출력은 사람/운영자용 observability이며 manifest bytes, split, audit binding에는
+    포함하지 않는다. background bootstrap의 stdout이 block-buffered여도 phase 전환을
+    바로 판별할 수 있도록 flush한다.
+    """
+
+    print(f"[진행] {message}", flush=True)
+
+
 def _hash_workers(value: int) -> int:
     """명시적 raw SHA worker 수를 제한한다.
 
@@ -920,6 +931,7 @@ def main() -> int:
         except (OSError, ValueError) as exc:
             print(f"[BLOCKED] decoder audit 검증 실패: {exc}", file=sys.stderr)
             return 1
+        _progress("decoder audit schema/fingerprint/inventory 검증 완료")
 
     tag_dirs: dict[str, list[Path]] = {}
     try:
@@ -1028,12 +1040,17 @@ def main() -> int:
     sources_by_tag: dict[str, list[Path]] = {}
     decoder_rejected_by_tag: dict[str, int] = {}
     for pool in plan.pools:
+        _progress(f"{pool.tag}: raw scan 시작")
         sources = tag_dirs.get(pool.tag, [])
         entries: list[dict] = []
         for src in sources:
             entries.extend(scan_wavs(src, pool.tag))
         if not entries:
             continue
+        _progress(
+            f"{pool.tag}: {len(entries)}개 raw content SHA 결속 시작 "
+            f"(workers={hash_workers})"
+        )
         try:
             entries = _bind_audio_content_hashes(
                 entries,
@@ -1043,10 +1060,16 @@ def main() -> int:
         except OSError as exc:
             print(f"[실패] {pool.tag} raw content hash 실패: {exc}", file=sys.stderr)
             return 1
+        _progress(f"{pool.tag}: raw content SHA 결속 완료")
         if decoder_audit_evidence is not None:
+            _progress(f"{pool.tag}: decoder audit entry 결속 시작 ({len(entries)}개)")
             accepted_entries: list[dict] = []
             rejected = 0
             for index, entry in enumerate(entries):
+                if index and index % 1_000 == 0:
+                    _progress(
+                        f"{pool.tag}: decoder audit entry {index}/{len(entries)} 검증"
+                    )
                 absolute = Path(os.path.abspath(Path(str(entry.get("path") or ""))))
                 try:
                     relative = absolute.relative_to(REPO_ROOT).as_posix()
@@ -1079,6 +1102,10 @@ def main() -> int:
                 accepted_entries.append(entry)
             entries = accepted_entries
             decoder_rejected_by_tag[pool.tag] = rejected
+            _progress(
+                f"{pool.tag}: decoder audit entry 결속 완료 "
+                f"(accept={len(entries)}, reject={rejected})"
+            )
         hashed_by_tag[pool.tag] = entries
         sources_by_tag[pool.tag] = sources
 
@@ -1104,12 +1131,17 @@ def main() -> int:
             # training 세대에서만 source-pool 추가 exclusion을 전달한다.
             if extra_excluded_basenames:
                 lineage_kwargs["extra_excluded_basenames"] = extra_excluded_basenames
+            _progress("public lineage component 구성 시작")
             lineage_build = build_public_lineage(
                 hashed_by_tag,
                 tag_roots=sources_by_tag,
                 repo_root=REPO_ROOT,
                 holdout_lineage=clip_lineage,
                 **lineage_kwargs,
+            )
+            _progress(
+                "public lineage component 구성 완료 "
+                f"(components={lineage_build.evidence['component_count']})"
             )
             # transitive component가 tag를 가로지를 수 있으므로 모든 tag를 한 번에
             # 분할하되, 각 public tag 안에도 val/test가 생기게 계층화한다. 단일
@@ -1144,6 +1176,7 @@ def main() -> int:
                 group_key="group_id",
                 stratify_key=stratify_tag,
             )
+            _progress("public lineage split 배정 완료")
             assigned_by_tag: dict[str, list[dict]] = {
                 tag: [] for tag in hashed_by_tag
             }
@@ -1152,6 +1185,7 @@ def main() -> int:
                 tag = str(item.pop("_public_lineage_tag"))
                 assigned_by_tag[tag].append(item)
             manifest_lineage = validate_public_manifest_lineage(assigned_by_tag)
+            _progress("public lineage split 누수 검증 완료")
         except PublicLineageError as exc:
             print(f"[BLOCKED] public corpus 계보를 증명할 수 없습니다: {exc}", file=sys.stderr)
             return 1
@@ -1219,6 +1253,7 @@ def main() -> int:
             return 1
 
     try:
+        _progress("canonical manifest transaction 시작")
         generation = write_generation_transactionally(
             prepared,
             out_dir=out_dir,

@@ -25,6 +25,8 @@ import pytest
 import soundfile as sf
 import yaml
 
+import deep_anc.data.manifest_contract as manifest_contract
+
 from deep_anc.data.holdout_contract import EXPECTED_HISTORICAL_BUILDERS
 from deep_anc.data.decoder_audit import (
     DEFAULT_AUDIO_EXTENSIONS,
@@ -509,6 +511,89 @@ def test_decoder_reject_rows_are_excluded_and_copied_audit_is_bound(
             if row["decision"] == "accept"
         ]
     )
+
+
+def test_decoder_audit_path_index_is_cached_once_per_raw_root_context(
+    tmp_path, monkeypatch
+):
+    """큰 corpus도 entry마다 inventory 전체를 다시 index하지 않아야 한다."""
+
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit_path = _write_decoder_audit(root)
+    audit = manifest_contract.read_decoder_audit(
+        root / audit_path,
+        repo_root=root,
+        label="cache fixture audit",
+    )
+    entries = [
+        {
+            "path": str(path),
+            "content_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "content_size": path.stat().st_size,
+        }
+        for path in sorted((root / "data/raw").rglob("*.wav"))
+    ]
+    original = manifest_contract._decoder_audit_index
+    calls = 0
+
+    def counted_index(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(manifest_contract, "_decoder_audit_index", counted_index)
+    for index, entry in enumerate(entries):
+        manifest_contract.validate_decoder_audit_manifest_entry(
+            audit,
+            entry,
+            repo_root=root,
+            raw_roots=[root / "data/raw"],
+            label=f"cache fixture entry #{index}",
+        )
+    assert calls == 1
+
+    # 동일 audit라도 raw-root 경계가 달라지면 stale absolute-path cache를 재사용하지 않는다.
+    manifest_contract.validate_decoder_audit_manifest_entry(
+        audit,
+        entries[0],
+        repo_root=root,
+        raw_roots=[root / "data"],
+        label="cache fixture changed root",
+    )
+    assert calls == 2
+
+
+def test_failed_raw_inventory_verification_does_not_leave_a_path_index(
+    tmp_path,
+):
+    """불완전 audit는 다음 caller가 파생 cache를 신뢰하게 해서는 안 된다."""
+
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit_path = _write_decoder_audit(root)
+    audit = manifest_contract.read_decoder_audit(
+        root / audit_path,
+        repo_root=root,
+        label="failed cache fixture audit",
+    )
+    _write_clips(root / "data/raw/unlisted", 1)
+
+    with pytest.raises(ValueError, match="raw inventory가 audit와 다릅니다"):
+        manifest_contract.validate_decoder_audit_raw_inventory(
+            audit,
+            repo_root=root,
+            raw_roots=[root / "data/raw"],
+            label="failed cache fixture",
+        )
+    assert "_index_by_raw_path" not in audit
+    assert "_index_context" not in audit
 
 
 def test_tampered_decoder_audit_inventory_digest_blocks_generation(

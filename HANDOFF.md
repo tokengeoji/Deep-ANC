@@ -157,6 +157,14 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   fail-closed로 잡았다. bootstrap은 이제 호출 위치/clone 이름 대신 script 위치에서 default
   repo root를 유도한다. 이 수정의 pytest·shell 검증과 새 full preflight를 통과한 SHA만 다음
   raw-audit 재사용 실행에 쓴다.
+- 새 경로 수정 `ae494ad`의 Elice preflight는 PASS했고, raw audit reuse도 internal/file SHA와
+  accept 36,868/reject 893을 PASS했다. 그러나 prepare의 manifest-entry 검증이 cache 없는
+  absolute path index를 매 entry마다 다시 만들어 약 `36,868 × 37,761` 경로 계약 검사를 수행하는
+  O(N²) 결함을 발견했다. raw hash 뒤 staging/output 0·raw 변경 0 상태에서 worker만 TERM해
+  `exit_code=143` receipt를 보존했다. path index는 이제 `(repo root, ordered raw roots)`
+  context별 process-local 파생 cache로 한 번만 만들며, entry별 SHA/size·accept/reject 검증과
+  transaction 후 전수 raw 재검증은 그대로 유지한다. prepare stdout은 artifact 계약에 영향을
+  주지 않는 flush phase log도 남긴다.
 
 ## 1. 구현된 계약
 

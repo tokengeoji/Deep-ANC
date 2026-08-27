@@ -351,6 +351,23 @@ def _decoder_audit_index(
     return result
 
 
+def _decoder_audit_index_context(
+    *, repo_root: Path, raw_roots: Iterable[Path]
+) -> tuple[str, tuple[str, ...]]:
+    """파생 path index가 유효한 repository/raw-root 경계를 식별한다.
+
+    audit JSON 자체에는 absolute path를 저장하지 않는다. 따라서 같은 in-memory audit
+    객체를 다른 checkout 또는 다른 raw root 집합에 재사용하면, 이전 path index를
+    신뢰해서는 안 된다. 이 context는 artifact에 기록하지 않는 process-local cache의
+    경계일 뿐이며 manifest/audit identity에는 영향을 주지 않는다.
+    """
+
+    return (
+        str(Path(os.path.abspath(repo_root))),
+        tuple(str(Path(os.path.abspath(root))) for root in raw_roots),
+    )
+
+
 def _raw_inventory_workers(value: int) -> int:
     """raw byte 재대조의 명시적 worker 수를 보수적으로 검증한다.
 
@@ -381,7 +398,7 @@ def validate_decoder_audit_raw_inventory(
     """
 
     worker_count = _raw_inventory_workers(workers)
-    roots = [Path(os.path.abspath(root)) for root in raw_roots]
+    roots = tuple(Path(os.path.abspath(root)) for root in raw_roots)
     index = _decoder_audit_index(
         audit,
         repo_root=repo_root,
@@ -436,6 +453,14 @@ def validate_decoder_audit_raw_inventory(
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             for _ in executor.map(_verify_one, ordered_paths):
                 pass
+    # 이 index는 raw byte가 아니라 성공한 inventory의 absolute-path projection이다.
+    # 검증 도중 예외가 난 audit 객체에는 cache를 남기지 않아 이후 호출도 fail-closed로
+    # 다시 검증하게 한다. 성공 뒤에는 entry마다 N개 inventory를 다시 path/symlink
+    # 검사하는 O(N²)를 피하기 위해 context와 함께 process-local로 재사용한다.
+    audit["_index_by_raw_path"] = index
+    audit["_index_context"] = _decoder_audit_index_context(
+        repo_root=Path(os.path.abspath(repo_root)), raw_roots=roots
+    )
     return index
 
 
@@ -515,14 +540,20 @@ def validate_decoder_audit_manifest_entry(
     """manifest 행이 audit에서 승인된 정확히 같은 raw file인지 fail-closed 검증한다."""
 
     root = Path(os.path.abspath(repo_root))
+    roots = tuple(Path(os.path.abspath(item)) for item in raw_roots)
+    context = _decoder_audit_index_context(repo_root=root, raw_roots=roots)
     index = audit.get("_index_by_raw_path")
-    if not isinstance(index, dict):
+    if not isinstance(index, dict) or audit.get("_index_context") != context:
         index = _decoder_audit_index(
             audit,
             repo_root=root,
-            raw_roots=raw_roots,
+            raw_roots=roots,
             label=label,
         )
+        # 같은 audit/checkout/raw-root 조합의 다음 entry는 이 projection만 재사용한다.
+        # content SHA/size·accept/reject 비교는 아래에서 entry마다 계속 수행한다.
+        audit["_index_by_raw_path"] = index
+        audit["_index_context"] = context
     absolute = Path(os.path.abspath(Path(str(entry.get("path") or ""))))
     row = index.get(str(absolute))
     if not isinstance(row, dict):
