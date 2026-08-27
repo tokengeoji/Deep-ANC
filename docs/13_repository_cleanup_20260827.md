@@ -93,9 +93,9 @@ results/provenance/<content-addressed-name>.<sha256>.json
 
 ## 브랜치 정리 원칙
 
-현재 작업 브랜치는 `fix/finetune-readiness-repair` 하나로 고정하고, 원격과 동일한
-`f299c31ee11a1e34fd7b09c5323f3cc2b2268c65`에 맞춘다. 다른 브랜치는 내용을 섞거나
-삭제하지 않고 용도를 보존한다.
+현재 작업 브랜치는 `fix/finetune-readiness-repair` 하나로 고정하고, 매 push 전에
+`git rev-parse HEAD`와 원격 브랜치 SHA가 동일한지 확인한다. 다른 브랜치는 내용을
+섞거나 삭제하지 않고 용도를 보존한다.
 
 | 브랜치 | 현재 역할 | 처리 |
 |---|---|---|
