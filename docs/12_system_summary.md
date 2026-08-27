@@ -807,7 +807,10 @@ TrtEngine 최적화 내역(30W 기준 P50 1.32 → 0.56 ms):
 > **유도된다** — `src/deep_anc/dsp/do_no_harm.py` 가 단일 출처이고
 > `margin = 20·log10(10^(G/20) − 1) = −18.27 dB` 다. 설정에 값을 되쓰면 `LossConfig` 가
 > 거부한다. 대역도 옥타브 경계에 정렬시켰다(가로지르면 한 옥타브에 에너지를 몰 수 있었다).
-> λ_dnh 는 0.12 → **0.001** 로 재교정했다(실측 예산비 41.8 → 0.348, 목표 0.2~0.4).
+> λ_dnh 는 legacy 0.12 → 0.001을 거쳐, strict-S 대표 학습 출력에서 다시
+> **0.00025**로 교정했다(λ=0.001 측정 예산비 1.221 → 목표 중앙값 약 0.305).
+> 고정 fixture의 예산비는 실행 출력 분포를 대표하지 않으므로 최종 수치는
+> campaign prerequisite ledger의 strict-S 증거로 판정한다.
 > 측정은 `ANCLoss.gradient_budget` 하나이고 `tests/test_loss_gradient_budget.py` 가
 > 예산을 걸어 둔다. 남은 미검증 2건은 그 파일 docstring 참조.
 

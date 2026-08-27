@@ -37,7 +37,11 @@ CANONICAL_LOSS_BASELINE = {
     "nmse_objective": "trusted_band",
     "nmse_cvar_q": 0.25,
     "nmse_cvar_min_k": 4,
-    "lambda_dnh": 0.001,
+    # strict S 대표 학습 출력(step 500)에서 λ=0.001의 대역 외 그래디언트
+    # 비중이 1.221로 목적항을 덮었다. 목표 0.2–0.4의 중앙값으로 재교정한
+    # 출하값(1.221 × 0.00025/0.001 ≈ 0.305)이다. 정확한 실행 증거는
+    # campaign prerequisite ledger의 gradient_budget에 고정한다.
+    "lambda_dnh": 0.00025,
     "dnh_weight_below": 1.0,
     "dnh_weight_above": 2.0,
     "nmse_frame_samples": 8192,
