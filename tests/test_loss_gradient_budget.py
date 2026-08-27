@@ -17,7 +17,8 @@ do-no-harm 마진이 ``+6.0`` 에서 게이트 유도값 ``−18.27 dB`` 로 24 
 83c6954). 힌지가 훨씬 자주 활성화되므로 같은 λ 의 예산 몫이 그만큼 커진다. 실측::
 
     λ_dnh = 0.12 (옛 출하값)  →  예산비 41.8   ← 목적함수를 42배로 덮는다
-λ_dnh = 0.00025           →  대표 학습 출력 기준 예산비 약 0.305
+λ_dnh = 0.00025           →  strict-S fixture 예산비 0.088 (승인 하한 미달)
+λ_dnh = 0.00075           →  strict-S fixture 예산비 0.264 (현행 출하값)
 
 같은 측정을 실제 체크포인트(``pretrain_tiny_corrected``)의 출력으로도 했고 0.394 로
 일치했다. 즉 아래 픽스처(실측 S(z) + 합성 y)는 실기 y 를 대표한다.
@@ -111,7 +112,7 @@ def test_shipped_lambda_dnh_is_the_calibrated_non_swamping_value() -> None:
     # 출력 분포를 보장하지 않는다. 실행별 strict-S 측정은 campaign ledger가
     # 검증한다. 여기서는 재교정값이 legacy 0.001로 되돌아가 목적함수를
     # 덮는 회귀와 0/극소값을 잡는다.
-    assert shipped == pytest.approx(0.00025)
+    assert shipped == pytest.approx(0.00075)
     share = _budget(shipped)["dnh"]
     assert 0.0 < share < BUDGET_HI
 

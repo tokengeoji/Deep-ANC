@@ -32,7 +32,7 @@ loss:
   nmse_cvar_q: 0.25
   nmse_cvar_alpha: 0.7
   nmse_cvar_min_k: 4
-  lambda_dnh: 0.00025
+  lambda_dnh: 0.00075
   dnh_weight_below: 1.0
   dnh_weight_above: 2.0
   lambda_frame: 0.5
