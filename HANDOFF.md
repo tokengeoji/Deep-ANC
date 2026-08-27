@@ -68,9 +68,12 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   §3.1`에 기록했고 기준선 commit `98df0b0`으로 push했다. 현재 Level 5(모델 선택 후 실제
   덕트 새 녹음) raw/session artifact는 아직 없으므로 현장 OOD 일반화는 `Not yet
   demonstrated`이다. 이 challenge는 학습·val 선택·test에 재사용하지 않는다.
-- 현재 exact commit `1aaece892ee1ab7bc5f6a224fb1b4f29171019c0`에서 전체 pytest는
+- 로컬 exact commit `63e3c4343e3e8c23c00c12f0c85742e7eef8a492`에서 전체 pytest는
   **0 FAIL**(경고는 로컬에 없는 downstream public manifest를 진단 fixture가 알리는 것),
-  `bash -n`과 `git diff --check`도 통과했다. Elice checkout도 같은 SHA의 detached 상태다.
+  `bash -n`과 `git diff --check`도 통과했다. 현재 실행 중인 Elice pilot은 실행 계약을
+  고정하기 위해 소스 변경이 없던 부모 commit `1aaece892ee1ab7bc5f6a224fb1b4f29171019c0`의
+  detached checkout에 남겨 두었다. pilot 종료 뒤 ledger/canonical에 사용할 exact SHA를
+  한 번 더 명시적으로 고정한다.
 
 - strict-S gradient budget 재교정 커밋 `1aaece892ee1ab7bc5f6a224fb1b4f29171019c0`을
   원격 브랜치에 push했고, 로컬 전체 pytest도 `/dev/shm` basetemp에서 0 FAIL로 재확인했다.
