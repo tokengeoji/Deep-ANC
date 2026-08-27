@@ -63,7 +63,7 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   §3.1`에 기록했고 기준선 commit `98df0b0`으로 push했다. 현재 Level 5(모델 선택 후 실제
   덕트 새 녹음) raw/session artifact는 아직 없으므로 현장 OOD 일반화는 `Not yet
   demonstrated`이다. 이 challenge는 학습·val 선택·test에 재사용하지 않는다.
-- 기준선 `98df0b0`에서 전체 pytest는 **0 FAIL**(경고는 로컬에 없는 downstream public
+- 현재 기준선 `17eb809`에서 전체 pytest는 **0 FAIL**(경고는 로컬에 없는 downstream public
   manifest를 진단 fixture가 알리는 것), `bash -n`과 `git diff --check`도 통과했다. Elice의
   canonical 실행 전에는 detached checkout `2d19f140a66e3d0264694e8f2e2941bce4fbd3bc`를
   기준선 전체 SHA로 다시 맞춘다.
