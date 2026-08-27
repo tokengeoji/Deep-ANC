@@ -121,9 +121,19 @@ dns_fullband, speech, music, demand, machine, esc50
 ```
 
 manifest schema는 각 raw audio content SHA, lineage component와 holdout SHA를 결속한다.
+여기에 더해 canonical schema v4는 `data/raw` 전체를 65,536·262,144-frame full sequential
+decode와 고정 seek grid로 읽은 `decoder_audit.json`을 transaction 안에서 함께 복사한다.
+audit은 현재 Python/SoundFile/libsndfile/libmpg123 fingerprint, raw inventory SHA/size, stderr
+warning·decode error·nonfinite·peak>2·RMS≤1e-8의 판정을 보존한다. reject raw는 원본을
+수정·삭제하지 않고 새 v4 manifest에서만 제외한다. audit 당시와 다른 decoder 환경, raw
+추가/변경, reject와 같은 content SHA, audit 없는 v3 manifest는 모두 canonical 학습을 막는다.
+`NoisePool`도 v4 경계에서는 이후 decode 이상을 다른 파일로 재시도하지 않고 즉시 실패한다.
 recorded/holdout와 synthetic train·val·test의 원본 계보 교집합은 모두 0이어야 한다.
 
-bootstrap 종료 후 noise QA, recorded QA, 전체 pytest와 readiness를 다시 실행한다.
+bootstrap은 `results/provenance/decoder_audit.json`을 먼저 만들고
+`data/manifests/canonical_v4/`에 새 세대를 발행한 뒤, 이 경로만 대상으로 noise QA를 실행한다.
+기존 `data/manifests/` v3 세대는 forensic/diagnostic 자료로 보존하며 canonical 설정이 읽지
+않는다. bootstrap 종료 후 noise QA, recorded QA, 전체 pytest와 readiness를 다시 실행한다.
 strict P/S·transfer/public corpus가 모두 정상이고 canonical init만 없는 상태가
 **14/15 PASS**다. 그보다 적으면 학습을 시작하지 않는다.
 

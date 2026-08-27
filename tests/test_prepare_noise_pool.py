@@ -26,6 +26,15 @@ import soundfile as sf
 import yaml
 
 from deep_anc.data.holdout_contract import EXPECTED_HISTORICAL_BUILDERS
+from deep_anc.data.decoder_audit import (
+    DEFAULT_AUDIO_EXTENSIONS,
+    DEFAULT_SEGMENT_FRAMES,
+    DEFAULT_SEGMENT_GRID_DENOMINATOR,
+    DEFAULT_SEQUENTIAL_CHUNK_FRAMES,
+    MAX_DECODED_PCM_ABS,
+    MIN_DECODED_RMS,
+    decoder_fingerprint,
+)
 from deep_anc.data.public_lineage import (
     ESC50_METADATA,
     FMA_TRACKS,
@@ -153,10 +162,76 @@ def _build_tree(tmp_path: Path, present_tags: dict[str, float], ratios: dict[str
     return tmp_path
 
 
-def _run(module, root: Path, monkeypatch) -> int:
+def _write_decoder_audit(
+    root: Path,
+    *,
+    decisions: dict[str, str] | None = None,
+    path: str = "results/decoder_audit.json",
+) -> str:
+    """prepare fixture의 raw inventory를 canonical decoder-audit v1 형식으로 쓴다."""
+
+    decisions = decisions or {}
+    inventory = []
+    for audio in sorted((root / "data/raw").rglob("*.wav")):
+        relative = audio.relative_to(root).as_posix()
+        inventory.append(
+            {
+                "relative_path": relative,
+                "content_sha256": hashlib.sha256(audio.read_bytes()).hexdigest(),
+                "content_size": audio.stat().st_size,
+                "decision": decisions.get(relative, "accept"),
+            }
+        )
+    payload = {
+        "schema_version": 1,
+        "status": "complete",
+        "audit_policy": {
+            "audio_extensions": sorted(DEFAULT_AUDIO_EXTENSIONS),
+            "sequential_chunk_frames": list(DEFAULT_SEQUENTIAL_CHUNK_FRAMES),
+            "segment_frames": DEFAULT_SEGMENT_FRAMES,
+            "segment_grid_denominator": DEFAULT_SEGMENT_GRID_DENOMINATOR,
+            "max_decoded_pcm_abs": MAX_DECODED_PCM_ABS,
+            "min_decoded_rms": MIN_DECODED_RMS,
+        },
+        "decoder_fingerprint": decoder_fingerprint(),
+        "inventory": inventory,
+    }
+    payload["decoder_fingerprint_sha256"] = canonical_json_sha256(
+        payload["decoder_fingerprint"]
+    )
+    payload["inventory_sha256"] = canonical_json_sha256(inventory)
+    payload["accepted_inventory_sha256"] = canonical_json_sha256(
+        [
+            {
+                "relative_path": row["relative_path"],
+                "content_sha256": row["content_sha256"],
+                "content_size": row["content_size"],
+            }
+            for row in inventory
+            if row["decision"] == "accept"
+        ]
+    )
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _run(
+    module,
+    root: Path,
+    monkeypatch,
+    *,
+    decoder_audit: str | None = "auto",
+) -> int:
     monkeypatch.setattr(module, "REPO_ROOT", root)
     holdout = root / "data/manifests/recorded_holdout.json"
     expected = hashlib.sha256(holdout.read_bytes()).hexdigest() if holdout.is_file() else "0" * 64
+    if decoder_audit == "auto":
+        decoder_audit = _write_decoder_audit(root)
 
     def fixture_holdout_validator(path, *, repo_root, expected_sha256=None):
         actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -237,17 +312,16 @@ def _run(module, root: Path, monkeypatch) -> int:
 
     monkeypatch.setattr(module, "validate_holdout_contract", fixture_holdout_validator)
     monkeypatch.setattr(module, "build_public_lineage", fixture_public_lineage)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "prepare_noise_pool.py",
-            "--out",
-            "data/manifests",
-            "--expected-holdout-sha256",
-            expected,
-        ],
-    )
+    argv = [
+        "prepare_noise_pool.py",
+        "--out",
+        "data/manifests",
+        "--expected-holdout-sha256",
+        expected,
+    ]
+    if decoder_audit is not None:
+        argv.extend(["--decoder-audit", decoder_audit])
+    monkeypatch.setattr(sys, "argv", argv)
     return module.main()
 
 
@@ -307,6 +381,7 @@ def test_every_declared_tag_present_builds_all_manifests(tmp_path, monkeypatch, 
     sidecar = json.loads(
         (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
     )
+    assert sidecar["schema_version"] == 4
     assert sidecar["training_eligible"] is True
     assert sidecar["holdout_sha256"] == hashlib.sha256(
         (root / "data/manifests/recorded_holdout.json").read_bytes()
@@ -316,6 +391,12 @@ def test_every_declared_tag_present_builds_all_manifests(tmp_path, monkeypatch, 
         assert metadata["sha256"] == hashlib.sha256(
             (root / "data/manifests" / f"{tag}.jsonl").read_bytes()
         ).hexdigest()
+    audit_binding = sidecar["decoder_audit"]
+    copied_audit = root / "data/manifests/decoder_audit.json"
+    assert copied_audit.is_file()
+    assert audit_binding["file"] == "decoder_audit.json"
+    assert audit_binding["sha256"] == hashlib.sha256(copied_audit.read_bytes()).hexdigest()
+    assert audit_binding["size"] == copied_audit.stat().st_size
     # 비율 0 인 태그는 만들지도, 요구하지도 않는다.
     assert not (root / "data/manifests/demand.jsonl").exists()
 
@@ -334,6 +415,190 @@ def test_missing_holdout_fails_before_writing_any_manifest(tmp_path, monkeypatch
     assert _run(module, root, monkeypatch) == 1
     assert "held-out 목록이 없습니다" in capsys.readouterr().err
     assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_training_generation_requires_completed_decoder_audit_before_writing(
+    tmp_path, monkeypatch, capsys
+):
+    """v3까지는 raw decoder 결과 없이도 canonical generation을 쓸 수 있었다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+
+    assert _run(module, root, monkeypatch, decoder_audit=None) == 2
+    assert "--decoder-audit" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_decoder_reject_rows_are_excluded_and_copied_audit_is_bound(
+    tmp_path, monkeypatch
+):
+    """audit가 reject한 파일은 retry 후보로 남기지 않고 manifest에서 제거한다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    rejected = "data/raw/esc50_family/esc50/clip_000.wav"
+    audit = _write_decoder_audit(root, decisions={rejected: "reject"})
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 0
+    manifest = root / "data/manifests/esc50.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    assert all(Path(row["path"]).relative_to(root).as_posix() != rejected for row in rows)
+
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    copied = root / "data/manifests/decoder_audit.json"
+    assert sidecar["decoder_audit"]["sha256"] == hashlib.sha256(copied.read_bytes()).hexdigest()
+    assert sidecar["decoder_audit"]["accepted_inventory_sha256"] == canonical_json_sha256(
+        [
+            {
+                "relative_path": row["relative_path"],
+                "content_sha256": row["content_sha256"],
+                "content_size": row["content_size"],
+            }
+            for row in json.loads(copied.read_text(encoding="utf-8"))["inventory"]
+            if row["decision"] == "accept"
+        ]
+    )
+
+
+def test_tampered_decoder_audit_inventory_digest_blocks_generation(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit = _write_decoder_audit(root)
+    path = root / audit
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["inventory"][0]["content_sha256"] = "0" * 64
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "inventory SHA 불일치" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_decoder_audit_must_match_the_current_decoder_runtime(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit = _write_decoder_audit(root)
+    path = root / audit
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["decoder_fingerprint"]["soundfile"] = "not-the-current-runtime"
+    payload["decoder_fingerprint_sha256"] = canonical_json_sha256(
+        payload["decoder_fingerprint"]
+    )
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "현재 runtime" in capsys.readouterr().err
+
+
+def test_decoder_audit_without_full_scan_recipe_blocks_generation(
+    tmp_path, monkeypatch, capsys
+):
+    """inventory만 그럴듯한 얕은 header audit은 canonical evidence가 아니다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit = _write_decoder_audit(root)
+    path = root / audit
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["audit_policy"]["sequential_chunk_frames"] = [65_536]
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "full sequential scan" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_decoder_audit_raw_inventory_addition_blocks_generation(
+    tmp_path, monkeypatch, capsys
+):
+    """태그 밖 raw 추가도 audit 전체성 계약을 무효화해야 한다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit = _write_decoder_audit(root)
+    _write_clips(root / "data/raw/unclassified", 1)
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "raw inventory가 audit와 다릅니다" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_accept_row_with_rejected_content_duplicate_blocks_generation(
+    tmp_path, monkeypatch, capsys
+):
+    """경로를 바꾼 duplicate가 reject raw를 다시 학습 분포에 넣으면 안 된다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    rejected = root / "data/raw/esc50_family/esc50/clip_000.wav"
+    accepted_duplicate = root / "data/raw/esc50_family/esc50/clip_001.wav"
+    accepted_duplicate.write_bytes(rejected.read_bytes())
+    audit = _write_decoder_audit(
+        root,
+        decisions={rejected.relative_to(root).as_posix(): "reject"},
+    )
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "reject 행과 중복" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_schema_v3_generation_is_diagnostic_only_and_cannot_feed_training(
+    tmp_path, monkeypatch
+):
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    assert _run(module, root, monkeypatch) == 0
+    sidecar_path = root / "data/manifests/manifest_generation.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["schema_version"] = 3
+    sidecar_path.write_text(json.dumps(sidecar, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="diagnostic-only"):
+        validate_manifest_generation(
+            root / "data/manifests", required_tags={"esc50"}, repo_root=root
+        )
 
 
 def test_allow_corpus_leak_is_an_explicit_diagnostic_only_escape_hatch(
@@ -577,7 +842,8 @@ def test_generation_binds_raw_audio_content_and_returns_one_read_snapshot(
     )
     entries = snapshot["_validated_entries"]["esc50"]
     assert entries and all("content_sha256" in row for row in entries)
-    assert snapshot["schema_version"] == 3
+    assert snapshot["schema_version"] == 4
+    assert snapshot["_canonical_decoder_audited"] is True
 
     # validator가 반환한 entry는 검증했던 동일 byte snapshot이다. 이후 JSONL 교체가
     # snapshot을 바꾸지 않으며, raw bytes 교체는 다음 소비 검증에서 즉시 실패한다.
@@ -590,7 +856,7 @@ def test_generation_binds_raw_audio_content_and_returns_one_read_snapshot(
     (manifest_dir / "esc50.jsonl").write_bytes(
         snapshot["_validated_manifest_bytes"]["esc50"]
     )
-    with pytest.raises(ValueError, match="raw content SHA 불일치"):
+    with pytest.raises(ValueError, match="raw (inventory SHA/size|content SHA).*(다릅니다|불일치)"):
         validate_manifest_generation(
             manifest_dir,
             required_tags={"esc50"},

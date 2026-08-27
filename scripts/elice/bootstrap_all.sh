@@ -160,6 +160,11 @@ HOLDOUT_MANIFEST="$REPO/data/manifests/recorded_holdout.json"
 HOLDOUT_VALIDATOR="$REPO/src/deep_anc/data/holdout_contract.py"
 TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"
 TRANSFER_VALIDATOR_MODULE="deep_anc.data.transfer_contract"
+# Canonical 학습은 raw 전수 decoder audit과 한 세대로 발행한 v4 manifest만 읽는다.
+# audit 원본은 결과 증거로 보존하고, prepare transaction이 같은 bytes를 canonical
+# directory에 복사해 sidecar와 결속한다.
+CANONICAL_MANIFEST_DIR="data/manifests/canonical_v4"
+DECODER_AUDIT_REPORT="results/provenance/decoder_audit.json"
 
 verify_exact_checkout() {
   local current_commit hidden_flags replace_refs
@@ -1079,10 +1084,21 @@ if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bun
   echo "[오류] 다운로드 후 manifest 준비 시작 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
 fi
+# MP3 등의 header/일부 seek만 정상인 raw를 NoisePool retry가 다른 파일로 조용히
+# 대체하지 못하게, 모든 공개 raw를 복수 접근 방식으로 먼저 전수 decode한다. reject는
+# forensic evidence로 report에 남기되, --allow-rejections으로 audit 자체는 성공시켜
+# prepare가 audit의 accepted inventory만 canonical v4 세대에 넣도록 한다.
+"$VENV_PYTHON" scripts/data/audit_decoder_eligibility.py \
+  --root . \
+  --scan-root data/raw \
+  --out "$DECODER_AUDIT_REPORT" \
+  --allow-rejections
 "$VENV_PYTHON" scripts/data/prepare_noise_pool.py \
   --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
   --recorded-source-pool-csv data/source_pool_v2/sources.csv \
-  --recorded-source-pool-csv data/source_pool/sources.csv
+  --recorded-source-pool-csv data/source_pool/sources.csv \
+  --out "$CANONICAL_MANIFEST_DIR" \
+  --decoder-audit "$DECODER_AUDIT_REPORT"
 if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle; then
   echo "[오류] manifest 준비 종료 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
@@ -1107,7 +1123,9 @@ if ! rir_bank_complete "$RIR_BANK"; then
   echo "[오류] 신뢰한 transferred RIR bank의 shape/finite 검증 실패. bootstrap은 이를 재생성하거나 덮어쓰지 않습니다." >&2
   exit 1
 fi
-"$VENV_PYTHON" scripts/data/validate_noise_pool.py
+"$VENV_PYTHON" scripts/data/validate_noise_pool.py \
+  --manifest-dir "$CANONICAL_MANIFEST_DIR" \
+  --out "$CANONICAL_MANIFEST_DIR/dataset_qa.md"
 
 echo "=== [5/6] 검증 (pytest) ==="
 "$VENV_PYTHON" -m pytest -q

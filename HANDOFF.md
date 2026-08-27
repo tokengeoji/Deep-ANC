@@ -51,6 +51,13 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   실제 Trainer의 strict S + 3549-sample 절단 fixture는 0.130이다. `gradient_budget`과
   campaign ledger는 이제 같은 loss_start_sample을 결속하며, 실제 A100 모델/배치의
   0.2–0.4 증거 없이는 canonical을 fail-closed한다.
+- old exact checkout `5979491`에서 frame-off 5k surrogate control 두 개를 끝냈다.
+  generic seed `20260802`는 trusted NMSE `−21.668 dB`, matched seed `20260803`/Tiny는
+  loss `44.3368 → −23.2893`, trusted NMSE `−24.308 dB`, 3.40 step/s, wrapper exit 0이다.
+  둘 다 `secondary_surrogate` 고정-batch 진단이며, 실제 덕트 감쇠·init 자격·model selection
+  근거가 아니다. 다만 동일 P/S·lead=115에서 frame-off가 영출력 붕괴 없이 학습되는 것을
+  재현한다. generic log의 구형 wrapper exit receipt는 literal `%s`라 별도 verified receipt로
+  보존했고, matched control은 올바른 exit receipt를 남겼다.
 - Elice music manifest 전체 6,356개 full-decode audit는 접근 방식에 따라 결과가 달라지는
   decoder 결함을 확인했다. 65,536-frame 순차 전수 검사에서는 train의 고유 38개(경고 34,
   실제 read error 3, peak>2 4; 범주는 중복 가능), 262,144-frame 검사에서는 21개가
@@ -58,6 +65,12 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   적격성을 주장할 수 없다. `NoisePool`의 retry는 문제 파일을 조용히 다른 파일로
   대체하므로 적격 manifest 증거가 아니다. raw는 불변으로 보존하고, 복수 접근 방식의
   전수 decoder audit에 결속한 신규 manifest 재생성·QA가 끝날 때까지 canonical을 열지 않는다.
+- 이 결함을 막는 local 구현은 완료됐다. audit은 65,536/262,144 full sequential과 seek grid,
+  C/Python decoder warning·decode error·nonfinite·peak·RMS·raw SHA/size를 기록한다. bootstrap은
+  `results/provenance/decoder_audit.json`에서 `data/manifests/canonical_v4/`을 새로 발행하며,
+  schema v3는 diagnostic-only다. v4는 decoder runtime fingerprint/raw inventory drift/reject
+  content duplicate를 fail-closed하고 runtime `NoisePool`도 fallback하지 않는다. Elice에서
+  이 새 exact commit을 checkout한 뒤 실제 전수 audit·v4 QA를 아직 실행해야 한다.
 - canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
@@ -286,7 +299,9 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
 
 ## 6. 아직 남은 실행 항목
 
-- 진행 중인 4개 loss pilot 완료 및 recorded-val 기준 winner 선택
+- Elice에서 새 exact commit으로 decoder 전수 audit → canonical_v4 manifest → QA/pytest/readiness를
+  다시 실행하고, audit binding이 실제 raw/decoder 환경과 일치하는지 확인
+- frame-metric-only alpha 2개 20k pilot을 recorded val만으로 실행·선택
 - winner의 5k measured probe, 실제 A100 bf16 중단→resume 수치등가 smoke, G0·gradient
   ledger 작성 및 SHA 결속
 - canonical tiny 100k surrogate-pretrain init checkpoint 생성 후 readiness 15/15 확인

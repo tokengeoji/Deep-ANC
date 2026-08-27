@@ -127,6 +127,30 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert "eta_probe.txt" in search_runner
 
 
+def test_bootstrap_binds_full_decoder_audit_to_canonical_v4_manifest_generation():
+    """기존 manifest가 있어도 canonical 학습이 audit 결속 세대만 읽어야 한다."""
+
+    bootstrap = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    data_config = (REPO_ROOT / "configs/data_sim.yaml").read_text(encoding="utf-8")
+
+    assert "noise_manifest_dir: data/manifests/canonical_v4" in data_config
+    assert 'CANONICAL_MANIFEST_DIR="data/manifests/canonical_v4"' in bootstrap
+    assert 'DECODER_AUDIT_REPORT="results/provenance/decoder_audit.json"' in bootstrap
+
+    audit_call = bootstrap.index('"$VENV_PYTHON" scripts/data/audit_decoder_eligibility.py')
+    prepare_call = bootstrap.index('"$VENV_PYTHON" scripts/data/prepare_noise_pool.py')
+    validate_call = bootstrap.index('"$VENV_PYTHON" scripts/data/validate_noise_pool.py')
+    assert audit_call < prepare_call < validate_call
+    assert "--root ." in bootstrap[audit_call:prepare_call]
+    assert "--scan-root data/raw" in bootstrap[audit_call:prepare_call]
+    assert '--out "$DECODER_AUDIT_REPORT"' in bootstrap[audit_call:prepare_call]
+    assert "--allow-rejections" in bootstrap[audit_call:prepare_call]
+    assert '--out "$CANONICAL_MANIFEST_DIR"' in bootstrap[prepare_call:validate_call]
+    assert '--decoder-audit "$DECODER_AUDIT_REPORT"' in bootstrap[prepare_call:validate_call]
+    assert '--manifest-dir "$CANONICAL_MANIFEST_DIR"' in bootstrap[validate_call:]
+    assert '--out "$CANONICAL_MANIFEST_DIR/dataset_qa.md"' in bootstrap[validate_call:]
+
+
 def test_setup_env_requires_exact_torch_cuda_and_writes_freeze_receipt():
     text = (REPO_ROOT / "scripts/elice/setup_env.sh").read_text(encoding="utf-8")
 

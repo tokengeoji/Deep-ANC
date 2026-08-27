@@ -104,7 +104,8 @@ git diff --check
   holdout, 두 CSV와 provenance report 결속
 - [ ] A100 80GB 한 장과 가용 128 GiB
 - [ ] torch 2.5.1+cu121/CUDA 12.1 environment receipt
-- [ ] untouched public raw 6종과 content-hashed manifest 재생성
+- [ ] untouched public raw 6종을 복수 full-decode/seek decoder audit으로 전수 검증하고,
+  audit-bound `data/manifests/canonical_v4` content-hashed manifest 재생성
 - [ ] noise QA, recorded QA, 전체 pytest
 - [ ] canonical init만 FAIL인 readiness 14/15
 

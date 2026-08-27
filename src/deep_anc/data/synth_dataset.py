@@ -189,6 +189,10 @@ class SynthANCDataset(IterableDataset):
             allow_missing=allow_missing_sources,
         )
         self._validated_pool_entries: dict[str, list[dict]] = {}
+        # schema-v4 manifest contract가 decoder 전수 audit까지 검증했을 때만
+        # NoisePool이 runtime decode drift를 다른 source로 대체하지 않게 한다.
+        # legacy/diagnostic JSONL을 직접 읽는 경로는 기존 retry 동작을 보존한다.
+        self._canonical_decoder_audited = False
         if self.pools and not allow_missing_sources:
             generation = validate_manifest_generation(
                 manifest_dir,
@@ -198,6 +202,11 @@ class SynthANCDataset(IterableDataset):
                 tag: list(generation["_validated_entries"][tag]) for tag in self.pools
             }
             self.manifest_build_id = str(generation["build_id"])
+            if generation.get("_canonical_decoder_audited") is not True:
+                raise RuntimeError(
+                    "검증된 canonical manifest에 decoder audit marker가 없습니다"
+                )
+            self._canonical_decoder_audited = True
         else:
             self.manifest_build_id = None
         self._pool_objs: dict[str, NoisePool] = {}
@@ -284,6 +293,7 @@ class SynthANCDataset(IterableDataset):
                     self.fs,
                     seed=int(rng.integers(1 << 31)),
                     validated_entries=self._validated_pool_entries.get(tag),
+                    canonical_decoder_audited=self._canonical_decoder_audited,
                 )
             except (FileNotFoundError, ValueError) as exc:
                 # 예전에는 여기서 한 줄 출력하고 태그를 버린 뒤 합성원으로 대체했다.
