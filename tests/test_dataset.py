@@ -298,10 +298,26 @@ def test_synth_digital_reference_lead_uses_continuous_future(cfgs, rir_bank):
     """K lead는 tail zero-padding이 아니라 같은 연속 source의 t+K여야 한다."""
     data, duct = cfgs
     data = dict(data)
+    # 현행 strict P/S artifact에서 TrainingTimingContract가 유도한 lead를
+    # fixture에 주입한다. 물리 지연을 116처럼 오래된 숫자로 고정하지 않는다.
+    derived_data = dict(data)
+    derived_data.pop("digital_reference_lead_samples", None)
+    derived_data.update(
+        {
+            "reference_mode": "digital",
+            "level_dbfs": [0.0, 0.0],
+            "snr_mic_noise_db": [300.0, 300.0],
+            "dc_hum_prob": 0.0,
+        }
+    )
+    derived_ds = SynthANCDataset(
+        derived_data, duct, split="train", seed=1, rir_bank=rir_bank
+    )
+    lead = int(derived_ds.digital_reference_lead)
     data.update(
         {
             "reference_mode": "digital",
-            "digital_reference_lead_samples": 116,
+            "digital_reference_lead_samples": lead,
             "level_dbfs": [0.0, 0.0],
             "snr_mic_noise_db": [300.0, 300.0],
             "dc_hum_prob": 0.0,
@@ -337,9 +353,9 @@ def test_synth_digital_reference_lead_uses_continuous_future(cfgs, rir_bank):
     ds._sample_source = deterministic_source
     item = ds._make_item(DeterministicItemRng(), SyntheticNoise(ds.fs, seed=0))
 
-    assert requested == [ds.segment + 116]
+    assert requested == [ds.segment + lead]
     np.testing.assert_array_equal(
-        item["x"][0].numpy(), np.arange(116, 116 + ds.segment, dtype=np.float32)
+        item["x"][0].numpy(), np.arange(lead, lead + ds.segment, dtype=np.float32)
     )
 
 

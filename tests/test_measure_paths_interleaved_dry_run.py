@@ -442,6 +442,7 @@ def test_actual_bootstrap_requires_meter_and_same_amplifier_before_config(
 def test_actual_bootstrap_validates_fresh_meter_before_session_or_audio(
     tmp_path, monkeypatch, capsys
 ):
+    monkeypatch.setattr(mpi, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(mpi, "load_yaml", lambda _path: _hardware())
     monkeypatch.setattr(
         mpi.cw,
@@ -473,6 +474,8 @@ def test_actual_bootstrap_validates_fresh_meter_before_session_or_audio(
     result = mpi.main(
         [
             "--bootstrap-level-evidence",
+            "--level-evidence",
+            str(tmp_path / "measurement_level_evidence.json"),
             "--bootstrap-meter-raw",
             "results/meter_raw.npz",
             "--confirm-same-amplifier-setting",
@@ -531,6 +534,7 @@ def test_bootstrap_dry_run_opens_no_audio_and_validates_no_raw(
 def test_bootstrap_evidence_failure_blocks_all_postprocessing_and_official_outputs(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(mpi, "REPO_ROOT", tmp_path)
     events = []
     lock_active = {"value": False}
     diagnostics = tmp_path / "diagnostics"
@@ -638,6 +642,8 @@ def test_bootstrap_evidence_failure_blocks_all_postprocessing_and_official_outpu
     result = mpi.main(
         [
             "--bootstrap-level-evidence",
+            "--level-evidence",
+            str(tmp_path / "measurement_level_evidence.json"),
             "--bootstrap-meter-raw",
             "results/meter_raw.npz",
             "--confirm-same-amplifier-setting",

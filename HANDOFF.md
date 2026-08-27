@@ -6,28 +6,39 @@
 ## 0. 현재 결론
 
 파인튜닝은 아직 시작하지 않는다. 이번 브랜치는 준비 계약과 계보를 복구하는 중이며,
-다음 네 외부 증거가 모두 생긴 뒤에만 canonical 학습을 연다.
+다음 증거가 모두 생긴 뒤에만 canonical 학습을 연다.
 
-1. 새 strict P/S 캡처와 level evidence
-2. 해당 P/S·82세션·계보 자료를 결속한 Elice transfer manifest
+1. (완료) 새 strict P/S 캡처와 level evidence
+2. (로컬 완료) 해당 P/S·82세션·계보 자료를 결속한 Elice transfer manifest
 3. Elice에서 재생성한 public corpus manifest 6종과 전체 QA
 4. 선택된 계약으로 처음부터 완료한 tiny 100k canonical init checkpoint
 
 과거 `pretrain_*_corrected`, `finetune_tiny`, legacy P/S는 삭제하지 않지만 모두
 diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사용하지 않는다.
 
-이 복구 작업에서 아직 스피커 출력이나 녹음을 실행하지 않았다. 라이브 측정은 전체 테스트,
-clean exact commit, push, 무음 dry-run과 장치 점유 확인 뒤 사용자 입회 아래 별도 단계로 한다.
+라이브 측정은 전체 테스트, 무음 dry-run, 장치 점유·CPU gate와 사용자 입회 뒤 실행했다.
+측정 종료 직후 오디오 스트림은 닫혔고 스피커 분리 안내를 출력했다.
 
 2026-08-27 확인 결과:
 
-- 입력 전용 2초 점검은 ERR/REF 두 채널 모두 무클리핑으로 통과했다. 스피커 출력은 하지 않았다.
+- strict P/S 실제 덕트 측정은 xrun/clip 0과 ERR/REF 입력 무클리핑으로 통과했다.
+  P `primary_path_il_strict_5dc06fdd.npz`는 bulk 1642/effective 1386샘플,
+  S `secondary_path_il_strict_5dc06fdd.npz`는 bulk 1501/effective 1245샘플이며,
+  handoff 256에서 `PlantDelays.lead()`가 lead 115샘플을 유도한다.
+  150–1600Hz consistency는 P 0.9998, S 0.9997, kept repeats 19/64,
+  clock drift 중앙 2.48샘플/주기, fractional joint-LS·cubic crosscheck·compact round-trip이 PASS다.
+- paired level evidence `assets/measured/measurement_level_evidence.json`도 PASS다
+  (meter -48.278 dBFS, interleaved ERR -48.246 dBFS,
+  SHA-256 `c76ac0d3c52c20fadd761d1ed0c85e27e3599328f60ca0d164535594336e73d0`).
+- strict raw/analysis와 P/S를 묶은 로컬 transfer manifest를 생성했다
+  (SHA-256 `39dc271672ac2916840a9919baaf7de5bdf078d228a68457f15096d433a76b4d`,
+  344 files/82 sessions).
 - canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
 - 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`은 원격 브랜치에 push 완료했다.
-- `check_finetune.py`는 외부 Elice `bootstrap_receipt`가 없어 의도적으로 중단된다. strict P/S
-  공식 캡처와 Elice corpus/receipt 없이는 readiness를 통과시킬 수 없다.
+- `check_finetune.py`는 외부 Elice `bootstrap_receipt`가 없어 의도적으로 중단된다. strict P/S와
+  로컬 계보는 통과했지만, Elice corpus/receipt 없이는 readiness를 통과시킬 수 없다.
 
 ## 1. 구현된 계약
 

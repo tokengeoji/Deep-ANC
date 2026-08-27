@@ -42,17 +42,18 @@ reflection:                     # 1D 영상법 시뮬 파라미터 (실측 후 �
   per_reflection_lowpass_hz: 4000.0
 
 secondary_path:                 # 학습·런타임·평가가 공용하는 단일 정의 (이중 정의 금지 — 감사 M9)
-  # 2026-08-05 재분석본 (캡처 20260804_225546_f7b0fecd, 48주기 중 18유지, 앵커 13).
+  # 2026-08-27 strict 공식 측정 (캡처 5ac1313488c8434bb4d672a36503df59).
   # P 와 **같은 캡처·같은 반복 집합·같은 앵커**에서 나왔고 capture_id 가 일치한다.
-  # delay=1462샘플, FIR 2048탭, 150-1600Hz 반복 일관성 0.9990
-  # (부대역 최소 0.9981 @600-1000Hz, 1000-1600Hz 0.9994).
+  # delay=1245샘플, FIR 2048탭, 150-1600Hz 반복 일관성 0.9997
+  # (부대역 최소 0.99896 @150-300Hz, 0.99955 @1000-1600Hz), xrun=0.
+  # 이전 2026-08-05 재분석본(1462샘플)은 diagnostic legacy artifact로 보존한다.
   #
   # 앞선 산출물(캡처 03f4c088, 16반복 전부 사용, 150-600Hz 0.9556)은 프레임 슬립
   # 반복 6개와 정상상태 미도달 반복 2개를 그대로 평균해 형상이 절반쯤 틀려 있었다.
   # scripts/data/reanalyse_paths_interleaved.py 가 저장된 원시 캡처만으로 이것을
   # 재생성한다 — 스피커를 다시 울리지 않는다. 백업: *_il.npz.orig
   # 구버전 assets/measured/secondary_path_4s.npz(순차 ESS, coherence 0.40)는 폐기.
-  npz: assets/measured/secondary_path_il.npz
+  npz: assets/measured/secondary_path_il_strict_5dc06fdd.npz
   # 3-스레드 런타임은 캘리브레이션(콜백 내 즉시 출력) 경로보다 1 hop 늦게 출력한다.
   # 학습 플랜트 지연 = delay_samples + handoff_extra_samples  [설계 교차검증 C1]
   # (지연 지터 증강 범위는 data_sim.yaml plant_perturbation.delay_jitter_range 가 단일 출처)
@@ -62,6 +63,8 @@ digital_reference:
   # noise 출력→error mic의 compact FIR+순수지연 단일 출처. measured는 FIR+delay를,
   # canonical secondary_surrogate는 delay를 이 NPZ에서 직접 읽는다. 절대 지연을
   # YAML 숫자로 복사하면 같은 캡처의 P/S 관계가 깨지므로 별도 delay 키는 두지 않는다.
-  primary_path_npz: assets/measured/primary_path_il.npz
+  # 2026-08-27 strict 공식 측정 P (bulk 1642, effective 1386, consistency 0.9998).
+  # 이전 primary_path_il.npz는 legacy diagnostic artifact로만 보존한다.
+  primary_path_npz: assets/measured/primary_path_il_strict_5dc06fdd.npz
 
 # 입출력 정규화 스케일은 모델 설정(model_*.yaml io_scale)이 단일 출처다 (감사 M8)

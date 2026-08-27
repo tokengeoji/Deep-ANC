@@ -1988,9 +1988,11 @@ def test_legacy_shipped_interleaved_artifacts_fail_closed():
     duct = load_yaml(REPO_ROOT / "configs/duct.yaml")
     finetune = load_yaml(REPO_ROOT / "configs/train_finetune.yaml")
     band = tuple(float(v) for v in finetune["readiness"]["required_path_band_hz"])
+    # 현재 duct.yaml은 strict capture를 가리킨다. 이 테스트는 이름 그대로
+    # 과거에 배송된 legacy artifact가 계속 fail-closed인지 확인한다.
     for key, channel in (
-        (duct["digital_reference"]["primary_path_npz"], "noise"),
-        (duct["secondary_path"]["npz"], "cancel"),
+        ("assets/measured/primary_path_il.npz", "noise"),
+        ("assets/measured/secondary_path_il.npz", "cancel"),
     ):
         with pytest.raises(ValueError, match="interleaved 측정 메타데이터가 없습니다"):
             audit_official_path_model(
