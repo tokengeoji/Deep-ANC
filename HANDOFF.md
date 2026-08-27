@@ -34,18 +34,22 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   (SHA-256 `39dc271672ac2916840a9919baaf7de5bdf078d228a68457f15096d433a76b4d`,
   344 files/82 sessions).
 - Elice `~/Deep_ANC`에 transfer bundle을 전송하고 exact checkout/holdout/strict P·S
-  SHA를 원격에서 대조했다. 그러나 2026-08-27 bootstrap hardware preflight에서
-  `nvidia-smi -L`가 `NVIDIA A100 80GB PCIe`의 `MIG 1g.10gb`만 노출해 A100 80GB
-  계약을 충족하지 못했고, 환경 설치·public raw 다운로드·학습은 시작하지 않았다.
-  full A100 80GB(또는 MIG가 해제된 동일 GPU) 인스턴스로 교체한 뒤 같은 명령을 재실행한다.
+  SHA를 원격에서 대조했다. 이후 full `NVIDIA A100 80GB PCIe`(world-size 1)를 확인하고
+  public raw 6종을 untouched 상태로 다운로드·manifest 재생성·QA했다. bootstrap 전체
+  pytest는 0 FAIL이며 receipt SHA는
+  `f56c3d1042211112627380f74315d5949f05bcf274bdcf3fefc588ea3d3caa7e`다.
+- 현재 Elice에서 seed `20260803`의 승인 loss grid 4개(각 20k surrogate pilot)를
+  순차 실행 중이다. 첫 후보 `alpha=0.7, lambda_frame=0.5`가 3.3 step/s로 진행 중이며,
+  후보 checkpoint는 init으로 승격하지 않는다. pilot·gradient·G0·measured probe·A100
+  resume 증거를 ledger로 묶은 뒤에만 canonical 100k를 연다.
 - canonical `recorded_regrouped.jsonl` 전수 QA는 82/82 세션·95.67분·오류/경고 0으로 통과했다.
   불변 `session.json`의 원본 pool group과 재그룹화 manifest의 lineage group을 직접 비교하던
   QA 결함을 수정했으며, 회귀 테스트와 전체 pytest도 0 FAIL이다.
 - QA 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`, strict 자산 승격 커밋
   `4c55386`, Elice 이관 상태 문서 커밋 `86c5c45`가 원격 브랜치에 push 완료됐다.
   현재 HEAD는 `86c5c458fbc0ffe586cdde31a3c9a82a9cb06a82`이다.
-- `check_finetune.py`는 외부 Elice `bootstrap_receipt`가 없어 의도적으로 중단된다. strict P/S와
-  로컬 계보는 통과했지만, Elice corpus/receipt 없이는 readiness를 통과시킬 수 없다.
+- Elice receipt가 생긴 뒤 `check_finetune.py`의 외부 입력 차단은 해소됐지만, canonical
+  init checkpoint·campaign ledger가 아직 없어 readiness는 의도적으로 15/15가 아니다.
 
 ## 1. 구현된 계약
 
@@ -236,12 +240,13 @@ G4 PASS 뒤에만 완전 미사용 natural-crest source로 speech/music/environm
 G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/배포, 실제 ANC ON
 평가로 진행하지 않는다.
 
-## 6. 아직 외부에서 필요한 것
+## 6. 아직 남은 실행 항목
 
-- 현재 접근 가능한 **full** Elice A100 80GB 인스턴스(현 인스턴스는 MIG 1g.10gb라 불충족)와
-  128GiB 저장공간
-- strict P/S 라이브 측정 시 사용자의 현장 입회와 배선/노브 확인
-- public raw corpus 다운로드(로컬 디스크에는 staging하지 않음)
-- canonical 100k+50k 학습 시간
+- 진행 중인 4개 loss pilot 완료 및 recorded-val 기준 winner 선택
+- winner의 5k measured probe, 실제 A100 bf16 중단→resume 수치등가 smoke, G0·gradient
+  ledger 작성 및 SHA 결속
+- canonical tiny 100k surrogate-pretrain init checkpoint 생성 후 readiness 15/15 확인
+- canonical measured 50k fine-tune, 고정 checkpoint의 단 한 번 G4 평가
+- G4 PASS 뒤 natural-crest challenge 녹음·평가
 
 이 항목들은 코드로 우회하거나 legacy artifact로 대체하지 않는다.
