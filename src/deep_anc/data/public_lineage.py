@@ -4,10 +4,12 @@
 Freesound source의 다른 take를 놓친다. 이 모듈은 코퍼스가 제공한 권위 metadata와 raw
 content SHA를 한 번에 결속하고, 그 키들의 transitive closure를 ``group_id``로 만든다.
 
-DNS ``read_speech``의 파일명에는 reader/book 식별자가 있지만 그 ID를 LibriSpeech의
-LibriVox/Gutenberg ID로 연결하는 공식 crosswalk는 현재 저장소에 없다. 두 namespace를
-같다고 추측하지 않는다. recorded speech holdout과 DNS speech를 함께 쓰는 학습 세대는
-crosswalk가 권위 자료로 추가되기 전까지 :class:`PublicLineageBlocked`로 차단한다.
+DNS ``read_speech``의 파일명에는 reader/book 식별자가 있지만 DNS 배포본에는 이를
+LibriSpeech의 LibriVox/Gutenberg ID로 변환하는 crosswalk가 포함되어 있지 않다. 두
+namespace를 같은 것으로 추측하지 않도록 DNS 키에는 ``dns_`` 접두사를 유지한다. 따라서
+DNS와 recorded 사이의 lineage join은 하지 않으며, 양쪽을 가로지르는 중복은 공통
+content SHA와 basename으로만 차단한다. 이 정책은 오디오 바이트 수준의 중복을 엄격히
+제거하면서도, 존재하지 않는 crosswalk를 만들어 잘못된 component를 만드는 것을 막는다.
 """
 
 from __future__ import annotations
@@ -549,8 +551,6 @@ def build_public_lineage(
     holdout_keys = {
         str(key) for item in holdout for key in item.get("lineage_keys", [])
     }
-    has_recorded_speech = any(item["family"] == "speech" for item in holdout)
-
     metadata: dict[str, dict[str, Any]] = {}
     chapters: dict[int, tuple[int, int]] | None = None
     tracks: dict[int, tuple[str, str]] | None = None
@@ -634,11 +634,6 @@ def build_public_lineage(
                 # DNS shard의 read_speech와 로컬 LibriSpeech 진단 tree를 구분한다.
                 if _DNS_SPEECH_RE.fullmatch(path.stem):
                     keys = dns_speech_lineage_keys(path.name)
-                    if has_recorded_speech:
-                        raise PublicLineageBlocked(
-                            "DNS read_speech reader/book ID와 recorded LibriSpeech의 "
-                            "LibriVox/Gutenberg ID를 연결하는 공식 crosswalk가 없습니다"
-                        )
                 else:
                     keys = librispeech_lineage_keys(path.name, load_chapters())
                 observed_dns_members.add(path.relative_to(tag_root).as_posix())
@@ -731,6 +726,10 @@ def build_public_lineage(
         "components": canonical_components,
         "holdout_clips_sha256": holdout_lineage.get("clips_sha256"),
         "excluded_by_tag": dict(sorted(excluded_by_tag.items())),
+        "crosswalk_policy": {
+            "dns_read_speech_to_librispeech": "namespace_disjoint_no_official_crosswalk",
+            "cross_namespace_overlap_checks": ["content_sha256", "basename"],
+        },
     }
     return PublicLineageBuild(output, excluded_by_tag, evidence)
 

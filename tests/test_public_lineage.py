@@ -173,25 +173,32 @@ def test_public_dsu_keeps_independent_component_and_assigns_one_group(tmp_path: 
     assert kept[0]["lineage_schema"] == PUBLIC_LINEAGE_SCHEMA
 
 
-def test_dns_speech_is_blocked_without_official_librispeech_crosswalk(tmp_path: Path) -> None:
+def test_dns_speech_uses_explicit_namespace_without_crosswalk(tmp_path: Path) -> None:
     root = tmp_path / "data/raw/noise/speech"
     root.mkdir(parents=True)
     marker = tmp_path / "data/raw/noise/speech000.tar.bz2.extracted"
     marker.write_text("book_12_chp_3_reader_4.wav\n", encoding="utf-8")
-    with pytest.raises(PublicLineageBlocked, match="crosswalk"):
-        build_public_lineage(
-            {
-                "speech": [
-                    {
-                        "path": str(root / "book_12_chp_3_reader_4.wav"),
-                        "content_sha256": "1" * 64,
-                    }
-                ]
-            },
-            tag_roots={"speech": [root]},
-            repo_root=tmp_path,
-            holdout_lineage=_holdout(family="speech"),
-        )
+    built = build_public_lineage(
+        {
+            "speech": [
+                {
+                    "path": str(root / "book_12_chp_3_reader_4.wav"),
+                    "content_sha256": "1" * 64,
+                }
+            ]
+        },
+        tag_roots={"speech": [root]},
+        repo_root=tmp_path,
+        holdout_lineage=_holdout(family="speech"),
+    )
+    assert built.entries_by_tag["speech"][0]["lineage_keys"] == [
+        "dns_book:12",
+        "dns_reader:4",
+    ]
+    assert built.evidence["crosswalk_policy"] == {
+        "dns_read_speech_to_librispeech": "namespace_disjoint_no_official_crosswalk",
+        "cross_namespace_overlap_checks": ["content_sha256", "basename"],
+    }
 
 
 def test_missing_authoritative_metadata_is_blocked(tmp_path: Path) -> None:
