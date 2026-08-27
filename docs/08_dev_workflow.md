@@ -135,3 +135,32 @@ G4와 crest challenge 전에는 closed-loop, ONNX export, 실제 ANC ON 평가�
 | recorded 평가 | `scripts/eval/evaluate_recorded.py` |
 
 실행 상태와 정확한 다음 명령은 [HANDOFF.md](../HANDOFF.md)를 단일 인수인계 문서로 사용한다.
+
+## 7. 브랜치 경계와 병합 규칙 (2026-08-27)
+
+현재 브랜치는 내용이 섞인 임시 작업선이 아니라, 서로 의존하는 준비 계약을 순서대로 쌓은
+검증 기준선이다. 과거 커밋을 재작성하거나 강제 reset하지 않고 아래 네임스페이스로 이후
+변경의 목적을 분리한다.
+
+| 브랜치 | 허용 범위 | 금지 범위 |
+|---|---|---|
+| `main` | 공개 릴리스 기준선과 검토된 병합만 | 직접 실측·학습·실험 커밋 |
+| `fix/finetune-readiness-repair` | timing/계보/strict P/S/readiness/bootstrap 계약의 기준선 유지 | 고주파 가설, canonical 학습 결과, legacy 결과를 기준선으로 승격 |
+| `work/canonical-training` | 선택된 loss 계약의 tiny 100k pretrain과 50k measured fine-tune 코드·설정 | pilot을 init으로 재사용, 고주파 P/S·모드 실험 |
+| `work/high-frequency-validation` | 1.6 kHz 밖의 P/S·덕트 모드·기하 확인과 별도 고주파 목적함수 실험 | 공식 150–1600 Hz 계약과 strict 자산 덮어쓰기 |
+| `archive/*` | 역사적 분석·재작성 전 ref 보존과 read-only 비교 | 실행, 재학습, 성능 근거 승격 |
+
+두 `work/*` 브랜치는 2026-08-27 기준선에서 의도적으로 같은 commit으로 시작한다. 이후
+실험은 해당 브랜치에서만 커밋하고, 결과·체크포인트·raw는 Git에 넣지 않고 Elice 실행
+receipt/transfer manifest로 결속한다. 한 실험의 변경을 다른 작업선에 cherry-pick할 때는
+전체 계약 SHA, pytest, provenance와 음향 평가 artifact를 함께 재검증한다.
+
+Elice 학습은 항상 `--expected-commit`으로 기록된 detached checkout에서 실행한다. 학습 중인
+checkout의 branch 이동·reset·force-push는 하지 않는다. 기준선으로 병합하기 전에는 다음을
+모두 통과해야 한다.
+
+```bash
+.venv/bin/python -m pytest -q
+bash -n scripts/elice/bootstrap_all.sh scripts/elice/setup_env.sh
+git diff --check
+```
