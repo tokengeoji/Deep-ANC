@@ -46,6 +46,18 @@ def test_g0_diagnostic_escapes_are_explicit():
     assert args.require_nmse_db is None
 
 
+def test_g0_can_ablate_one_auxiliary_loss_without_claiming_nmse_only():
+    module = _module()
+    args = module.build_parser().parse_args(
+        ["--disable-loss-term", "mrstft", "--disable-loss-term", "frame"]
+    )
+    overrides = module.build_diagnostic_overrides(args, "/tmp/diagnostic")
+
+    assert args.nmse_only is False
+    assert "loss.lambda_mrstft=0.0" in overrides
+    assert "loss.lambda_frame=0.0" in overrides
+
+
 def test_g0_canonical_input_is_resolved_as_noneligible_diagnostic(tmp_path):
     module = _module()
     args = module.build_parser().parse_args(

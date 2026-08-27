@@ -42,6 +42,13 @@ from deep_anc.train.trainer import (
 
 
 _DEAD_KEY = re.compile(r"loss\.([A-Za-z_][A-Za-z0-9_]*)=")
+_LOSS_TERM_FIELDS = {
+    "mrstft": "lambda_mrstft",
+    "dnh": "lambda_dnh",
+    "frame": "lambda_frame",
+    "sat": "lambda_sat",
+    "pow": "lambda_pow",
+}
 
 
 def _warned_keys(loss_cfg: dict) -> tuple[str, ...]:
@@ -165,6 +172,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--disable-loss-term",
+        action="append",
+        choices=sorted(_LOSS_TERM_FIELDS),
+        default=[],
+        help=(
+            "지정한 보조 손실 항만 0으로 끄는 통제 실험(여러 번 지정 가능). "
+            "--nmse-only와 함께 쓸 수 없습니다."
+        ),
+    )
+    parser.add_argument(
         "--require-nmse-db", type=float, default=-6.0,
         help="최종 NMSE가 이 값 미만이 아니면 종료코드 2를 반환합니다(기본 G0: -6 dB).",
     )
@@ -229,6 +246,8 @@ def build_diagnostic_overrides(args: argparse.Namespace, ckpt_dir: str) -> list[
                 ),
             ]
         )
+    for term in args.disable_loss_term:
+        overrides.append(f"loss.{_LOSS_TERM_FIELDS[term]}=0.0")
     return overrides
 
 
@@ -238,6 +257,8 @@ def main() -> int:
 
     if args.steps < 1 or args.batch_size < 1 or args.log_every < 1:
         parser.error("steps, batch-size, log-every는 1 이상이어야 합니다")
+    if args.nmse_only and args.disable_loss_term:
+        parser.error("--nmse-only와 --disable-loss-term은 함께 사용할 수 없습니다")
 
     diagnostic_dir = tempfile.mkdtemp(prefix=f"deep_anc_overfit_{args.mode}_")
     overrides = build_diagnostic_overrides(args, diagnostic_dir)
@@ -303,14 +324,17 @@ def main() -> int:
             print(
                 f"step {step:5d} | loss {metrics['loss']:9.4f} | "
                 f"nmse {metrics['nmse_db']:8.3f} dB | grad {grad_norm:9.3e} | "
-                f"y_rms {y_rms:8.5f} | y_peak {y_peak:8.5f}",
+                f"y_rms {y_rms:8.5f} | y_peak {y_peak:8.5f} | "
+                f"mrstft {metrics['mrstft']:8.4f} | dnh {metrics['dnh']:8.4f} | "
+                f"frame {metrics['frame']:8.4f} | sat {metrics['sat']:8.4f}",
                 flush=True,
             )
 
     elapsed = time.monotonic() - start
     assert initial_loss is not None
     print(
-        f"결과 mode={args.mode} primary={args.primary_mode} lead={lead_samples}: "
+        f"결과 mode={args.mode} primary={args.primary_mode} lead={lead_samples} "
+        f"disabled={','.join(args.disable_loss_term) or 'none'}: "
         f"loss {initial_loss:.4f} -> {final_metrics['loss']:.4f}, "
         f"NMSE {final_metrics['nmse_db']:.3f} dB, "
         f"{args.steps / max(elapsed, 1e-9):.2f} step/s"
