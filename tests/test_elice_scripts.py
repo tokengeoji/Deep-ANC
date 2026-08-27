@@ -240,6 +240,49 @@ def _run_bootstrap_gate(root: Path, *args: str) -> subprocess.CompletedProcess[s
     )
 
 
+def test_bootstrap_derives_default_repo_from_its_own_path(tmp_path: Path):
+    """Elice clone 이름이 Deep-ANC가 아니어도 하드코딩 경로로 실패하지 않는다."""
+
+    root, _commit = _make_bootstrap_git_repo(tmp_path)
+    underscore_root = tmp_path / "Deep_ANC"
+    root.rename(underscore_root)
+    root = underscore_root
+    script = root / "scripts/elice/bootstrap_all.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(ELICE_SCRIPTS[0], script)
+    subprocess.run(["git", "add", str(script.relative_to(root))], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "bootstrap script fixture"],
+        cwd=root,
+        check=True,
+    )
+    env = os.environ.copy()
+    env.pop("DEEP_ANC_BOOTSTRAP_REPO", None)
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--expected-commit",
+            "0" * 40,
+            "--expected-holdout-sha256",
+            "1" * 64,
+            "--no-update",
+            "--preflight-only",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert str(root) not in result.stderr
+    assert "저장소에 들어갈 수 없습니다" not in result.stderr
+    assert "expected commit" in result.stderr
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

@@ -149,6 +149,14 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   재현할 수 있었지만, component의 members·identity digest·분할 의미는 root 이름이 아니라
   canonicalized data로 결정되므로 이 변경은 계보 의미를 바꾸지 않고 대형 corpus chain을
   안전하게 닫는다.
+- 2026-08-28 구 `5632c08` Elice bootstrap은 stage 4에서 약 3시간 54분 동안 user CPU만
+  증가하고 raw I/O·staging·canonical_v4·로그 진행이 없었다. raw 변경 0, tracked 변경 0,
+  staging 0을 재확인한 뒤 worker 하나에만 TERM을 보내 `exit_code=143` receipt를 남겼고,
+  원 log/status는 `results/training_prerequisites/evidence/diagnostic/`에 같은 SHA로 보존했다.
+  새 exact checkout의 preflight는 기존 기본 경로 `~/Deep-ANC`와 실제 `~/Deep_ANC`의 불일치를
+  fail-closed로 잡았다. bootstrap은 이제 호출 위치/clone 이름 대신 script 위치에서 default
+  repo root를 유도한다. 이 수정의 pytest·shell 검증과 새 full preflight를 통과한 SHA만 다음
+  raw-audit 재사용 실행에 쓴다.
 
 ## 1. 구현된 계약
 

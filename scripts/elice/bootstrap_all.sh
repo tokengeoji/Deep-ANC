@@ -1,7 +1,7 @@
 #!/bin/bash
 # 새 Elice 인스턴스 부트스트랩 — exact code + canonical holdout + 환경 + 데이터 검증.
 # 사용 (새 인스턴스의 홈에서):
-#   git clone https://github.com/Roka-jsj/Deep-ANC.git && cd Deep-ANC
+#   git clone https://github.com/Roka-jsj/Deep-ANC.git Deep_ANC && cd Deep_ANC
 #   bash scripts/elice/bootstrap_all.sh \
 #     --expected-commit "$EXPECTED_COMMIT" \
 #     --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
@@ -227,7 +227,12 @@ if [[ ! "$RAW_HASH_WORKERS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
   exit 2
 fi
 
-REPO=${DEEP_ANC_BOOTSTRAP_REPO:-"$HOME/Deep-ANC"}
+# 호출 위치나 clone 디렉터리 이름에 의존하지 않는다. 실제 스크립트 위치에서 저장소
+# root를 계산하므로 Elice의 ``~/Deep_ANC``와 사용자의 다른 clone 이름 모두 같은
+# exact checkout을 검사한다. 명시 환경변수는 테스트/운영에서만 이 기본값을 덮는다.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+DEFAULT_REPO=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)
+REPO=${DEEP_ANC_BOOTSTRAP_REPO:-"$DEFAULT_REPO"}
 if ! cd "$REPO"; then
   echo "[오류] 저장소에 들어갈 수 없습니다: $REPO" >&2
   exit 1
