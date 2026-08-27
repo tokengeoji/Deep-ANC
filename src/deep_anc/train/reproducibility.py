@@ -96,6 +96,9 @@ def _environment_payload() -> dict:
                 "index": index,
                 "name": torch.cuda.get_device_name(index),
                 "capability": list(torch.cuda.get_device_capability(index)),
+                "total_memory_bytes": int(
+                    torch.cuda.get_device_properties(index).total_memory
+                ),
             }
             for index in range(torch.cuda.device_count())
         ]

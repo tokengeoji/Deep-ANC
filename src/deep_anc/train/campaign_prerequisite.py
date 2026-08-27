@@ -11,9 +11,14 @@ from typing import Any
 
 from .evaluation_contract import FileSnapshot, snapshot_regular_file
 from .experiment_contract import validate_embedded_experiment_contract
+from .a100_pretrain_smoke import (
+    SMOKE_ROOT,
+    build_a100_pretrain_smoke_target,
+    validate_a100_pretrain_smoke_receipt,
+)
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 CANONICAL_PATH = "results/training_prerequisites/canonical_pretrain.json"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 # signed frame-CVaR는 λ=0.5와 0.2에서 모두 영출력 붕괴를 재현했다. v1은 frame
@@ -40,9 +45,22 @@ def _path_inside(root: Path, value: object, *, label: str) -> Path:
     path = Path(str(value)).expanduser()
     target = Path(os.path.abspath(path if path.is_absolute() else root / path))
     try:
-        target.relative_to(root)
+        relative = target.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"{label}는 저장소 내부여야 합니다: {target}") from exc
+    if root.is_symlink():
+        raise ValueError(f"저장소 root는 심볼릭 링크일 수 없습니다: {root}")
+    cursor = root
+    for component in relative.parts:
+        cursor /= component
+        if cursor.is_symlink():
+            raise ValueError(
+                f"{label} 경로에 심볼릭 링크가 있어 저장소 밖을 가리킬 수 있습니다: {cursor}"
+            )
+    try:
+        target.resolve(strict=False).relative_to(root.resolve(strict=True))
+    except ValueError as exc:
+        raise ValueError(f"{label}의 resolved path가 저장소 밖입니다: {target}") from exc
     return target
 
 
@@ -233,48 +251,42 @@ def validate_canonical_pretrain_prerequisites(
 
     smoke = _exact_keys(
         ledger["a100_smoke_resume"],
-        {"evidence", "environment_receipt", "device", "cuda", "amp", "stop_step", "resumed_step", "model_equal", "optimizer_equal", "scheduler_equal", "batch_sequence_equal"},
+        {"evidence", "environment_receipt", "telemetry"},
         label="A100 smoke resume",
     )
-    _evidence_snapshot(root, smoke["evidence"], label="A100 smoke evidence")
-    environment_snapshot = _evidence_snapshot(
+    receipt_snapshot = _evidence_snapshot(
+        root, smoke["evidence"], label="A100 smoke receipt evidence"
+    )
+    _evidence_snapshot(
         root, smoke["environment_receipt"], label="A100 environment receipt"
     )
+    _evidence_snapshot(
+        root, smoke["telemetry"], label="A100 smoke telemetry"
+    )
     try:
-        environment = json.loads(environment_snapshot.content.decode("utf-8"))
+        receipt = json.loads(receipt_snapshot.content.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError("A100 environment receipt JSON이 손상됐습니다") from exc
-    devices = environment.get("devices") if isinstance(environment, dict) else None
-    if (
-        not isinstance(environment, dict)
-        or environment.get("cuda_available") is not True
-        or environment.get("device_count") != 1
-        or not isinstance(devices, list)
-        or len(devices) != 1
-        or "A100" not in str(devices[0].get("name", ""))
-        or environment.get("deterministic_algorithms") is not True
-        or environment.get("cudnn_benchmark") is not False
-        or environment.get("cudnn_deterministic") is not True
-        or environment.get("cublas_workspace_config") not in {":4096:8", ":16:8"}
-        or not str(environment.get("torch") or "")
-        or not str(environment.get("torch_cuda") or "")
-    ):
-        raise ValueError(
-            "A100 environment receipt가 world1/CUDA/결정론 backend 계약을 증명하지 못합니다"
-        )
-    stop_step = int(smoke["stop_step"])
-    if (
-        "A100" not in str(smoke["device"])
-        or smoke["cuda"] is not True
-        or smoke["amp"] != "bf16"
-        or not 200 <= stop_step <= 500
-        or int(smoke["resumed_step"]) <= stop_step
-        or any(
-            smoke[key] is not True
-            for key in ("model_equal", "optimizer_equal", "scheduler_equal", "batch_sequence_equal")
-        )
-    ):
-        raise ValueError("A100 bf16 중단→resume 수치등가 증거가 불완전합니다")
+        raise ValueError("A100 smoke receipt JSON이 손상됐습니다") from exc
+    if not isinstance(receipt, dict):
+        raise ValueError("A100 smoke receipt 최상위가 mapping이 아닙니다")
+    # ledger가 가리킨 bytes와 receipt 안의 bytes reference가 서로 같아야 한다.
+    # 이후 validator는 full/resumed checkpoint, phase telemetry, CUDA environment를
+    # fresh snapshot으로 다시 열어 model/optimizer/scheduler/RNG까지 직접 비교한다.
+    if receipt.get("environment_receipt") != smoke["environment_receipt"]:
+        raise ValueError("A100 smoke receipt environment reference가 ledger와 다릅니다")
+    if receipt.get("telemetry") != smoke["telemetry"]:
+        raise ValueError("A100 smoke receipt telemetry reference가 ledger와 다릅니다")
+    expected_smoke_target = build_a100_pretrain_smoke_target(
+        cfg, repo_root=root
+    )["sha256"]
+    expected_receipt_path = (root / SMOKE_ROOT / expected_smoke_target / "receipt.json").absolute()
+    if receipt_snapshot.path != expected_receipt_path:
+        raise ValueError("A100 smoke receipt는 target prerequisite root의 receipt.json이어야 합니다")
+    validate_a100_pretrain_smoke_receipt(
+        receipt,
+        repo_root=root,
+        expected_smoke_target_sha256=expected_smoke_target,
+    )
     return ledger
 
 

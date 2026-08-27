@@ -54,11 +54,17 @@ def _normalise(value: Any) -> Any:
 
 
 def _canonical_config(cfg: dict) -> dict:
+    operational = set(_OPERATIONAL_TOP_LEVEL_KEYS)
+    # smoke의 label/run root만 두 arm 사이에 달라지는 output metadata다. 이를
+    # 모든 role에서 전역 제외하면 canonical/fine-tune cfg에 같은 키를 주입해도
+    # resume contract가 감지하지 못한다. 반드시 smoke role에서만 제외한다.
+    if str(cfg.get("experiment_role", "")) == "a100_pretrain_smoke":
+        operational.update({"a100_smoke_run_label", "resolved_smoke_run_dir"})
     return _normalise(
         {
             key: value
             for key, value in cfg.items()
-            if key not in _OPERATIONAL_TOP_LEVEL_KEYS
+            if key not in operational
         }
     )
 
@@ -357,14 +363,17 @@ def validate_embedded_experiment_contract(cfg: dict) -> dict:
     return _verify_embedded(cfg)
 
 
-def require_canonical_source_trust(
-    cfg: dict, *, repo_root: str | Path | None = None
+def require_exact_source_trust(
+    cfg: dict,
+    *,
+    repo_root: str | Path | None = None,
+    roles: frozenset[str] | set[str] | tuple[str, ...] = CANONICAL_ROLES,
 ) -> dict:
-    """실제 canonical 학습/receipt 발행 시 clean exact commit만 허용한다."""
+    """지정 역할의 실제 실행은 clean exact source generation만 허용한다."""
 
     contract = _verify_embedded(cfg)
     role = str(cfg.get("experiment_role", ""))
-    if role not in CANONICAL_ROLES:
+    if role not in set(roles):
         return contract
     source = contract.get("source")
     if not isinstance(source, dict) or not bool(source.get("verifiable")):
@@ -388,6 +397,16 @@ def require_canonical_source_trust(
     if not bool(current.get("clean_exact_commit")):
         raise ValueError("canonical 실행 시점 전체 worktree가 clean exact commit이 아닙니다")
     return contract
+
+
+def require_canonical_source_trust(
+    cfg: dict, *, repo_root: str | Path | None = None
+) -> dict:
+    """실제 canonical 학습/receipt 발행 시 clean exact commit만 허용한다."""
+
+    return require_exact_source_trust(
+        cfg, repo_root=repo_root, roles=CANONICAL_ROLES
+    )
 
 
 def _diff_paths(left: Any, right: Any, prefix: str = "") -> list[str]:
@@ -442,6 +461,7 @@ __all__ = [
     "contract_run_directory",
     "stamp_experiment_contract",
     "validate_embedded_experiment_contract",
+    "require_exact_source_trust",
     "require_canonical_source_trust",
     "validate_resume_experiment",
 ]

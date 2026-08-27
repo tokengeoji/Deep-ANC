@@ -14,6 +14,8 @@ from typing import Any
 
 import yaml
 
+from .train.a100_pretrain_smoke import A100_PRETRAIN_SMOKE_ROLE
+
 # 저장소 루트 (src/deep_anc/config.py 기준 두 단계 위)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -24,6 +26,7 @@ DEFAULT_HANDOFF_SAMPLES = 256
 
 CANONICAL_FINETUNE_POLICY_VERSION = "canonical_finetune_v1"
 CANONICAL_PRETRAIN_POLICY_VERSION = "canonical_pretrain_v1"
+A100_PRETRAIN_SMOKE_POLICY_VERSION = "a100_pretrain_smoke_v1"
 CANONICAL_DETERMINISM_POLICY = {
     "schema_version": 1,
     "torch_use_deterministic_algorithms": True,
@@ -261,14 +264,25 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
         role = str(cfg.get("experiment_role", ""))
         if role == "canonical_pretrain":
             _enforce_canonical_pretrain_policy(cfg)
+        elif role == A100_PRETRAIN_SMOKE_ROLE:
+            _enforce_a100_pretrain_smoke_policy(cfg)
         else:
             _enforce_pretrain_derivative_policy(cfg)
+    # canonical YAML 밖에서 이 역할 이름만 주입해 장기/완화 학습을 우회하는
+    # 경로도 닫는다. smoke는 canonical pretrain의 semantic projection만 증명하는
+    # 별도 role이지 임의 config를 A100 prerequisite로 승격하는 escape hatch가 아니다.
+    elif str(cfg.get("experiment_role", "")) == A100_PRETRAIN_SMOKE_ROLE:
+        _enforce_a100_pretrain_smoke_policy(cfg)
     transfer_anchor_keys = {
         "bootstrap_receipt_sha256",
         "transfer_manifest_sha256",
     }
     resolved_role = str(cfg.get("experiment_role", ""))
-    if resolved_role in {"canonical_pretrain", "canonical_finetune"}:
+    if resolved_role in {
+        "canonical_pretrain",
+        "canonical_finetune",
+        A100_PRETRAIN_SMOKE_ROLE,
+    }:
         # 공식 계약은 검증된 Elice bootstrap generation을 config에 먼저
         # 결속한 뒤에만 timing/experiment SHA를 만들 수 있다. anchor 없는
         # config를 일단 stamp하고 Trainer에서 뒤늦게 거부하면 동일 YAML이
@@ -304,6 +318,7 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
     if str(cfg.get("experiment_role", "")) in {
         "canonical_pretrain",
         "canonical_finetune",
+        A100_PRETRAIN_SMOKE_ROLE,
     }:
         declared_primary_delay = cfg["data"].get("require_primary_delay_artifact")
         if declared_primary_delay is False:
@@ -316,7 +331,29 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
     _propagate_training_timing_contract(cfg)
     _finalize_training_metadata(cfg)
     _validate_resolved_training_contract(cfg)
-    if bool(cfg.get("contract_run_dir", False)):
+    if resolved_role == A100_PRETRAIN_SMOKE_ROLE:
+        # smoke는 campaign ledger 없이 먼저 실행되지만, canonical과 같은 resolved
+        # semantics를 target으로 결속하고 canonical ``runs/``와 분리한다. target은
+        # output/resume/run_until을 제외하므로 uninterrupted와 K+resume arm이 같은
+        # 학습 의미를 공유한다.
+        from .train.a100_pretrain_smoke import (
+            build_a100_pretrain_smoke_target,
+            smoke_run_directory,
+            validate_a100_pretrain_smoke_config,
+        )
+        from .train.experiment_contract import stamp_experiment_contract
+
+        target = build_a100_pretrain_smoke_target(cfg, repo_root=REPO_ROOT)
+        cfg["smoke_target_sha256"] = target["sha256"]
+        run_dir = smoke_run_directory(cfg, repo_root=REPO_ROOT)
+        cfg["ckpt_dir"] = str(run_dir.relative_to(REPO_ROOT))
+        cfg["resolved_smoke_run_dir"] = {
+            "schema": "results/training_prerequisites/a100_pretrain_smoke/<target>/<label>",
+            "smoke_target_sha256": target["sha256"],
+        }
+        cfg = stamp_experiment_contract(cfg, repo_root=REPO_ROOT)
+        validate_a100_pretrain_smoke_config(cfg, repo_root=REPO_ROOT)
+    elif bool(cfg.get("contract_run_dir", False)):
         from .train.experiment_contract import contract_run_directory
 
         run_dir, contract_sha = contract_run_directory(cfg, repo_root=REPO_ROOT)
@@ -377,6 +414,20 @@ def _enforce_canonical_pretrain_policy(cfg: dict) -> None:
     for key, required in CANONICAL_PRETRAIN_POLICY.items():
         if cfg.get(key) != required:
             mismatches.append(f"{key}={cfg.get(key)!r} (required {required!r})")
+    _collect_canonical_pretrain_semantic_mismatches(cfg, mismatches)
+    if mismatches:
+        raise ValueError(
+            "canonical_pretrain trust policy는 override로 약화할 수 없습니다: "
+            + "; ".join(mismatches)
+        )
+    cfg["canonical_trust_policy"] = CANONICAL_PRETRAIN_POLICY_VERSION
+
+
+def _collect_canonical_pretrain_semantic_mismatches(
+    cfg: dict, mismatches: list[str]
+) -> None:
+    """role/output/ledger 외 canonical-pretrain 학습 의미의 공용 검사."""
+
     if bool(cfg.get("freeze_encoder", False)):
         mismatches.append("freeze_encoder=true (required false)")
     _collect_common_training_policy_mismatches(
@@ -402,12 +453,51 @@ def _enforce_canonical_pretrain_policy(cfg: dict) -> None:
             mismatches.append(
                 f"data.{key}={data.get(key)!r} (required {required!r})"
             )
+
+
+def _enforce_a100_pretrain_smoke_policy(cfg: dict) -> None:
+    """ledger 순환을 끊되 canonical pretrain 의미를 약화하지 않는 smoke 역할."""
+
+    mismatches: list[str] = []
+    for key, required in CANONICAL_PRETRAIN_POLICY.items():
+        if key in {"experiment_role", "init_eligible", "contract_run_dir"}:
+            continue
+        if cfg.get(key) != required:
+            mismatches.append(f"{key}={cfg.get(key)!r} (required {required!r})")
+    if cfg.get("experiment_role") != A100_PRETRAIN_SMOKE_ROLE:
+        mismatches.append(
+            f"experiment_role={cfg.get('experiment_role')!r} "
+            f"(required {A100_PRETRAIN_SMOKE_ROLE!r})"
+        )
+    if cfg.get("init_eligible") is not False:
+        mismatches.append("init_eligible must be false")
+    if cfg.get("contract_run_dir") is not False:
+        mismatches.append("contract_run_dir must be false")
+    if cfg.get("campaign_prerequisite") not in (None, "") or cfg.get(
+        "campaign_prerequisite_sha256"
+    ) not in (None, ""):
+        mismatches.append("campaign prerequisite must be null for smoke")
+    if cfg.get("init_ckpt") not in (None, ""):
+        mismatches.append("init_ckpt must be null for smoke")
+    label = str(cfg.get("a100_smoke_run_label", ""))
+    if label not in {"uninterrupted", "resumed"}:
+        mismatches.append("a100_smoke_run_label must be uninterrupted or resumed")
+    # 이 role은 장기 학습의 우회 통로가 아니라 canonical 이전의 bounded
+    # exact-resume 증거만 만드는 용도다. run_until_step은 smoke target에서
+    # 제외되는 운영값이지만, role policy 자체는 200–500 step으로 닫는다.
+    try:
+        run_until_step = int(cfg.get("run_until_step", 0))
+    except (TypeError, ValueError):
+        run_until_step = 0
+    if not 200 <= run_until_step <= 500:
+        mismatches.append("run_until_step must be in [200, 500] for A100 smoke")
+    _collect_canonical_pretrain_semantic_mismatches(cfg, mismatches)
     if mismatches:
         raise ValueError(
-            "canonical_pretrain trust policy는 override로 약화할 수 없습니다: "
+            "a100_pretrain_smoke trust policy는 canonical 학습 의미를 약화할 수 없습니다: "
             + "; ".join(mismatches)
         )
-    cfg["canonical_trust_policy"] = CANONICAL_PRETRAIN_POLICY_VERSION
+    cfg["canonical_trust_policy"] = A100_PRETRAIN_SMOKE_POLICY_VERSION
 
 
 def _enforce_pretrain_derivative_policy(cfg: dict) -> None:
@@ -510,7 +600,17 @@ def validate_canonical_training_policy(cfg: dict) -> None:
                 "canonical_finetune checkpoint에 canonical_finetune_v1 trust policy가 없습니다"
             )
         _enforce_canonical_finetune_policy(cfg)
-    if role in {"canonical_pretrain", "canonical_finetune"}:
+    elif role == A100_PRETRAIN_SMOKE_ROLE:
+        if cfg.get("canonical_trust_policy") != A100_PRETRAIN_SMOKE_POLICY_VERSION:
+            raise ValueError(
+                "a100_pretrain_smoke checkpoint에 a100_pretrain_smoke_v1 trust policy가 없습니다"
+            )
+        _enforce_a100_pretrain_smoke_policy(cfg)
+    if role in {
+        "canonical_pretrain",
+        "canonical_finetune",
+        A100_PRETRAIN_SMOKE_ROLE,
+    }:
         if cfg.get("determinism_policy") != CANONICAL_DETERMINISM_POLICY:
             raise ValueError(
                 "canonical checkpoint의 determinism_policy가 승인 정책과 다릅니다"
@@ -564,6 +664,7 @@ def _finalize_training_metadata(cfg: dict) -> None:
     if str(cfg.get("experiment_role", "")) in {
         "canonical_pretrain",
         "canonical_finetune",
+        A100_PRETRAIN_SMOKE_ROLE,
     }:
         derived["determinism_policy"] = copy.deepcopy(
             CANONICAL_DETERMINISM_POLICY

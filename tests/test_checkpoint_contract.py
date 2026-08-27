@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import random
 import shutil
 import subprocess
@@ -16,12 +17,30 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from deep_anc.config import REPO_ROOT, load_train_config, load_yaml
+from deep_anc.config import (
+    A100_PRETRAIN_SMOKE_POLICY_VERSION,
+    REPO_ROOT,
+    load_train_config,
+    load_yaml,
+)
 from deep_anc.data.resumable_stream import indexed_rng, worker_global_item_indices
-from deep_anc.train.checkpoint import load_checkpoint, save_checkpoint
+from deep_anc.train.checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+    validate_resume_checkpoint_preview,
+)
 from deep_anc.train.campaign_prerequisite import (
     CANONICAL_PATH as CANONICAL_PREREQUISITE_PATH,
     validate_canonical_pretrain_prerequisites,
+)
+from deep_anc.train.a100_pretrain_smoke import (
+    A100_PRETRAIN_SMOKE_ROLE,
+    SMOKE_ROOT,
+    build_a100_pretrain_smoke_artifacts,
+    build_a100_pretrain_smoke_environment_receipt,
+    build_a100_pretrain_smoke_resume_input,
+    build_a100_pretrain_smoke_target,
+    finalize_a100_pretrain_smoke_receipt,
 )
 from deep_anc.train.completion_receipt import (
     validate_completion_receipt,
@@ -48,7 +67,9 @@ _BOOTSTRAP_SHA = "a" * 64
 _PREREQUISITE_SHA = "d" * 64
 
 
-def _load_bound_canonical(path, overrides: list[str] | None = None) -> dict:
+def _load_bound_canonical(
+    path, overrides: list[str] | None = None, *, campaign_anchor: bool = True
+) -> dict:
     """정책 단위 테스트용 검증 완료 transfer generation stub.
 
     transfer bytes 자체의 공격 검증은 test_elice_transfer_contract가 담당한다.
@@ -64,12 +85,9 @@ def _load_bound_canonical(path, overrides: list[str] | None = None) -> dict:
         )
 
     values = list(overrides or [])
-    values.extend(
-        [
-            f"data.bootstrap_receipt_sha256={_BOOTSTRAP_SHA}",
-            f"campaign_prerequisite_sha256={_PREREQUISITE_SHA}",
-        ]
-    )
+    values.append(f"data.bootstrap_receipt_sha256={_BOOTSTRAP_SHA}")
+    if campaign_anchor:
+        values.append(f"campaign_prerequisite_sha256={_PREREQUISITE_SHA}")
     with patch(
         "deep_anc.data.transfer_contract.bind_recorded_transfer_config", _bind
     ), patch(
@@ -503,6 +521,86 @@ def test_canonical_smoke_stop_budget_keeps_the_long_run_contract():
         validate_resume_experiment({"cfg": saved}, current)
 
 
+def test_a100_pretrain_smoke_has_same_target_but_never_uses_canonical_runs():
+    canonical = _load_bound_canonical(REPO_ROOT / "configs/train_pretrain_tiny.yaml")
+    common = [
+        f"experiment_role={A100_PRETRAIN_SMOKE_ROLE}",
+        "init_eligible=false",
+        "contract_run_dir=false",
+        "campaign_prerequisite=null",
+        "campaign_prerequisite_sha256=null",
+        "a100_smoke_run_label=uninterrupted",
+        "run_until_step=500",
+    ]
+    smoke = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        common,
+        campaign_anchor=False,
+    )
+    resumed = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        common[:-2]
+        + ["a100_smoke_run_label=resumed", "run_until_step=300"],
+        campaign_anchor=False,
+    )
+    assert smoke["init_eligible"] is False
+    assert smoke["smoke_target_sha256"] == resumed["smoke_target_sha256"]
+    assert smoke["experiment_contract_sha256"] == resumed[
+        "experiment_contract_sha256"
+    ]
+    assert smoke["ckpt_dir"].startswith(
+        "results/training_prerequisites/a100_pretrain_smoke/"
+    )
+    assert not smoke["ckpt_dir"].startswith("runs/")
+    assert build_a100_pretrain_smoke_target(
+        canonical, repo_root=REPO_ROOT
+    )["sha256"] == smoke["smoke_target_sha256"]
+
+
+def test_a100_operational_fields_are_not_ignored_by_canonical_contract(tmp_path):
+    """label/run-root exclusion은 smoke role에만 한정돼야 한다."""
+
+    canonical = _config(tmp_path)
+    canonical["experiment_role"] = "canonical_pretrain"
+    baseline = build_experiment_contract(canonical, repo_root=REPO_ROOT)
+    injected = deepcopy(canonical)
+    injected["a100_smoke_run_label"] = "resumed"
+    injected["resolved_smoke_run_dir"] = {"smoke_target_sha256": "a" * 64}
+    assert build_experiment_contract(injected, repo_root=REPO_ROOT)["sha256"] != baseline[
+        "sha256"
+    ]
+
+
+def test_a100_pretrain_smoke_rejects_semantic_weakening_and_role_output_misuse():
+    base = [
+        f"experiment_role={A100_PRETRAIN_SMOKE_ROLE}",
+        "init_eligible=false",
+        "contract_run_dir=false",
+        "campaign_prerequisite=null",
+        "campaign_prerequisite_sha256=null",
+        "a100_smoke_run_label=uninterrupted",
+        "run_until_step=500",
+    ]
+    with pytest.raises(ValueError, match="B96|batch_size"):
+        _load_bound_canonical(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            base + ["batch_size=95"],
+            campaign_anchor=False,
+        )
+    with pytest.raises(ValueError, match="a100_smoke_run_label"):
+        _load_bound_canonical(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            base[:-2] + ["a100_smoke_run_label=other", "run_until_step=500"],
+            campaign_anchor=False,
+        )
+    with pytest.raises(ValueError, match="run_until_step"):
+        _load_bound_canonical(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            base[:-1] + ["run_until_step=501"],
+            campaign_anchor=False,
+        )
+
+
 @pytest.mark.parametrize(
     "saved_cfg, message",
     [
@@ -632,6 +730,238 @@ def test_canonical_loss_identity_must_match_between_pretrain_and_finetune():
         validate_init_checkpoint_role({"cfg": mismatched}, finetune)
 
 
+def _sha_ref(source_root: Path, path: Path) -> dict[str, str]:
+    return {
+        "path": str(path.relative_to(source_root)),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _write_smoke_phase_telemetry(
+    path: Path,
+    *,
+    cfg: dict,
+    start_step: int,
+    completed_step: int,
+    resume_checkpoint_sha256: str | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "smoke_target_sha256": cfg["smoke_target_sha256"],
+                "experiment_role": A100_PRETRAIN_SMOKE_ROLE,
+                "init_eligible": False,
+                "experiment_contract_sha256": cfg["experiment_contract_sha256"],
+                "start_step": start_step,
+                "completed_step": completed_step,
+                "run_until_step": completed_step,
+                "schedule_total_steps": cfg["schedule"]["total_steps"],
+                "elapsed_seconds": 1.0,
+                "steps_completed": completed_step - start_step,
+                "steps_per_second": float(completed_step - start_step),
+                "device": "cuda:0",
+                "cuda_available": True,
+                "device_count": 1,
+                "amp": "bf16",
+                "max_memory_allocated_bytes": 1,
+                "max_memory_reserved_bytes": 1,
+                "resume_checkpoint_sha256": resume_checkpoint_sha256,
+                "final_train_metrics": {"loss": -1.0},
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _a100_smoke_ledger_refs(source_root: Path, canonical_cfg: dict) -> dict:
+    """schema-v4 ledger test용 실제 checkpoint/resume receipt를 만든다."""
+
+    target = build_a100_pretrain_smoke_target(
+        canonical_cfg, repo_root=source_root
+    )["sha256"]
+
+    def smoke_cfg(label: str, *, run_until: int, resume: str | None = None) -> dict:
+        cfg = deepcopy(canonical_cfg)
+        cfg.update(
+            experiment_role=A100_PRETRAIN_SMOKE_ROLE,
+            canonical_trust_policy=A100_PRETRAIN_SMOKE_POLICY_VERSION,
+            init_eligible=False,
+            contract_run_dir=False,
+            campaign_prerequisite=None,
+            campaign_prerequisite_sha256=None,
+            init_ckpt=None,
+            a100_smoke_run_label=label,
+            smoke_target_sha256=target,
+            run_until_step=run_until,
+        )
+        run_dir = source_root / SMOKE_ROOT / target / label
+        cfg["ckpt_dir"] = str(run_dir.relative_to(source_root))
+        cfg["resolved_smoke_run_dir"] = {
+            "schema": "results/training_prerequisites/a100_pretrain_smoke/<target>/<label>",
+            "smoke_target_sha256": target,
+        }
+        if resume is not None:
+            cfg["resume"] = resume
+        return stamp_experiment_contract(cfg, repo_root=source_root)
+
+    full_cfg = smoke_cfg("uninterrupted", run_until=500)
+    resumed_dir = source_root / SMOKE_ROOT / target / "resumed"
+    resumed_last = resumed_dir / "ckpt" / "last.pt"
+    stop_path = resumed_dir / "ckpt" / "stop.pt"
+    stopped_cfg = smoke_cfg("resumed", run_until=300)
+    resumed_cfg = smoke_cfg("resumed", run_until=500, resume=str(stop_path))
+    assert full_cfg["experiment_contract_sha256"] == resumed_cfg[
+        "experiment_contract_sha256"
+    ]
+
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    full_path = source_root / SMOKE_ROOT / target / "uninterrupted" / "ckpt" / "last.pt"
+    save_checkpoint(
+        full_path,
+        model,
+        optimizer,
+        scheduler,
+        500,
+        -1.0,
+        full_cfg,
+        training_state=_training_state(),
+    )
+    state = torch.load(full_path, map_location="cpu", weights_only=False)
+    # 실제 A100 smoke는 world1 CUDA RNG 한 벌을 저장해야 한다. 이 CPU fixture도
+    # receipt validator가 그 schema를 직접 검사하도록 같은 구조를 materialize한다.
+    state["rng"]["cuda"] = [torch.zeros(32, dtype=torch.uint8)]
+    torch.save(state, full_path)
+    stopped_state = deepcopy(state)
+    stopped_state["cfg"] = stopped_cfg
+    stopped_state["step"] = 300
+    stopped_state["data_stream"] = {"schema_version": 1, "global_batch_index": 300}
+    # default smoke stop=300은 eval_every=500 전이므로 selection이 아직 없다.
+    stopped_state["best_metric"] = float("inf")
+    stop_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(stopped_state, stop_path)
+    target_root = resumed_dir.parent
+    resume_input_path = target_root / "resume_input.json"
+    resume_input_path.write_text(
+        json.dumps(
+            build_a100_pretrain_smoke_resume_input(
+                repo_root=source_root,
+                smoke_target_sha256=target,
+                resume_checkpoint=stop_path,
+                stop_checkpoint=stop_path,
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    resumed_state = deepcopy(state)
+    resumed_state["cfg"] = resumed_cfg
+    resumed_state["step"] = 500
+    resumed_state["data_stream"] = {"schema_version": 1, "global_batch_index": 500}
+    resumed_temporary = resumed_last.with_name(".last-resumed.tmp")
+    torch.save(resumed_state, resumed_temporary)
+    os.replace(resumed_temporary, resumed_last)
+
+    full_dir = full_path.parent.parent
+    _write_smoke_phase_telemetry(
+        full_dir / "telemetry" / "000000_000500.json",
+        cfg=full_cfg,
+        start_step=0,
+        completed_step=500,
+    )
+    _write_smoke_phase_telemetry(
+        resumed_dir / "telemetry" / "000000_000300.json",
+        cfg=stopped_cfg,
+        start_step=0,
+        completed_step=300,
+    )
+    _write_smoke_phase_telemetry(
+        resumed_dir / "telemetry" / "000300_000500.json",
+        cfg=resumed_cfg,
+        start_step=300,
+        completed_step=500,
+        resume_checkpoint_sha256=_sha_ref(source_root, stop_path)["sha256"],
+    )
+    environment_payload = {
+        "python": "fixture",
+        "torch": "2.5.1+cu121",
+        "torch_cuda": "12.1",
+        "cuda_available": True,
+        "device_count": 1,
+        "devices": [
+            {
+                "index": 0,
+                "name": "NVIDIA A100-SXM4-40GB",
+                "capability": [8, 0],
+                "total_memory_bytes": 80 * 1024**3,
+            }
+        ],
+        "deterministic_algorithms": True,
+        "cudnn_benchmark": False,
+        "cudnn_deterministic": True,
+        "cublas_workspace_config": ":4096:8",
+    }
+    full_environment = full_dir / "environment.json"
+    environment = resumed_dir / "environment.json"
+    for path in (full_environment, environment):
+        path.write_text(
+            json.dumps(environment_payload, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    environment_receipt_path = target_root / "environment_receipt.json"
+    environment_receipt_path.write_text(
+        json.dumps(
+            build_a100_pretrain_smoke_environment_receipt(
+                repo_root=source_root,
+                smoke_target_sha256=target,
+                uninterrupted_environment=full_environment,
+                resumed_environment=environment,
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    combined, receipt = build_a100_pretrain_smoke_artifacts(
+        repo_root=source_root,
+        smoke_target_sha256=target,
+        uninterrupted_checkpoint=full_path,
+        stop_checkpoint=stop_path,
+        resumed_checkpoint=resumed_last,
+        uninterrupted_telemetry=full_dir / "telemetry" / "000000_000500.json",
+        stopped_telemetry=resumed_dir / "telemetry" / "000000_000300.json",
+        resumed_telemetry=resumed_dir / "telemetry" / "000300_000500.json",
+        environment_receipt=environment_receipt_path,
+        resume_input=resume_input_path,
+    )
+    combined_path = target_root / "telemetry.json"
+    combined_path.write_text(
+        json.dumps(combined, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    receipt = finalize_a100_pretrain_smoke_receipt(
+        receipt, telemetry_reference=_sha_ref(source_root, combined_path)
+    )
+    receipt_path = target_root / "receipt.json"
+    receipt_path.write_text(
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "evidence": _sha_ref(source_root, receipt_path),
+        "environment_receipt": _sha_ref(source_root, environment_receipt_path),
+        "telemetry": _sha_ref(source_root, combined_path),
+    }
+
+
 def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
     source_root = tmp_path / "campaign-source"
     (source_root / "src").mkdir(parents=True)
@@ -677,7 +1007,12 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
                 "cuda_available": True,
                 "device_count": 1,
                 "devices": [
-                    {"index": 0, "name": "NVIDIA A100-SXM4-40GB", "capability": [8, 0]}
+                    {
+                        "index": 0,
+                        "name": "NVIDIA A100-SXM4-40GB",
+                        "capability": [8, 0],
+                        "total_memory_bytes": 80 * 1024**3,
+                    }
                 ],
                 "deterministic_algorithms": True,
                 "cudnn_benchmark": False,
@@ -712,7 +1047,7 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
             }
         )
     ledger = {
-        "schema_version": 3,
+        "schema_version": 4,
         "source": {
             "git_commit": source["git_commit"],
             "source_tree_sha256": source["source_tree_sha256"],
@@ -749,19 +1084,7 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
             "alpha": 0.7,
             "lambda_frame": 0.0,
         },
-        "a100_smoke_resume": {
-            "evidence": evidence_ref,
-            "environment_receipt": environment_ref,
-            "device": "NVIDIA A100-SXM4-40GB",
-            "cuda": True,
-            "amp": "bf16",
-            "stop_step": 300,
-            "resumed_step": 500,
-            "model_equal": True,
-            "optimizer_equal": True,
-            "scheduler_equal": True,
-            "batch_sequence_equal": True,
-        },
+        "a100_smoke_resume": _a100_smoke_ledger_refs(source_root, cfg),
     }
     ledger_path = source_root / CANONICAL_PREREQUISITE_PATH
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -782,7 +1105,11 @@ def test_canonical_pretrain_prerequisites_bind_every_campaign_gate(tmp_path):
         cfg, repo_root=source_root
     )
     assert ledger["g0"]["nmse_trusted_db"] < -6.0
-    assert ledger["a100_smoke_resume"]["batch_sequence_equal"] is True
+    assert set(ledger["a100_smoke_resume"]) == {
+        "evidence",
+        "environment_receipt",
+        "telemetry",
+    }
 
     evidence = source_root / json.loads(ledger_path.read_text())["g0"]["evidence"]["path"]
     evidence.write_text('{"verified":false}\n')
@@ -797,6 +1124,176 @@ def test_canonical_pretrain_prerequisite_rejects_gradient_share_outside_budget(
         tmp_path, gradient_share=0.199999
     )
     with pytest.raises(ValueError, match="0.2–0.4"):
+        validate_canonical_pretrain_prerequisites(cfg, repo_root=source_root)
+
+
+def _restamp_campaign_anchor(cfg: dict, source_root: Path, ledger_path: Path) -> dict:
+    refreshed = deepcopy(cfg)
+    refreshed["campaign_prerequisite_sha256"] = hashlib.sha256(
+        ledger_path.read_bytes()
+    ).hexdigest()
+    return stamp_experiment_contract(refreshed, repo_root=source_root)
+
+
+def test_a100_smoke_receipt_target_tamper_rejects_canonical_ledger(tmp_path):
+    cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    receipt_path = source_root / ledger["a100_smoke_resume"]["evidence"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["smoke_target_sha256"] = "0" * 64
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+    ledger["a100_smoke_resume"]["evidence"] = _sha_ref(source_root, receipt_path)
+    ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
+    refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
+    with pytest.raises(ValueError, match="target/role/init"):
+        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+
+
+def test_a100_smoke_role_misuse_rejects_canonical_ledger(tmp_path):
+    cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    receipt_path = source_root / ledger["a100_smoke_resume"]["evidence"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["experiment_role"] = "canonical_pretrain"
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+    ledger["a100_smoke_resume"]["evidence"] = _sha_ref(source_root, receipt_path)
+    ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
+    refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
+    with pytest.raises(ValueError, match="target/role/init"):
+        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+
+
+def test_a100_smoke_resumed_checkpoint_tamper_rejects_ledger(tmp_path):
+    cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    receipt_path = source_root / ledger["a100_smoke_resume"]["evidence"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    resumed_path = source_root / receipt["resumed_checkpoint"]["path"]
+    state = torch.load(resumed_path, map_location="cpu", weights_only=False)
+    first = next(iter(state["model"].values()))
+    first.add_(1.0)
+    torch.save(state, resumed_path)
+    receipt["resumed_checkpoint"] = _sha_ref(source_root, resumed_path)
+
+    telemetry_path = source_root / receipt["telemetry"]["path"]
+    telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    telemetry["resumed_checkpoint"] = receipt["resumed_checkpoint"]
+    telemetry_path.write_text(json.dumps(telemetry, sort_keys=True) + "\n", encoding="utf-8")
+    receipt["telemetry"] = _sha_ref(source_root, telemetry_path)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+    ledger["a100_smoke_resume"]["evidence"] = _sha_ref(source_root, receipt_path)
+    ledger["a100_smoke_resume"]["telemetry"] = _sha_ref(source_root, telemetry_path)
+    ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
+    refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
+    with pytest.raises(ValueError, match="model state"):
+        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+
+
+def test_a100_smoke_resume_input_mismatch_rejects_ledger(tmp_path):
+    """final last.pt의 resume pathname도 immutable stop-input receipt와 같아야 한다."""
+
+    cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    receipt_path = source_root / ledger["a100_smoke_resume"]["evidence"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    resumed_path = source_root / receipt["resumed_checkpoint"]["path"]
+    state = torch.load(resumed_path, map_location="cpu", weights_only=False)
+    state["cfg"]["resume"] = "results/training_prerequisites/not-the-stop/ckpt/last.pt"
+    torch.save(state, resumed_path)
+    receipt["resumed_checkpoint"] = _sha_ref(source_root, resumed_path)
+
+    telemetry_path = source_root / receipt["telemetry"]["path"]
+    telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    telemetry["resumed_checkpoint"] = receipt["resumed_checkpoint"]
+    telemetry_path.write_text(json.dumps(telemetry, sort_keys=True) + "\n", encoding="utf-8")
+    receipt["telemetry"] = _sha_ref(source_root, telemetry_path)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+    ledger["a100_smoke_resume"]["evidence"] = _sha_ref(source_root, receipt_path)
+    ledger["a100_smoke_resume"]["telemetry"] = _sha_ref(source_root, telemetry_path)
+    ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
+    refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
+    with pytest.raises(ValueError, match="cfg.resume"):
+        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+
+
+def test_a100_smoke_default_stop_before_first_eval_allows_only_inf_sentinel(tmp_path):
+    """default 300→500 smoke는 stop 시점에 아직 validation best가 없다."""
+
+    _, source_root, ledger_path = _prerequisite_components(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    receipt_path = source_root / ledger["a100_smoke_resume"]["evidence"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    stop_path = source_root / receipt["stop_checkpoint"]["path"]
+    state = torch.load(stop_path, map_location="cpu", weights_only=False)
+    assert state["step"] == state["cfg"]["run_until_step"] == 300
+    assert state["cfg"]["eval_every"] == 500
+    assert state["best_metric"] == float("inf")
+
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    validate_resume_checkpoint_preview(stop_path, state, model, optimizer, scheduler)
+
+    invalid = deepcopy(state)
+    invalid["best_metric"] = float("-inf")
+    invalid_path = tmp_path / "invalid" / "stop.pt"
+    invalid_path.parent.mkdir()
+    torch.save(invalid, invalid_path)
+    with pytest.raises(ValueError, match="best_metric"):
+        validate_resume_checkpoint_preview(
+            invalid_path, invalid, model, optimizer, scheduler
+        )
+
+
+def test_a100_smoke_rejects_actual_torch_cuda_environment_drift(tmp_path):
+    """freeze receipt만 같아도 실제 A100 interpreter가 바뀌면 smoke 증거가 아니다."""
+
+    cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    receipt_path = source_root / ledger["a100_smoke_resume"]["evidence"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    environment_receipt_path = source_root / receipt["environment_receipt"]["path"]
+    environment_receipt = json.loads(
+        environment_receipt_path.read_text(encoding="utf-8")
+    )
+    environment_path = source_root / environment_receipt["uninterrupted_environment"][
+        "path"
+    ]
+    environment = json.loads(environment_path.read_text(encoding="utf-8"))
+    environment["torch"] = "2.5.2+cu121"
+    environment_path.write_text(
+        json.dumps(environment, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    environment_receipt["uninterrupted_environment"] = _sha_ref(
+        source_root, environment_path
+    )
+    environment_receipt_path.write_text(
+        json.dumps(environment_receipt, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    receipt["environment_receipt"] = _sha_ref(source_root, environment_receipt_path)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+    ledger["a100_smoke_resume"]["evidence"] = _sha_ref(source_root, receipt_path)
+    ledger["a100_smoke_resume"]["environment_receipt"] = _sha_ref(
+        source_root, environment_receipt_path
+    )
+    ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
+    refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
+    with pytest.raises(ValueError, match="world1/CUDA/결정론"):
+        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+
+
+def test_a100_smoke_rejects_target_root_parent_symlink_escape(tmp_path):
+    """lexical ``results/...`` 경로라도 parent symlink 밖 artifact는 인정하지 않는다."""
+
+    cfg, source_root, _ = _prerequisite_components(tmp_path)
+    target_root = next(
+        (source_root / SMOKE_ROOT).iterdir()
+    )
+    smoke_parent = target_root.parent
+    external = tmp_path / "external-smoke-root"
+    shutil.move(str(smoke_parent), external)
+    smoke_parent.symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="심볼릭"):
         validate_canonical_pretrain_prerequisites(cfg, repo_root=source_root)
 
 

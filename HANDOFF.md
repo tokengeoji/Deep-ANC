@@ -104,6 +104,26 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   `/dev/shm` basetemp에서 0 FAIL로 재확인했다. 이 commit은 frame=0 metric-only 후보의
   policy 변경 전 기준이며, 진행 중인 Elice diagnostic은 기존 `5979491` detached checkout에
   보존한다.
+- 2026-08-28 Elice의 실제 raw decoder audit은 후보 37,761개 중 36,868개를 적격으로,
+  893개를 부적격으로 판정했다. 적격 수는 music 7,941, DNS noise 15,553, speech 7,971,
+  DEMAND 96, MIMII 3,600, ESC-50 1,707이다. 원본을 삭제하지 않고 audit SHA
+  `ceac538487ffe1414d433e3a83fdee11a0d17c204427cf8e7fed92bb73c2940f`와 accepted inventory
+  SHA `b665bbb7dd28fc46cdada1d9da9a0535d74ca5ae73a030fbf5612cfcc6e61955`로 보존한다.
+  현재 raw 재대조와 `canonical_v4` manifest transaction이 실행 중이므로, bootstrap의
+  exit 0·QA·pytest·readiness receipt가 생기기 전에는 이 수치를 readiness PASS로 승격하지
+  않는다.
+- 현장 evaluator는 새 source-energy 계약으로 보강했다. OFF/ON은 source를 끄는 것이 아니라
+  ANC control만 OFF→ON→OFF로 바꾸며, raw NPZ에는 요청 상태를 저장한다. 각 octave는 OFF
+  source의 폭 정규화 PSD 비율이 충분할 때만 감쇠를 발행하고, 그렇지 않으면 `NaN/무효`와
+  진단용 원계산값을 분리 저장한다. 따라서 이 필드가 없는 legacy live result는 고주파 또는
+  canonical 현장 성능 근거가 아니다.
+- canonical ledger가 요구하는 A100 exact-resume smoke와 canonical 계약 사이의 순환을
+  `a100_pretrain_smoke` 역할로 분리했다. 이 역할은 init-eligible=false, 200–500 step,
+  A100 80GiB·world=1·CUDA/bf16·결정론 조건 및 prerequisite-root 격리를 강제한다. immutable
+  `stop.pt`의 실제 resume SHA, 두 arm의 환경·telemetry·model/optimizer/scheduler/RNG/
+  best-metric/data-stream 동등성을 검증하고, 첫 evaluation 전 stop checkpoint의 `+inf`
+  sentinel만 제한적으로 허용한다. 새 전체 pytest는 `/dev/shm`에서 exit 0이며 기존
+  diagnostic manifest-missing RuntimeWarning 2건만 있다.
 
 ## 1. 구현된 계약
 
