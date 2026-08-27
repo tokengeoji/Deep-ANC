@@ -57,8 +57,9 @@ def _overrides(
     bootstrap_sha256: str,
     label: str,
     run_until_step: int,
+    loss_alpha: float | None = None,
 ) -> list[str]:
-    return [
+    overrides = [
         f"experiment_role={A100_PRETRAIN_SMOKE_ROLE}",
         "init_eligible=false",
         "contract_run_dir=false",
@@ -69,6 +70,14 @@ def _overrides(
         f"run_until_step={int(run_until_step)}",
         f"data.bootstrap_receipt_sha256={bootstrap_sha256}",
     ]
+    # smoke receipt는 canonical의 학습 의미를 증명한다. 따라서 pilot 승자가 기본
+    # alpha=0.7이 아닐 때 YAML을 복사하거나 receipt를 다른 loss에 재사용하지 않고,
+    # 허용된 grid 값 자체를 resolved config/target에 넣는다.
+    if loss_alpha is not None:
+        # YAML scalar type도 target JSON에 들어간다. ``:g``는 1.0을 정수 ``1``로
+        # 바꾸어 canonical 후보(1.0)와 다른 contract를 만들므로 float literal을 보존한다.
+        overrides.append(f"loss.nmse_cvar_alpha={float(loss_alpha)!r}")
+    return overrides
 
 
 def _resolved_cfg(
@@ -77,6 +86,7 @@ def _resolved_cfg(
     bootstrap_sha256: str,
     label: str,
     run_until_step: int,
+    loss_alpha: float | None = None,
 ) -> dict:
     return load_train_config(
         config,
@@ -84,6 +94,7 @@ def _resolved_cfg(
             bootstrap_sha256=bootstrap_sha256,
             label=label,
             run_until_step=run_until_step,
+            loss_alpha=loss_alpha,
         ),
     )
 
@@ -95,6 +106,7 @@ def _run_train(
     label: str,
     run_until_step: int,
     cublas_workspace_config: str,
+    loss_alpha: float | None = None,
     resume: Path | None = None,
 ) -> dict:
     cfg = _resolved_cfg(
@@ -102,6 +114,7 @@ def _run_train(
         bootstrap_sha256=bootstrap_sha256,
         label=label,
         run_until_step=run_until_step,
+        loss_alpha=loss_alpha,
     )
     command = [
         sys.executable,
@@ -113,6 +126,7 @@ def _run_train(
         bootstrap_sha256=bootstrap_sha256,
         label=label,
         run_until_step=run_until_step,
+        loss_alpha=loss_alpha,
     ):
         command.extend(["--set", override])
     if resume is not None:
@@ -173,7 +187,7 @@ def _preflight_a100(*, cublas_workspace_config: str) -> None:
     )
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
@@ -188,12 +202,26 @@ def main() -> int:
     parser.add_argument("--stop-step", type=int, default=300)
     parser.add_argument("--final-step", type=int, default=500)
     parser.add_argument(
+        "--loss-alpha",
+        type=float,
+        choices=(0.7, 0.85, 1.0),
+        default=None,
+        help=(
+            "선택된 loss pilot의 alpha로 smoke semantic target을 결속한다 "
+            "(기본: config의 alpha)"
+        ),
+    )
+    parser.add_argument(
         "--cublas-workspace-config",
         choices=(":4096:8", ":16:8"),
         default=":4096:8",
         help="smoke subprocess에만 주입할 deterministic GEMM 환경값",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     config = Path(args.config).expanduser()
     if not config.is_absolute():
@@ -203,6 +231,7 @@ def main() -> int:
         raise ValueError("--bootstrap-receipt-sha256은 64자리 SHA-256이어야 합니다")
     stop_step = int(args.stop_step)
     final_step = int(args.final_step)
+    loss_alpha = None if args.loss_alpha is None else float(args.loss_alpha)
     if not 200 <= stop_step <= 500 or not stop_step < final_step <= 500:
         raise ValueError("A100 smoke는 200 <= stop-step < final-step <= 500 이어야 합니다")
     _preflight_a100(cublas_workspace_config=args.cublas_workspace_config)
@@ -214,6 +243,7 @@ def main() -> int:
         bootstrap_sha256=bootstrap_sha,
         label="uninterrupted",
         run_until_step=final_step,
+        loss_alpha=loss_alpha,
     )
     target = str(preview["smoke_target_sha256"])
     target_root = smoke_run_directory(preview, repo_root=REPO_ROOT).parent
@@ -229,6 +259,7 @@ def main() -> int:
         label="uninterrupted",
         run_until_step=final_step,
         cublas_workspace_config=args.cublas_workspace_config,
+        loss_alpha=loss_alpha,
     )
     resumed_initial_cfg = _run_train(
         config,
@@ -236,6 +267,7 @@ def main() -> int:
         label="resumed",
         run_until_step=stop_step,
         cublas_workspace_config=args.cublas_workspace_config,
+        loss_alpha=loss_alpha,
     )
     full_dir = smoke_run_directory(full_cfg, repo_root=REPO_ROOT)
     resumed_dir = smoke_run_directory(resumed_initial_cfg, repo_root=REPO_ROOT)
@@ -259,6 +291,7 @@ def main() -> int:
         label="resumed",
         run_until_step=final_step,
         cublas_workspace_config=args.cublas_workspace_config,
+        loss_alpha=loss_alpha,
         resume=stop_checkpoint,
     )
     if str(resumed_cfg["smoke_target_sha256"]) != target:

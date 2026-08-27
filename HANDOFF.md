@@ -134,6 +134,11 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   best-metric/data-stream 동등성을 검증하고, 첫 evaluation 전 stop checkpoint의 `+inf`
   sentinel만 제한적으로 허용한다. 새 전체 pytest는 `/dev/shm`에서 exit 0이며 기존
   diagnostic manifest-missing RuntimeWarning 2건만 있다.
+- smoke는 pilot 선택 **뒤** 선택된 loss와 같은 semantic target으로 실행한다. runner의
+  `--loss-alpha {0.7,0.85,1.0}`는 YAML 복제가 아니라 resolved config에 float literal을
+  넣어 target/contract에 결속한다(특히 `1.0`을 정수 `1`로 바꾸지 않는다). 따라서 기본
+  alpha=0.7 smoke receipt를 0.85/1.0 canonical에 재사용할 수 없고, 선택된 alpha가
+  달라지면 그 값으로 새 smoke를 실행한다.
 
 ## 1. 구현된 계약
 

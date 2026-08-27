@@ -557,6 +557,33 @@ def test_a100_pretrain_smoke_has_same_target_but_never_uses_canonical_runs():
     )["sha256"] == smoke["smoke_target_sha256"]
 
 
+@pytest.mark.parametrize("alpha", [0.7, 0.85, 1.0])
+def test_a100_smoke_target_binds_the_selected_loss_grid_alpha(alpha):
+    common = [
+        f"experiment_role={A100_PRETRAIN_SMOKE_ROLE}",
+        "init_eligible=false",
+        "contract_run_dir=false",
+        "campaign_prerequisite=null",
+        "campaign_prerequisite_sha256=null",
+        "a100_smoke_run_label=uninterrupted",
+        "run_until_step=500",
+        f"loss.nmse_cvar_alpha={alpha}",
+    ]
+    smoke = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        common,
+        campaign_anchor=False,
+    )
+    canonical = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        [f"loss.nmse_cvar_alpha={alpha}"],
+    )
+    assert smoke["loss"]["nmse_cvar_alpha"] == alpha
+    assert build_a100_pretrain_smoke_target(
+        canonical, repo_root=REPO_ROOT
+    )["sha256"] == smoke["smoke_target_sha256"]
+
+
 def test_a100_operational_fields_are_not_ignored_by_canonical_contract(tmp_path):
     """label/run-root exclusion은 smoke role에만 한정돼야 한다."""
 
