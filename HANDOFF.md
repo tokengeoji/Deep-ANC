@@ -48,7 +48,9 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
 - QA 수정 커밋 `cef615ec40b18e26c1fe3e7fa53a09c715cb7a67`, strict 자산 승격 커밋
   `4c55386`, Elice 이관 상태 문서 커밋 `86c5c45`, 데이터/손실 안정화 커밋
   `2d19f14`, 예산 근거·진행 문서 커밋 `bd2a0cf`/`43563be`가 모두 원격 브랜치에
-  push 완료됐다. 현재 HEAD는 `5059d2b`다.
+  push 완료됐다. 현재 준비 기준선은 clean 상태로 push된
+  `fix/finetune-readiness-repair`의 HEAD이며, 실행에 사용할 exact SHA는
+  `git rev-parse HEAD`로 확인한다. 브랜치별 범위는 `docs/08_dev_workflow.md §7`에 고정했다.
 - Elice receipt가 생긴 뒤 `check_finetune.py`의 외부 입력 차단은 해소됐지만, canonical
   init checkpoint·campaign ledger가 아직 없어 readiness는 의도적으로 15/15가 아니다.
 
