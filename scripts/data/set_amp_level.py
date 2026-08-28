@@ -458,8 +458,10 @@ def capture_meter_stream(
     call_started = time.monotonic()
     stream_started: float | None = None
     deadline: float | None = None
+    signal_scope = scoped_live_audio_signal_handlers()
+    signal_scope.__enter__()
     try:
-        with scoped_live_audio_signal_handlers():
+        try:
             if pre_open_check is not None:
                 pre_open_check()
             stream = sd.Stream(
@@ -497,34 +499,44 @@ def capture_meter_stream(
                 filled = max(0, min(40, int(level + 70.0))) if np.isfinite(level) else 0
                 bar = "█" * filled
                 print(f"  {level:+7.1f} dBFS  {bar:<40} {verdict(level)}", flush=True)
-    except LiveAudioTermination as exc:
-        telemetry["interrupted"] = True
-        telemetry["termination_signal"] = int(exc.signum)
-        failure = exc
-    except KeyboardInterrupt as exc:
-        telemetry["interrupted"] = True
-        failure = exc
-    except BaseException as exc:
-        failure = exc
+        except LiveAudioTermination as exc:
+            telemetry["interrupted"] = True
+            telemetry["termination_signal"] = int(exc.signum)
+            failure = exc
+        except KeyboardInterrupt as exc:
+            telemetry["interrupted"] = True
+            failure = exc
+        except BaseException as exc:
+            failure = exc
 
-    if stream is not None:
-        try:
-            stream.abort()
-        except BaseException as exc:
-            telemetry["stream_abort_error"] = f"{type(exc).__name__}: {exc}"
-        try:
-            stream.close()
-        except BaseException as exc:
-            telemetry["stream_close_error"] = f"{type(exc).__name__}: {exc}"
-    telemetry["output_stop_confirmed"] = bool(
-        stream is None or telemetry["stream_close_error"] is None
-    )
-    print(
-        SPEAKER_DISCONNECT_NOTICE
-        if telemetry["output_stop_confirmed"]
-        else SPEAKER_STOP_UNCONFIRMED_NOTICE,
-        flush=True,
-    )
+        if stream is not None:
+            try:
+                stream.abort()
+            except BaseException as exc:
+                telemetry["stream_abort_error"] = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, LiveAudioTermination):
+                    telemetry["interrupted"] = True
+                    telemetry["termination_signal"] = int(exc.signum)
+                    failure = failure or exc
+            try:
+                stream.close()
+            except BaseException as exc:
+                telemetry["stream_close_error"] = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, LiveAudioTermination):
+                    telemetry["interrupted"] = True
+                    telemetry["termination_signal"] = int(exc.signum)
+                    failure = failure or exc
+        telemetry["output_stop_confirmed"] = bool(
+            stream is None or telemetry["stream_close_error"] is None
+        )
+        print(
+            SPEAKER_DISCONNECT_NOTICE
+            if telemetry["output_stop_confirmed"]
+            else SPEAKER_STOP_UNCONFIRMED_NOTICE,
+            flush=True,
+        )
+    finally:
+        signal_scope.__exit__(None, None, None)
 
     while True:
         try:

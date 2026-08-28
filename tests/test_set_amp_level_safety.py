@@ -345,6 +345,106 @@ def test_meter_sighup_aborts_closes_and_announces_disconnect(capsys):
     assert "스피커 출력 종료" in capsys.readouterr().out
 
 
+def test_meter_signal_during_abort_still_closes_and_announces_disconnect(capsys):
+    signum = getattr(signal, "SIGHUP", signal.SIGTERM)
+    events = []
+
+    class FakeSD:
+        class CallbackStop(Exception):
+            pass
+
+        class CallbackAbort(Exception):
+            pass
+
+        class Stream:
+            def __init__(self, *, callback, **_kwargs):
+                self.callback = callback
+                self.active = True
+
+            def start(self):
+                events.append("start")
+                indata = np.arange(16, dtype=np.int32).reshape(8, 2)
+                outdata = np.zeros((8, 2), dtype=np.int16)
+                with pytest.raises(FakeSD.CallbackStop):
+                    self.callback(indata, outdata, 8, None, None)
+
+            def abort(self):
+                events.append("abort")
+                handler = signal.getsignal(signum)
+                handler(signum, None)
+
+            def close(self):
+                events.append("close")
+
+    levels, telemetry = meter.capture_meter_stream(
+        FakeSD,
+        noise=np.zeros(8, dtype=np.float32),
+        fs=48_000,
+        in_dev=1,
+        out_dev=2,
+        err_ch=0,
+        noise_out_ch=0,
+    )
+
+    assert levels == []
+    assert telemetry["interrupted"] is True
+    assert telemetry["termination_signal"] == int(signum)
+    assert telemetry["output_stop_confirmed"] is True
+    assert "LiveAudioTermination" in telemetry["stream_abort_error"]
+    assert events == ["start", "abort", "close"]
+    assert "스피커 출력 종료" in capsys.readouterr().out
+
+
+def test_meter_signal_during_close_is_fail_closed_and_warns_disconnect(capsys):
+    signum = getattr(signal, "SIGHUP", signal.SIGTERM)
+    events = []
+
+    class FakeSD:
+        class CallbackStop(Exception):
+            pass
+
+        class CallbackAbort(Exception):
+            pass
+
+        class Stream:
+            def __init__(self, *, callback, **_kwargs):
+                self.callback = callback
+                self.active = True
+
+            def start(self):
+                events.append("start")
+                indata = np.arange(16, dtype=np.int32).reshape(8, 2)
+                outdata = np.zeros((8, 2), dtype=np.int16)
+                with pytest.raises(FakeSD.CallbackStop):
+                    self.callback(indata, outdata, 8, None, None)
+
+            def abort(self):
+                events.append("abort")
+
+            def close(self):
+                events.append("close")
+                handler = signal.getsignal(signum)
+                handler(signum, None)
+
+    levels, telemetry = meter.capture_meter_stream(
+        FakeSD,
+        noise=np.zeros(8, dtype=np.float32),
+        fs=48_000,
+        in_dev=1,
+        out_dev=2,
+        err_ch=0,
+        noise_out_ch=0,
+    )
+
+    assert levels == []
+    assert telemetry["interrupted"] is True
+    assert telemetry["termination_signal"] == int(signum)
+    assert telemetry["output_stop_confirmed"] is False
+    assert "LiveAudioTermination" in telemetry["stream_close_error"]
+    assert events == ["start", "abort", "close"]
+    assert "정지 확인 불가" in capsys.readouterr().out
+
+
 def test_official_meter_duration_cannot_be_overridden(monkeypatch, capsys):
     monkeypatch.setattr(
         meter,

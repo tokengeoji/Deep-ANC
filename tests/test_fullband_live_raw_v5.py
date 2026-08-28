@@ -353,6 +353,18 @@ def test_success_exact_schema_roundtrip_but_external_admission_unbound(tmp_path:
         )
 
 
+def test_termination_signal_can_never_publish_capture_pass(tmp_path: Path) -> None:
+    planned = _planned()
+    captured, telemetry = _success_capture(planned)
+    telemetry["termination_signal"] = 15
+
+    _, _, _, published = _publish(tmp_path, (captured, telemetry))
+
+    assert published["metadata"]["status"] == "INVALID"
+    assert published["metadata"]["valid"] is False
+    assert "termination_signal_received" in published["metadata"]["invalid_reasons"]
+
+
 def test_partial_callback_failure_is_immutable_invalid_with_zero_tail(tmp_path: Path) -> None:
     planned = _planned()
     failure = _failure(planned, silence_unconfirmed=True)

@@ -1044,6 +1044,8 @@ def _validate_and_build_metadata(
         invalid.append("normal_stop_not_completed")
     if scalar["output_stop_confirmed"] is False:
         invalid.append("output_stop_unconfirmed")
+    if termination is not None:
+        invalid.append("termination_signal_received")
     if np.any(status != 0) or xrun_count or status_count:
         invalid.append("callback_status_nonzero")
     for name in ("callback_error", "stream_stop_error", "stream_abort_error", "stream_close_error"):
