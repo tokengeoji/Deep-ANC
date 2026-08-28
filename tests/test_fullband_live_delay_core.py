@@ -73,6 +73,7 @@ def _telemetry(submitted_pcm: np.ndarray) -> dict[str, object]:
         "stream_stop_error": None,
         "stream_abort_error": None,
         "stream_close_error": None,
+        "termination_signal": None,
         "normal_stop_completed": True,
         "output_stop_confirmed": True,
         "actual_submitted_pcm": submitted.copy(),
@@ -311,6 +312,15 @@ def test_duplex_parser_is_auxiliary_exact_and_rejects_bad_evidence() -> None:
     with pytest.raises(ValueError, match="actual submitted PCM"):
         validate_duplex_telemetry_auxiliary(
             wrong_actual,
+            captured_adc_pcm=captured,
+            expected_submitted_pcm=submitted,
+        )
+
+    terminated = copy.deepcopy(telemetry)
+    terminated["termination_signal"] = 15
+    with pytest.raises(ValueError, match="completion/status/error"):
+        validate_duplex_telemetry_auxiliary(
+            terminated,
             captured_adc_pcm=captured,
             expected_submitted_pcm=submitted,
         )

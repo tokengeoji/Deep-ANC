@@ -46,6 +46,11 @@ SCAN_ROOTS = (REPO_ROOT / "src", REPO_ROOT / "scripts")
 AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     # 규약 자체를 정의하는 곳
     "src/deep_anc/audio_io.py": (False, True, "규약의 단일 출처. 장치 해석과 게이트를 제공한다"),
+    "src/deep_anc/dsp/fullband_v5_meter.py": (
+        False,
+        True,
+        "v5 meter consumer가 static 계약 뒤 현재 PortAudio device identity만 조회한다",
+    ),
     # 실기 런타임
     "src/deep_anc/realtime/run_realtime.py": (True, True, "ANC 런타임. 명시적 사용자·볼륨·장치 게이트"),
     "src/deep_anc/baselines/fxlms_core.py": (False, True, "FxLMS 오프라인 기준선 유틸리티"),
@@ -69,6 +74,7 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
 PRECONDITION_CALLS = frozenset(
     {
         "assert_measurement_preconditions",
+        "capture_measurement_preflight_raw",
         "assert_live_pcm_clock_preconditions",
         "input_rail_gate",  # 레일 게이트를 직접 부르는 진입점
     }
@@ -343,3 +349,90 @@ def test_precondition_checks_both_pcm_endpoints_before_recording(monkeypatch):
 
     with pytest.raises(RuntimeError, match="output PCM busy"):
         audio_io.assert_measurement_preconditions(_MustNotRecord(), hardware)
+
+
+def test_public_preflight_returns_owned_post_settle_int32_raw(monkeypatch):
+    """총 1.5초를 입력만 캡처하고 앞 0.5초를 버린 exact raw를 반환한다."""
+
+    import numpy as np
+    import deep_anc.audio_io as audio_io
+
+    events = []
+    fs = 48_000
+    hardware = {
+        "sample_rate": fs,
+        "input": {"card": "APE", "pcm": 1},
+        "output": {"card": "Audio", "pcm": 0},
+    }
+
+    class _InputOnlyDevice:
+        def rec(self, frames, **kwargs):
+            events.append(("rec", int(frames), dict(kwargs)))
+            rng = np.random.default_rng(7)
+            signal = rng.integers(-2_000_000, 2_000_000, size=(int(frames), 2), dtype=np.int32)
+            return signal
+
+        def wait(self):
+            events.append(("wait",))
+
+        def play(self, *_args, **_kwargs):  # pragma: no cover - 호출되면 즉시 실패
+            raise AssertionError("input-only preflight가 출력 API를 호출했습니다")
+
+        def Stream(self, *_args, **_kwargs):  # noqa: N802  # pragma: no cover
+            raise AssertionError("input-only preflight가 duplex/output stream을 열었습니다")
+
+    monkeypatch.setattr(audio_io, "assert_measurement_pcm_unoccupied", lambda _h: events.append(("pcm",)))
+    monkeypatch.setattr(audio_io, "assert_capture_clock_undisturbed", lambda _c: events.append(("clock",)))
+    monkeypatch.setattr(audio_io, "resolve_alsa_portaudio_device", lambda *_a, **_k: 17)
+
+    raw, report = audio_io.capture_measurement_preflight_raw(
+        _InputOnlyDevice(), hardware
+    )
+
+    assert events[:2] == [("pcm",), ("clock",)]
+    assert events[2][0:2] == ("rec", 72_000)
+    assert events[2][2] == {
+        "samplerate": 48_000,
+        "channels": 2,
+        "dtype": "int32",
+        "device": 17,
+    }
+    assert events[3] == ("wait",)
+    assert raw.dtype == np.dtype("<i4")
+    assert raw.shape == (48_000, 2)
+    assert raw.flags.owndata and raw.flags.c_contiguous
+    assert report["frames"] == 48_000
+    assert report["resolved_input_device"] == 17
+    assert report["capture_seconds"] == 1.5
+    assert report["settle_seconds"] == 0.5
+    assert report["analyzed_seconds"] == 1.0
+    assert report["passed"] is True
+
+
+def test_assert_preconditions_delegates_to_public_raw_capture(monkeypatch):
+    import numpy as np
+    import deep_anc.audio_io as audio_io
+
+    calls = []
+    report = {
+        "passed": True,
+        "channels": [
+            {"channel": 0, "clip_ratio": 0.001},
+            {"channel": 1, "clip_ratio": 0.002},
+        ],
+    }
+    monkeypatch.setattr(
+        audio_io,
+        "capture_measurement_preflight_raw",
+        lambda sd, hardware, **kwargs: (
+            calls.append((sd, hardware, kwargs))
+            or (np.zeros((1, 2), dtype="<i4"), report)
+        ),
+    )
+
+    marker = object()
+    hardware = {"sample_rate": 48_000, "input": {"card": "APE", "pcm": 1}}
+    ratios = audio_io.assert_measurement_preconditions(marker, hardware, seconds=1.5)
+
+    assert ratios == [0.001, 0.002]
+    assert calls == [(marker, hardware, {"seconds": 1.5, "settle_seconds": 0.5})]

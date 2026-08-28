@@ -8,12 +8,14 @@ from typing import Any, Callable
 
 import numpy as np
 
+from deep_anc.dsp.measurement_level import scoped_live_audio_signal_handlers
+
 
 SAMPLE_RATE = 48_000
 BLOCK_SIZE = 256
 LATENCY = "low"
 CHANNELS = (2, 2)
-DUPLEX_TELEMETRY_SCHEMA = "fullband_causal_v5_duplex_telemetry_v3"
+DUPLEX_TELEMETRY_SCHEMA = "fullband_causal_v5_duplex_telemetry_v4"
 STATUS_INPUT_UNDERFLOW = 1 << 0
 STATUS_INPUT_OVERFLOW = 1 << 1
 STATUS_OUTPUT_UNDERFLOW = 1 << 2
@@ -79,6 +81,7 @@ def capture_duplex_v5(
     watchdog_grace_seconds: float = 2.0,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    on_output_closed: Callable[[bool], None] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     planned = np.asarray(submitted_pcm)
     if (
@@ -190,51 +193,67 @@ def capture_duplex_v5(
     stop_error = None
     abort_error = None
     close_error = None
+    signal_scope = scoped_live_audio_signal_handlers()
+    signal_scope.__enter__()
     try:
-        if pre_open_check:
-            pre_open_check()
-        stream = backend.Stream(
-            samplerate=48_000,
-            blocksize=256,
-            device=(input_device, output_device),
-            channels=(2, 2),
-            dtype=("int32", "int16"),
-            latency=("low", "low"),
-            callback=callback,
-            prime_output_buffers_using_stream_callback=False,
-        )
-        stream.start()
-        deadline = capture_monotonic_started + total / 48_000 + grace
-        while not completed:
-            if callback_error:
-                raise RuntimeError(f"오디오 callback 실패: {callback_error}")
-            if monotonic() >= deadline:
-                raise TimeoutError("v5 duplex capture watchdog 초과")
-            sleep(0.001)
-        if invalid:
-            failure = RuntimeError(
-                "callback canonical-invalid: "
-                + ",".join(dict.fromkeys(invalid))
-            )
-        else:
-            try:
-                stream.stop(ignore_errors=False)
-            except BaseException as exc:
-                stop_error = exc
-    except BaseException as exc:
-        failure = exc
-    if stream is not None:
-        if failure is not None or stop_error is not None:
-            try:
-                stream.abort(ignore_errors=False)
-            except BaseException as exc:
-                abort_error = exc
         try:
-            stream.close(ignore_errors=False)
+            if pre_open_check:
+                pre_open_check()
+            stream = backend.Stream(
+                samplerate=48_000,
+                blocksize=256,
+                device=(input_device, output_device),
+                channels=(2, 2),
+                dtype=("int32", "int16"),
+                latency=("low", "low"),
+                callback=callback,
+                prime_output_buffers_using_stream_callback=False,
+            )
+            stream.start()
+            deadline = capture_monotonic_started + total / 48_000 + grace
+            while not completed:
+                if callback_error:
+                    raise RuntimeError(f"오디오 callback 실패: {callback_error}")
+                if monotonic() >= deadline:
+                    raise TimeoutError("v5 duplex capture watchdog 초과")
+                sleep(0.001)
+            if invalid:
+                failure = RuntimeError(
+                    "callback canonical-invalid: "
+                    + ",".join(dict.fromkeys(invalid))
+                )
+            else:
+                try:
+                    stream.stop(ignore_errors=False)
+                except BaseException as exc:
+                    stop_error = exc
         except BaseException as exc:
-            close_error = exc
+            failure = exc
+        if stream is not None:
+            try:
+                if failure is not None or stop_error is not None:
+                    try:
+                        stream.abort(ignore_errors=False)
+                    except BaseException as exc:
+                        abort_error = exc
+            finally:
+                try:
+                    stream.close(ignore_errors=False)
+                except BaseException as exc:
+                    close_error = exc
+        if on_output_closed is not None:
+            try:
+                on_output_closed(bool(stream is None or close_error is None))
+            except BaseException as exc:
+                failure = failure or exc
+    finally:
+        signal_scope.__exit__(None, None, None)
 
-    capture_monotonic_completed = float(monotonic())
+    try:
+        capture_monotonic_completed = float(monotonic())
+    except BaseException as exc:
+        failure = failure or exc
+        capture_monotonic_completed = capture_monotonic_started
     if not np.isfinite(capture_monotonic_completed):
         failure = failure or ValueError("capture monotonic completion은 finite여야 합니다")
     capture_monotonic_elapsed = capture_monotonic_completed - capture_monotonic_started
@@ -294,6 +313,7 @@ def capture_duplex_v5(
             if close_error is None
             else f"{type(close_error).__name__}: {close_error}"
         ),
+        "termination_signal": getattr(failure, "signum", None),
         "normal_stop_completed": bool(
             completed and failure is None and stop_error is None
         ),

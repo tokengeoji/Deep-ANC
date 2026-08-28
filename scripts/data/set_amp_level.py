@@ -37,11 +37,13 @@ ch0 으로만 흘리고, ERR 마이크의 대역 RMS 를 0.25초마다 출력한
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
+import shlex
 import sys
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -49,9 +51,23 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from deep_anc.config import load_yaml  # noqa: E402
+from deep_anc.data.repository_fd import repository_execution_identity  # noqa: E402
+from deep_anc.dsp.fullband_v5_meter import (  # noqa: E402
+    CONFIRMATION_KEYS as _V5_CONFIRMATION_KEYS,
+    DEFAULT_HARDWARE_PATH as V5_HARDWARE_PATH,
+    DEFAULT_LEVEL_EVIDENCE_PATH as V5_LEVEL_EVIDENCE_PATH,
+    DEFAULT_LIVE_AUTHORITY_PATH as V5_LIVE_AUTHORITY_PATH,
+    DEFAULT_PLAN_ENVELOPE_PATH as V5_PLAN_ENVELOPE_PATH,
+    DEFAULT_RAW_TARGET_PATH as V5_RAW_TARGET_PATH,
+    FULLBAND_V5_FOLLOWUP_SCHEMA,
+    build_fullband_v5_followup as _build_fullband_v5_followup,
+    resolve_fullband_v5_devices as _package_resolve_fullband_v5_devices,
+    validate_fullband_v5_meter_raw,
+    validate_fullband_v5_static_contract,
+    write_fullband_v5_meter_raw_atomic,
+)
 from deep_anc.dsp.measurement_level import (  # noqa: E402
     BOOTSTRAP_METER_RAW_SCHEMA,
-    DEFAULT_MEASUREMENT_LEVEL_EVIDENCE_PATH,
     LIVE_WATCHDOG_GRACE_SECONDS,
     LiveAudioTermination,
     OFFICIAL_MEASUREMENT_LEVEL,
@@ -66,6 +82,12 @@ from deep_anc.dsp.measurement_level import (  # noqa: E402
     write_bootstrap_meter_raw_atomic,
 )
 
+METER_MODE_STRICT = "strict"
+METER_MODE_FULLBAND_V5 = "fullband-v5"
+FULLBAND_V5_DEFAULT_DIAGNOSTICS_ROOT = "results/fullband_causal_v5/level_meter"
+FULLBAND_V5_ADAPTER_SCRIPT = "scripts/data/measure_paths_fullband_causal_v5.py"
+SET_AMP_REPOSITORY_PATH = "scripts/data/set_amp_level.py"
+
 SPEAKER_DISCONNECT_NOTICE = (
     "[스피커 출력 종료] 오디오 스트림을 닫았습니다. "
     "지금 스피커/앰프 연결을 즉시 해제하세요."
@@ -78,6 +100,41 @@ SPEAKER_PREFLIGHT_ABORT_NOTICE = (
     "[실기 측정 중단] 출력 스트림을 열기 전에 실패했습니다. "
     "스피커/앰프가 연결되어 있으면 지금 물리적으로 분리하세요."
 )
+
+
+def _load_fullband_v5_static_contract(
+    args, *, require_sealed_raw_fresh: bool  # noqa: ANN001
+) -> dict[str, Any]:
+    """CLI namespace를 package 공용 static validator에 전달한다."""
+
+    return validate_fullband_v5_static_contract(
+        repository_root=REPO_ROOT,
+        plan_envelope_path=args.plan_envelope,
+        live_authority_path=args.live_authority,
+        level_evidence_path=args.level_evidence,
+        hardware_path=args.hardware,
+        raw_target_path=args.raw_target,
+        require_sealed_raw_fresh=require_sealed_raw_fresh,
+    )
+
+
+def _v5_repository_execution_identity() -> dict[str, Any]:
+    return repository_execution_identity(REPO_ROOT, SET_AMP_REPOSITORY_PATH)
+
+
+def _resolve_fullband_v5_devices(sd, contract):  # noqa: ANN001
+    return _package_resolve_fullband_v5_devices(contract, sd_module=sd)
+
+
+def _v5_confirmations(args) -> dict[str, bool]:  # noqa: ANN001
+    return {
+        "speaker_output": bool(args.confirm_speaker),
+        "user_present": bool(args.confirm_user_present),
+        "volume_minimum": bool(args.confirm_volume_minimum),
+        "routing_and_geometry": bool(args.confirm_routing_and_geometry),
+        "same_amplifier_setting": bool(args.confirm_same_amplifier_setting),
+    }
+
 
 # 목표 ERR 대역 RMS (dBFS) — 과거 실측 메모에서 유도된 후보값.
 #
@@ -135,6 +192,58 @@ def strict_followup_command(
         f"--primary-out assets/measured/primary_path_il_strict_{output_suffix}.npz "
         f"--secondary-out assets/measured/secondary_path_il_strict_{output_suffix}.npz"
     )
+
+
+def fullband_v5_live_adapter_available() -> bool:
+    """오디오/스크립트 import 없이 reviewed live adapter marker만 확인한다."""
+
+    path = REPO_ROOT / FULLBAND_V5_ADAPTER_SCRIPT
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return False
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        if not isinstance(value, ast.Constant) or value.value is not True:
+            continue
+        if any(
+            isinstance(target, ast.Name)
+            and target.id == "FULLBAND_V5_LIVE_ADAPTER_IMPLEMENTED"
+            for target in targets
+        ):
+            return True
+    return False
+
+
+def fullband_v5_followup_command(meter_raw: str | Path) -> str:
+    """PASS v5 meter에 exact 결속된 live capture 명령을 생성한다."""
+
+    values = [
+        str(Path(sys.executable).absolute()),
+        str((REPO_ROOT / FULLBAND_V5_ADAPTER_SCRIPT).resolve(strict=True)),
+        "--execute-live",
+        "--plan-envelope",
+        V5_PLAN_ENVELOPE_PATH,
+        "--live-authority",
+        V5_LIVE_AUTHORITY_PATH,
+        "--meter-raw",
+        str(meter_raw),
+        "--level-evidence",
+        V5_LEVEL_EVIDENCE_PATH,
+        "--hardware",
+        V5_HARDWARE_PATH,
+        "--raw-target",
+        V5_RAW_TARGET_PATH,
+        "--confirm-speaker",
+        "--confirm-user-present",
+        "--confirm-volume-minimum",
+        "--confirm-routing-and-geometry",
+        "--confirm-same-amplifier-setting",
+    ]
+    return "  " + " ".join(shlex.quote(value) for value in values)
 
 
 def probe_signal(seconds: float) -> np.ndarray:
@@ -451,8 +560,6 @@ def _bootstrap_meter_session(args) -> tuple[Path, str]:  # noqa: ANN001
 
 
 def measure(args) -> int:
-    import sounddevice as sd
-
     from deep_anc.audio_io import (
         assert_measurement_preconditions,
         resolve_alsa_portaudio_device,
@@ -470,10 +577,37 @@ def measure(args) -> int:
             file=sys.stderr,
         )
         return 2
+    mode = str(getattr(args, "mode", METER_MODE_STRICT))
+    if mode not in {METER_MODE_STRICT, METER_MODE_FULLBAND_V5}:
+        print(f"[중단] 알 수 없는 meter mode: {mode!r}", file=sys.stderr)
+        return 2
     bootstrap = bool(getattr(args, "bootstrap_level_evidence", False))
+    if mode == METER_MODE_FULLBAND_V5 and bootstrap:
+        print(
+            "[중단] fullband-v5는 기존 strict paired level evidence만 사용하며 "
+            "bootstrap 우회를 허용하지 않습니다",
+            file=sys.stderr,
+        )
+        return 2
     calibration_evidence: dict | None = None
+    v5_contract: dict[str, Any] | None = None
+    v5_execution_identity: dict[str, Any] | None = None
     try:
-        if bootstrap:
+        if mode == METER_MODE_FULLBAND_V5:
+            # authority/plan/hardware/evidence/sealed raw freshness를 PortAudio import보다
+            # 먼저 검증한다. old broadband/v4 파일은 loader schema/SHA에서 거부된다.
+            v5_execution_identity = _v5_repository_execution_identity()
+            v5_contract = _load_fullband_v5_static_contract(
+                args,
+                require_sealed_raw_fresh=True,
+            )
+            calibration_evidence = v5_contract["evidence"]
+            hardware_config = v5_contract["hardware_config"]
+            hardware = v5_contract["hardware_audio"]
+            channel_map = v5_contract["channel_map"]
+            physical_fingerprint = v5_contract["physical_fingerprint"]
+            hardware_identity = v5_contract["hardware_identity"]
+        elif bootstrap:
             evidence_path = (REPO_ROOT / args.level_evidence).resolve()
             evidence_path.relative_to(REPO_ROOT.resolve())
             if evidence_path.exists():
@@ -481,34 +615,51 @@ def measure(args) -> int:
                     "canonical level evidence가 이미 있어 bootstrap을 다시 실행할 수 없습니다: "
                     f"{evidence_path}"
                 )
+            hardware_config = load_yaml(REPO_ROOT / args.hardware)
+            hardware, channel_map = validate_measurement_hardware_contract(
+                hardware_config
+            )
+            physical_fingerprint = collect_alsa_physical_fingerprint(hardware_config)
+            hardware_identity = measurement_hardware_identity(
+                hardware_config,
+                physical_fingerprint=physical_fingerprint,
+            )
         else:
             calibration_evidence = load_measurement_level_evidence(
                 args.level_evidence,
                 repository_root=REPO_ROOT,
             )
-        hardware_config = load_yaml(REPO_ROOT / args.hardware)
-        hardware, channel_map = validate_measurement_hardware_contract(
-            hardware_config
-        )
-        physical_fingerprint = collect_alsa_physical_fingerprint(hardware_config)
-        hardware_identity = measurement_hardware_identity(
-            hardware_config,
-            physical_fingerprint=physical_fingerprint,
-        )
-        if (
-            calibration_evidence is not None
-            and calibration_evidence.get("hardware_identity") != hardware_identity
+            hardware_config = load_yaml(REPO_ROOT / args.hardware)
+            hardware, channel_map = validate_measurement_hardware_contract(
+                hardware_config
+            )
+            physical_fingerprint = collect_alsa_physical_fingerprint(hardware_config)
+            hardware_identity = measurement_hardware_identity(
+                hardware_config,
+                physical_fingerprint=physical_fingerprint,
+            )
+        if calibration_evidence is not None and (
+            calibration_evidence.get("hardware_identity") != hardware_identity
         ):
             raise ValueError(
                 "영구 calibration evidence의 hardware identity가 현재 meter "
                 "hardware/channel 계약과 다릅니다"
             )
-        in_dev = resolve_alsa_portaudio_device(
-            hardware["input"]["card"], hardware["input"]["pcm"], "input", 2
-        )
-        out_dev = resolve_alsa_portaudio_device(
-            hardware["output"]["card"], hardware["output"]["pcm"], "output", 2
-        )
+
+        # 위 read-only file/identity gate가 모두 끝난 뒤에만 PortAudio를 import/query한다.
+        import sounddevice as sd
+
+        if v5_contract is not None:
+            devices = _resolve_fullband_v5_devices(sd, v5_contract)
+            in_dev = devices["input"]
+            out_dev = devices["output"]
+        else:
+            in_dev = resolve_alsa_portaudio_device(
+                hardware["input"]["card"], hardware["input"]["pcm"], "input", 2
+            )
+            out_dev = resolve_alsa_portaudio_device(
+                hardware["output"]["card"], hardware["output"]["pcm"], "output", 2
+            )
         bootstrap_session, capture_id = _bootstrap_meter_session(args)
     except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
         print(f"[중단] 실기 preflight 실패: {exc}", file=sys.stderr)
@@ -533,6 +684,7 @@ def measure(args) -> int:
         "Ctrl-C는 안전 중단이지만 결과는 무조건 FAIL입니다.\n",
         flush=True,
     )
+    post_revalidation_error: str | None = None
     try:
         with repository_audio_lock(REPO_ROOT, purpose="measurement_level_meter") as audio_lock:
             print(
@@ -550,11 +702,34 @@ def measure(args) -> int:
             def _pre_open_check() -> None:
                 # capture 함수가 큰 raw buffer를 준비한 **뒤**, sd.Stream open 직전에
                 # 실제 codec/DAC와 PCM/clock을 read-only로 확인한다.
-                refreshed = collect_alsa_physical_fingerprint(hardware_config)
-                if refreshed != physical_fingerprint:
-                    raise RuntimeError(
-                        "output 직전 ALSA physical fingerprint가 preflight 이후 변경됐습니다"
+                if v5_contract is not None:
+                    refreshed_contract = _load_fullband_v5_static_contract(
+                        args,
+                        require_sealed_raw_fresh=True,
                     )
+                    refreshed_devices = _resolve_fullband_v5_devices(
+                        sd, refreshed_contract
+                    )
+                    expected_followup = _build_fullband_v5_followup(
+                        v5_contract,
+                        resolved_devices={"input": in_dev, "output": out_dev},
+                        confirmations=_v5_confirmations(args),
+                    )
+                    refreshed_followup = _build_fullband_v5_followup(
+                        refreshed_contract,
+                        resolved_devices=refreshed_devices,
+                        confirmations=_v5_confirmations(args),
+                    )
+                    if refreshed_followup != expected_followup:
+                        raise RuntimeError(
+                            "v5 output 직전 plan/authority/hardware/evidence/device 결속이 변경됐습니다"
+                        )
+                else:
+                    refreshed = collect_alsa_physical_fingerprint(hardware_config)
+                    if refreshed != physical_fingerprint:
+                        raise RuntimeError(
+                            "output 직전 ALSA physical fingerprint가 preflight 이후 변경됐습니다"
+                        )
                 assert_live_pcm_clock_preconditions(hardware)
 
             started_at_utc = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -571,6 +746,30 @@ def measure(args) -> int:
                 include_raw=True,
                 pre_open_check=_pre_open_check,
             )
+            if v5_contract is not None:
+                try:
+                    refreshed_contract = _load_fullband_v5_static_contract(
+                        args,
+                        require_sealed_raw_fresh=True,
+                    )
+                    refreshed_devices = _resolve_fullband_v5_devices(
+                        sd, refreshed_contract
+                    )
+                    if _build_fullband_v5_followup(
+                        refreshed_contract,
+                        resolved_devices=refreshed_devices,
+                        confirmations=_v5_confirmations(args),
+                    ) != _build_fullband_v5_followup(
+                        v5_contract,
+                        resolved_devices={"input": in_dev, "output": out_dev},
+                        confirmations=_v5_confirmations(args),
+                    ):
+                        raise RuntimeError(
+                            "v5 capture 뒤 plan/authority/hardware/evidence/device 결속이 변경됐습니다"
+                        )
+                except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+                    # 출력은 이미 close됐다. 유일한 raw는 보존하되 PASS 승격만 막는다.
+                    post_revalidation_error = f"{type(exc).__name__}: {exc}"
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"[중단] output 직전 precondition/audio lock 실패: {exc}", file=sys.stderr)
         print(SPEAKER_PREFLIGHT_ABORT_NOTICE, file=sys.stderr, flush=True)
@@ -582,6 +781,8 @@ def measure(args) -> int:
         levels,
         expected_frames=int(noise.size),
     )
+    if post_revalidation_error is not None:
+        reasons.append("fullband_v5_post_capture_binding_invalid")
     final = (
         float(np.median(levels[-8:] if len(levels) >= 8 else levels))
         if levels and np.all(np.isfinite(np.asarray(levels, dtype=np.float64)))
@@ -604,19 +805,33 @@ def measure(args) -> int:
             "hardware_identity": hardware_identity,
             "resolved_devices": {"input": int(in_dev), "output": int(out_dev)},
             "audio_lock": dict(audio_lock),
-            "calibration_evidence": {
-                "mode": "bootstrap_pending" if bootstrap else "verified_existing",
-                "path": (
-                    None
-                    if calibration_evidence is None
-                    else calibration_evidence.get("_evidence_path")
-                ),
-                "sha256": (
-                    None
-                    if calibration_evidence is None
-                    else calibration_evidence.get("_evidence_sha256")
-                ),
-            },
+            "calibration_evidence": (
+                {
+                    "mode": "fullband_v5_tracked_attestation",
+                    "level_evidence": {
+                        "path": v5_contract["level_evidence"]["path"],
+                        "file_sha256": v5_contract["level_evidence"][
+                            "file_sha256"
+                        ],
+                        "scope": v5_contract["level_evidence"]["scope"],
+                        "preserved_raw_revalidated": False,
+                    },
+                }
+                if v5_contract is not None
+                else {
+                    "mode": "bootstrap_pending" if bootstrap else "verified_existing",
+                    "path": (
+                        None
+                        if calibration_evidence is None
+                        else calibration_evidence.get("_evidence_path")
+                    ),
+                    "sha256": (
+                        None
+                        if calibration_evidence is None
+                        else calibration_evidence.get("_evidence_sha256")
+                    ),
+                }
+            ),
             "operator_confirmations": {
                 "speaker_output": bool(args.confirm_speaker),
                 "user_present": bool(args.confirm_user_present),
@@ -640,15 +855,37 @@ def measure(args) -> int:
             "telemetry": telemetry,
             "invalid_reasons": list(reasons),
     }
+    if v5_contract is not None:
+        metadata["repository_execution"] = v5_execution_identity
+        metadata["fullband_v5_followup"] = _build_fullband_v5_followup(
+            v5_contract,
+            resolved_devices={"input": in_dev, "output": out_dev},
+            confirmations=_v5_confirmations(args),
+        )
+        metadata["fullband_v5_post_capture_revalidation"] = {
+            "passed": post_revalidation_error is None,
+            "error": post_revalidation_error,
+        }
     try:
-        bootstrap_paths = write_bootstrap_meter_raw_atomic(
+        raw_writer = (
+            write_fullband_v5_meter_raw_atomic
+            if v5_contract is not None
+            else write_bootstrap_meter_raw_atomic
+        )
+        bootstrap_paths = raw_writer(
             bootstrap_session / "meter_raw.npz",
             repository_root=REPO_ROOT,
             metadata=metadata,
             submitted_output_pcm_int16=submitted_output_pcm,
             input_raw_int32=input_raw,
         )
-    except (FileNotFoundError, FileExistsError, OSError, ValueError) as exc:
+    except (
+        FileNotFoundError,
+        FileExistsError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
         raw_candidate = bootstrap_session / "meter_raw.npz"
         recovery = (
             f" immutable raw는 보존됐습니다: {raw_candidate}"
@@ -665,6 +902,12 @@ def measure(args) -> int:
         f"{bootstrap_paths['raw'].relative_to(REPO_ROOT)}\n"
         f"  SHA256 {bootstrap_paths['sha256']}"
     )
+    if "recovery_relative_path" in bootstrap_paths:
+        print(
+            "  durable same-inode recovery hardlink (중복 캡처 아님): "
+            f"{bootstrap_paths['recovery_relative_path']}\n"
+            f"  recovery SHA256 {bootstrap_paths['recovery_sha256']}"
+        )
     if reasons:
         print(
             "[실패] 레벨 미터 캡처 계약 위반: " + ", ".join(reasons),
@@ -676,6 +919,37 @@ def measure(args) -> int:
     if target_pass:
         assert bootstrap_paths is not None
         raw_rel = bootstrap_paths["raw"].relative_to(REPO_ROOT)
+        if v5_contract is not None:
+            try:
+                precommand = validate_fullband_v5_meter_raw(
+                    raw_rel,
+                    repository_root=REPO_ROOT,
+                    require_fresh=True,
+                    require_sealed_raw_fresh=True,
+                )
+            except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+                print(
+                    f"[실패] v5 capture 명령 직전 meter/authority 재검증 실패: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            command = fullband_v5_followup_command(raw_rel)
+            print(
+                "fullband-v5 fresh meter/plan/authority/hardware/evidence 결속 PASS:\n"
+                f"  meter identity {precommand['identity_sha256']}\n"
+                f"  followup contract {precommand['followup_contract_sha256']}\n"
+                "같은 앰프 노브를 유지하고 10분 안에 아래 exact v5 capture를 실행하세요:\n"
+                + command
+            )
+            if fullband_v5_live_adapter_available():
+                print("[READY] reviewed fullband-v5 --execute-live adapter marker를 확인했습니다")
+            else:
+                print(
+                    "[차단] fullband-v5 --execute-live adapter가 아직 구현/표시되지 않았습니다. "
+                    "위 명령은 기록용이며 실행하면 안 됩니다.",
+                    file=sys.stderr,
+                )
+            return 0
         command = strict_followup_command(
             raw_rel, capture_id=capture_id, bootstrap=bootstrap
         )
@@ -698,7 +972,28 @@ def measure(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hardware", default="configs/hardware_jetson.yaml")
+    parser.add_argument(
+        "--mode",
+        choices=(METER_MODE_STRICT, METER_MODE_FULLBAND_V5),
+        default=METER_MODE_STRICT,
+        help="strict interleaved 또는 committed causal fullband-v5 후속 측정",
+    )
+    parser.add_argument("--hardware", default=V5_HARDWARE_PATH)
+    parser.add_argument(
+        "--plan-envelope",
+        default=V5_PLAN_ENVELOPE_PATH,
+        help="fullband-v5에서만 사용; sealed exact path만 허용",
+    )
+    parser.add_argument(
+        "--live-authority",
+        default=V5_LIVE_AUTHORITY_PATH,
+        help="fullband-v5에서만 사용; capture-only authority sealed exact path",
+    )
+    parser.add_argument(
+        "--raw-target",
+        default=V5_RAW_TARGET_PATH,
+        help="fullband-v5에서만 사용; 아직 존재하지 않는 sealed raw exact path",
+    )
     parser.add_argument(
         "--seconds",
         type=float,
@@ -707,7 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--level-evidence",
-        default=str(DEFAULT_MEASUREMENT_LEVEL_EVIDENCE_PATH),
+        default=V5_LEVEL_EVIDENCE_PATH,
         help="peak 0.003 paired raw evidence JSON",
     )
     parser.add_argument(
@@ -720,7 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--diagnostics-root",
-        default="results/calibration_interleaved/level_bootstrap",
+        default=None,
         help="bootstrap meter immutable raw의 새 session 상위 경로(results/ 아래만 허용)",
     )
     parser.add_argument("--self-test", action="store_true", help="소리 없이 미터만 검증")
@@ -735,7 +1030,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="출력 시작 전 앰프 볼륨이 최저임을 명시적으로 확인",
     )
+    parser.add_argument(
+        "--confirm-routing-and-geometry",
+        action="store_true",
+        help="fullband-v5 ERR/REF 및 NS/CS 배선·덕트 기하가 authority와 같음을 확인",
+    )
+    parser.add_argument(
+        "--confirm-same-amplifier-setting",
+        action="store_true",
+        help="fullband-v5에서 paired evidence와 같은 앰프/노브 설정을 유지함을 확인",
+    )
     args = parser.parse_args(argv)
+
+    if args.diagnostics_root is None:
+        args.diagnostics_root = (
+            FULLBAND_V5_DEFAULT_DIAGNOSTICS_ROOT
+            if args.mode == METER_MODE_FULLBAND_V5
+            else "results/calibration_interleaved/level_bootstrap"
+        )
 
     if args.self_test:
         return self_test()
@@ -763,6 +1075,16 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "[중단] 모든 live meter는 사용자 입회와 시작 전 볼륨 최저 확인이 "
             "모두 필요합니다: --confirm-user-present --confirm-volume-minimum",
+            file=sys.stderr,
+        )
+        return 2
+    if args.mode == METER_MODE_FULLBAND_V5 and not (
+        args.confirm_routing_and_geometry and args.confirm_same_amplifier_setting
+    ):
+        print(
+            "[중단] fullband-v5 meter는 다섯 확인이 모두 필요합니다: "
+            "--confirm-speaker --confirm-user-present --confirm-volume-minimum "
+            "--confirm-routing-and-geometry --confirm-same-amplifier-setting",
             file=sys.stderr,
         )
         return 2

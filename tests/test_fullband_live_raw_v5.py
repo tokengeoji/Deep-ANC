@@ -72,6 +72,11 @@ def _session() -> dict:
         "started_at_utc": started.isoformat(),
         "completed_at_utc": completed.isoformat(),
         "audio_lock_identity_sha256": _sha("audio-lock"),
+        "repository_commit": "a" * 40,
+        "repository_branch": "work/test",
+        "repository_dirty": False,
+        "adapter_path": "scripts/data/measure_paths_fullband_causal_v5.py",
+        "adapter_file_sha256": _sha("adapter"),
     }
 
 
@@ -129,6 +134,8 @@ def _bindings(
             "path": "assets/measured/measurement_level_evidence.json",
             "file_sha256": evidence_file,
             "identity_sha256": _sha("evidence-identity"),
+            "scope": "tracked_historical_attestation_for_fresh_v5_meter_only",
+            "preserved_raw_revalidated": False,
         },
         "hardware": {
             "schema": "jetson_measurement_hardware_v1",
@@ -223,6 +230,7 @@ def _telemetry(prefix: int, *, status: int = 0, completed: bool = True) -> dict:
         "stream_stop_error": None,
         "stream_abort_error": None,
         "stream_close_error": None,
+        "termination_signal": None,
         "normal_stop_completed": completed and status == 0,
         "output_stop_confirmed": True,
     }
@@ -659,6 +667,16 @@ def test_session_sha_and_posix_path_types_are_exact(tmp_path: Path) -> None:
     bad_id["capture_id"] = bad_id["capture_id"].upper()
     with pytest.raises(ValueError, match="capture_id"):
         raw.publish_live_raw_v5(session=bad_id, **kwargs)
+    for field, value, match in (
+        ("repository_commit", "abc", "repository_commit"),
+        ("repository_dirty", True, "repository_dirty"),
+        ("adapter_path", "scripts/data/other.py", "adapter_path"),
+        ("adapter_file_sha256", "bad", "adapter_file_sha256"),
+    ):
+        bad_execution = _session()
+        bad_execution[field] = value
+        with pytest.raises(ValueError, match=match):
+            raw.publish_live_raw_v5(session=bad_execution, **kwargs)
     reverse = _session()
     reverse["completed_at_utc"] = (
         dt.datetime.fromisoformat(reverse["started_at_utc"])

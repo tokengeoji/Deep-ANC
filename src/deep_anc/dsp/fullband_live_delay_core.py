@@ -225,6 +225,7 @@ def validate_duplex_telemetry_auxiliary(
         "stream_stop_error",
         "stream_abort_error",
         "stream_close_error",
+        "termination_signal",
         "normal_stop_completed",
         "output_stop_confirmed",
         "actual_submitted_pcm",
@@ -376,6 +377,7 @@ def validate_duplex_telemetry_auxiliary(
         or telemetry["stream_stop_error"] is not None
         or telemetry["stream_abort_error"] is not None
         or telemetry["stream_close_error"] is not None
+        or telemetry["termination_signal"] is not None
         or telemetry["normal_stop_completed"] is not True
         or telemetry["output_stop_confirmed"] is not True
     ):

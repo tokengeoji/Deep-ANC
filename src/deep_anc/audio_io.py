@@ -420,6 +420,123 @@ def input_rail_gate(
     return bool(max(ratios, default=0.0) <= float(max_clip_ratio)), ratios
 
 
+def capture_measurement_preflight_raw(
+    sd,
+    hardware: dict,
+    *,
+    seconds: float = 1.5,
+    settle_seconds: float = 0.5,
+) -> tuple[np.ndarray, dict]:
+    """출력 API를 열지 않고 official 입력 preflight raw와 분석을 반환한다.
+
+    ``seconds``는 **전체 캡처 시간**이다. 기본 1.5초 중 앞 0.5초 I2S 기동
+    트랜지언트를 버리고 남은 1.0초만 판정한다. 반환 raw는 이 판정 구간의
+    소유권 있는 exact little-endian ``<i4 [frames, 2]`` 배열이다. 따라서 상위 live
+    adapter가 같은 bytes를 immutable session raw에 결속할 수 있다.
+
+    이 함수는 ``sd.rec``/``sd.wait`` 입력 API만 사용한다. 출력 stream이나 재생 API는
+    열지 않는다. 신호가 dead/railed이면 report의 ``passed``가 false가 되며, 기존
+    예외 API가 필요한 호출부는 :func:`assert_measurement_preconditions`를 사용한다.
+    """
+
+    total_seconds = float(seconds)
+    settle = float(settle_seconds)
+    if not np.isfinite(total_seconds) or total_seconds <= 0.0:
+        raise ValueError("preflight 전체 캡처 시간은 finite 양수여야 합니다")
+    if not np.isfinite(settle) or settle < 0.0 or settle >= total_seconds:
+        raise ValueError("preflight settle은 전체 캡처 시간보다 작은 finite 비음수여야 합니다")
+
+    if isinstance(hardware.get("output"), dict):
+        assert_measurement_pcm_unoccupied(hardware)
+
+    card = hardware["input"]["card"]
+    assert_capture_clock_undisturbed(card)
+    fs = int(hardware["sample_rate"])
+    if fs <= 0:
+        raise ValueError("preflight sample_rate는 양수여야 합니다")
+    device = resolve_alsa_portaudio_device(card, hardware["input"]["pcm"], "input", 2)
+    total_frames = int(round(total_seconds * fs))
+    settle_frames = int(round(settle * fs))
+    if total_frames <= settle_frames:
+        raise ValueError("preflight 분석 frame이 하나 이상이어야 합니다")
+
+    captured = np.asarray(
+        sd.rec(
+            total_frames,
+            samplerate=fs,
+            channels=2,
+            dtype=MEASUREMENT_DTYPE[0],
+            device=device,
+        )
+    )
+    sd.wait()
+    if captured.dtype != np.dtype(np.int32) or captured.shape != (total_frames, 2):
+        raise RuntimeError(
+            "input-only preflight가 exact int32 [frames,2]를 반환하지 않았습니다: "
+            f"{captured.dtype}/{captured.shape}"
+        )
+
+    # 단순 view를 반환하면 PortAudio/가짜 backend buffer 수명에 종속된다. 명시적
+    # little-endian copy로 session publisher가 소유할 bytes를 만든다.
+    raw = np.array(captured[settle_frames:], dtype="<i4", order="C", copy=True)
+    report = analyze_int32_input_probe(
+        raw,
+        min_rms_dbfs=MIN_PROBE_DBFS,
+        max_clip_ratio=MAX_PROBE_CLIP_RATIO,
+    )
+    report.update(
+        {
+            "passed": bool(all(channel["valid"] for channel in report["channels"])),
+            "resolved_input_device": int(device),
+            "sample_rate_hz": fs,
+            "capture_seconds": total_seconds,
+            "settle_seconds": settle,
+            "analyzed_seconds": float(raw.shape[0]) / float(fs),
+        }
+    )
+    return raw, report
+
+
+def _raise_invalid_measurement_preflight(report: dict) -> None:
+    channels = report.get("channels")
+    if not isinstance(channels, list) or len(channels) < 2:
+        raise RuntimeError("마이크 preflight 분석 보고서가 ERR/REF 2채널을 포함하지 않습니다")
+
+    railed = [
+        channel
+        for channel in channels
+        if float(channel.get("clip_ratio", 1.0)) > MAX_PROBE_CLIP_RATIO
+    ]
+    if railed:
+        ratios = [float(channel.get("clip_ratio", 1.0)) for channel in channels]
+        raise RuntimeError(
+            f"마이크 입력이 풀스케일에 붙어 있습니다 (레일 비율 "
+            f"{ratios[0]:.4f}/{ratios[1]:.4f} > {MAX_PROBE_CLIP_RATIO}). "
+            "이 상태의 계측은 음향과 무관한 숫자를 냅니다 — 볼륨을 돌려도 안 움직입니다.\n"
+            "입력단 전원·배선(J30 핀 접촉)을 확인한 뒤 다시 실행하세요."
+        )
+
+    dead = [
+        int(channel.get("channel", index))
+        for index, channel in enumerate(channels)
+        if float(channel.get("rms_dbfs", -200.0)) < MIN_PROBE_DBFS
+        or bool(channel.get("stuck", True))
+    ]
+    if dead:
+        detail = " / ".join(
+            f"ch{int(channel.get('channel', index))} "
+            f"{float(channel.get('rms_dbfs', -200.0)):.1f} dBFS"
+            for index, channel in enumerate(channels)
+        )
+        raise RuntimeError(
+            f"마이크가 무신호입니다 ({detail} < {MIN_PROBE_DBFS:.0f} dBFS 또는 stuck). "
+            f"채널 {dead} 에 유효 데이터가 오지 않습니다.\n"
+            "이 상태로 계측하면 숫자가 음향과 무관해집니다. "
+            "입력단 전원·배선(J30 핀 접촉)과 I2S 클록을 확인한 뒤 다시 실행하세요."
+        )
+    raise RuntimeError("마이크 input-only preflight가 알 수 없는 사유로 실패했습니다")
+
+
 def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5) -> list[float]:
     """스피커를 울리기 **전에** 실기 전제조건을 전부 확인한다. 하나라도 깨지면 예외.
 
@@ -431,41 +548,12 @@ def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5
     ``tests/test_audio_entry_contract.py`` 가 거부한다.
     """
 
-    if isinstance(hardware.get("output"), dict):
-        assert_measurement_pcm_unoccupied(hardware)
-
-    card = hardware["input"]["card"]
-    assert_capture_clock_undisturbed(card)
-
-    device = resolve_alsa_portaudio_device(card, hardware["input"]["pcm"], "input", 2)
-    probe = sd.rec(
-        int(seconds * int(hardware["sample_rate"])),
-        samplerate=int(hardware["sample_rate"]),
-        channels=2,
-        dtype=MEASUREMENT_DTYPE[0],
-        device=device,
+    _raw, report = capture_measurement_preflight_raw(
+        sd,
+        hardware,
+        seconds=seconds,
+        settle_seconds=0.5,
     )
-    sd.wait()
-    settle = int(0.5 * int(hardware["sample_rate"]))
-    probe_f = pcm_int32_to_float32(probe[settle:])
-    ok, ratios = input_rail_gate(probe_f)
-    if not ok:
-        raise RuntimeError(
-            f"마이크 입력이 풀스케일에 붙어 있습니다 (레일 비율 "
-            f"{ratios[0]:.4f}/{ratios[1]:.4f} > {MAX_PROBE_CLIP_RATIO}). "
-            "이 상태의 계측은 음향과 무관한 숫자를 냅니다 — 볼륨을 돌려도 안 움직입니다.\n"
-            "입력단 전원·배선(J30 핀 접촉)을 확인한 뒤 다시 실행하세요."
-        )
-
-    # 하한 — 상한만 보면 반쪽이다. 무신호 마이크도 "레일 아님" 으로 통과한다.
-    levels = [rms_dbfs(probe_f[:, ch]) for ch in range(probe_f.shape[1])]
-    dead = [ch for ch, db in enumerate(levels) if db < MIN_PROBE_DBFS]
-    if dead:
-        detail = " / ".join(f"ch{ch} {levels[ch]:.1f} dBFS" for ch in range(len(levels)))
-        raise RuntimeError(
-            f"마이크가 무신호입니다 ({detail} < {MIN_PROBE_DBFS:.0f} dBFS). "
-            f"채널 {dead} 에 데이터가 오지 않습니다.\n"
-            "이 상태로 계측하면 숫자가 음향과 무관해집니다. "
-            "입력단 전원·배선(J30 핀 접촉)과 I2S 클록을 확인한 뒤 다시 실행하세요."
-        )
-    return ratios
+    if report.get("passed") is not True:
+        _raise_invalid_measurement_preflight(report)
+    return [float(channel["clip_ratio"]) for channel in report["channels"]]

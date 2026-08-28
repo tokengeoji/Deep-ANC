@@ -1,3 +1,5 @@
+import signal
+
 import numpy as np
 import pytest
 
@@ -247,6 +249,41 @@ def test_cleanup_errors_not_ignored():
         message in str(caught.value)
         for message in ("stop failed", "abort failed", "close failed")
     )
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_live_signal_aborts_and_closes_before_failure_returns(signum):
+    backend = Backend(blocks=2)
+
+    def interrupt(_seconds):
+        signal.raise_signal(signum)
+
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend, sleep=interrupt)
+    assert caught.value.telemetry["termination_signal"] == int(signum)
+    assert backend.calls[-2:] == [("abort", False), ("close", False)]
+
+
+def test_post_close_interrupt_still_reports_closed_before_failure():
+    backend = Backend()
+    events = []
+    ticks = iter([0.0])
+
+    def monotonic():
+        try:
+            return next(ticks)
+        except StopIteration:
+            raise KeyboardInterrupt("post-close injected")
+
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(
+            backend,
+            monotonic=monotonic,
+            on_output_closed=lambda confirmed: events.append(("notice", confirmed)),
+        )
+    assert events == [("notice", True)]
+    assert backend.calls[-2:] == [("stop", False), ("close", False)]
+    assert "post-close injected" in str(caught.value)
 
 
 def test_output_buffer_write_failure_is_atomic():

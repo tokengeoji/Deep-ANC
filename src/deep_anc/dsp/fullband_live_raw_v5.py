@@ -94,7 +94,14 @@ BINDING_KEYS = {
         "level_evidence_file_sha256",
         "hardware_file_sha256",
     },
-    "level_evidence": {"schema", "path", "file_sha256", "identity_sha256"},
+    "level_evidence": {
+        "schema",
+        "path",
+        "file_sha256",
+        "identity_sha256",
+        "scope",
+        "preserved_raw_revalidated",
+    },
     "hardware": {
         "schema",
         "path",
@@ -139,6 +146,11 @@ SESSION_KEYS = {
     "completed_at_utc",
     "publisher_prepared_at_utc",
     "audio_lock_identity_sha256",
+    "repository_commit",
+    "repository_branch",
+    "repository_dirty",
+    "adapter_path",
+    "adapter_file_sha256",
 }
 SESSION_INPUT_KEYS = SESSION_KEYS - {"publisher_prepared_at_utc"}
 PREFLIGHT_REPORT_KEYS = {
@@ -393,6 +405,15 @@ def _validate_bindings(value: Any) -> dict[str, Any]:
     meter = result["meter"]
     evidence = result["level_evidence"]
     hardware = result["hardware"]
+    if (
+        evidence["scope"]
+        != "tracked_historical_attestation_for_fresh_v5_meter_only"
+        or evidence["preserved_raw_revalidated"] is not False
+    ):
+        raise ValueError(
+            "level evidence는 tracked historical scope이고 preserved raw는 "
+            "재검증되지 않은 상태여야 합니다"
+        )
     cross_checks = (
         (authority["signal_plan_file_sha256"], plan["file_sha256"], "authority/plan file SHA"),
         (authority["signal_plan_payload_sha256"], plan["payload_sha256"], "authority/plan payload SHA"),
@@ -572,6 +593,24 @@ def _validate_session(value: Any) -> tuple[dict[str, Any], list[str]]:
     session["audio_lock_identity_sha256"] = _sha256(
         session["audio_lock_identity_sha256"],
         label="session.audio_lock_identity_sha256",
+    )
+    commit = session["repository_commit"]
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or commit != commit.lower()
+        or any(character not in "0123456789abcdef" for character in commit)
+    ):
+        raise ValueError("session.repository_commit은 exact 40-char lowercase hex여야 합니다")
+    branch = session["repository_branch"]
+    if not isinstance(branch, str) or not branch or any(c.isspace() for c in branch):
+        raise ValueError("session.repository_branch가 필요합니다")
+    if session["repository_dirty"] is not False:
+        raise ValueError("session.repository_dirty는 exact false여야 합니다")
+    if session["adapter_path"] != "scripts/data/measure_paths_fullband_causal_v5.py":
+        raise ValueError("session.adapter_path가 canonical adapter와 다릅니다")
+    session["adapter_file_sha256"] = _sha256(
+        session["adapter_file_sha256"], label="session.adapter_file_sha256"
     )
     invalid: list[str] = []
     if utc_duration <= 0.0:
@@ -754,6 +793,7 @@ def _telemetry_scalar_keys() -> set[str]:
         "stream_stop_error",
         "stream_abort_error",
         "stream_close_error",
+        "termination_signal",
         "normal_stop_completed",
         "output_stop_confirmed",
     }
@@ -945,6 +985,11 @@ def _validate_and_build_metadata(
     for name in ("callback_error", "stream_stop_error", "stream_abort_error", "stream_close_error"):
         if scalar[name] is not None and (not isinstance(scalar[name], str) or not scalar[name]):
             raise ValueError(f"duplex telemetry {name}은 None 또는 nonempty string이어야 합니다")
+    termination = scalar["termination_signal"]
+    if termination is not None and (
+        type(termination) is not int or termination not in {1, 2, 15}
+    ):
+        raise ValueError("duplex telemetry termination_signal이 유효하지 않습니다")
 
     checked_bindings = _validate_bindings(bindings)
     if scalar["resolved_input_device"] != checked_bindings["hardware"]["resolved_devices"]["input"]:
