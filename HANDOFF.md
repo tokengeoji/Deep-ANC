@@ -16,6 +16,44 @@
 과거 `pretrain_*_corrected`, `finetune_tiny`, legacy P/S는 삭제하지 않지만 모두
 diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사용하지 않는다.
 
+### 2026-08-28 Elice v10 — 실제 cache-safe pre-init 증거
+
+Elice `~/Deep_ANC`에서 exact clean commit
+`937af1175b3818b00d54f08732d63a9ecf07907a`으로 full bootstrap과 readiness를 다시
+실행했다. bootstrap은 exit 0, 전체 pytest 0 FAIL로 끝났고 receipt
+`data/manifests/elice_bootstrap_receipt.json`의 SHA-256은
+`63a714902401114df9c86c0d3b6604b2a1a58b313e274aa0098f4d46ee4f009c`다.
+
+- readiness artifact는
+  `results/training_prerequisites/evidence/readiness_v10_937af11/readiness.json`
+  (SHA-256 `27a175bc69e0c4c54f9faf24c1f692dc8a427d974e2356fcfa4773a4ad09743e`)이다.
+  **16 gate 중 15 PASS / 1 FAIL**이며, 유일한 FAIL은 의도된
+  `completed_init_checkpoint: init_ckpt가 비었습니다`다.
+- strict P/S·lead=115, transfer/recorded QA, lineage leakage=0, 통계 검정력과 plant
+  confidence ceiling은 모두 PASS했다.
+- 이전 결함인 `assets/measured/.design_ceiling_cache.json`의 tracked write는 재발하지
+  않았고, readiness 종료 뒤에도 원격 `git status --porcelain`은 비어 있었다.
+- 이 evidence는 데이터·환경·pre-init readiness만 증명한다. canonical init, campaign
+  ledger, 실제 학습·덕트 ANC 성능은 아직 증명하지 않는다.
+
+### campaign prerequisite schema v5
+
+canonical 100k를 열기 전에 수기 NMSE, gradient share, pilot score/winner 또는
+`passed=true`를 ledger에 적는 경로를 폐기했다. schema v5는 다음 raw artifact에서
+결론을 재계산한다.
+
+1. G0 final model state와 fixed batch의 trusted NMSE `< -6 dB`
+2. loss pilot `best.pt`/`last.pt`/recorded-val `metrics.npz`/manifest의 provenance와
+   raw per-segment trusted worst-10% score
+3. 선택 pilot `best.pt`와 fixed batch의 strict-S DNH gradient share `0.2–0.4`
+4. selected init에 결속한 measured 5k probe의 checkpoint·manifest·finite val metrics
+5. 선택 loss와 같은 A100 exact-resume smoke receipt
+
+새 source commit으로 전환하면 bootstrap receipt도 exact commit에 결속되어 바뀐다.
+따라서 위 v10 receipt를 다음 campaign의 anchor로 재사용하지 않고, 같은 raw/audit을
+새 exact commit에서 다시 full bootstrap하여 새 receipt와 15/16 readiness를 만든 뒤
+G0부터 시작한다.
+
 라이브 측정은 전체 테스트, 무음 dry-run, 장치 점유·CPU gate와 사용자 입회 뒤 실행했다.
 측정 종료 직후 오디오 스트림은 닫혔고 스피커 분리 안내를 출력했다.
 
@@ -83,7 +121,7 @@ diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사�
   `fix/finetune-readiness-repair`의 HEAD이며, 실행에 사용할 exact SHA는
   `git rev-parse HEAD`로 확인한다. 브랜치별 범위는 `docs/08_dev_workflow.md §7`에 고정했다.
 - Elice receipt가 생긴 뒤 `check_finetune.py`의 외부 입력 차단은 해소됐지만, canonical
-  init checkpoint·campaign ledger가 아직 없어 readiness는 의도적으로 15/15가 아니다.
+  init checkpoint·campaign ledger가 아직 없어 readiness는 의도적으로 16/16이 아니다.
 - 2026-08-27 고주파 진단 캡처는 공식 자산과 분리해 수행했지만 유효한 clock witness를
   만들지 못했다. `results/experimental_high_band/20260827_fullband/20260827_203328_1b24d0c2/`
   의 immutable raw에서 ERR/REF 공통 clock 유효 주기가 0개(최소 8, score≥0.995)로 판정되어
@@ -361,25 +399,29 @@ bash scripts/elice/bootstrap_all.sh \
 
 bootstrap은 torch `2.5.1+cu121`, CUDA 12.1 계약, A100, 저장공간, public raw 수량과 FMA
 metadata를 검증하고 manifest 6종을 untouched raw에서 재생성한다. noise/recorded QA,
-전체 pytest와 readiness까지 통과한 정상 사전학습 출발 상태는 init 하나만 FAIL인 14/15다.
+전체 pytest와 readiness까지 통과한 정상 사전학습 출발 상태는 init 하나만 FAIL인 15/16이다.
 
 ## 4. 공식 학습 순서
 
 1. family→lineage component→session 균등 sampler와 공통 gain/polarity/EQ, input-only mic
    noise를 사용한다. session mixing과 lead jitter는 0이다.
-2. strict S로 `lambda_dnh` gradient 비중 0.2–0.4를 확인한다.
-3. 고정 batch G0에서 trusted NMSE < −6 dB와 lead metadata를 확인한다.
-4. seed `20260803`, frame-metric-only(`lambda_frame=0`)의 `alpha∈{0.7,1.0}`을 20k
+2. 고정 batch G0에서 trusted NMSE < −6 dB와 lead metadata를 확인한다.
+3. seed `20260803`, frame-metric-only(`lambda_frame=0`)의 `alpha∈{0.7,1.0}`을 20k
    surrogate + 5k measured probe로 recorded val만 사용해 비교한다. 0.2 dB 이내
    동률/alpha 1.0 불안정이면 alpha 0.85를 추가하고, 계속 동률이면 alpha 0.7을 택한다.
    170ms frame metric은 candidate마다 기록해 비교·원인 분석에 사용한다. 고정 local
    pass threshold가 생기기 전에는 이 metric으로 성능 PASS를 주장하지 않는다. pilot checkpoint는
    init 자격이 없다.
-5. 선택 계약의 tiny를 새 run에서 100k 처음부터 사전학습한다. 200–500 step smoke에서 VRAM,
-   처리량/ETA, 중단·재개 등가를 먼저 확인한다.
-6. canonical init 지정 뒤 readiness 15/15를 확인하고 open-loop, recorded 70% + synthetic 30%,
+4. 선택된 pilot `best.pt`와 fixed batch에서 strict S의 `lambda_dnh` gradient 비중 0.2–0.4를
+   재계산한다. 같은 winner를 init으로 한 measured 5k probe의 completion/provenance와 finite
+   recorded-val metrics를 확인한다.
+5. 선택 계약의 A100 200–500 step exact-resume smoke에서 VRAM, 처리량/ETA, 중단·재개
+   수치등가를 먼저 확인한다. schema v5 issuer가 G0·pilot·gradient·probe·smoke raw artifact를
+   다시 검증해 canonical ledger를 no-replace 발행한 뒤에만 다음 단계로 간다.
+6. 선택 계약의 tiny를 새 run에서 100k 처음부터 사전학습한다.
+7. canonical init 지정 뒤 readiness 16/16을 확인하고 open-loop, recorded 70% + synthetic 30%,
    bf16 forward + FP32 loss, 50k fine-tune을 실행한다.
-7. checkpoint 선택은 recorded val만 사용한다. 선택을 고정한 뒤 test를 정확히 한 번 연다.
+8. checkpoint 선택은 recorded val만 사용한다. 선택을 고정한 뒤 test를 정확히 한 번 연다.
    경계 0.3 dB 이내 또는 INCONCLUSIVE일 때만 seed `20260903`의 100k+50k를 한 번 더 한다.
 
 공식 test G4는 trusted 150–1600 Hz 평균/모든 family 평균/최악 10%/family cluster-bootstrap
@@ -402,7 +444,7 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
 - frame-metric-only alpha 2개 20k pilot을 recorded val만으로 실행·선택
 - winner의 5k measured probe, 실제 A100 bf16 중단→resume 수치등가 smoke, G0·gradient
   ledger 작성 및 SHA 결속
-- canonical tiny 100k surrogate-pretrain init checkpoint 생성 후 readiness 15/15 확인
+- canonical tiny 100k surrogate-pretrain init checkpoint 생성 후 readiness 16/16 확인
 - canonical measured 50k fine-tune, 고정 checkpoint의 단 한 번 G4 평가
 - G4 PASS 뒤 natural-crest challenge 녹음·평가
 

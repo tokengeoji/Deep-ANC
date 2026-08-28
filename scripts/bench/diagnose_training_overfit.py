@@ -40,6 +40,10 @@ from deep_anc.train.trainer import (
     validate_finite_parameters,
     validate_g0_nmse,
 )
+from deep_anc.train.campaign_evidence import publish_g0_evidence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 _DEAD_KEY = re.compile(r"loss\.([A-Za-z_][A-Za-z0-9_]*)=")
@@ -226,6 +230,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="진단 전용: G0 NMSE 합격선을 적용하지 않습니다.",
     )
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument(
+        "--bootstrap-receipt-sha256",
+        default=None,
+        help=(
+            "campaign G0 receipt를 만들 때 결속할 Elice bootstrap SHA-256. "
+            "--evidence-dir와 함께 필수입니다."
+        ),
+    )
+    parser.add_argument(
+        "--evidence-dir",
+        default=None,
+        help=(
+            "성공한 approved G0의 immutable raw checkpoint/batch/receipt directory. "
+            "기존 directory는 절대 덮어쓰지 않습니다."
+        ),
+    )
     return parser
 
 
@@ -257,6 +277,9 @@ def build_diagnostic_overrides(args: argparse.Namespace, ckpt_dir: str) -> list[
         overrides.append(
             f"data.digital_reference_lead_samples={int(args.lead_samples)}"
         )
+    bootstrap_sha = getattr(args, "bootstrap_receipt_sha256", None)
+    if bootstrap_sha is not None:
+        overrides.append(f"data.bootstrap_receipt_sha256={str(bootstrap_sha).lower()}")
     if args.mode == "augmented":
         overrides.extend(
             [
@@ -292,6 +315,10 @@ def main() -> int:
         parser.error("steps, batch-size, log-every는 1 이상이어야 합니다")
     if args.nmse_only and args.disable_loss_term:
         parser.error("--nmse-only와 --disable-loss-term은 함께 사용할 수 없습니다")
+    if args.evidence_dir is not None:
+        bootstrap = str(args.bootstrap_receipt_sha256 or "").lower()
+        if len(bootstrap) != 64 or any(char not in "0123456789abcdef" for char in bootstrap):
+            parser.error("--evidence-dir에는 64자리 --bootstrap-receipt-sha256이 필요합니다")
 
     diagnostic_dir = tempfile.mkdtemp(prefix=f"deep_anc_overfit_{args.mode}_")
     overrides = build_diagnostic_overrides(args, diagnostic_dir)
@@ -396,6 +423,22 @@ def main() -> int:
         except (FloatingPointError, ValueError) as exc:
             print(f"[실패] {exc}", file=sys.stderr)
             return 2
+    if args.evidence_dir is not None:
+        raw_model = model.module if hasattr(model, "module") else model
+        receipt = publish_g0_evidence(
+            repo_root=REPO_ROOT,
+            output_dir=args.evidence_dir,
+            cfg=cfg,
+            model_state=raw_model.state_dict(),
+            batch={"x": batch["x"], "d": batch["d"]},
+            steps=args.steps,
+            mode=args.mode,
+            primary_mode=args.primary_mode,
+            require_nmse_db=args.require_nmse_db,
+            nmse_only=args.nmse_only,
+            disable_loss_terms=args.disable_loss_term,
+        )
+        print(f"[campaign G0] raw receipt → {receipt}", flush=True)
     return 0
 
 

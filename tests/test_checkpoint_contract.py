@@ -8,6 +8,7 @@ import os
 import random
 import shutil
 import subprocess
+from types import SimpleNamespace
 from copy import deepcopy
 from unittest.mock import patch
 
@@ -33,6 +34,8 @@ from deep_anc.train.campaign_prerequisite import (
     CANONICAL_PATH as CANONICAL_PREREQUISITE_PATH,
     validate_canonical_pretrain_prerequisites,
 )
+import deep_anc.train.campaign_prerequisite as campaign_prerequisite_module
+from deep_anc.train.campaign_evidence import PILOT_SELECTION_RULE
 from deep_anc.train.a100_pretrain_smoke import (
     A100_PRETRAIN_SMOKE_ROLE,
     SMOKE_ROOT,
@@ -989,7 +992,7 @@ def _a100_smoke_ledger_refs(source_root: Path, canonical_cfg: dict) -> dict:
     }
 
 
-def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
+def _prerequisite_components(tmp_path):
     source_root = tmp_path / "campaign-source"
     (source_root / "src").mkdir(parents=True)
     (source_root / "src" / "training.py").write_text("VALUE = 1\n")
@@ -1057,24 +1060,15 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
     provisional = stamp_experiment_contract(cfg, repo_root=source_root)
     source = provisional["experiment_contract"]["source"]
     artifacts = provisional["experiment_contract"]["artifacts"]
-    candidates = []
-    for alpha, frame, score in (
-        (0.7, 0.0, -4.0),
-        (1.0, 0.0, -2.0),
-    ):
-        candidates.append(
-            {
-                "alpha": alpha,
-                "lambda_frame": frame,
-                "run_until_step": 20_000,
-                "experiment_role": "loss_pilot",
-                "init_eligible": False,
-                "score_db": score,
-                "evidence": evidence_ref,
-            }
-        )
+    # v5 ledger는 사람이 score/winner/gradient/NMSE를 적지 않고 raw artifact
+    # reference만 보관한다. 이 fixture의 P/S는 unit-test용 bytes라 raw DSP
+    # 재계산은 아래 helper에서 stub하고, A100 smoke chain만 독립 검증한다.
+    candidates = [
+        {"fixture_pair": [0.7, 0.0]},
+        {"fixture_pair": [1.0, 0.0]},
+    ]
     ledger = {
-        "schema_version": 4,
+        "schema_version": 5,
         "source": {
             "git_commit": source["git_commit"],
             "source_tree_sha256": source["source_tree_sha256"],
@@ -1082,34 +1076,18 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
             "primary_path_sha256": artifacts["primary_path"]["sha256"],
             "secondary_path_sha256": artifacts["secondary_path"]["sha256"],
         },
-        "g0": {
-            "evidence": evidence_ref,
-            "all_finite": True,
-            "nmse_trusted_db": -6.1,
-            "threshold_exclusive_db": -6.0,
-        },
-        "gradient_budget": {
-            "evidence": evidence_ref,
-            "strict_ps": True,
-            "lambda_dnh": cfg["loss"]["lambda_dnh"],
-            "gradient_share": gradient_share,
-            "loss_start_sample": cfg["loss_start_sample"],
-        },
+        "g0": {"receipt": evidence_ref},
+        "gradient_budget": {"receipt": evidence_ref},
         "loss_pilot_selection": {
-            "selection_rule": "minimum_recorded_val_score_db",
-            "conditional_alpha_085_triggered": False,
+            "selection_rule": PILOT_SELECTION_RULE,
             "candidates": candidates,
-            "winner": {"alpha": 0.7, "lambda_frame": 0.0},
         },
         "measured_probe": {
-            "evidence": evidence_ref,
-            "experiment_role": "measured_probe",
-            "init_eligible": False,
-            "run_until_step": 5_000,
-            "strict_ps": True,
-            "passed": True,
-            "alpha": 0.7,
-            "lambda_frame": 0.0,
+            "best_checkpoint": evidence_ref,
+            "last_checkpoint": evidence_ref,
+            "metrics": evidence_ref,
+            "manifest": evidence_ref,
+            "init_checkpoint": evidence_ref,
         },
         "a100_smoke_resume": _a100_smoke_ledger_refs(source_root, cfg),
     }
@@ -1126,32 +1104,81 @@ def _prerequisite_components(tmp_path, *, gradient_share: float = 0.3):
     return cfg, source_root, ledger_path
 
 
+def _validate_fixture_campaign(cfg: dict, source_root: Path):
+    """A100 smoke fixture에서는 새 raw-DSP validators만 분리한다.
+
+    이 파일의 fake ``*.npz``는 transfer/source/a100 receipt test를 빠르게 하기 위한
+    text fixture다. schema-v5 raw G0/pilot/probe 계산은
+    ``tests/test_campaign_evidence.py``의 real raw artifact fixture에서 다룬다.
+    """
+
+    pairs = iter(((0.7, 0.0, -4.0), (1.0, 0.0, -2.0)))
+
+    def pilot(*_args, **_kwargs):
+        alpha, frame, score = next(pairs)
+        return {
+            "pair": (alpha, frame),
+            "score_db": score,
+            "best_snapshot": SimpleNamespace(sha256=("a" if alpha == 0.7 else "b") * 64),
+        }
+
+    with patch.object(
+        campaign_prerequisite_module,
+        "validate_canonical_evidence_target",
+        return_value=cfg["experiment_contract"],
+    ), patch.object(
+        campaign_prerequisite_module,
+        "validate_g0_receipt",
+        return_value={},
+    ), patch.object(
+        campaign_prerequisite_module,
+        "validate_loss_pilot_candidate",
+        side_effect=pilot,
+    ), patch.object(
+        campaign_prerequisite_module,
+        "validate_gradient_budget_receipt",
+        return_value={},
+    ), patch.object(
+        campaign_prerequisite_module,
+        "validate_measured_probe",
+        return_value={},
+    ):
+        return validate_canonical_pretrain_prerequisites(cfg, repo_root=source_root)
+
+
 def test_canonical_pretrain_prerequisites_bind_every_campaign_gate(tmp_path):
     cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
-    ledger = validate_canonical_pretrain_prerequisites(
-        cfg, repo_root=source_root
-    )
-    assert ledger["g0"]["nmse_trusted_db"] < -6.0
+    ledger = _validate_fixture_campaign(cfg, source_root)
+    assert set(ledger["g0"]) == {"receipt"}
     assert set(ledger["a100_smoke_resume"]) == {
         "evidence",
         "environment_receipt",
         "telemetry",
     }
 
-    evidence = source_root / json.loads(ledger_path.read_text())["g0"]["evidence"]["path"]
-    evidence.write_text('{"verified":false}\n')
-    with pytest.raises(ValueError, match="evidence bytes SHA"):
-        validate_canonical_pretrain_prerequisites(cfg, repo_root=source_root)
+    # old scalar schema must not remain an accidental manual-evidence escape hatch.
+    legacy = json.loads(ledger_path.read_text())
+    legacy["schema_version"] = 4
+    ledger_path.write_text(json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8")
+    refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
+    with pytest.raises(ValueError, match="schema_version"):
+        _validate_fixture_campaign(refreshed, source_root)
 
 
-def test_canonical_pretrain_prerequisite_rejects_gradient_share_outside_budget(
-    tmp_path,
-):
-    cfg, source_root, _ = _prerequisite_components(
-        tmp_path, gradient_share=0.199999
-    )
-    with pytest.raises(ValueError, match="0.2–0.4"):
-        validate_canonical_pretrain_prerequisites(cfg, repo_root=source_root)
+def test_canonical_pretrain_prerequisite_rejects_manual_v4_gradient_fields(tmp_path):
+    cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["gradient_budget"] = {
+        "evidence": ledger["g0"]["receipt"],
+        "strict_ps": True,
+        "lambda_dnh": cfg["loss"]["lambda_dnh"],
+        "gradient_share": 0.3,
+        "loss_start_sample": cfg["loss_start_sample"],
+    }
+    ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
+    refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
+    with pytest.raises(ValueError, match="gradient budget key 집합"):
+        _validate_fixture_campaign(refreshed, source_root)
 
 
 def _restamp_campaign_anchor(cfg: dict, source_root: Path, ledger_path: Path) -> dict:
@@ -1173,7 +1200,7 @@ def test_a100_smoke_receipt_target_tamper_rejects_canonical_ledger(tmp_path):
     ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
     refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
     with pytest.raises(ValueError, match="target/role/init"):
-        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+        _validate_fixture_campaign(refreshed, source_root)
 
 
 def test_a100_smoke_role_misuse_rejects_canonical_ledger(tmp_path):
@@ -1187,7 +1214,7 @@ def test_a100_smoke_role_misuse_rejects_canonical_ledger(tmp_path):
     ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
     refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
     with pytest.raises(ValueError, match="target/role/init"):
-        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+        _validate_fixture_campaign(refreshed, source_root)
 
 
 def test_a100_smoke_resumed_checkpoint_tamper_rejects_ledger(tmp_path):
@@ -1213,7 +1240,7 @@ def test_a100_smoke_resumed_checkpoint_tamper_rejects_ledger(tmp_path):
     ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
     refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
     with pytest.raises(ValueError, match="model state"):
-        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+        _validate_fixture_campaign(refreshed, source_root)
 
 
 def test_a100_smoke_resume_input_mismatch_rejects_ledger(tmp_path):
@@ -1240,7 +1267,7 @@ def test_a100_smoke_resume_input_mismatch_rejects_ledger(tmp_path):
     ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
     refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
     with pytest.raises(ValueError, match="cfg.resume"):
-        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+        _validate_fixture_campaign(refreshed, source_root)
 
 
 def test_a100_smoke_default_stop_before_first_eval_allows_only_inf_sentinel(tmp_path):
@@ -1306,7 +1333,7 @@ def test_a100_smoke_rejects_actual_torch_cuda_environment_drift(tmp_path):
     ledger_path.write_text(json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8")
     refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
     with pytest.raises(ValueError, match="world1/CUDA/결정론"):
-        validate_canonical_pretrain_prerequisites(refreshed, repo_root=source_root)
+        _validate_fixture_campaign(refreshed, source_root)
 
 
 def test_a100_smoke_rejects_target_root_parent_symlink_escape(tmp_path):
@@ -1321,7 +1348,7 @@ def test_a100_smoke_rejects_target_root_parent_symlink_escape(tmp_path):
     shutil.move(str(smoke_parent), external)
     smoke_parent.symlink_to(external, target_is_directory=True)
     with pytest.raises(ValueError, match="심볼릭"):
-        validate_canonical_pretrain_prerequisites(cfg, repo_root=source_root)
+        _validate_fixture_campaign(cfg, source_root)
 
 
 def _completion_components(tmp_path):
