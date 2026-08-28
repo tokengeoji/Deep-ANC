@@ -107,11 +107,12 @@ ONNX·지연 파이프라인을 검증하는 데는 쓸 수 있지만, 실제 no
 - `digital_reference_lead_samples` 는 자기생성 소음의 실제 재생을 그만큼 FIFO로 늦춰
   모델에 확정된 선행 신호를 제공한다. 소음 게이트도 같은 FIFO를 통과하므로 ON/OFF 전환
   중에도 `ref[t]=source[t+lead]` 정렬을 유지한다.
-  **배포 중인 ONNX 는 `lead=109` 로 사전학습됐고 `configs/runtime_tiny.yaml` 도 109 다.**
-  그러나 **2026-08-05 플랜트 복구 후 실측 lead 는 116** 이다
-  (`S 1462 + handoff 256 − P 1602`). 7샘플(146 µs) 어긋난 상태이며, 새 파인튜닝이 116으로
-  끝나면 런타임 설정도 116으로 올린다. 런타임은 checkpoint/ONNX 메타와 설정이 다르면
-  **오디오를 열기 전에 거부**하므로 두 값이 조용히 섞이지는 않는다.
+  **legacy ONNX 는 `lead=109` 로 사전학습됐고 `configs/runtime_tiny.yaml`도 109다.**
+  현재 strict P/S의 실측 lead는 **115** (`S.delay 1245 + handoff 256 − P.delay 1386`)다.
+  따라서 legacy 설정은 runtime strict-plant preflight가 raw/analysis provenance와 함께
+  sounddevice import 전에 거부한다. 숫자만 115로 바꾸는 것은 legacy weight의 학습 timing을
+  바꾸지 않으므로 허용하지 않는다. canonical 115 checkpoint/ONNX와 완료된 현장 게이트가
+  생긴 뒤에만 별도 deployment config를 만든다.
 - 배포 템플릿 `configs/runtime.yaml`은 legacy artifact의 자동 오실행을 피하려고 0을
   유지한다. **artifact의 학습 lead와 런타임 lead를 반드시 같게** 맞춘다.
   `reference: mic`은 0 이외의 값을 거부한다.

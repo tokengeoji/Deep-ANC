@@ -16,6 +16,42 @@
 과거 `pretrain_*_corrected`, `finetune_tiny`, legacy P/S는 삭제하지 않지만 모두
 diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사용하지 않는다.
 
+### 2026-08-28 runtime physical timing audit
+
+현 Jetson의 `runtime_tiny.yaml`/`runtime.yaml`은 legacy artifact의 lead=109만
+서로 맞춘 설정이다. 현재 strict P/S capture
+`5ac1313488c8434bb4d672a36503df59`의 authoritative lead는
+`S.delay 1245 + handoff 256 − P.delay 1386 = 115`다. 6 samples(0.125 ms)의
+불일치는 2 kHz에서 약 90°, 4 kHz에서 약 180° 위상 오차가 될 수 있으므로,
+legacy 숫자를 115로 고쳐 실행하는 것은 금지한다.
+
+`src/deep_anc/realtime/plant_contract.py`는 digital-reference DL runtime이
+sounddevice import·engine 생성·입력 probe보다 먼저 다음을 read-only로 대조하도록
+추가됐다.
+
+- same-capture P/S metadata, 48 kHz/256/low, 채널, xrun/repeat/consistency
+- immutable raw/analysis SHA 및 paired level evidence(probe=0.003)
+- `PlantDelays.lead()`가 유도한 lead=115
+
+따라서 legacy runtime은 정상적으로 fail-closed 되어야 하며, current Tiny/Base의
+실제 덕트 ANC 성능 근거로 사용하지 않는다. canonical 115 checkpoint/ONNX와 G4,
+natural-crest evidence가 생긴 뒤 별도 deployment config를 만든다.
+
+### 2026-08-28 Jetson storage cleanup
+
+Google Drive의 `gdrive:DeepANC/jetson_data_backup_20260827/data/raw/music`는 local/remote
+file count·bytes, fixed manifest SHA, `rclone check --one-way`(0 differences)까지
+검증했다. 그 뒤 정확히 `data/raw/music/fma_small`만 삭제했다
+(8,002 files, 7,975,472,258 bytes). `fma_metadata/tracks.csv`(260,414,445 bytes)는
+Elice transfer lineage 입력이라 보존했다.
+
+`data/raw/noise/esc50/ESC-50-master/audio`도 Drive 내용 대조가
+`0 differences / 2,000 matching`인 것을 확인한 뒤에만 삭제했다
+(2,000 files, 882,088,000 bytes). `meta/esc50.csv`와 repository metadata는 남겼다.
+`raw/speech`는 아직 Drive 전송 중이므로 삭제하지 않는다. 두 검증 삭제 뒤 Jetson의
+실제 여유 공간은 11,261,136,896 bytes (약 10.49 GiB)다. strict P/S raw/analysis·82
+recorded 세션·RIR·manifest는 삭제 대상이 아니다.
+
 ### 2026-08-28 Elice v10 — 실제 cache-safe pre-init 증거
 
 Elice `~/Deep_ANC`에서 exact clean commit

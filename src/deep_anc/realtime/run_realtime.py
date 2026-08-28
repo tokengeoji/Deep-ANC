@@ -37,8 +37,13 @@ from ..audio_io import (
 )
 from ..config import REPO_ROOT, load_runtime_config
 from ..dsp.filters import DCBlocker
-from .engines import build_engine, secondary_path_npz
+from .engines import (
+    build_engine,
+    engine_digital_reference_lead_samples_from_config,
+    secondary_path_npz,
+)
 from .noise_gen import DigitalReferenceBuffer, NoiseProgram
+from .plant_contract import validate_runtime_plant_contract
 from .ring_buffer import SPSCRing
 from .safety import (
     BlockObservation,
@@ -307,16 +312,37 @@ def validate_digital_reference_lead(
 class RealtimeANC:
     """프로그래밍 API — evaluate_session 등에서 재사용. CLI 는 main() 참조."""
 
-    def __init__(self, cfg: dict, record_seconds: float = 0.0) -> None:
+    def __init__(
+        self,
+        cfg: dict,
+        record_seconds: float = 0.0,
+        *,
+        validate_plant_contract: bool = True,
+    ) -> None:
         if bool(cfg.get("start_on", False)):
             raise ValueError(
                 "안전 규약상 start_on=true는 허용되지 않습니다. "
                 "ANC는 OFF로 시작한 뒤 현장에서 명시적으로 켜야 합니다."
             )
 
+        # 실제 P/S와의 lead 검증은 sounddevice import·engine 생성보다도 앞선다.
+        # legacy 109-sample artifact가 strict plant(115)에 맞는 것처럼 시작하는 경로를
+        # 없앤다. --calibrate의 ChirpEngine은 모델 배포가 아니라 별도 경로 지연 측정이라
+        # 해당 함수가 명시적으로 이 검사를 끈다.
+        self.plant_contract = (
+            validate_runtime_plant_contract(cfg) if validate_plant_contract else None
+        )
+
         reference = str(cfg.get("reference", "digital"))
         digital_reference_lead = validate_digital_reference_lead(
             reference, cfg.get("digital_reference_lead_samples", 0)
+        )
+
+        # API 호출도 CLI preflight를 우회할 수 없다. artifact의 lead를 먼저 metadata만
+        # 읽어 비교하므로 legacy config를 115로 덮어도 PortAudio import 이전에 막힌다.
+        preflight_engine_lead = engine_digital_reference_lead_samples_from_config(cfg)
+        validate_digital_reference_lead(
+            reference, digital_reference_lead, preflight_engine_lead
         )
 
         import sounddevice as sd
@@ -747,7 +773,11 @@ def run_calibrate(cfg: dict) -> int:
     # mute 한다** — 캘리브레이션 중이라고 보이스코일에 DC 를 흘려도 되는 것은 아니다.
     cfg["safety"] = dict(cfg.get("safety", {}))
     cfg["safety"]["measurement_mode"] = True
-    anc = RealtimeANC(cfg, record_seconds=seconds + 2.0)
+    anc = RealtimeANC(
+        cfg,
+        record_seconds=seconds + 2.0,
+        validate_plant_contract=False,
+    )
     anc.engine = ChirpEngine(anc.hop)
     anc.state.anc_enabled = True          # 게이트를 열어 처프를 내보낸다
     anc.anc_gate.set_target(1.0)
@@ -806,14 +836,43 @@ def main() -> int:
         print(format_sounddevice_devices())
         return 0
 
+    try:
+        cfg = load_runtime_config(args.config, args.overrides)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"[중단] runtime 설정 해석 실패: {exc}", file=sys.stderr)
+        return 2
+
+    # 이 검사는 파일/metadata만 읽으며 스피커·마이크를 열지 않는다. 사용자 확인보다
+    # 앞서 수행해 legacy lead 불일치를 즉시 드러내되, 실제 출력은 아래 확인 세 개가
+    # 모두 있어야만 가능하다.
+    if not args.calibrate:
+        try:
+            validate_runtime_plant_contract(cfg)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[중단] strict runtime plant 계약 실패: {exc}", file=sys.stderr)
+            return 2
+
+    # 엔진 artifact와 lead metadata도 hardware를 열기 전에 검사한다. 그 뒤에야
+    # confirmation·PortAudio input probe 순으로 진행한다.
+    try:
+        for warning in require_engine_artifacts_to_start(cfg):
+            print(f"[경고] {warning}", file=sys.stderr)
+        preflight_engine_lead = engine_digital_reference_lead_samples_from_config(cfg)
+        validate_digital_reference_lead(
+            str(cfg.get("reference", "digital")),
+            int(cfg.get("digital_reference_lead_samples", 0)),
+            preflight_engine_lead,
+        )
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        print(f"[중단] runtime engine preflight 실패: {exc}", file=sys.stderr)
+        return 2
+
     if not (args.confirm_speaker and args.confirm_user_present and args.confirm_volume_minimum):
         print(
             "[중단] 런타임 출력에는 --confirm-speaker, --confirm-user-present, "
             "--confirm-volume-minimum이 모두 필요합니다.", file=sys.stderr
         )
         return 2
-
-    cfg = load_runtime_config(args.config, args.overrides)
     try:
         import sounddevice as sd
         from ..dsp.measurement_level import assert_live_pcm_clock_preconditions
@@ -821,15 +880,6 @@ def main() -> int:
         assert_measurement_preconditions(sd, cfg["hardware"]["audio"])
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"[중단] 오디오 사전점검 실패: {exc}", file=sys.stderr)
-        return 2
-    # 엔진 아티팩트 확인은 **오디오 장치를 열기 전에** 한다. 마이크 프로브보다도
-    # 먼저인 이유는 이 검사가 하드웨어를 전혀 건드리지 않고 즉시 끝나기 때문이다 —
-    # 없는 파일 때문에 실패할 실행에 스피커를 울릴 이유가 없다.
-    try:
-        for warning in require_engine_artifacts_to_start(cfg):
-            print(f"[경고] {warning}", file=sys.stderr)
-    except FileNotFoundError as exc:
-        print(f"[중단] {exc}", file=sys.stderr)
         return 2
     try:
         if not input_preflight(cfg, seconds=args.input_probe_seconds):

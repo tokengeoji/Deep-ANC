@@ -1,8 +1,9 @@
-# 배포 후보 런타임 — hybrid_anc_tiny + ONNX Runtime.
+# legacy diagnostic runtime — hybrid_anc_tiny + ONNX Runtime.
 #
-# base 와 tiny 를 동일 held-out 조건에서 비교한 결과 tiny 가 7/7 소스에서 앞섰고
-# 최악 소스 fullband 도 base +13.89dB 대비 tiny +4.06dB 로 안전했다. 따라서 실기
-# 런타임의 기본 후보는 tiny 다 (근거: runs/pretrain_{base,tiny}_corrected/eval_final_*).
+# 이 파일은 과거 artifact를 보존·감사하기 위한 것이며 실제 덕트 배포 후보가 아니다.
+# 현재 strict P/S가 유도하는 lead=115와 여기의 legacy ONNX lead=109가 다르므로
+# run_realtime은 sounddevice import 전에 이 설정을 거부한다. canonical fine-tune 뒤
+# strict 115 contract와 G4/crest evidence를 가진 별도 runtime artifact만 배포한다.
 #
 # ⚠ 이 checkpoint 의 physics_status 는 secondary_surrogate_representation_pretrain 이다.
 # P(z)=S(z) 대용품으로 학습했으므로 **실측 덕트 성능을 주장할 수 없다.** 실측 P/S 로
@@ -21,21 +22,18 @@ controller: dl
 # (S 순수지연 1342 + 스레드 핸드오프 256) − D_noise 1489 = 109.
 # checkpoint/ONNX 메타와 불일치하면 오디오를 열기 전에 거부된다.
 #
-# ⚠ 109 는 **현재 배포 중인 ONNX 기준**이고 실측 플랜트와 다르다.
+# ⚠ 109 는 legacy ONNX 기준일 뿐 실제 strict 플랜트와 다르다.
 # 이 모델은 실측 P/S 확보 전에 추정값(S 1342 + handoff 256 − D_noise 1489)으로
-# 사전학습했다. 2026-08-05 플랜트 복구 결과 실측 lead 는 **116** 이다
-# (S 1462 + handoff 256 − P 1602; 독립 캡처 9건에서 115~117, 중앙 116).
-# configs/data_sim.yaml 이 116 을 쓴다.
+# 사전학습했다. 현재 strict capture 5ac13134의 실측 lead는 **115**다
+# (S.delay 1245 + handoff 256 − P.delay 1386). configs/data_sim.yaml의
+# compact-P resolved contract도 같은 115를 유도한다.
 #
 # 즉 109 는 checkpoint/ONNX/plan 메타와 **자기들끼리만** 일관되고 실제 덕트와는
-# 7 샘플(146 µs) 어긋난다. 런타임 자체검사(validate_digital_reference_lead)는
-# runtime↔checkpoint 만 보므로 이 불일치를 잡지 못한다 — "일관성 검사"가
-# "정확성 검사"를 대신하고 있는 상태다. 정확성은 파인튜닝 진입 게이트
-# path_delay_and_lead 가 지킨다(설정 lead == 실측 S+handoff−P 를 정확히 요구).
+# 6 샘플(125 µs) 어긋난다. runtime strict plant 계약이 P/S raw·analysis SHA,
+# capture_id, level evidence, lead=115를 오디오 장치보다 먼저 대조해 차단한다.
 #
-# 실측 lead 스캔(150-600Hz, 정규방정식): 0 → −5.54 / 116 → −6.53 dB.
-# lead 오차는 조용한 성능 손실이지 오류가 아니므로 로그에 남지 않는다.
-# 파인튜닝이 116 으로 끝나면 새 ONNX 를 내보내고 이 값을 116 으로 올린다.
+# lead 오차는 고역에서 위상 오차가 되므로 조용한 성능 손실로 취급하지 않는다.
+# 숫자만 115로 바꾸면 legacy weight와 다시 불일치하므로 금지한다.
 digital_reference_lead_samples: 109
 
 engine:

@@ -289,9 +289,10 @@ class Lead(BaseModel):
     이 관계를 손으로 다시 쓰면 반드시 갈라진다 — 실제로 trainer 와 게이트가 109 와
     113 으로 갈라졌다. 그래서 생성자를 직접 부르면 ``TypeError`` 다.
 
-    실측 기준값(2026-08-05, 캡처 225546_f7b0fecd): S 1462 + handoff 256 − P 1602 = **116**.
-    독립 캡처 9건에서 115/116/116/116/116/116/116/116/117 로 재현된다. 절대 지연은
-    클록 드리프트(364~729ppm) 때문에 재현되지 않지만 **P−S = 140** 과 lead 는 재현된다.
+    역사적 2026-08-05 capture 225546_f7b0fecd는 116이었지만, 현재 strict official
+    capture 5ac1313488c8434bb4d672a36503df59의 단일 출처는
+    ``S.delay 1245 + handoff 256 − P.delay 1386 = 115``다. 절대 지연은 capture마다
+    재현되지 않으므로 P/S는 반드시 같은 capture·같은 anchor에서 함께 읽어야 한다.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
