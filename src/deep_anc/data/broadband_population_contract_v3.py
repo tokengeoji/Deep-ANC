@@ -40,6 +40,16 @@ REQUIRED_SPLITS = ("train", "val", "test")
 MIN_DENSITY_RATIO = 0.25
 MIN_COMPONENTS_PER_SPLIT_FAMILY_BAND = 4
 MIN_VALID_ITEMS_PER_BATCH_BAND = 4
+MAX_QUALIFIED_ITEMS_V3 = 65_536
+MAX_BATCH_SIZE_V3 = 256
+STRUCTURAL_BATCH_SEARCH_ATTEMPTS_V3 = 256
+POPULATION_V3_SCAFFOLD_BLOCKERS = (
+    "POPULATION_V3_AUTHORITY is None",
+    "EXTERNAL_MANIFEST_AUTHORITY_NOT_BOUND",
+    "CONNECTED_COMPONENT_AUTHORITY_NOT_BOUND",
+    "INTERVAL_ALIAS_AUTHORITY_NOT_BOUND",
+    "LOCAL_FILE_RECOMPUTATION_IS_NOT_EXTERNAL_RAW_AUTHORITY",
+)
 POPULATION_V3_AUTHORITY: dict[str, str] | None = None
 
 
@@ -395,8 +405,8 @@ class PopulationAuditV3(BaseModel):
     schema_version: Literal["broadband_population_source_audit_v3"] = (
         "broadband_population_source_audit_v3"
     )
-    role: Literal["actual_bytes_recomputed_structural_audit"] = (
-        "actual_bytes_recomputed_structural_audit"
+    role: Literal["local_recomputation_scaffold_not_external_raw_authority"] = (
+        "local_recomputation_scaffold_not_external_raw_authority"
     )
     contract: PopulationCoverageContractV3
     contract_sha256: str
@@ -404,9 +414,15 @@ class PopulationAuditV3(BaseModel):
     structural_status: Literal["PASS", "BLOCKED"]
     canonical_status: Literal["BLOCKED"] = "BLOCKED"
     authority: None = None
+    external_manifest_authority_bound: Literal[False] = False
+    connected_component_authority_bound: Literal[False] = False
+    interval_alias_authority_bound: Literal[False] = False
+    actual_raw_manifest_authority_bound: Literal[False] = False
     blockers: tuple[str, ...]
     candidates_verified: int = Field(gt=0)
-    qualified_items: tuple[QualifiedPopulationItemV3, ...]
+    qualified_items: tuple[QualifiedPopulationItemV3, ...] = Field(
+        max_length=MAX_QUALIFIED_ITEMS_V3
+    )
     coverage: tuple[PopulationCoverageRowV3, ...]
     all_bands_per_clip_required: Literal[False] = False
     density_threshold_lowered: Literal[False] = False
@@ -424,6 +440,23 @@ class PopulationAuditV3(BaseModel):
         ids = [item.item_id for item in self.qualified_items]
         if len(ids) != len(set(ids)):
             raise ValueError("audit qualified item_id가 중복됐습니다")
+        candidate_assignment: dict[str, tuple[str, str, str]] = {}
+        lineage_assignment: dict[str, tuple[str, str]] = {}
+        for item in self.qualified_items:
+            candidate_value = (
+                item.split,
+                item.source_family,
+                item.lineage_component_id,
+            )
+            prior_candidate = candidate_assignment.get(item.candidate_id)
+            if prior_candidate is not None and prior_candidate != candidate_value:
+                raise ValueError("audit candidate가 split/family/lineage를 넘나듭니다")
+            candidate_assignment[item.candidate_id] = candidate_value
+            lineage_value = (item.split, item.source_family)
+            prior_lineage = lineage_assignment.get(item.lineage_component_id)
+            if prior_lineage is not None and prior_lineage != lineage_value:
+                raise ValueError("audit lineage component가 split/family를 넘나듭니다")
+            lineage_assignment[item.lineage_component_id] = lineage_value
 
         control = canonical.control_band_contract
         expected: dict[tuple[str, str, str, int], tuple[float, float]] = {}
@@ -450,11 +483,35 @@ class PopulationAuditV3(BaseModel):
             raise ValueError("audit coverage가 split×family×band 전체를 덮지 않습니다")
         if any(actual[key].band_hz != band for key, band in expected.items()):
             raise ValueError("audit coverage band가 inline v3와 다릅니다")
+        for key, row in actual.items():
+            split, family, role, band_index = key
+            attribute = (
+                "physical_valid_bands"
+                if role == "physical_identification"
+                else "objective_octave_valid_bands"
+            )
+            lineage_count = len(
+                {
+                    item.lineage_component_id
+                    for item in self.qualified_items
+                    if item.split == split
+                    and item.source_family == family
+                    and bool(getattr(item, attribute)[band_index])
+                }
+            )
+            if row.independent_lineage_components != lineage_count:
+                raise ValueError(
+                    "audit coverage independent lineage count가 qualified item과 다릅니다"
+                )
         expected_status = "PASS" if all(row.passed for row in self.coverage) else "BLOCKED"
         if self.structural_status != expected_status:
             raise ValueError("audit structural status와 coverage 결과가 모순됩니다")
-        if not any("AUTHORITY is None" in blocker for blocker in self.blockers):
-            raise ValueError("audit가 authority=None blocker를 누락했습니다")
+        missing_blockers = set(POPULATION_V3_SCAFFOLD_BLOCKERS) - set(self.blockers)
+        if missing_blockers:
+            raise ValueError(
+                "audit가 external authority scaffold blocker를 누락했습니다: "
+                f"{sorted(missing_blockers)!r}"
+            )
         return self
 
     def digest(self) -> str:
@@ -462,27 +519,48 @@ class PopulationAuditV3(BaseModel):
 
 
 class PopulationBatchPlanV3(BaseModel):
+    """Schema/consistency scaffold; ``model_validate``는 admission parser가 아니다."""
+
     model_config = _FROZEN
 
     schema_version: Literal["broadband_population_batch_plan_v3"] = (
         "broadband_population_batch_plan_v3"
     )
-    role: Literal["structural_feasibility_not_training_authority"] = (
-        "structural_feasibility_not_training_authority"
+    role: Literal["incomplete_structural_search_not_admission_parser"] = (
+        "incomplete_structural_search_not_admission_parser"
     )
     contract_sha256: str
     population_audit_sha256: str
+    population_audit_rng_entropy_material_sha256: str
     split: Literal["train", "val"]
     batch_index: int = Field(ge=0)
-    seed: int
-    batch_size: int = Field(gt=0)
-    selected_item_ids: tuple[str, ...]
+    seed: int = Field(ge=0)
+    batch_size: int = Field(gt=0, le=MAX_BATCH_SIZE_V3)
+    selected_items: tuple[QualifiedPopulationItemV3, ...] = Field(
+        max_length=MAX_BATCH_SIZE_V3
+    )
+    selected_item_ids: tuple[str, ...] = Field(max_length=MAX_BATCH_SIZE_V3)
+    selected_candidate_ids: tuple[str, ...] = Field(max_length=MAX_BATCH_SIZE_V3)
+    selected_lineage_component_ids: tuple[str, ...] = Field(
+        max_length=MAX_BATCH_SIZE_V3
+    )
     family_counts: tuple[tuple[str, int], ...]
     physical_valid_item_counts: tuple[int, ...]
     objective_octave_valid_item_counts: tuple[int, ...]
+    physical_distinct_lineage_counts: tuple[int, ...]
+    objective_octave_distinct_lineage_counts: tuple[int, ...]
     minimum_valid_items_per_band: Literal[4] = 4
     structural_status: Literal["PASS"] = "PASS"
     canonical_training_status: Literal["BLOCKED"] = "BLOCKED"
+    external_manifest_authority_bound: Literal[False] = False
+    connected_component_authority_bound: Literal[False] = False
+    interval_alias_authority_bound: Literal[False] = False
+    actual_raw_manifest_authority_bound: Literal[False] = False
+    component_uniform_long_run_sampler_proven: Literal[False] = False
+    feasibility_search_complete: Literal[False] = False
+    feasibility_false_negative_possible: Literal[True] = True
+    feasibility_search_attempt_limit: Literal[256] = STRUCTURAL_BATCH_SEARCH_ATTEMPTS_V3
+    standalone_model_validate_is_admission_parser: Literal[False] = False
     authority: None = None
 
     @model_validator(mode="after")
@@ -491,26 +569,111 @@ class PopulationBatchPlanV3(BaseModel):
         if self.contract_sha256 != contract.digest():
             raise ValueError("batch plan population contract SHA가 다릅니다")
         _require_sha("population_audit_sha256", self.population_audit_sha256)
-        if len(self.selected_item_ids) != self.batch_size or len(
-            set(self.selected_item_ids)
-        ) != self.batch_size:
+        _require_sha(
+            "population_audit_rng_entropy_material_sha256",
+            self.population_audit_rng_entropy_material_sha256,
+        )
+        expected_entropy_sha = hashlib.sha256(
+            bytes.fromhex(self.population_audit_sha256)
+        ).hexdigest()
+        if self.population_audit_rng_entropy_material_sha256 != expected_entropy_sha:
+            raise ValueError("population audit RNG entropy material SHA가 다릅니다")
+        if self.batch_size <= len(REQUIRED_SOURCE_FAMILIES):
+            raise ValueError("v3 structural batch_size=4는 금지됩니다")
+        if len(self.selected_items) != self.batch_size:
+            raise ValueError("batch selected item 증거 수가 batch_size와 다릅니다")
+        expected_item_ids = tuple(item.item_id for item in self.selected_items)
+        expected_candidate_ids = tuple(item.candidate_id for item in self.selected_items)
+        expected_lineage_ids = tuple(
+            item.lineage_component_id for item in self.selected_items
+        )
+        if (
+            self.selected_item_ids != expected_item_ids
+            or self.selected_candidate_ids != expected_candidate_ids
+            or self.selected_lineage_component_ids != expected_lineage_ids
+        ):
+            raise ValueError("batch item/candidate/lineage 벡터가 선택 증거와 다릅니다")
+        if len(set(self.selected_item_ids)) != self.batch_size:
             raise ValueError("batch item 수/고유성이 batch_size와 다릅니다")
+        if len(set(self.selected_lineage_component_ids)) != self.batch_size:
+            raise ValueError("batch에서 같은 lineage component를 두 번 선택할 수 없습니다")
         if any(not item_id.strip() for item_id in self.selected_item_ids):
             raise ValueError("batch item_id가 비었습니다")
+        if any(item.split != self.split for item in self.selected_items):
+            raise ValueError("batch selected item의 split이 plan과 다릅니다")
+        candidate_assignment: dict[str, tuple[str, str]] = {}
+        lineage_assignment: dict[str, str] = {}
+        for item in self.selected_items:
+            candidate_value = (item.source_family, item.lineage_component_id)
+            prior_candidate = candidate_assignment.get(item.candidate_id)
+            if prior_candidate is not None and prior_candidate != candidate_value:
+                raise ValueError("batch candidate가 family/lineage를 넘나듭니다")
+            candidate_assignment[item.candidate_id] = candidate_value
+            prior_family = lineage_assignment.get(item.lineage_component_id)
+            if prior_family is not None and prior_family != item.source_family:
+                raise ValueError("batch lineage component가 family를 넘나듭니다")
+            lineage_assignment[item.lineage_component_id] = item.source_family
         if self.batch_size % len(REQUIRED_SOURCE_FAMILIES):
             raise ValueError("batch_size가 네 family로 나뉘지 않습니다")
         quota = self.batch_size // len(REQUIRED_SOURCE_FAMILIES)
-        expected_families = tuple((family, quota) for family in REQUIRED_SOURCE_FAMILIES)
-        if self.family_counts != expected_families:
+        expected_families = tuple(
+            (
+                family,
+                sum(item.source_family == family for item in self.selected_items),
+            )
+            for family in REQUIRED_SOURCE_FAMILIES
+        )
+        if self.family_counts != expected_families or any(
+            count != quota for _, count in expected_families
+        ):
             raise ValueError("batch family count가 정확히 균형이 아닙니다")
-        if len(self.physical_valid_item_counts) != 8 or min(
-            self.physical_valid_item_counts
-        ) < 4:
+        physical_item_counts = tuple(
+            sum(item.physical_valid_bands[index] for item in self.selected_items)
+            for index in range(8)
+        )
+        octave_item_counts = tuple(
+            sum(
+                item.objective_octave_valid_bands[index]
+                for item in self.selected_items
+            )
+            for index in range(7)
+        )
+        physical_lineage_counts = tuple(
+            len(
+                {
+                    item.lineage_component_id
+                    for item in self.selected_items
+                    if item.physical_valid_bands[index]
+                }
+            )
+            for index in range(8)
+        )
+        octave_lineage_counts = tuple(
+            len(
+                {
+                    item.lineage_component_id
+                    for item in self.selected_items
+                    if item.objective_octave_valid_bands[index]
+                }
+            )
+            for index in range(7)
+        )
+        if self.physical_valid_item_counts != physical_item_counts:
+            raise ValueError("batch physical valid item count가 선택 증거와 다릅니다")
+        if self.objective_octave_valid_item_counts != octave_item_counts:
+            raise ValueError("batch objective valid item count가 선택 증거와 다릅니다")
+        if self.physical_distinct_lineage_counts != physical_lineage_counts:
+            raise ValueError("batch physical distinct lineage count가 선택 증거와 다릅니다")
+        if self.objective_octave_distinct_lineage_counts != octave_lineage_counts:
+            raise ValueError("batch objective distinct lineage count가 선택 증거와 다릅니다")
+        if len(physical_item_counts) != 8 or min(physical_item_counts) < 4:
             raise ValueError("batch physical band valid item 수가 4 미만입니다")
-        if len(self.objective_octave_valid_item_counts) != 7 or min(
-            self.objective_octave_valid_item_counts
-        ) < 4:
+        if len(octave_item_counts) != 7 or min(octave_item_counts) < 4:
             raise ValueError("batch objective octave valid item 수가 4 미만입니다")
+        if min(physical_lineage_counts) < 4:
+            raise ValueError("batch physical band distinct lineage가 4 미만입니다")
+        if min(octave_lineage_counts) < 4:
+            raise ValueError("batch objective octave distinct lineage가 4 미만입니다")
         return self
 
     def digest(self) -> str:
@@ -731,6 +894,10 @@ def audit_population_manifest_v3(
             for band, valid in zip(octave_bands, octave_valid, strict=True):
                 if valid and candidate.native_nyquist_hz < band[1]:
                     raise ValueError(f"{item.item_id}: native Nyquist로 objective octave를 덮지 못합니다")
+            if len(qualified) >= MAX_QUALIFIED_ITEMS_V3:
+                raise ValueError(
+                    f"qualified item은 {MAX_QUALIFIED_ITEMS_V3}개를 넘을 수 없습니다"
+                )
             qualified.append(
                 QualifiedPopulationItemV3(
                     item_id=item.item_id,
@@ -786,8 +953,8 @@ def audit_population_manifest_v3(
     canonical_blockers = list(blockers)
     canonical_blockers.extend(
         (
-            "POPULATION_V3_AUTHORITY is None",
-            "structural actual-byte audit cannot self-issue training authority",
+            *POPULATION_V3_SCAFFOLD_BLOCKERS,
+            "local file recomputation scaffold cannot self-issue training authority",
         )
     )
     return PopulationAuditV3(
@@ -810,34 +977,51 @@ def plan_structural_batch_v3(
     batch_index: int,
     seed: int,
 ) -> PopulationBatchPlanV3:
-    """family-balanced set-cover 가능성만 증명하며 canonical training을 열지 않는다."""
+    """family→lineage→item set-cover만 증명하며 training을 열지 않는다."""
 
     if audit.structural_status != "PASS":
         raise PopulationV3Blocked("population structural coverage가 BLOCKED입니다")
     size = int(batch_size)
-    if size <= 0 or size % len(REQUIRED_SOURCE_FAMILIES):
+    if size <= len(REQUIRED_SOURCE_FAMILIES):
+        raise ValueError("v3 structural batch_size=4는 금지됩니다")
+    if size > MAX_BATCH_SIZE_V3:
+        raise ValueError(f"v3 batch_size는 {MAX_BATCH_SIZE_V3}를 넘을 수 없습니다")
+    if size % len(REQUIRED_SOURCE_FAMILIES):
         raise ValueError("batch_size는 네 family로 정확히 나뉘는 양수여야 합니다")
     if int(batch_index) < 0:
         raise ValueError("batch_index는 0 이상이어야 합니다")
+    if int(seed) < 0:
+        raise ValueError("seed는 0 이상이어야 합니다")
     quota = size // len(REQUIRED_SOURCE_FAMILIES)
     pool = [item for item in audit.qualified_items if item.split == split]
+    audit_bytes = bytes.fromhex(audit.digest())
+    audit_entropy = tuple(
+        int.from_bytes(audit_bytes[offset : offset + 4], "little")
+        for offset in range(0, len(audit_bytes), 4)
+    )
     selected: list[QualifiedPopulationItemV3] | None = None
-    for attempt in range(256):
+    for attempt in range(STRUCTURAL_BATCH_SEARCH_ATTEMPTS_V3):
         rng = np.random.default_rng(
-            np.random.SeedSequence([int(seed), int(batch_index), int(attempt), 0x5033])
+            np.random.SeedSequence(
+                [int(seed), int(batch_index), int(attempt), 0x5033, *audit_entropy]
+            )
         )
         remaining = list(pool)
         chosen: list[QualifiedPopulationItemV3] = []
         family_counts = {family: 0 for family in REQUIRED_SOURCE_FAMILIES}
         physical_counts = [0] * 8
         octave_counts = [0] * 7
+        physical_lineages = [set() for _ in range(8)]
+        octave_lineages = [set() for _ in range(7)]
         for _ in range(size):
             best_score = -1
-            best: list[QualifiedPopulationItemV3] = []
+            best_by_lineage: dict[
+                tuple[str, str], list[QualifiedPopulationItemV3]
+            ] = {}
             for item in remaining:
                 if family_counts[item.source_family] >= quota:
                     continue
-                score = sum(
+                item_gain = sum(
                     count < MIN_VALID_ITEMS_PER_BATCH_BAND and valid
                     for count, valid in zip(
                         physical_counts, item.physical_valid_bands, strict=True
@@ -848,32 +1032,83 @@ def plan_structural_batch_v3(
                         octave_counts, item.objective_octave_valid_bands, strict=True
                     )
                 )
+                lineage_gain = sum(
+                    len(lineages) < MIN_VALID_ITEMS_PER_BATCH_BAND
+                    and valid
+                    and item.lineage_component_id not in lineages
+                    for lineages, valid in zip(
+                        physical_lineages, item.physical_valid_bands, strict=True
+                    )
+                ) + sum(
+                    len(lineages) < MIN_VALID_ITEMS_PER_BATCH_BAND
+                    and valid
+                    and item.lineage_component_id not in lineages
+                    for lineages, valid in zip(
+                        octave_lineages,
+                        item.objective_octave_valid_bands,
+                        strict=True,
+                    )
+                )
+                score = 2 * lineage_gain + item_gain
+                lineage_key = (item.source_family, item.lineage_component_id)
                 if score > best_score:
                     best_score = int(score)
-                    best = [item]
+                    best_by_lineage = {lineage_key: [item]}
                 elif score == best_score:
-                    best.append(item)
-            if not best:
+                    best_by_lineage.setdefault(lineage_key, []).append(item)
+            if not best_by_lineage:
                 break
-            item = best[int(rng.integers(len(best)))]
+            lineage_keys = sorted(best_by_lineage)
+            lineage_key = lineage_keys[int(rng.integers(len(lineage_keys)))]
+            candidate_groups: dict[str, list[QualifiedPopulationItemV3]] = {}
+            for candidate_item in best_by_lineage[lineage_key]:
+                candidate_groups.setdefault(candidate_item.candidate_id, []).append(
+                    candidate_item
+                )
+            candidate_ids = sorted(candidate_groups)
+            candidate_id = candidate_ids[int(rng.integers(len(candidate_ids)))]
+            candidate_items = sorted(
+                candidate_groups[candidate_id], key=lambda value: value.item_id
+            )
+            item = candidate_items[int(rng.integers(len(candidate_items)))]
             chosen.append(item)
-            remaining.remove(item)
+            remaining = [
+                candidate
+                for candidate in remaining
+                if candidate.lineage_component_id != item.lineage_component_id
+            ]
             family_counts[item.source_family] += 1
             for index, valid in enumerate(item.physical_valid_bands):
                 physical_counts[index] += int(valid)
+                if valid:
+                    physical_lineages[index].add(item.lineage_component_id)
             for index, valid in enumerate(item.objective_octave_valid_bands):
                 octave_counts[index] += int(valid)
+                if valid:
+                    octave_lineages[index].add(item.lineage_component_id)
         if (
             len(chosen) == size
             and set(family_counts.values()) == {quota}
             and all(count >= MIN_VALID_ITEMS_PER_BATCH_BAND for count in physical_counts)
             and all(count >= MIN_VALID_ITEMS_PER_BATCH_BAND for count in octave_counts)
+            and all(
+                len(lineages) >= MIN_VALID_ITEMS_PER_BATCH_BAND
+                for lineages in physical_lineages
+            )
+            and all(
+                len(lineages) >= MIN_VALID_ITEMS_PER_BATCH_BAND
+                for lineages in octave_lineages
+            )
         ):
             selected = chosen
             break
     if selected is None:
         raise PopulationV3Blocked(
-            "family-balanced batch에서 physical/objective band별 valid item>=4를 구성할 수 없습니다"
+            "family-balanced batch에서 physical/objective band별 valid item>=4 "
+            "및 distinct lineage>=4를 구성할 수 없습니다. "
+            f"{STRUCTURAL_BATCH_SEARCH_ATTEMPTS_V3}-attempt randomized greedy는 "
+            "incomplete feasibility search이므로 "
+            "실제 feasible population에서도 false negative가 가능합니다"
         )
     family_counts = tuple(
         (family, sum(item.source_family == family for item in selected))
@@ -886,17 +1121,47 @@ def plan_structural_batch_v3(
         sum(item.objective_octave_valid_bands[index] for item in selected)
         for index in range(7)
     )
+    physical_lineage_counts = tuple(
+        len(
+            {
+                item.lineage_component_id
+                for item in selected
+                if item.physical_valid_bands[index]
+            }
+        )
+        for index in range(8)
+    )
+    octave_lineage_counts = tuple(
+        len(
+            {
+                item.lineage_component_id
+                for item in selected
+                if item.objective_octave_valid_bands[index]
+            }
+        )
+        for index in range(7)
+    )
     return PopulationBatchPlanV3(
         contract_sha256=audit.contract_sha256,
         population_audit_sha256=audit.digest(),
+        population_audit_rng_entropy_material_sha256=hashlib.sha256(
+            bytes.fromhex(audit.digest())
+        ).hexdigest(),
         split=split,
         batch_index=int(batch_index),
         seed=int(seed),
         batch_size=size,
+        selected_items=tuple(selected),
         selected_item_ids=tuple(item.item_id for item in selected),
+        selected_candidate_ids=tuple(item.candidate_id for item in selected),
+        selected_lineage_component_ids=tuple(
+            item.lineage_component_id for item in selected
+        ),
         family_counts=family_counts,
         physical_valid_item_counts=physical_counts,
         objective_octave_valid_item_counts=octave_counts,
+        physical_distinct_lineage_counts=physical_lineage_counts,
+        objective_octave_distinct_lineage_counts=octave_lineage_counts,
     )
 
 
@@ -904,10 +1169,13 @@ __all__ = [
     "CausalPrimaryOperatorV3",
     "CurrentPopulationV3Gate",
     "LocalFileReferenceV3",
+    "MAX_BATCH_SIZE_V3",
+    "MAX_QUALIFIED_ITEMS_V3",
     "MIN_COMPONENTS_PER_SPLIT_FAMILY_BAND",
     "MIN_DENSITY_RATIO",
     "MIN_VALID_ITEMS_PER_BATCH_BAND",
     "POPULATION_V3_AUTHORITY",
+    "POPULATION_V3_SCAFFOLD_BLOCKERS",
     "PopulationAuditV3",
     "PopulationBatchPlanV3",
     "PopulationCandidateV3",
@@ -915,6 +1183,7 @@ __all__ = [
     "PopulationItemClaimV3",
     "PopulationManifestV3",
     "PopulationV3Blocked",
+    "STRUCTURAL_BATCH_SEARCH_ATTEMPTS_V3",
     "UntouchedLevel5PolicyV3",
     "apply_causal_primary_v3",
     "audit_population_manifest_v3",

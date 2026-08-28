@@ -15,7 +15,7 @@ import hashlib
 import json
 from typing import Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..dsp.control_band_contract import (
     BROADBAND_V3_OCTAVE_OBJECTIVE_BANDS_HZ,
@@ -24,8 +24,10 @@ from ..dsp.control_band_contract import (
     resolve_control_band_contract,
 )
 from .broadband_population_contract_v3 import (
+    MAX_BATCH_SIZE_V3,
     MIN_VALID_ITEMS_PER_BATCH_BAND,
     PopulationAuditV3,
+    PopulationBatchPlanV3,
     PopulationV3Blocked,
     plan_structural_batch_v3,
 )
@@ -35,10 +37,15 @@ FULL_OCTAVE_BATCH_PRIMITIVE_SCHEMA = "broadband_full_octave_batch_primitive_v3"
 FULL_OCTAVE_GLOBAL_ITEM_SCHEMA = "broadband_full_octave_global_item_v3"
 FULL_OCTAVE_BATCH_BLOCKER = "BLOCKED_INCOMPLETE_BROADBAND_V3_ADMISSION"
 FULL_OCTAVE_BATCH_ADMISSION_BLOCKERS = (
+    "POPULATION_V3_AUTHORITY is None",
     "MISSING_LIVE_V5_CAUSAL_AUTHORITY_ENVELOPE",
     "MISSING_OUTPUT_Y_GRADIENT_SHARE_0P2_0P4_CALIBRATION",
     "MISSING_ACTUAL_FAMILY_BALANCED_BATCH_RECEIPT_BINDING",
     "MISSING_CAUSAL_PREFIX_OPERATOR_TIMING_BINDING",
+    "EXTERNAL_MANIFEST_AUTHORITY_NOT_BOUND",
+    "CONNECTED_COMPONENT_AUTHORITY_NOT_BOUND",
+    "INTERVAL_ALIAS_AUTHORITY_NOT_BOUND",
+    "LOCAL_FILE_RECOMPUTATION_IS_NOT_EXTERNAL_RAW_AUTHORITY",
 )
 REQUIRED_FAMILIES = ("speech", "music", "environment", "machine")
 
@@ -63,32 +70,49 @@ def _require_sha256(value: object, *, label: str) -> str:
 
 
 class FullOctaveBatchPlanV3(BaseModel):
-    """한 global batch의 immutable 구조적 plan."""
+    """한 global batch의 scaffold. ``model_validate``는 admission parser가 아니다."""
 
     model_config = _FROZEN
 
     schema_version: Literal["broadband_full_octave_batch_primitive_v3"] = (
         FULL_OCTAVE_BATCH_PRIMITIVE_SCHEMA
     )
-    role: Literal["global_index_structural_plan_not_training_authority"] = (
-        "global_index_structural_plan_not_training_authority"
+    role: Literal["global_index_scaffold_requires_authority_bound_parser"] = (
+        "global_index_scaffold_requires_authority_bound_parser"
     )
     control_band_contract: BroadbandFullOctaveContractV3
     control_band_contract_sha256: str
     physical_identification_population_receipt_sha256: str
+    population_audit_rng_entropy_material_sha256: str
+    structural_population_plan: PopulationBatchPlanV3
     structural_population_plan_sha256: str
     seed: int
     split: Literal["train", "val"]
     global_batch_index: int
     first_global_sample_index: int
-    batch_size: int
-    selected_item_ids: tuple[str, ...]
+    batch_size: int = Field(le=MAX_BATCH_SIZE_V3)
+    selected_item_ids: tuple[str, ...] = Field(max_length=MAX_BATCH_SIZE_V3)
+    selected_candidate_ids: tuple[str, ...] = Field(max_length=MAX_BATCH_SIZE_V3)
+    selected_lineage_component_ids: tuple[str, ...] = Field(
+        max_length=MAX_BATCH_SIZE_V3
+    )
     family_counts: tuple[tuple[str, int], ...]
     physical_identification_valid_item_counts: tuple[int, ...]
     objective_octave_valid_item_counts: tuple[int, ...]
+    physical_identification_distinct_lineage_counts: tuple[int, ...]
+    objective_octave_distinct_lineage_counts: tuple[int, ...]
     minimum_valid_items_per_band: Literal[4] = 4
     legacy_v2_automatic_promotion_allowed: Literal[False] = False
     canonical_training_eligible: Literal[False] = False
+    external_manifest_authority_bound: Literal[False] = False
+    connected_component_authority_bound: Literal[False] = False
+    interval_alias_authority_bound: Literal[False] = False
+    actual_raw_manifest_authority_bound: Literal[False] = False
+    component_uniform_long_run_sampler_proven: Literal[False] = False
+    feasibility_search_complete: Literal[False] = False
+    feasibility_false_negative_possible: Literal[True] = True
+    feasibility_search_attempt_limit: Literal[256] = 256
+    standalone_model_validate_is_admission_parser: Literal[False] = False
     training_admission_status: Literal[
         "BLOCKED_INCOMPLETE_BROADBAND_V3_ADMISSION"
     ] = FULL_OCTAVE_BATCH_BLOCKER
@@ -109,9 +133,22 @@ class FullOctaveBatchPlanV3(BaseModel):
             label="physical population receipt SHA",
         )
         _require_sha256(
+            self.population_audit_rng_entropy_material_sha256,
+            label="population audit RNG entropy material SHA",
+        )
+        _require_sha256(
             self.structural_population_plan_sha256,
             label="structural population plan SHA",
         )
+        if self.structural_population_plan.digest() != self.structural_population_plan_sha256:
+            raise ValueError("inline structural population plan과 SHA가 다릅니다")
+        if (
+            self.structural_population_plan.population_audit_sha256
+            != self.physical_identification_population_receipt_sha256
+            or self.structural_population_plan.population_audit_rng_entropy_material_sha256
+            != self.population_audit_rng_entropy_material_sha256
+        ):
+            raise ValueError("structural plan이 다른 population receipt/entropy에 결속됐습니다")
         if self.global_batch_index < 0 or self.seed < 0:
             raise ValueError("batch index/seed는 0 이상이어야 합니다")
         if self.batch_size <= 4 or self.batch_size % len(REQUIRED_FAMILIES):
@@ -124,6 +161,26 @@ class FullOctaveBatchPlanV3(BaseModel):
             raise ValueError("batch item 수가 batch_size와 다릅니다")
         if len(set(self.selected_item_ids)) != len(self.selected_item_ids):
             raise ValueError("v3 batch selected_item_ids가 중복됐습니다")
+        if len(set(self.selected_lineage_component_ids)) != self.batch_size:
+            raise ValueError("v3 batch에서 같은 lineage component를 두 번 선택할 수 없습니다")
+        structural = self.structural_population_plan
+        if (
+            structural.split != self.split
+            or structural.batch_index != self.global_batch_index
+            or structural.seed != self.seed
+            or structural.batch_size != self.batch_size
+            or structural.selected_item_ids != self.selected_item_ids
+            or structural.selected_candidate_ids != self.selected_candidate_ids
+            or structural.selected_lineage_component_ids
+            != self.selected_lineage_component_ids
+            or structural.feasibility_search_complete
+            != self.feasibility_search_complete
+            or structural.feasibility_false_negative_possible
+            != self.feasibility_false_negative_possible
+            or structural.feasibility_search_attempt_limit
+            != self.feasibility_search_attempt_limit
+        ):
+            raise ValueError("outer batch plan이 inline structural selection과 다릅니다")
         expected_quota = self.batch_size // len(REQUIRED_FAMILIES)
         if self.family_counts != tuple(
             (family, expected_quota) for family in REQUIRED_FAMILIES
@@ -133,6 +190,17 @@ class FullOctaveBatchPlanV3(BaseModel):
             raise ValueError("physical-identification count는 정확히 8개여야 합니다")
         if len(self.objective_octave_valid_item_counts) != 7:
             raise ValueError("objective-octave count는 정확히 7개여야 합니다")
+        if (
+            self.physical_identification_valid_item_counts
+            != structural.physical_valid_item_counts
+            or self.objective_octave_valid_item_counts
+            != structural.objective_octave_valid_item_counts
+            or self.physical_identification_distinct_lineage_counts
+            != structural.physical_distinct_lineage_counts
+            or self.objective_octave_distinct_lineage_counts
+            != structural.objective_octave_distinct_lineage_counts
+        ):
+            raise ValueError("outer batch count가 inline structural selection과 다릅니다")
         if any(
             int(count) < MIN_VALID_ITEMS_PER_BATCH_BAND
             for count in (
@@ -141,6 +209,16 @@ class FullOctaveBatchPlanV3(BaseModel):
             )
         ):
             raise ValueError("v3 batch의 band별 valid item이 4개 미만입니다")
+        if len(self.physical_identification_distinct_lineage_counts) != 8 or any(
+            int(count) < MIN_VALID_ITEMS_PER_BATCH_BAND
+            for count in self.physical_identification_distinct_lineage_counts
+        ):
+            raise ValueError("v3 batch의 physical band별 distinct lineage가 4개 미만입니다")
+        if len(self.objective_octave_distinct_lineage_counts) != 7 or any(
+            int(count) < MIN_VALID_ITEMS_PER_BATCH_BAND
+            for count in self.objective_octave_distinct_lineage_counts
+        ):
+            raise ValueError("v3 batch의 objective band별 distinct lineage가 4개 미만입니다")
         if tuple(self.training_admission_blockers) != (
             FULL_OCTAVE_BATCH_ADMISSION_BLOCKERS
         ):
@@ -162,10 +240,17 @@ class FullOctaveGlobalItemV3(BaseModel):
     global_sample_index: int
     global_batch_index: int
     batch_offset: int
-    batch_size: int
+    batch_size: int = Field(le=MAX_BATCH_SIZE_V3)
     selected_item_id: str
+    selected_candidate_id: str
+    selected_lineage_component_id: str
     batch_plan_sha256: str
     physical_identification_population_receipt_sha256: str
+    external_manifest_authority_bound: Literal[False] = False
+    connected_component_authority_bound: Literal[False] = False
+    interval_alias_authority_bound: Literal[False] = False
+    actual_raw_manifest_authority_bound: Literal[False] = False
+    standalone_model_validate_is_admission_parser: Literal[False] = False
     canonical_training_eligible: Literal[False] = False
     training_admission_status: Literal[
         "BLOCKED_INCOMPLETE_BROADBAND_V3_ADMISSION"
@@ -186,8 +271,14 @@ class FullOctaveGlobalItemV3(BaseModel):
             or self.batch_offset != expected_offset
         ):
             raise ValueError("global sample index의 batch/offset 분해가 다릅니다")
-        if self.batch_offset < 0 or not self.selected_item_id:
-            raise ValueError("batch offset/item id가 유효하지 않습니다")
+        if self.batch_offset < 0 or not all(
+            (
+                self.selected_item_id,
+                self.selected_candidate_id,
+                self.selected_lineage_component_id,
+            )
+        ):
+            raise ValueError("batch offset/item/candidate/lineage id가 유효하지 않습니다")
         _require_sha256(self.batch_plan_sha256, label="batch plan SHA")
         _require_sha256(
             self.physical_identification_population_receipt_sha256,
@@ -258,6 +349,8 @@ class BroadbandFullOctaveBatchPrimitiveV3:
                 "batch_size=4는 band별 valid item>=4와 family balance를 동시에 "
                 "만족하려면 네 item 모두가 모든 band를 통과해야 하므로 v3에서 금지합니다"
             )
+        if size > MAX_BATCH_SIZE_V3:
+            raise ValueError(f"v3 batch_size는 {MAX_BATCH_SIZE_V3}를 넘을 수 없습니다")
         if size % len(REQUIRED_FAMILIES):
             raise ValueError("v3 batch_size는 네 family로 정확히 나뉘어야 합니다")
         if int(seed) < 0:
@@ -329,6 +422,10 @@ class BroadbandFullOctaveBatchPrimitiveV3:
             physical_identification_population_receipt_sha256=(
                 self.population_receipt_sha256
             ),
+            population_audit_rng_entropy_material_sha256=(
+                structural.population_audit_rng_entropy_material_sha256
+            ),
+            structural_population_plan=structural,
             structural_population_plan_sha256=structural.digest(),
             seed=self.seed,
             split=self.split,
@@ -336,6 +433,10 @@ class BroadbandFullOctaveBatchPrimitiveV3:
             first_global_sample_index=index * self.batch_size,
             batch_size=self.batch_size,
             selected_item_ids=structural.selected_item_ids,
+            selected_candidate_ids=structural.selected_candidate_ids,
+            selected_lineage_component_ids=(
+                structural.selected_lineage_component_ids
+            ),
             family_counts=structural.family_counts,
             physical_identification_valid_item_counts=(
                 structural.physical_valid_item_counts
@@ -343,7 +444,37 @@ class BroadbandFullOctaveBatchPrimitiveV3:
             objective_octave_valid_item_counts=(
                 structural.objective_octave_valid_item_counts
             ),
+            physical_identification_distinct_lineage_counts=(
+                structural.physical_distinct_lineage_counts
+            ),
+            objective_octave_distinct_lineage_counts=(
+                structural.objective_octave_distinct_lineage_counts
+            ),
         )
+
+    def validate_serialized_plan(
+        self, payload: Mapping[str, Any] | FullOctaveBatchPlanV3
+    ) -> FullOctaveBatchPlanV3:
+        """유일한 authority-bound parser: receipt/config으로 plan을 재계획한다."""
+
+        observed = (
+            payload
+            if isinstance(payload, FullOctaveBatchPlanV3)
+            else FullOctaveBatchPlanV3.model_validate(dict(payload))
+        )
+        if (
+            observed.physical_identification_population_receipt_sha256
+            != self.population_receipt_sha256
+            or observed.control_band_contract_sha256 != self.contract_sha256
+            or observed.split != self.split
+            or observed.batch_size != self.batch_size
+            or observed.seed != self.seed
+        ):
+            raise ValueError("serialized plan이 현재 primitive authority/config와 다릅니다")
+        expected = self.plan_for_batch_index(observed.global_batch_index)
+        if observed != expected:
+            raise ValueError("serialized plan이 population-bound 결정적 재계획과 다릅니다")
+        return observed
 
     def item_for_global_sample_index(
         self, global_sample_index: int
@@ -359,6 +490,10 @@ class BroadbandFullOctaveBatchPrimitiveV3:
             batch_offset=offset,
             batch_size=self.batch_size,
             selected_item_id=plan.selected_item_ids[offset],
+            selected_candidate_id=plan.selected_candidate_ids[offset],
+            selected_lineage_component_id=(
+                plan.selected_lineage_component_ids[offset]
+            ),
             batch_plan_sha256=plan.digest(),
             physical_identification_population_receipt_sha256=(
                 self.population_receipt_sha256

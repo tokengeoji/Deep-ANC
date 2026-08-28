@@ -10,8 +10,11 @@ from pydantic import ValidationError
 from deep_anc.data.broadband_population_contract_v3 import (
     CausalPrimaryOperatorV3,
     LocalFileReferenceV3,
+    MAX_QUALIFIED_ITEMS_V3,
     MIN_DENSITY_RATIO,
     POPULATION_V3_AUTHORITY,
+    POPULATION_V3_SCAFFOLD_BLOCKERS,
+    PopulationAuditV3,
     PopulationCandidateV3,
     PopulationBatchPlanV3,
     PopulationCoverageContractV3,
@@ -247,7 +250,21 @@ def test_partial_band_counterexample_passes_population_without_lowering_threshol
     # 실제 bytes 재검산 PASS도 canonical training authority를 만들지 않는다.
     assert audit.canonical_status == "BLOCKED"
     assert audit.authority is None
+    assert audit.role == "local_recomputation_scaffold_not_external_raw_authority"
+    assert audit.external_manifest_authority_bound is False
+    assert audit.connected_component_authority_bound is False
+    assert audit.interval_alias_authority_bound is False
+    assert audit.actual_raw_manifest_authority_bound is False
+    assert set(POPULATION_V3_SCAFFOLD_BLOCKERS).issubset(audit.blockers)
     assert any("AUTHORITY is None" in blocker for blocker in audit.blockers)
+
+
+def test_population_audit_schema_has_qualified_item_upper_bound() -> None:
+    metadata = PopulationAuditV3.model_fields["qualified_items"].metadata
+    assert any(
+        getattr(constraint, "max_length", None) == MAX_QUALIFIED_ITEMS_V3
+        for constraint in metadata
+    )
 
 
 def test_family_balanced_batch_covers_every_physical_and_objective_band(
@@ -266,16 +283,18 @@ def test_family_balanced_batch_covers_every_physical_and_objective_band(
     assert len(plan.selected_item_ids) == len(set(plan.selected_item_ids)) == 32
     assert min(plan.physical_valid_item_counts) >= 4
     assert min(plan.objective_octave_valid_item_counts) >= 4
+    assert min(plan.physical_distinct_lineage_counts) >= 4
+    assert min(plan.objective_octave_distinct_lineage_counts) >= 4
     assert plan.structural_status == "PASS"
     assert plan.canonical_training_status == "BLOCKED"
     assert plan.authority is None
 
     forged = plan.model_dump(mode="json")
     forged["physical_valid_item_counts"][0] = 3
-    with pytest.raises(ValidationError, match="physical band"):
+    with pytest.raises(ValidationError, match="physical valid item count"):
         PopulationBatchPlanV3.model_validate(forged)
 
-    with pytest.raises(PopulationV3Blocked, match="valid item>=4"):
+    with pytest.raises(ValueError, match="batch_size=4"):
         plan_structural_batch_v3(
             audit,
             split="train",
@@ -283,6 +302,14 @@ def test_family_balanced_batch_covers_every_physical_and_objective_band(
             batch_index=0,
             seed=1,
         )
+
+
+def test_audit_rejects_forged_lineage_coverage_count(population_fixture) -> None:
+    _root, _manifest, audit = population_fixture
+    payload = audit.model_dump(mode="python")
+    payload["coverage"][0]["independent_lineage_components"] += 1
+    with pytest.raises(ValidationError, match="lineage count"):
+        PopulationAuditV3.model_validate(payload)
 
 
 def test_population_requires_four_independent_components_per_split_family_band(
