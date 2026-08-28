@@ -42,6 +42,14 @@ from .engines import (
     engine_digital_reference_lead_samples_from_config,
     secondary_path_npz,
 )
+from .clock_telemetry import (
+    ClockTelemetryRecorder,
+    RuntimeCounterSnapshot,
+    bind_recording_to_clock_receipt,
+    payload_sha256,
+    sha256_file,
+    write_clock_receipt_exclusive,
+)
 from .noise_gen import DigitalReferenceBuffer, NoiseProgram
 from .plant_contract import validate_runtime_plant_contract
 from .ring_buffer import SPSCRing
@@ -396,6 +404,24 @@ class RealtimeANC:
         # 소유자인 추론 스레드만 이 플래그를 읽어 adapt 상태를 바꾼다.
         self.in_ring = SPSCRing(4, self.hop * 64)      # err, ref_mic, ref_digital, adapt
         self.out_ring = SPSCRing(1, self.hop * 64)
+        self.clock_telemetry = ClockTelemetryRecorder(
+            sample_rate=self.fs,
+            block_size=self.block,
+            input_device=(
+                f"{hw['input']['card']}:{int(hw['input']['pcm'])} "
+                f"(PortAudio index {self.in_dev})"
+            ),
+            output_device=(
+                f"{hw['output']['card']}:{int(hw['output']['pcm'])} "
+                f"(PortAudio index {self.out_dev})"
+            ),
+            allowed_input_backlog_samples=(
+                self.handoff_budget.input_keep_backlog_samples
+            ),
+            allowed_output_backlog_samples=(
+                self.handoff_budget.output_keep_backlog_samples
+            ),
+        )
 
         self.err_meter = PowerEMA(self.fs, 0.4)
         self.ctrl_meter = PowerEMA(self.fs, 0.4)
@@ -405,6 +431,13 @@ class RealtimeANC:
         self._last_input_drops = 0
         self.step_times_ms: list[float] = []
         self.xruns = 0
+        # inference ``engine.step`` 자체가 1 block wall-time을 넘긴 횟수다.
+        # output ring이 비어 실제 무음을 낸 fallback과 같은 사건으로 중복 계상하지 않는다.
+        self._deadline_miss_blocks = 0
+        self._fallback_silence_blocks = 0
+        # 현재 runtime은 hard sample insertion으로 clock을 맞추지 않는다. 향후
+        # rate matcher가 추가되면 이 counter를 실제 삽입 sample 수에 연결해야 한다.
+        self._ring_add_samples = 0
         self._last_anc = False
         self._adaptation_hold_samples = 0
 
@@ -426,10 +459,73 @@ class RealtimeANC:
 
     # ---------- 콜백 (PortAudio 스레드) ----------
 
-    def _callback(self, indata, outdata, frames, _time_info, status) -> None:
+    def _ensure_clock_telemetry(self) -> ClockTelemetryRecorder:
+        """정상 생성 경로와 기존 ``__new__`` 기반 callback harness를 함께 지원한다."""
+
+        recorder = getattr(self, "clock_telemetry", None)
+        if recorder is not None:
+            return recorder
+        budget = self.handoff_budget
+        recorder = ClockTelemetryRecorder(
+            sample_rate=int(self.fs),
+            block_size=int(self.block),
+            input_device=f"unbound (PortAudio index {getattr(self, 'in_dev', 'unknown')})",
+            output_device=f"unbound (PortAudio index {getattr(self, 'out_dev', 'unknown')})",
+            allowed_input_backlog_samples=int(
+                budget.input_keep_backlog_samples
+            ),
+            allowed_output_backlog_samples=int(
+                budget.output_keep_backlog_samples
+            ),
+        )
+        self.clock_telemetry = recorder
+        return recorder
+
+    def _runtime_counter_snapshot(self) -> RuntimeCounterSnapshot:
+        return RuntimeCounterSnapshot(
+            xrun_count=int(getattr(self, "xruns", 0)),
+            deadline_miss_count=int(getattr(self, "_deadline_miss_blocks", 0)),
+            input_ring_drop_samples=int(self.in_ring.drops),
+            output_ring_drop_samples=int(self.out_ring.drops),
+            input_ring_overrun_blocks=int(self.in_ring.overruns),
+            output_ring_overrun_blocks=int(self.out_ring.overruns),
+            input_ring_underrun_blocks=int(self.in_ring.underruns),
+            output_ring_underrun_blocks=int(self.out_ring.underruns),
+            ring_add_samples=int(getattr(self, "_ring_add_samples", 0)),
+            input_backlog_samples=int(self.in_ring.available()),
+            output_backlog_samples=int(self.out_ring.available()),
+            fallback_silence_blocks=int(
+                getattr(self, "_fallback_silence_blocks", 0)
+            ),
+            watchdog_trip_counts={
+                item.value: int(count)
+                for item, count in self.safety.trip_counts.items()
+            },
+        )
+
+    def clock_telemetry_receipt(self) -> dict:
+        """현재 session의 fail-closed clock/queue receipt payload를 반환한다."""
+
+        return self._ensure_clock_telemetry().build_receipt(
+            final_snapshot=self._runtime_counter_snapshot()
+        )
+
+    def _callback(self, indata, outdata, frames, time_info, status) -> None:
+        clock_token = None
+        clock_entry_snapshot = None
+        clock_telemetry = self._ensure_clock_telemetry()
         try:
+            # PortAudio time_info를 버리지 않는다. 이 frame counter는 callback에서
+            # 관측한 exact 정수일 뿐, callback 전에 silent-drop된 ADC period가 없다는
+            # 물리 증거는 아니다(clock receipt는 그래서 최대 INCONCLUSIVE다).
+            clock_token = clock_telemetry.begin_callback(
+                frames=frames, time_info=time_info, status=status
+            )
             if status:
                 self.xruns += 1
+            # output ring을 pop하기 전 backlog를 보존해야 callback 종료 snapshot에서
+            # 사라지는 순간 최대치를 놓치지 않는다.
+            clock_entry_snapshot = self._runtime_counter_snapshot()
 
             mics = pcm_int32_to_float32(indata[:, :2])
             err = self.err_dc.process(mics[:, self.ch_err])
@@ -452,6 +548,10 @@ class RealtimeANC:
             y_blk, had_data = self.out_ring.pop_latest(
                 frames, keep_backlog=self.handoff_budget.output_keep_backlog_samples
             )
+            if not had_data:
+                self._fallback_silence_blocks = int(
+                    getattr(self, "_fallback_silence_blocks", 0)
+                ) + 1
             out_report = self.safety.limit_output(y_blk[0])
             y_lim, clip_frac = out_report.signal, out_report.clipped_fraction
 
@@ -567,7 +667,18 @@ class RealtimeANC:
                 "xruns": self.xruns,
                 "step_ms": float(np.mean(self.step_times_ms[-50:])) if self.step_times_ms else 0.0,
             }
+            clock_telemetry.finish_callback(
+                clock_token,
+                entry_snapshot=clock_entry_snapshot,
+                snapshot=self._runtime_counter_snapshot(),
+            )
+            clock_token = None
+            self.state.latest_stats["clock_telemetry_status"] = (
+                clock_telemetry.live_status()
+            )
         except BaseException as exc:      # 콜백 예외 → 안전 정지
+            if clock_token is not None:
+                clock_telemetry.abort_callback(clock_token, error=exc)
             outdata.fill(0)
             self.state.fatal_error = exc
             self.state.quit_event.set()
@@ -612,6 +723,8 @@ class RealtimeANC:
                 y = np.zeros(self.hop, dtype=np.float32)
             dt = (time.perf_counter() - t0) * 1000.0
             self.step_times_ms.append(dt)
+            if dt >= 1000.0 * self.hop / self.fs:
+                self._deadline_miss_blocks += 1
             if len(self.step_times_ms) > 10000:
                 del self.step_times_ms[:5000]
             self.out_ring.push(y.reshape(1, -1))
@@ -660,7 +773,40 @@ class RealtimeANC:
         return {k: v[:n].copy() for k, v in self.rec.items()}
 
 
+def _prepare_runtime_record_targets(record_path: str | Path) -> tuple[Path, Path]:
+    """오디오 시작 전에 no-replace session/receipt 목적지를 fail-closed로 검사한다."""
+
+    base = Path(record_path)
+    npz_path = base.with_suffix(".npz")
+    receipt_path = base.with_suffix(".runtime_clock.json")
+    if npz_path == receipt_path:
+        raise ValueError("runtime NPZ와 clock receipt 경로가 같을 수 없습니다")
+    parent = npz_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if not parent.is_dir():
+        raise ValueError(f"runtime record parent가 디렉터리가 아닙니다: {parent}")
+    # no-replace 증거 경로가 symlink를 통해 실행 중 다른 곳으로 바뀌는 것을 막는다.
+    cursor = parent.absolute()
+    while True:
+        if cursor.is_symlink():
+            raise ValueError(f"runtime record parent에 symlink가 포함됩니다: {cursor}")
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    for target in (npz_path, receipt_path):
+        if os.path.lexists(target):
+            raise FileExistsError(
+                f"runtime no-replace target이 이미 존재합니다: {target}"
+            )
+    return npz_path, receipt_path
+
+
 def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
+    # target 충돌을 소리를 낸 뒤 발견하면 실험과 speaker 연결 시간을 낭비한다.
+    # 끝의 xb/O_EXCL 검사도 유지해 이 preflight 뒤 TOCTOU를 다시 막는다.
+    record_targets = (
+        _prepare_runtime_record_targets(record_path) if record_path else None
+    )
     anc = RealtimeANC(cfg, record_seconds=run_seconds if record_path else 0.0)
     keyboard = KeyboardController(anc.state)
 
@@ -687,6 +833,7 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
     keyboard.start()
     started = time.monotonic()
     next_report = started
+    run_error: Exception | None = None
     try:
         while not anc.state.quit_event.is_set():
             now = time.monotonic()
@@ -713,18 +860,50 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
             time.sleep(0.05)
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        # callback 실패 receipt도 먼저 보존한 뒤 기존처럼 예외를 다시 올린다.
+        run_error = exc
     finally:
         keyboard.stop()
         anc.stop()
 
+    clock_payload = anc.clock_telemetry_receipt()
     if record_path:
+        assert record_targets is not None
         data = anc.session_data()
-        if data:
-            out = Path(record_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(out.with_suffix(".npz"), fs=anc.fs, **data)
-            print(f"세션 저장: {out.with_suffix('.npz')}")
+        npz_path, clock_receipt_path = record_targets
+        telemetry_digest = payload_sha256(clock_payload)
+        # raw와 telemetry binding을 덮어쓰지 못하게 session NPZ도 exclusive-create한다.
+        with npz_path.open("xb") as handle:
+            np.savez_compressed(
+                handle,
+                fs=anc.fs,
+                runtime_clock_telemetry_sha256=np.asarray(telemetry_digest),
+                runtime_clock_authority_status=np.asarray(
+                    clock_payload["authority_status"]
+                ),
+                **data,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        receipt_bundle = bind_recording_to_clock_receipt(
+            clock_payload,
+            recording_path=npz_path,
+            recording_sha256=sha256_file(npz_path),
+        )
+        receipt_path, receipt_sha = write_clock_receipt_exclusive(
+            clock_receipt_path, receipt_bundle
+        )
+        print(f"세션 저장: {npz_path}")
+        print(
+            f"clock receipt: {receipt_path} | {clock_payload['authority_status']} "
+            f"| sha256={receipt_sha}"
+        )
+    else:
+        print(f"clock telemetry: {clock_payload['authority_status']} (미저장)")
     print("종료 — 양 채널 무음.")
+    if run_error is not None:
+        raise run_error
     return 0
 
 
