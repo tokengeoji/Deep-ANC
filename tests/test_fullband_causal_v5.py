@@ -120,6 +120,38 @@ def test_v5_exact_support_1024_condition_passes_and_longer_are_not_claimed() -> 
         )
 
 
+@pytest.mark.parametrize("audit", ["unshifted", "shifted"])
+@pytest.mark.parametrize("mutation", ["layout", "payload"])
+def test_public_exact_audits_reject_rehashed_plan_tampering_before_heavy_math(
+    monkeypatch: pytest.MonkeyPatch, audit: str, mutation: str
+) -> None:
+    plan, pcm = build_plan_v5()
+    changed = copy.deepcopy(plan)
+    if mutation == "layout":
+        changed["layout"][1]["central_start_frame"] += 1
+    else:
+        changed["excitation"]["payloads"]["primary_fit_a"]["seed"] += 2
+    unsigned = {
+        key: value for key, value in changed.items()
+        if key != "canonical_payload_sha256"
+    }
+    changed["canonical_payload_sha256"] = causal_v5._payload_sha256(unsigned)
+
+    def forbidden_heavy_audit(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("canonical 변조가 heavy Gram 계산 전에 거부되지 않았습니다")
+
+    monkeypatch.setattr(
+        causal_v5, "_exact_condition_audit_with_shifts_v5", forbidden_heavy_audit
+    )
+    with pytest.raises(ValueError, match="canonical v5 plan/layout/payload/PCM"):
+        if audit == "unshifted":
+            exact_condition_audit_v5(changed, pcm)
+        else:
+            exact_shifted_condition_audit_v5(
+                changed, pcm, zeros_by_path=(1386, 1245)
+            )
+
+
 @pytest.mark.parametrize("mutation", ["pcm", "plan"])
 def test_shifted_heavy_audit_detects_source_toctou(
     monkeypatch: pytest.MonkeyPatch, mutation: str

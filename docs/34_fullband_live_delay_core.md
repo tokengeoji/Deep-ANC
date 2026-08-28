@@ -101,7 +101,8 @@ operator 정의와 SHA, plan/PCM SHA를 포함한다. unshifted condition receip
 public shifted audit는 canonical builder의 plan/layout/PCM exact equality를 자체 검증하고,
 입구에서 owned copy를 만든 후 entry/exit SHA로 TOCTOU를 검사한다. 보고하는
 condition은 acoustic transfer condition이 아니라 shifted finite-support periodic normal
-matrix `X^T X` Gram condition이며, 서로 다른 4개 probe의 `A^T A`↔Gram
+matrix `G=A^T A`의 `κ₂(G)=λmax/λmin=κ₂(A)²` Gram condition이다. 즉
+보고값을 `A`의 singular-value condition으로 해석하지 않는다. 서로 다른 4개 probe의 `A^T A`↔Gram
 quadratic form을 모두 교차 검사한다.
 
 ## Fit, cross, terminal holdout

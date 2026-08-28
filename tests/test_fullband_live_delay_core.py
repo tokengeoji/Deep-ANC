@@ -13,6 +13,7 @@ from deep_anc.audio_duplex_v5 import (
     capture_duplex_v5,
 )
 import deep_anc.dsp.fullband_live_delay_core as live_core
+import deep_anc.dsp.fullband_causal_v5 as causal_v5
 from deep_anc.dsp.fullband_causal_v5 import BLOCK, FS, build_plan_v5
 from deep_anc.dsp.fullband_live_delay_core import (
     EXPECTED_PCM_SHA256,
@@ -199,6 +200,69 @@ def test_only_exact_committed_plan_pcm_can_derive_internal_windows() -> None:
     wrong_pcm[0, 0] += 1
     with pytest.raises(ValueError, match="PCM SHA"):
         validate_committed_plan_and_derive_windows(plan, wrong_pcm)
+
+
+def _small_shifted_gram(
+    rows_by_role: dict[str, np.ndarray], *, support: int,
+    zeros: tuple[int, int], shift_by_row: bool = False,
+) -> np.ndarray:
+    gram = np.zeros((2 * support, 2 * support), dtype=np.float64)
+    for rows in rows_by_role.values():
+        shifted = np.empty_like(rows)
+        for row in range(2):
+            for channel in range(2):
+                shift = zeros[row] if shift_by_row else zeros[channel]
+                shifted[row, :, channel] = np.roll(rows[row, :, channel], shift)
+        for left in range(2):
+            for right in range(2):
+                correlation = sum(
+                    causal_v5._periodic_cross_correlation(
+                        shifted[row, :, left], shifted[row, :, right]
+                    )
+                    for row in range(2)
+                )
+                gram[
+                    left * support:(left + 1) * support,
+                    right * support:(right + 1) * support,
+                ] += causal_v5._toeplitz_gram_block(correlation, support)
+    return (gram + gram.T) * 0.5
+
+
+def test_production_linear_operator_normal_matches_shifted_gram() -> None:
+    """작은 support에서 production A.T@(A@v)의 row/channel shift를 고정한다."""
+
+    plan, submitted = build_plan_v5()
+    _, windows = validate_committed_plan_and_derive_windows(plan, submitted)
+    support = 12
+    zeros = (137, 509)
+    rows_by_role = {
+        role: np.stack([
+            submitted[slice(*windows[(role, path)])].astype(np.float64)
+            for path in live_core.PATHS
+        ])
+        for role in live_core.FIT_ROLES
+    }
+    grid = np.arange(2 * support, dtype=np.float64)
+    probe = np.sin(0.17 * grid) + 0.23 * np.cos(0.31 * grid)
+    production_normal = np.zeros_like(probe)
+    for rows in rows_by_role.values():
+        operator, _ = live_core._joint_circular_operator(
+            rows, support=support, zeros_by_path=zeros
+        )
+        production_normal += operator.T @ (operator @ probe)
+
+    gram = _small_shifted_gram(
+        rows_by_role, support=support, zeros=zeros
+    )
+    np.testing.assert_allclose(
+        production_normal, gram @ probe, rtol=2.0e-12, atol=1.0e-5
+    )
+
+    row_shifted_gram = _small_shifted_gram(
+        rows_by_role, support=support, zeros=zeros, shift_by_row=True
+    )
+    mismatch = np.linalg.norm(production_normal - row_shifted_gram @ probe)
+    assert mismatch / np.linalg.norm(production_normal) > 1.0e-4
 
 
 def test_actual_capture_return_integrates_with_duplex_validator() -> None:

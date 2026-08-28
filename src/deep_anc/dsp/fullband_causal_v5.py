@@ -315,6 +315,37 @@ def build_plan_v5(
     return plan, submitted
 
 
+def _validate_canonical_plan_and_pcm_v5(
+    plan: Mapping[str, Any],
+    submitted_pcm: np.ndarray,
+    *,
+    allow_configured_raw_path: bool,
+) -> tuple[dict[str, Any], np.ndarray]:
+    """허용된 raw 경로로 재생성한 canonical builder 결과만 반환한다."""
+
+    if allow_configured_raw_path:
+        publisher = plan.get("publisher_contract")
+        if not isinstance(publisher, Mapping):
+            raise ValueError("canonical v5 plan publisher contract가 없습니다")
+        raw_path = publisher.get("raw_session_relative_path")
+        if not isinstance(raw_path, str):
+            raise ValueError("canonical v5 plan raw path가 문자열이 아닙니다")
+        expected_plan, expected_pcm = build_plan_v5(
+            raw_session_relative_path=raw_path
+        )
+    else:
+        expected_plan, expected_pcm = build_plan_v5()
+    submitted = np.asarray(submitted_pcm)
+    if (
+        dict(plan) != expected_plan
+        or submitted.dtype != np.int16
+        or submitted.shape != expected_pcm.shape
+        or not np.array_equal(submitted, expected_pcm)
+    ):
+        raise ValueError("audit 입력이 canonical v5 plan/layout/payload/PCM이 아닙니다")
+    return expected_plan, expected_pcm
+
+
 def _periodic_cross_correlation(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return np.fft.ifft(
         np.conj(np.fft.fft(left.astype(np.float64)))
@@ -448,6 +479,8 @@ def _exact_condition_audit_with_shifts_v5(
     )
     if not np.isfinite(lo) or not np.isfinite(hi) or lo <= 0.0:
         raise ValueError("joint exact shifted Gram 고유값이 finite positive가 아닙니다")
+    # 여기서 보고하는 condition은 kappa_2(A)가 아니라
+    # periodic normal-matrix Gram의 kappa_2(G)=lambda_max/lambda_min=kappa_2(A)^2다.
     condition = hi / lo
     operator_definition = {
         "operator": "two_row_two_input_periodic_convolution_finite_support",
@@ -495,11 +528,14 @@ def _exact_condition_audit_with_shifts_v5(
 def exact_condition_audit_v5(
     plan: Mapping[str, Any], submitted_pcm: np.ndarray, *, support: int = 1_024
 ) -> dict[str, Any]:
-    """unshifted fit_a/fit_b actual PCM의 exact periodic joint Gram을 계산한다."""
+    """canonical unshifted actual PCM의 exact periodic Gram kappa를 계산한다."""
 
+    owned_plan, owned_pcm = _validate_canonical_plan_and_pcm_v5(
+        plan, submitted_pcm, allow_configured_raw_path=True
+    )
     return _exact_condition_audit_with_shifts_v5(
-        plan,
-        submitted_pcm,
+        owned_plan,
+        owned_pcm,
         support=support,
         zeros_by_path=(0, 0),
         schema="fullband_causal_exact_gram_condition_v5",
@@ -526,9 +562,9 @@ def exact_shifted_condition_audit_v5(
         plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8") or source_pcm_sha != _array_sha256(source_pcm):
         raise ValueError("shifted condition audit input TOCTOU mutation")
-    expected_plan, expected_pcm = build_plan_v5()
-    if owned_plan != expected_plan or not np.array_equal(owned_pcm, expected_pcm):
-        raise ValueError("shifted condition audit가 canonical v5 plan/layout/PCM이 아닙니다")
+    owned_plan, owned_pcm = _validate_canonical_plan_and_pcm_v5(
+        owned_plan, owned_pcm, allow_configured_raw_path=False
+    )
     receipt = _exact_condition_audit_with_shifts_v5(
         owned_plan,
         owned_pcm,
