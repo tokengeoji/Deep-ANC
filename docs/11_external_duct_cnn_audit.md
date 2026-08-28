@@ -17,7 +17,7 @@
 |---|---|---|---|
 | 목적 | 논문형 raw CNN·측정 준비 도구 | strict P/S 기반 HybridANC 학습·배포 파이프라인 | 외부는 대체 구현이 아님 |
 | 모델 | 10층 causal dilated CNN, 3,232 params, FIR 512 | `hybrid_anc_tiny`, 1,164,809 params | 외부 모델을 init/배포 후보로 사용하지 않음 |
-| 학습 | 없음 | A100 loss pilot 진행 중, canonical pretrain 미시작 | 외부에 학습 결과 없음 |
+| 학습 | 없음 | 감사 당시 A100 diagnostic pilot 진행, canonical pretrain 미시작 | 외부에 학습 결과 없음 |
 | Primary | 100–1,000 Hz, 별도 스트림, 5회/3회 raw | 150–1,600 Hz strict interleaved P | 외부 P는 진단 교차검증만 가능 |
 | Secondary | 완전한 S 없음; retry는 proxy·프레임 불일치 | strict interleaved S, 19 repeats, xrun 0 | 외부 S를 절대 가져오지 않음 |
 | Feedback | 없음 | 현행 1차 open-loop 계약에는 미사용 | 외부에서 보강되지 않음 |
@@ -25,7 +25,8 @@
 | 지연 | 모델/loopback/음향을 분리하지만 end-to-end artifact 없음 | `TrainingTimingContract`, `PlantDelays.lead()` 단일 출처 | 외부 숫자로 lead를 덮어쓰지 않음 |
 
 감사 시점의 strict 기준선은 branch `fix/finetune-readiness-repair`, commit
-`d269699`였고, 이 감사 기록을 포함한 현재 HEAD는 `6473b27`이다. strict P/S 공식
+`d269699`였고, 이 감사 기록을 처음 포함한 역사적 HEAD는 `6473b27`이다. 현재 권위 HEAD와
+운영 상태는 `HANDOFF.md` 상단에서만 확인한다. strict P/S 공식
 artifact는 `capture_id=5ac1313488c8434bb4d672a36503df59`,
 P effective delay 1386, S effective delay 1245, handoff 256, 따라서
 `PlantDelays.lead() = 115`이다. 외부 자료를 읽었다고 canonical readiness나
@@ -332,7 +333,7 @@ positions/gain/serial null도 확인했다.
 | source/manifest 계보 | 복구·Elice 재검증 경로 진행 | 아니오 |
 | public corpus/recorded QA | Elice bootstrap 및 QA 완료 | 아니오 |
 | loss pilot | 4번째 20k 후보 실행 중; 앞선 3개는 diagnostic | 아니오 |
-| canonical 100k pretrain | **NOT STARTED** (pilot winner·probe·deterministic resume smoke 선행) | 아니오 |
+| canonical 100k pretrain | **NOT STARTED** (후보별 20k pilot+5k measured probe 선택·deterministic resume smoke 선행) | 아니오 |
 | measured 50k fine-tune | **NOT STARTED** | 아니오 |
 | ONNX/TensorRT canonical export | **NOT STARTED** | 아니오 |
 | Jetson canonical realtime | **NOT STARTED** | 아니오 |
@@ -346,9 +347,15 @@ positions/gain/serial null도 확인했다.
   `-9.64 dB`는 ANC attenuation이 아니다.
 - 1,000–1,600 Hz 및 1,600 Hz 이상, speech/music/environment/machine의 실제 ANC,
   고주파 증폭 유무, Tiny/Base 우열은 외부 폴더로 판단할 수 없다.
-- 현재 고주파 최우선 목표는 외부 3232-parameter 모델을 붙이는 것이 아니라, 현행
-  strict S가 검증된 150–1,600 Hz에서 canonical 학습 후 실제 덕트 G4와 Level-5
-  natural challenge로 검증하는 것이다.
+- 현재 최우선 목표는 외부 3,232-parameter 모델을 곧바로 붙이는 것이 아니라, 별도 v3
+  계약으로 88.388–11,313.708 Hz causal P/S·데이터·loss·runtime을 먼저 성립시키는 것이다.
+  기존 150–1,600 Hz strict 자산은 Stage-1 저역 보호 증거로만 유지하고, 최종 2/4/8 kHz
+  성능은 실제 덕트의 matched FxLMS A/B와 Level-5 natural challenge로 검증한다.
+
+사용자가 제공한 실제 POSTECH 학위논문과 별도의 ChatGPT 구현 지시서에 대한 원문 대조는
+[`docs/34_postech_thesis_evidence_audit.md`](34_postech_thesis_evidence_audit.md)에 있다.
+논문의 14.3–14.8 dB와 2 kHz crossover는 인이어 헤드폰의 100–2,000 Hz 실험이며 현행
+덕트의 4/8 kHz 증거로 전용하지 않는다.
 
 ## 재사용 목록
 
