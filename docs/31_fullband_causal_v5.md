@@ -13,9 +13,9 @@ finite causal P/S 학습 operator의 지속 여기 조건을 만족하지 못했
 
 | 범위 | exact condition | 고정 임계 | 판정 |
 |---|---:|---:|---|
-| fit-a, support 1024 | 6.8619135102 | ≤20 | PASS |
-| fit-b, support 1024 | 7.3716267719 | ≤20 | PASS |
-| fit-a+fit-b, support 1024 | 5.3028264873 | ≤20 | PASS |
+| fit-a, support 1024 | 11.5717140215 | ≤20 | PASS |
+| fit-b, support 1024 | 12.5752910925 | ≤20 | PASS |
+| fit-a+fit-b, support 1024 | 9.0580335309 | ≤20 | PASS |
 | support 2048/4096/8192 | 계산하지 않음 | ≤20 | `NOT_AUDITED_NO_CLAIM` |
 
 긴 support의 condition이 좋아진다고 주장하지 않는다. v5에서 authority 후보로 선택 가능한
@@ -30,14 +30,17 @@ finite causal P/S 학습 operator의 지속 여기 조건을 만족하지 못했
 
 - sample rate/block: 48 kHz / 256
 - 총 길이: 557,056 frames, 11.605333초
-- actual submitted peak: 90 PCM count, 제한 98 이하
+- actual submitted peak: 69 PCM count, 제한 98 이하
+- whole active-slot two-output total power: `2.4505060310e-6`, 공식
+  `MeasurementLevelContract` actual-int16 meter recipe `2.4719371771e-6` 대비
+  `-0.037817 dB`로 초과하지 않음. 두 값 모두 `/32768` 변환을 사용한다.
 - P/S 각각 `fit_a`, `fit_b`, terminal `holdout`의 서로 다른 seed
 - 각 slot: 16,384-sample cyclic prefix + 32,768-sample central period +
   16,384-sample suffix
 - path switch와 period boundary 양쪽 16,384 samples는 분석에서 제외
 - P/S main PE는 동시에 켜지지 않음
 - continuous 152--600 Hz disjoint pilot은 모든 frame에 유지
-- near-white PE는 actual int16 `±70`; qualification 80--11,313.7084989848 Hz,
+- near-white PE는 actual int16 `±49`; qualification 80--11,313.7084989848 Hz,
   실제 spectrum은 DC--Nyquist까지 존재
 
 `BroadbandFullOctaveContractV3.canonical()`의 **전체 payload**를 plan에 inline하고 그
@@ -48,10 +51,10 @@ control contract SHA-256:
 53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2
 
 actual submitted PCM SHA-256:
-8890385c88e72f2e1cbdc992706e0645a593aa75828c493f28ba838d9fb6553b
+c18416e4066556479fd317659d908c215e6662d08f5bfa9d50e4ac63971c4aff
 
 signal plan canonical payload SHA-256:
-c918f7117e7ca82a5aba0824b7c579bc2429da74158fd484bb881f2a0c420769
+32a79b3700b457dc40373dc4dd0969301287baea7100b1ec5edd86ea907ee127
 ```
 
 따라서 88.388--150 Hz를 빠뜨린 v2/7-band plan은 v5로 승격할 수 없다. 물리 식별은
@@ -91,9 +94,13 @@ P/S 2 × ERR/REF 2 × v3 physical identification subband 8 = 32 rows
 ```
 
 각 행에는 response bin 수, pilot-only lead/tail의 두 입력 exact-zero noise bin 수,
-noise-conditioned relative residual, complex agreement, coherence, response-to-noise dB가
-들어간다. 모든 행이 각각 residual ≤0.10, agreement/coherence ≥0.995, SNR ≥20 dB를
+noise-conditioned relative residual, complex agreement, response-to-noise dB가 들어간다.
+모든 행이 각각 residual ≤0.10, agreement ≥0.995, SNR ≥20 dB를
 통과해야 한다. global residual로 저역 에너지가 고역 실패를 숨길 수 없다.
+
+단일 deterministic FFT의 complex agreement를 별도 coherence로 복제하지 않는다. 독립
+repeat/Welch coherence가 필요한 live authority gate는 future raw schema가 제공할 때까지
+명시적으로 미구현·차단 상태다.
 
 fit-a와 fit-b만 생성·지원 선택에 사용하고 holdout은 마지막 한 번의 terminal validation에만
 사용한다. 현재 모듈은 score primitive와 합성 fixed-LTI 회귀까지만 제공한다. 실제 raw-derived
@@ -105,8 +112,9 @@ training admission은 계속 fail-closed다.
 
 plan은 정확한 raw 상대경로(기본
 `results/fullband_causal_v5/raw_capture.npz`)를 미리 포함한다. offline publisher는 해당
-경로만 허용하고 lexical repository containment와 모든 parent symlink를 검사한다. 파일은
-`O_EXCL`/`O_NOFOLLOW`로 no-replace 생성하고 파일과 parent directory를 모두 `fsync`한다.
+경로만 허용하고 lexical repository containment와 모든 parent symlink를 검사한다. raw는
+같은 directory의 exclusive sibling staging 파일에 쓰고 `fsync`한 뒤 atomic hard-link
+no-replace로 발행하며 staging을 제거하고 parent directory도 `fsync`한다.
 NPZ에는 `submitted_pcm`, `captured_pcm`, `callback_frames`, uint8 canonical JSON metadata만
 저장하며 plan/actual PCM/captured/callback SHA를 결속한다. 기존 target과 symlink parent를
 거부하는 회귀가 있다.
@@ -126,7 +134,8 @@ signal-only 명령은 다음이다. 이 명령은 소리를 내지 않는다.
 
 ## 6. 남은 blocker
 
-1. actual raw capture와 callback/slip 증거 없음
+1. actual raw capture와 독립 xrun/slip telemetry 증거 없음. callback frame 배열은
+   저장 frame accounting일 뿐 xrun/slip authority가 아니다.
 2. actual-input spectral common-q 및 cubic crosscheck의 raw receipt 없음
 3. fit-a/fit-b P/S×ERR/REF×8대역 stationarity/change-point PASS 없음
 4. support-1024 joint causal FIR fit과 immutable operator NPZ 없음

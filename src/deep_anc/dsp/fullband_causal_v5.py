@@ -21,6 +21,7 @@ from scipy.interpolate import CubicSpline
 
 from .control_band_contract import BroadbandFullOctaveContractV3
 from .fullband_causal_v4 import continuous_pilot_period
+from .measurement_level import expected_meter_output_pcm
 
 FS = 48_000
 BLOCK = 256
@@ -33,12 +34,11 @@ CONDITION_AUDIT_SUPPORT = 1_024
 MAX_CONDITION = 20.0
 CLOCK_HARD_MAX_RESIDUAL_SAMPLES = 0.06755189029558946
 CLOCK_VIEW_MAX_ENDPOINT_DISAGREEMENT_SAMPLES = 0.05
-PE_PEAK_PCM = 70
+PE_PEAK_PCM = 49
 SUBMITTED_PEAK_LIMIT_PCM = 98
 EXCITATION_QUALIFICATION_BAND_HZ = (80.0, 11_313.7084989848)
 SUBBAND_MAX_RELATIVE_RESIDUAL = 0.10
 SUBBAND_MIN_COMPLEX_AGREEMENT = 0.995
-SUBBAND_MIN_COHERENCE = 0.995
 SUBBAND_MIN_RESPONSE_TO_NOISE_DB = 20.0
 ROLES = ("fit_a", "fit_b", "holdout")
 PATH_CHANNEL = {"primary": 0, "secondary": 1}
@@ -52,7 +52,7 @@ SEEDS = {
 }
 LIVE_AUTHORITY = None
 CANONICAL_BLOCKER = (
-    "signal-only 설계와 합성 fixture는 실제 raw P/S, 8대역 SNR/coherence/residual, "
+    "signal-only 설계와 합성 fixture는 실제 raw P/S, 8대역 SNR/agreement/residual, "
     "stationarity/change-point 증거를 대신하지 않는다"
 )
 
@@ -215,6 +215,18 @@ def build_plan_v5(
     submitted = submitted32.astype(np.int16)
     if len(submitted) % BLOCK:
         raise AssertionError("v5 signal은 256-frame block aligned여야 합니다")
+    active_total_powers = []
+    for row in layout:
+        if row.get("role") in ROLES:
+            slot = submitted[row["start_frame"] : row["stop_frame"]].astype(np.float64) / 32768.0
+            active_total_powers.append(float(np.sum(np.mean(slot**2, axis=0))))
+    worst_total_power = max(active_total_powers)
+    meter_pcm = expected_meter_output_pcm(noise_channel=0)
+    meter_total_power = float(
+        np.sum(np.mean((meter_pcm.astype(np.float64) / 32768.0) ** 2, axis=0))
+    )
+    if worst_total_power > meter_total_power:
+        raise AssertionError("v5 active-slot total power가 official meter recipe를 초과합니다")
 
     physical_bands = contract_payload["physical_identification_subbands_hz"]
     plan: dict[str, Any] = {
@@ -261,7 +273,8 @@ def build_plan_v5(
             "terminal_holdout_role": "holdout",
             "holdout_used_for_generation_or_selection": False,
             "physical_identification_subbands_hz": physical_bands,
-            "each_path_mic_band_requires_snr_coherence_residual_complex_agreement": True,
+            "each_path_mic_band_requires_snr_residual_complex_agreement": True,
+            "independent_coherence_available": False,
             "global_residual_alone_sufficient": False,
             "finite_memory_proved_by_finite_capture": False,
         },
@@ -275,14 +288,28 @@ def build_plan_v5(
             "raw_session_relative_path": raw_path,
             "raw_npz_schema": "fullband_causal_raw_capture_v5",
             "lexical_parent_symlink_rejected": True,
-            "no_replace_o_excl": True,
+            "atomic_sibling_staging_hardlink_noreplace": True,
             "flush_and_fsync_file_and_parent": True,
             "required_arrays": ["submitted_pcm", "captured_pcm", "callback_frames"],
+            "role": "fixture_only_raw_container_v5",
+            "callback_semantics": "frame_accounting_only",
+            "live_xrun_slip_authority": False,
+            "live_authority_at_plan_time": None,
         },
         "actual_submitted_pcm_sha256": _array_sha256(submitted),
         "actual_submitted_shape": list(submitted.shape),
         "actual_submitted_dtype": submitted.dtype.str,
         "actual_submitted_peak_pcm": peak,
+        "measurement_level_safety": {
+            "official_meter_output_pcm_sha256": _array_sha256(meter_pcm),
+            "official_meter_reference_total_power": meter_total_power,
+            "worst_active_slot_total_power": worst_total_power,
+            "normalization_divisor": 32768,
+            "scope": "whole_active_slot_including_prefix_central_suffix",
+            "worst_active_slot_vs_meter_db": 10.0
+            * math.log10(worst_total_power / meter_total_power),
+            "meter_total_power_not_exceeded": True,
+        },
     }
     plan["canonical_payload_sha256"] = _payload_sha256(plan)
     return plan, submitted
@@ -494,7 +521,7 @@ def _waveform_transfer_bank_v5(
     rate_ratio: float,
     path: str,
     rows: list[dict[str, Any]],
-    interpolators: list[CubicSpline] | None = None,
+    interpolators: list[Any] | None = None,
 ) -> np.ndarray:
     channel = PATH_CHANNEL[path]
     bins = np.asarray(plan["clock_contract"][f"{path}_pilot_bins"], dtype=np.int64)
@@ -529,6 +556,7 @@ def estimate_common_clock_from_waveforms_v5(
     plan: Mapping[str, Any],
     submitted_pcm: np.ndarray,
     captured_adc_pcm: np.ndarray,
+    interpolation_kind: str = "cubic",
 ) -> dict[str, Any]:
     """raw waveform에서 actual two-input denominator를 직접 사용해 공통 q를 추정한다."""
 
@@ -545,9 +573,17 @@ def estimate_common_clock_from_waveforms_v5(
 
     path_rows = {path: _clock_waveform_rows_v5(plan, path) for path in PATH_CHANNEL}
     adc_index = np.arange(len(captured), dtype=np.float64)
-    interpolators = [
-        CubicSpline(adc_index, captured[:, mic], extrapolate=False) for mic in range(2)
-    ]
+    if interpolation_kind == "cubic":
+        interpolators = [
+            CubicSpline(adc_index, captured[:, mic], extrapolate=False) for mic in range(2)
+        ]
+    elif interpolation_kind == "linear":
+        interpolators = [
+            (lambda query, mic=mic: np.interp(query, adc_index, captured[:, mic]))
+            for mic in range(2)
+        ]
+    else:
+        raise ValueError("clock interpolation은 linear/cubic만 허용합니다")
 
     def banks(candidate_ratio: float, validation: bool = False) -> dict[str, np.ndarray]:
         index = 1 if validation else 0
@@ -627,6 +663,7 @@ def estimate_common_clock_from_waveforms_v5(
         "actual_submitted_pcm_sha256": plan["actual_submitted_pcm_sha256"],
         "captured_adc_pcm_sha256": _array_sha256(np.asarray(captured_adc_pcm)),
         "estimated_rate_ratio": ratio,
+        "interpolation_kind": interpolation_kind,
         "estimated_ppm": (ratio - 1.0) * 1.0e6,
         "view_rate_ratios": view_ratios,
         "maximum_view_endpoint_disagreement_samples": float(view_disagreement),
@@ -761,11 +798,9 @@ def score_candidate_on_role_v5(
                 snr_db = 10.0 * math.log10(
                     max(target_power, np.finfo(np.float64).tiny) / noise_power
                 )
-                coherence = agreement
                 passed = bool(
                     relative <= SUBBAND_MAX_RELATIVE_RESIDUAL
                     and agreement >= SUBBAND_MIN_COMPLEX_AGREEMENT
-                    and coherence >= SUBBAND_MIN_COHERENCE
                     and snr_db >= SUBBAND_MIN_RESPONSE_TO_NOISE_DB
                 )
                 rows.append(
@@ -778,7 +813,6 @@ def score_candidate_on_role_v5(
                         "exact_zero_noise_bins": int(np.sum(noise_mask)),
                         "noise_conditioned_relative_residual": relative,
                         "complex_agreement": agreement,
-                        "coherence": coherence,
                         "response_to_noise_db": snr_db,
                         "passed": passed,
                     }

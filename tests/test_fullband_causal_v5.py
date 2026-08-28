@@ -31,6 +31,16 @@ def test_v5_plan_binds_exact_v3_contract_actual_pcm_and_live_lock() -> None:
     assert plan["control_band_contract_sha256"] == (
         "53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2"
     )
+    assert plan["canonical_payload_sha256"] == (
+        "32a79b3700b457dc40373dc4dd0969301287baea7100b1ec5edd86ea907ee127"
+    )
+    assert plan["actual_submitted_pcm_sha256"] == (
+        "c18416e4066556479fd317659d908c215e6662d08f5bfa9d50e4ac63971c4aff"
+    )
+    assert plan["measurement_level_safety"]["official_meter_output_pcm_sha256"] == (
+        "95a7f97b19d1ea26203ae05d72309326eacd3f0f9a5c54f8e60f5041b817f596"
+    )
+    assert plan["measurement_level_safety"]["meter_total_power_not_exceeded"] is True
     bands = plan["control_band_contract"]["physical_identification_subbands_hz"]
     assert len(bands) == 8 and bands[0][0] == pytest.approx(88.3883476483)
     assert bands[-1][1] == pytest.approx(11313.7084989848)
@@ -69,9 +79,9 @@ def test_v5_exact_support_1024_condition_passes_and_longer_are_not_claimed() -> 
     plan, pcm = build_plan_v5()
     receipt = exact_condition_audit_v5(plan, pcm)
     assert receipt["passed"] is True
-    assert receipt["joint_fit_condition_number"] == pytest.approx(5.302826487260713)
-    assert receipt["role_condition_numbers"]["fit_a"] == pytest.approx(6.861913510234575)
-    assert receipt["role_condition_numbers"]["fit_b"] == pytest.approx(7.37162677190416)
+    assert receipt["joint_fit_condition_number"] == pytest.approx(9.05803353091781)
+    assert receipt["role_condition_numbers"]["fit_a"] == pytest.approx(11.571714021472099)
+    assert receipt["role_condition_numbers"]["fit_b"] == pytest.approx(12.575291092522646)
     assert set(receipt["longer_supports"].values()) == {"NOT_AUDITED_NO_CLAIM"}
     with pytest.raises(ValueError, match="1024"):
         exact_condition_audit_v5(plan, pcm, support=2048)
@@ -253,5 +263,16 @@ def test_v5_offline_raw_publisher_exact_path_no_replace(tmp_path: Path, monkeypa
             plan=plan,
             submitted_pcm=submitted,
             captured_pcm=captured,
+            callback_frames=callbacks,
+        )
+    assert not list((tmp_path / "results/v5-test").glob(".*.staging-*"))
+    with pytest.raises(ValueError, match="<i4"):
+        other_plan, other_submitted = build_plan_v5(
+            raw_session_relative_path="results/v5-test/raw-float.npz"
+        )
+        module._publish_raw_no_replace(
+            plan=other_plan,
+            submitted_pcm=other_submitted,
+            captured_pcm=np.zeros(other_submitted.shape, dtype=np.float64),
             callback_frames=callbacks,
         )
