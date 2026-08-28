@@ -281,6 +281,8 @@ class ANCLoss(nn.Module):
         e: torch.Tensor,
         d: torch.Tensor,
         band_hz: tuple[float, float],
+        *,
+        include_upper: bool = True,
     ) -> torch.Tensor:
         """e/d [B,T]의 주어진 대역 NMSE [B]를 미분가능하게 계산."""
         samples = e.shape[-1]
@@ -288,6 +290,14 @@ class ANCLoss(nn.Module):
             raise ValueError(f"NMSE FFT에 필요한 샘플이 부족합니다: {samples}")
         lo, hi = band_hz
         lo_bin, hi_bin = self._band_bins(samples, lo, hi)
+        if not include_upper:
+            # [lo, hi) 규약. hi가 FFT bin 사이면 floor와 같고, 정확히 bin이면 그
+            # 경계 bin을 다음 인접 subband에만 귀속한다. 기본값은 기존 Stage-1의
+            # 양끝 포함 동작을 그대로 보존한다.
+            hi_bin = min(
+                hi_bin,
+                int(math.ceil(float(hi) * samples / self.sample_rate)) - 1,
+            )
         if lo_bin > hi_bin:
             raise ValueError(
                 f"세그먼트 {samples}샘플 FFT에 trusted band {band_hz} bin이 없습니다"
@@ -313,6 +323,32 @@ class ANCLoss(nn.Module):
         e_band_pow = (e_pow * weights).sum(dim=-1)
         d_band_pow = (d_pow * weights).sum(dim=-1)
         return 10.0 * torch.log10((e_band_pow + _EPS) / (d_band_pow + _EPS))
+
+    def _main_nmse_objective(
+        self,
+        e: torch.Tensor,
+        d: torch.Tensor,
+        nmse_fullband_db: torch.Tensor,
+        nmse_trusted_db: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """주 목적 NMSE를 반환하는 확장 지점.
+
+        Stage-1 :class:`ANCLoss`의 계산은 기존과 바이트 단위로 같은 수식이다. 최종
+        광대역 역할은 이 메서드만 재정의해 일곱 subband를 독립 정규화한다. 이렇게
+        분리하면 기존 150--1600 Hz 설정에 광대역 키를 섞거나, 광대역 구현을 위해
+        :meth:`_forward_fp32` 전체를 복제할 필요가 없다.
+        """
+
+        del e, d  # 기본 구현은 위에서 계산한 연속 대역/fullband 값만 사용한다.
+        if self.nmse_objective == "trusted_band":
+            assert nmse_trusted_db is not None
+            return self._worst_aggregate(nmse_trusted_db), {}
+        return self._worst_aggregate(nmse_fullband_db), {}
+
+    def _dnh_band_bins(self, samples: int, lo_hz: float, hi_hz: float) -> tuple[int, int]:
+        """DNH bin 범위 확장 지점. Stage-1은 기존 양끝 포함 규약을 유지한다."""
+
+        return self._band_bins(samples, lo_hz, hi_hz)
 
     # -------------------------------------------------------- 대역 밖 do-no-harm
     def _do_no_harm(
@@ -348,7 +384,7 @@ class ANCLoss(nn.Module):
         worst = -math.inf
         for item in plan.bands:
             lo, hi = item.band.as_tuple()
-            lo_bin, hi_bin = self._band_bins(samples, lo, hi)
+            lo_bin, hi_bin = self._dnh_band_bins(samples, lo, hi)
             if lo_bin > hi_bin:
                 continue
             num = sy_pow[..., lo_bin : hi_bin + 1].sum(dim=-1)
@@ -448,6 +484,11 @@ class ANCLoss(nn.Module):
         nl_params: dict | None = None,
     ) -> dict[str, float]:
         """각 항이 ``∂/∂y`` 예산에서 차지하는 몫: ``‖λ·∇term‖ / ‖∇nmse‖``.
+
+        여기서 ``y``는 리미터를 통과한 **모델 출력 파형**이다. 이 값은 model
+        parameter-gradient가 아니다. 파라미터 Jacobian을 곱하기 전 손실 표면에서
+        보조항과 NMSE의 상대 크기를 재는 진단이며, 문서와 campaign receipt도 반드시
+        ``model_output_y`` gradient라고 표기해야 한다.
 
         왜 손실 안에 있는가
         ------------------
@@ -560,11 +601,12 @@ class ANCLoss(nn.Module):
         if self.trusted_band_hz is not None:
             nmse_trusted_db = self._band_nmse_db(e_flat, d_flat, self.trusted_band_hz)
 
-        if self.nmse_objective == "trusted_band":
-            assert nmse_trusted_db is not None
-            l_nmse = self._worst_aggregate(nmse_trusted_db)
-        else:
-            l_nmse = self._worst_aggregate(nmse_fullband_db)
+        l_nmse, nmse_objective_metrics = self._main_nmse_objective(
+            e_flat,
+            d_flat,
+            nmse_fullband_db,
+            nmse_trusted_db,
+        )
 
         # 다중해상도 STFT (주파수 가중) — e 의 스펙트럼 에너지를 d 대비로 정규화
         l_mrstft = y.new_zeros(())
@@ -642,6 +684,7 @@ class ANCLoss(nn.Module):
             metrics["frame_worst_db"] = frame_worst_db
         if frame_valid_count is not None:
             metrics["frame_valid_count"] = float(frame_valid_count)
+        metrics.update(nmse_objective_metrics)
         metrics.update(dnh_metrics)
         if nmse_trusted_db is not None:
             mean_db = float(nmse_trusted_db.mean().detach())
