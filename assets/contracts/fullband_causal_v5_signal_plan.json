@@ -1,0 +1,488 @@
+{
+  "schema": "fullband_causal_signal_plan_envelope_v5",
+  "signal_plan": {
+    "actual_submitted_dtype": "<i2",
+    "actual_submitted_pcm_sha256": "c18416e4066556479fd317659d908c215e6662d08f5bfa9d50e4ac63971c4aff",
+    "actual_submitted_peak_pcm": 69,
+    "actual_submitted_shape": [
+      557056,
+      2
+    ],
+    "block_size": 256,
+    "boundary_contract": {
+      "path_switch_and_period_boundary_both_sides_excluded": true,
+      "post_exclusion_samples": 16384,
+      "pre_exclusion_samples": 16384,
+      "support_1024_fits_inside_each_exclusion": true
+    },
+    "canonical_blocker": "signal-only 설계와 합성 fixture는 실제 raw P/S, 8대역 SNR/agreement/residual, stationarity/change-point 증거를 대신하지 않는다",
+    "canonical_payload_sha256": "32a79b3700b457dc40373dc4dd0969301287baea7100b1ec5edd86ea907ee127",
+    "canonical_training_eligible": false,
+    "clock_contract": {
+      "actual_submitted_denominator_includes_near_white_pe": true,
+      "err_ref_primary_secondary_one_common_affine_map_required": true,
+      "fit_roles": [
+        "fit_a",
+        "fit_b"
+      ],
+      "holdout_used_for_fit_or_selection": false,
+      "method": "matching_path_actual_submitted_two_input_spectral_fit",
+      "opposite_path_actual_dft_null_required_at_selected_pilot_lines": true,
+      "pe_contamination_ignored": false,
+      "piecewise_or_change_point_must_reject": true,
+      "pilot_frequencies_are_adc_observed_rate_witness": true,
+      "pilot_present_for_every_submitted_frame": true,
+      "primary_pilot_bins": [
+        104,
+        112,
+        120,
+        128,
+        136,
+        144,
+        152,
+        160,
+        168,
+        176,
+        184,
+        192,
+        200,
+        208,
+        216,
+        224,
+        232,
+        240,
+        248,
+        256,
+        264,
+        272,
+        280,
+        288,
+        296,
+        304,
+        312,
+        320,
+        328,
+        336,
+        344,
+        352,
+        360,
+        368,
+        376,
+        384,
+        392,
+        400,
+        408
+      ],
+      "secondary_pilot_bins": [
+        108,
+        116,
+        124,
+        132,
+        140,
+        148,
+        156,
+        164,
+        172,
+        180,
+        188,
+        196,
+        204,
+        212,
+        220,
+        228,
+        236,
+        244,
+        252,
+        260,
+        268,
+        276,
+        284,
+        292,
+        300,
+        308,
+        316,
+        324,
+        332,
+        340,
+        348,
+        356,
+        364,
+        372,
+        380,
+        388,
+        396,
+        404
+      ]
+    },
+    "control_band_contract": {
+      "contract_id": "broadband_full_octave_88_11314_v3",
+      "equal_weight_octave_objective_bands_hz": [
+        [
+          88.3883476483,
+          176.7766952966
+        ],
+        [
+          176.7766952966,
+          353.5533905933
+        ],
+        [
+          353.5533905933,
+          707.1067811865
+        ],
+        [
+          707.1067811865,
+          1414.2135623731
+        ],
+        [
+          1414.2135623731,
+          2828.4271247462
+        ],
+        [
+          2828.4271247462,
+          5656.8542494924
+        ],
+        [
+          5656.8542494924,
+          11313.7084989848
+        ]
+      ],
+      "legacy_v2_automatic_promotion_allowed": false,
+      "octave_objective_centers_hz": [
+        125.0,
+        250.0,
+        500.0,
+        1000.0,
+        2000.0,
+        4000.0,
+        8000.0
+      ],
+      "octave_objective_semantics": "seven_equal_weight_target_energy_normalized_octaves",
+      "physical_identification_semantics": "plant_identification_and_coverage_not_loss_weighting",
+      "physical_identification_subbands_hz": [
+        [
+          88.3883476483,
+          150.0
+        ],
+        [
+          150.0,
+          300.0
+        ],
+        [
+          300.0,
+          600.0
+        ],
+        [
+          600.0,
+          1000.0
+        ],
+        [
+          1000.0,
+          1600.0
+        ],
+        [
+          1600.0,
+          2828.4271247462
+        ],
+        [
+          2828.4271247462,
+          5656.8542494924
+        ],
+        [
+          5656.8542494924,
+          11313.7084989848
+        ]
+      ],
+      "required_excitation_lower_hz": 80.0,
+      "required_excitation_upper_hz": 11313.7084989848,
+      "requires_exact_v3_contract_sha256": true,
+      "role": "broadband_full_octave",
+      "sample_rate": 48000,
+      "schema_version": "control_band_contract_v3",
+      "source_families": [
+        "speech",
+        "music",
+        "environment",
+        "machine"
+      ],
+      "stage1_low_guard_semantics": "separate_positive_attenuation_guard_not_octave_objective",
+      "stage1_low_guard_subbands_hz": [
+        [
+          150.0,
+          300.0
+        ],
+        [
+          300.0,
+          600.0
+        ],
+        [
+          600.0,
+          1000.0
+        ],
+        [
+          1000.0,
+          1600.0
+        ]
+      ]
+    },
+    "control_band_contract_sha256": "53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2",
+    "duration_seconds": 11.605333333333334,
+    "excitation": {
+      "actual_spectral_extent_hz": [
+        0.0,
+        24000.0
+      ],
+      "kind": "actual_int16_near_white_time_separated_by_path",
+      "p_and_s_main_pe_simultaneously_active": false,
+      "payloads": {
+        "primary_fit_a": {
+          "distribution": "deterministic_rademacher_actual_int16",
+          "pcm_sha256": "78e31ac488430715a2096fe81a10657c90ed28fb66577b9f9d02388d528fa704",
+          "peak_pcm": 49,
+          "qualified_bin_nonzero_fraction": 1.0,
+          "rms_pcm": 49,
+          "seed": 710001
+        },
+        "primary_fit_b": {
+          "distribution": "deterministic_rademacher_actual_int16",
+          "pcm_sha256": "5408bbb55583032ade5c072f87f344aa96c2c049e59c354bb850e5da1d066c4a",
+          "peak_pcm": 49,
+          "qualified_bin_nonzero_fraction": 1.0,
+          "rms_pcm": 49,
+          "seed": 710021
+        },
+        "primary_holdout": {
+          "distribution": "deterministic_rademacher_actual_int16",
+          "pcm_sha256": "ae6132289f2bb7a925a8db588eb9c9a497a353e05443f2b6ddeca89463d70d48",
+          "peak_pcm": 49,
+          "qualified_bin_nonzero_fraction": 1.0,
+          "rms_pcm": 49,
+          "seed": 710041
+        },
+        "secondary_fit_a": {
+          "distribution": "deterministic_rademacher_actual_int16",
+          "pcm_sha256": "e9398696266cd90a4c531d41cc12a75e155371e08bc0999210161eb7b357a4be",
+          "peak_pcm": 49,
+          "qualified_bin_nonzero_fraction": 1.0,
+          "rms_pcm": 49,
+          "seed": 710003
+        },
+        "secondary_fit_b": {
+          "distribution": "deterministic_rademacher_actual_int16",
+          "pcm_sha256": "1f0f0fce90c4a1104700aed0a6513368ed1e078cc5b1ac84f9a817826e173355",
+          "peak_pcm": 49,
+          "qualified_bin_nonzero_fraction": 1.0,
+          "rms_pcm": 49,
+          "seed": 710023
+        },
+        "secondary_holdout": {
+          "distribution": "deterministic_rademacher_actual_int16",
+          "pcm_sha256": "0b62a8b3ac809a0a1b045b23b5a8d015b4abda6efa8b691acadca8be5b5071fd",
+          "peak_pcm": 49,
+          "qualified_bin_nonzero_fraction": 1.0,
+          "rms_pcm": 49,
+          "seed": 710043
+        }
+      },
+      "qualification_band_hz": [
+        80.0,
+        11313.7084989848
+      ]
+    },
+    "layout": [
+      {
+        "frames": 65536,
+        "kind": "pilot_only_lead",
+        "start_frame": 0,
+        "stop_frame": 65536
+      },
+      {
+        "central_start_frame": 81920,
+        "central_stop_frame": 114688,
+        "kind": "primary_fit_a_slot",
+        "path": "primary",
+        "payload_pcm_sha256": "78e31ac488430715a2096fe81a10657c90ed28fb66577b9f9d02388d528fa704",
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "fit_a",
+        "start_frame": 65536,
+        "stop_frame": 131072
+      },
+      {
+        "central_start_frame": 147456,
+        "central_stop_frame": 180224,
+        "kind": "secondary_fit_a_slot",
+        "path": "secondary",
+        "payload_pcm_sha256": "e9398696266cd90a4c531d41cc12a75e155371e08bc0999210161eb7b357a4be",
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "fit_a",
+        "start_frame": 131072,
+        "stop_frame": 196608
+      },
+      {
+        "central_start_frame": 212992,
+        "central_stop_frame": 245760,
+        "kind": "primary_fit_b_slot",
+        "path": "primary",
+        "payload_pcm_sha256": "5408bbb55583032ade5c072f87f344aa96c2c049e59c354bb850e5da1d066c4a",
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "fit_b",
+        "start_frame": 196608,
+        "stop_frame": 262144
+      },
+      {
+        "central_start_frame": 278528,
+        "central_stop_frame": 311296,
+        "kind": "secondary_fit_b_slot",
+        "path": "secondary",
+        "payload_pcm_sha256": "1f0f0fce90c4a1104700aed0a6513368ed1e078cc5b1ac84f9a817826e173355",
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "fit_b",
+        "start_frame": 262144,
+        "stop_frame": 327680
+      },
+      {
+        "central_start_frame": 344064,
+        "central_stop_frame": 376832,
+        "kind": "primary_holdout_slot",
+        "path": "primary",
+        "payload_pcm_sha256": "ae6132289f2bb7a925a8db588eb9c9a497a353e05443f2b6ddeca89463d70d48",
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "holdout",
+        "start_frame": 327680,
+        "stop_frame": 393216
+      },
+      {
+        "central_start_frame": 409600,
+        "central_stop_frame": 442368,
+        "kind": "secondary_holdout_slot",
+        "path": "secondary",
+        "payload_pcm_sha256": "0b62a8b3ac809a0a1b045b23b5a8d015b4abda6efa8b691acadca8be5b5071fd",
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "holdout",
+        "start_frame": 393216,
+        "stop_frame": 458752
+      },
+      {
+        "frames": 98304,
+        "kind": "pilot_only_tail",
+        "start_frame": 458752,
+        "stop_frame": 557056
+      }
+    ],
+    "live_authority": null,
+    "live_capture_enabled": false,
+    "measurement_level_safety": {
+      "meter_total_power_not_exceeded": true,
+      "normalization_divisor": 32768,
+      "official_meter_output_pcm_sha256": "95a7f97b19d1ea26203ae05d72309326eacd3f0f9a5c54f8e60f5041b817f596",
+      "official_meter_reference_total_power": 2.4719371770819027e-06,
+      "scope": "whole_active_slot_including_prefix_central_suffix",
+      "worst_active_slot_total_power": 2.450506030982069e-06,
+      "worst_active_slot_vs_meter_db": -0.03781653503135252
+    },
+    "plant_identification": {
+      "candidate_support_samples": [
+        1024,
+        2048,
+        4096,
+        8192
+      ],
+      "each_path_mic_band_requires_snr_residual_complex_agreement": true,
+      "finite_memory_proved_by_finite_capture": false,
+      "fit_roles": [
+        "fit_a",
+        "fit_b"
+      ],
+      "global_residual_alone_sufficient": false,
+      "holdout_used_for_generation_or_selection": false,
+      "independent_coherence_available": false,
+      "operator": "joint_two_input_finite_causal_fir_actual_full_input",
+      "physical_identification_subbands_hz": [
+        [
+          88.3883476483,
+          150.0
+        ],
+        [
+          150.0,
+          300.0
+        ],
+        [
+          300.0,
+          600.0
+        ],
+        [
+          600.0,
+          1000.0
+        ],
+        [
+          1000.0,
+          1600.0
+        ],
+        [
+          1600.0,
+          2828.4271247462
+        ],
+        [
+          2828.4271247462,
+          5656.8542494924
+        ],
+        [
+          5656.8542494924,
+          11313.7084989848
+        ]
+      ],
+      "selected_support_before_live_evidence": 1024,
+      "support_1024_exact_condition_required_max": 20.0,
+      "support_2048_4096_8192_condition_status": "NOT_AUDITED_NO_CLAIM",
+      "terminal_holdout_role": "holdout"
+    },
+    "publisher_contract": {
+      "atomic_sibling_staging_hardlink_noreplace": true,
+      "callback_semantics": "frame_accounting_only",
+      "flush_and_fsync_file_and_parent": true,
+      "lexical_parent_symlink_rejected": true,
+      "live_authority_at_plan_time": null,
+      "live_xrun_slip_authority": false,
+      "raw_npz_schema": "fullband_causal_raw_capture_v5",
+      "raw_session_relative_path": "results/fullband_causal_v5/raw_capture.npz",
+      "required_arrays": [
+        "submitted_pcm",
+        "captured_pcm",
+        "callback_frames"
+      ],
+      "role": "fixture_only_raw_container_v5"
+    },
+    "role": "signal_only_dry_run_no_audio",
+    "sample_rate": 48000,
+    "schema": "fullband_causal_time_separated_near_white_v5"
+  },
+  "support_1024_condition_receipt": {
+    "actual_submitted_pcm_sha256": "c18416e4066556479fd317659d908c215e6662d08f5bfa9d50e4ac63971c4aff",
+    "canonical_payload_sha256": "300078f714fd19e6b15eaee1bc212b196960301a1c745c256d3d46ac9295b61f",
+    "fit_roles": [
+      "fit_a",
+      "fit_b"
+    ],
+    "joint_fit_condition_number": 9.058033530917806,
+    "longer_supports": {
+      "2048": "NOT_AUDITED_NO_CLAIM",
+      "4096": "NOT_AUDITED_NO_CLAIM",
+      "8192": "NOT_AUDITED_NO_CLAIM"
+    },
+    "maximum_allowed": 20.0,
+    "maximum_eigenvalue": 1013588159.6722435,
+    "minimum_eigenvalue": 111899360.5193181,
+    "passed": true,
+    "role_condition_numbers": {
+      "fit_a": 11.571714021472085,
+      "fit_b": 12.575291092522631
+    },
+    "schema": "fullband_causal_exact_gram_condition_v5",
+    "support_samples": 1024
+  }
+}
