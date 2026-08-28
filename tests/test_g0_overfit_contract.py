@@ -33,6 +33,7 @@ def _module():
 def test_g0_uses_config_lead_and_enforces_minus_six_db_by_default():
     args = _module().build_parser().parse_args([])
 
+    assert args.config == "configs/train_pretrain_tiny.yaml"
     assert args.lead_samples is None
     assert args.require_nmse_db == -6.0
 

@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 
 from ..config import (
     CANONICAL_DETERMINISM_POLICY,
+    PRETRAIN_DERIVATIVE_STRICT_ROLES,
     REPO_ROOT,
     loss_selection_sha256,
     validate_canonical_training_policy,
@@ -60,7 +61,14 @@ from .experiment_contract import (
 from .reproducibility import set_seed, snapshot_run
 
 
-STRICT_RUN_ROLES = CANONICAL_ROLES | frozenset({A100_PRETRAIN_SMOKE_ROLE})
+# pilot/probe는 canonical init 자체는 아니지만, winner를 결정하는 raw evidence다.
+# non-strict snapshot으로 같은 contract directory를 재실행해 best/last를 바꾸거나,
+# CUDA 결정론 설정 없이 seed 차이를 선택 결과로 오인하면 안 된다.
+STRICT_RUN_ROLES = (
+    CANONICAL_ROLES
+    | frozenset({A100_PRETRAIN_SMOKE_ROLE})
+    | PRETRAIN_DERIVATIVE_STRICT_ROLES
+)
 
 
 def _ddp_env() -> tuple[int, int, int]:
@@ -196,8 +204,11 @@ def validate_canonical_run_entry(
     validate_canonical_training_policy(cfg)
     if role == A100_PRETRAIN_SMOKE_ROLE:
         validate_a100_pretrain_smoke_config(cfg, repo_root=REPO_ROOT)
-    else:
+    elif role in CANONICAL_ROLES:
         validate_canonical_pretrain_prerequisites(cfg, repo_root=REPO_ROOT)
+    # loss_pilot/measured_probe는 canonical ledger를 만들기 전의 evidence라 ledger
+    # 자체는 아직 요구하지 않는다. 위 공통 bootstrap/P/S/embedded-contract/source
+    # 검증과 아래 no-overwrite/explicit-resume 경계는 canonical과 동일하게 적용된다.
     require_exact_source_trust(
         cfg, repo_root=REPO_ROOT, roles=STRICT_RUN_ROLES
     )

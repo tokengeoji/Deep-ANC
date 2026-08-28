@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from deep_anc.config import load_train_config  # noqa: E402
 from deep_anc.train.a100_pretrain_smoke import (  # noqa: E402
+    A100_MIN_USABLE_MEMORY_BYTES,
     A100_PRETRAIN_SMOKE_ROLE,
     A100_REQUIRED_CUDA_VERSION,
     A100_REQUIRED_TORCH_VERSION,
@@ -172,9 +173,9 @@ def _preflight_a100(*, cublas_workspace_config: str) -> None:
     if "A100" not in name:
         raise RuntimeError(f"A100 smoke는 A100에서만 실행할 수 있습니다: {name}")
     total_memory = int(torch.cuda.get_device_properties(0).total_memory)
-    if total_memory < 80 * 1024**3:
+    if total_memory < A100_MIN_USABLE_MEMORY_BYTES:
         raise RuntimeError(
-            "A100 smoke는 80 GiB 이상 GPU가 필요합니다: "
+            "A100 smoke는 nominal 80 GB A100의 최소 79 GiB usable VRAM이 필요합니다: "
             f"{total_memory / 1024**3:.1f} GiB"
         )
     if cublas_workspace_config not in {":4096:8", ":16:8"}:

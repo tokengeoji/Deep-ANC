@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+from deep_anc.train.a100_pretrain_smoke import A100_MIN_USABLE_MEMORY_BYTES
+
 
 RUNNER = Path(__file__).resolve().parents[1] / "scripts/train/run_a100_pretrain_smoke.py"
 
@@ -43,3 +45,9 @@ def test_runner_only_admits_the_approved_loss_alpha_grid():
         item for item in runner.build_parser()._actions if item.dest == "loss_alpha"
     )
     assert tuple(action.choices) == (0.7, 0.85, 1.0)
+
+
+def test_runner_uses_the_same_nominal_a100_usable_memory_floor_as_receipt_validator():
+    runner = _load_runner()
+    assert runner.A100_MIN_USABLE_MEMORY_BYTES == A100_MIN_USABLE_MEMORY_BYTES
+    assert A100_MIN_USABLE_MEMORY_BYTES == 79 * 1024**3

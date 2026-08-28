@@ -556,6 +556,7 @@ class QueueSpec:
     entry_gate: dict = field(default_factory=dict)
     adopt: list = field(default_factory=list)
     jobs: list[Job] = field(default_factory=list)
+    execution_class: str = "canonical"
     source: str = ""
 
     def tunable(self, name: str, default: Any) -> Any:
@@ -622,8 +623,14 @@ def load_queue(path: str | Path) -> QueueSpec:
         entry_gate=dict(raw.get("entry_gate") or {}),
         adopt=list(raw.get("adopt") or []),
         jobs=jobs,
+        execution_class=str(raw.get("execution_class", "canonical")),
         source=str(target),
     )
+    if spec.execution_class not in {"canonical", "legacy_diagnostic"}:
+        raise QueueSpecError(
+            "execution_class는 canonical 또는 legacy_diagnostic이어야 합니다: "
+            f"{spec.execution_class!r}"
+        )
     validate_comparability(spec)
     return spec
 

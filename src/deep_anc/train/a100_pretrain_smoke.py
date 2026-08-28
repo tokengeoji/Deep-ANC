@@ -52,6 +52,12 @@ SMOKE_RUN_LABELS = frozenset({"uninterrupted", "resumed"})
 A100_REQUIRED_TORCH_VERSION = "2.5.1+cu121"
 A100_REQUIRED_CUDA_VERSION = "12.1"
 
+# Elice의 nominal A100 80 GB PCIe는 driver-reserved memory 때문에 PyTorch에서
+# 79.4 GiB로 보고된다. 80 * 2**30을 요구하면 실제 80 GB 장치를 잘못 거부한다.
+# bootstrap hardware gate와 동일하게 79 GiB 이상을 요구해 A100 40 GB/MIG slice는
+# 계속 거부하면서, receipt에는 원래 device name/정확한 byte 값을 보존한다.
+A100_MIN_USABLE_MEMORY_BYTES = 79 * 1024**3
+
 # role/init/ledger/run-until/output/resume/embedded contract는 의도적으로 target에서
 # 제외한다. 그 밖의 resolved training 의미는 명시적으로 모두 기록한다. ``data``와
 # ``duct``는 compact P/S, manifest generation, timing contract까지 포함한다.
@@ -591,7 +597,8 @@ def _validate_environment(snapshot: FileSnapshot) -> dict[str, Any]:
         or not isinstance(devices, list)
         or len(devices) != 1
         or "A100" not in str(devices[0].get("name", ""))
-        or int(devices[0].get("total_memory_bytes", 0)) < 80 * 1024**3
+        or int(devices[0].get("total_memory_bytes", 0))
+        < A100_MIN_USABLE_MEMORY_BYTES
         or environment.get("deterministic_algorithms") is not True
         or environment.get("cudnn_benchmark") is not False
         or environment.get("cudnn_deterministic") is not True

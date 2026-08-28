@@ -180,7 +180,9 @@ def isolate_nmse(loss_cfg: dict) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/train_pretrain.yaml")
+    # campaign receipt는 tiny canonical derivative config에서만 유효하다. legacy
+    # train_pretrain.yaml 기본값으로 receipt를 만들고 뒤늦게 거부되는 낭비를 막는다.
+    parser.add_argument("--config", default="configs/train_pretrain_tiny.yaml")
     parser.add_argument("--model-config", default="configs/model_tiny.yaml")
     parser.add_argument("--mode", choices=["nominal", "augmented"], default="nominal")
     parser.add_argument("--steps", type=int, default=500)

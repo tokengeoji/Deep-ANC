@@ -27,6 +27,8 @@ DEFAULT_HANDOFF_SAMPLES = 256
 CANONICAL_FINETUNE_POLICY_VERSION = "canonical_finetune_v1"
 CANONICAL_PRETRAIN_POLICY_VERSION = "canonical_pretrain_v1"
 A100_PRETRAIN_SMOKE_POLICY_VERSION = "a100_pretrain_smoke_v1"
+PRETRAIN_DERIVATIVE_STRICT_ROLES = frozenset({"loss_pilot", "measured_probe"})
+"""canonical 선택 증거를 만드는 단일-GPU·결정론 derivative 역할."""
 CANONICAL_DETERMINISM_POLICY = {
     "schema_version": 1,
     "torch_use_deterministic_algorithms": True,
@@ -518,6 +520,10 @@ def _enforce_pretrain_derivative_policy(cfg: dict) -> None:
         cfg.get("contract_run_dir", False)
     ):
         raise ValueError(f"{role}는 contract_run_dir=true여야 합니다")
+    if role in PRETRAIN_DERIVATIVE_STRICT_ROLES and cfg.get("required_world_size") != 1:
+        raise ValueError(
+            f"{role}는 canonical 선택 증거이므로 required_world_size=1이어야 합니다"
+        )
     cfg["canonical_trust_policy"] = f"{role}_derivative_v1"
 
 
@@ -606,14 +612,21 @@ def validate_canonical_training_policy(cfg: dict) -> None:
                 "a100_pretrain_smoke checkpoint에 a100_pretrain_smoke_v1 trust policy가 없습니다"
             )
         _enforce_a100_pretrain_smoke_policy(cfg)
+    elif role in PRETRAIN_DERIVATIVE_STRICT_ROLES:
+        expected_policy = f"{role}_derivative_v1"
+        if cfg.get("canonical_trust_policy") != expected_policy:
+            raise ValueError(
+                f"{role} checkpoint에 {expected_policy} trust policy가 없습니다"
+            )
+        _enforce_pretrain_derivative_policy(cfg)
     if role in {
         "canonical_pretrain",
         "canonical_finetune",
         A100_PRETRAIN_SMOKE_ROLE,
-    }:
+    } | PRETRAIN_DERIVATIVE_STRICT_ROLES:
         if cfg.get("determinism_policy") != CANONICAL_DETERMINISM_POLICY:
             raise ValueError(
-                "canonical checkpoint의 determinism_policy가 승인 정책과 다릅니다"
+                "canonical/derivative checkpoint의 determinism_policy가 승인 정책과 다릅니다"
             )
 
 
@@ -665,7 +678,7 @@ def _finalize_training_metadata(cfg: dict) -> None:
         "canonical_pretrain",
         "canonical_finetune",
         A100_PRETRAIN_SMOKE_ROLE,
-    }:
+    } | PRETRAIN_DERIVATIVE_STRICT_ROLES:
         derived["determinism_policy"] = copy.deepcopy(
             CANONICAL_DETERMINISM_POLICY
         )

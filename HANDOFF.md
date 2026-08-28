@@ -49,6 +49,16 @@ canonical 100k를 열기 전에 수기 NMSE, gradient share, pilot score/winner 
 4. selected init에 결속한 measured 5k probe의 checkpoint·manifest·finite val metrics
 5. 선택 loss와 같은 A100 exact-resume smoke receipt
 
+issuer와 canonical 100k 명령은 모두 raw pilot selection으로 유도된 같은
+`loss.nmse_cvar_alpha` float를 명시해야 한다. YAML 기본 alpha=0.7을 조용히 쓰지
+않으므로 winner가 0.85 또는 1.0일 때도 다른 계약으로 ledger를 발행할 수 없다.
+
+Elice의 nominal A100 80GB PCIe는 PyTorch에서 driver-reserved memory를 뺀 약
+79.4GiB로 보인다. smoke runner와 receipt validator는 bootstrap과 동일하게
+`79GiB` usable-memory 하한, A100 device name, exact torch/CUDA, world=1,
+결정론 backend를 함께 요구한다. 따라서 40GB A100/MIG slice는 계속 거부하며,
+실제 device name과 byte 값은 immutable environment receipt에 남긴다.
+
 새 source commit으로 전환하면 bootstrap receipt도 exact commit에 결속되어 바뀐다.
 따라서 위 v10 receipt를 다음 campaign의 anchor로 재사용하지 않고, 같은 raw/audit을
 새 exact commit에서 다시 full bootstrap하여 새 receipt와 15/16 readiness를 만든 뒤
@@ -408,7 +418,9 @@ metadata를 검증하고 manifest 6종을 untouched raw에서 재생성한다. n
 2. 고정 batch G0에서 trusted NMSE < −6 dB와 lead metadata를 확인한다.
 3. seed `20260803`, frame-metric-only(`lambda_frame=0`)의 `alpha∈{0.7,1.0}`을 20k
    surrogate + 5k measured probe로 recorded val만 사용해 비교한다. 0.2 dB 이내
-   동률/alpha 1.0 불안정이면 alpha 0.85를 추가하고, 계속 동률이면 alpha 0.7을 택한다.
+   동률이면 alpha 0.85를 추가하고, 계속 동률이면 alpha 0.7을 택한다. alpha 1.0의
+   non-finite/실행 실패는 immutable pre-forward witness를 재실행하는 failure receipt
+   구현 전에는 fallback 근거로 쓰지 않고 canonical을 fail-closed한다.
    170ms frame metric은 candidate마다 기록해 비교·원인 분석에 사용한다. 고정 local
    pass threshold가 생기기 전에는 이 metric으로 성능 PASS를 주장하지 않는다. pilot checkpoint는
    init 자격이 없다.

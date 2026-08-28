@@ -8,6 +8,7 @@
 예시 (모든 artifact는 Elice repository 내부의 immutable 파일이어야 한다):
   .venv/bin/python scripts/train/issue_canonical_pretrain_prerequisite.py \
     --bootstrap-receipt-sha256 "$BOOTSTRAP_SHA" \
+    --loss-alpha <WINNER_ALPHA> \
     --g0-receipt results/training_prerequisites/evidence/g0_x/receipt.json \
     --gradient-receipt results/training_prerequisites/evidence/gradient_x/receipt.json \
     --pilot-best runs/<pilot07>/ckpt/best.pt --pilot-last runs/<pilot07>/ckpt/last.pt \
@@ -64,12 +65,22 @@ def _reference(path: str, *, label: str) -> dict[str, str]:
     return make_campaign_evidence_reference(REPO_ROOT, path, label=label)
 
 
-def _canonical_cfg(config: str, bootstrap_sha: str, prerequisite_sha: str) -> dict:
+def _canonical_cfg(
+    config: str,
+    bootstrap_sha: str,
+    prerequisite_sha: str,
+    *,
+    loss_alpha: float,
+) -> dict:
     return load_train_config(
         config,
         [
             f"data.bootstrap_receipt_sha256={bootstrap_sha}",
             f"campaign_prerequisite_sha256={prerequisite_sha}",
+            # ``1``이 아닌 ``1.0``으로 직렬화해 loss selection digest가 pilot과
+            # 달라지는 것을 막는다. winner와 다른 값을 주면 raw validator가 거부한다.
+            f"loss.nmse_cvar_alpha={float(loss_alpha):.1f}" if float(loss_alpha).is_integer()
+            else f"loss.nmse_cvar_alpha={float(loss_alpha):.12g}",
         ],
     )
 
@@ -88,6 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/train_pretrain_tiny.yaml")
     parser.add_argument("--bootstrap-receipt-sha256", required=True)
+    parser.add_argument(
+        "--loss-alpha",
+        type=float,
+        required=True,
+        help=(
+            "raw pilot selection으로 유도된 canonical alpha. issuer와 이후 100k "
+            "명령은 반드시 같은 float literal을 사용한다."
+        ),
+    )
     parser.add_argument("--g0-receipt", required=True)
     parser.add_argument("--gradient-receipt", required=True)
     parser.add_argument("--pilot-best", action="append", required=True)
@@ -125,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.out != CANONICAL_PATH:
         raise ValueError(f"campaign ledger output은 {CANONICAL_PATH}로 고정됩니다")
     bootstrap_sha = _sha(args.bootstrap_receipt_sha256, label="bootstrap receipt SHA")
+    loss_alpha = float(args.loss_alpha)
     lengths = {len(args.pilot_best), len(args.pilot_last), len(args.pilot_metrics)}
     if len(lengths) != 1 or next(iter(lengths)) < 2:
         raise ValueError("pilot best/last/metrics는 같은 개수의 최소 두 candidate여야 합니다")
@@ -140,7 +161,9 @@ def main(argv: list[str] | None = None) -> int:
     # 아직 ledger bytes가 없으므로 dummy external anchor로 canonical semantic target을
     # resolve한다. campaign SHA는 source/P/S/loss 선택 자체에는 포함하지 않으며, 실제
     # write 뒤에는 새 SHA로 resolve한 cfg를 validator가 다시 검사한다.
-    provisional = _canonical_cfg(args.config, bootstrap_sha, "0" * 64)
+    provisional = _canonical_cfg(
+        args.config, bootstrap_sha, "0" * 64, loss_alpha=loss_alpha
+    )
     require_exact_source_trust(
         provisional, repo_root=REPO_ROOT, roles={"canonical_pretrain"}
     )
@@ -192,7 +215,9 @@ def main(argv: list[str] | None = None) -> int:
     # 이 prospective SHA가 config의 external trust anchor가 된다. raw validator를
     # 먼저 돌려 실패한 evidence가 canonical fixed pathname을 점유하지 않게 한다.
     prospective_sha = _ledger_sha256(ledger)
-    prospective_cfg = _canonical_cfg(args.config, bootstrap_sha, prospective_sha)
+    prospective_cfg = _canonical_cfg(
+        args.config, bootstrap_sha, prospective_sha, loss_alpha=loss_alpha
+    )
     validate_canonical_pretrain_ledger_payload(
         prospective_cfg,
         ledger,
@@ -204,7 +229,9 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("canonical prerequisite JSON digest가 prospective SHA와 다릅니다")
     # 원자 공개 뒤, canonical entrypoint와 동일한 path+external SHA에서 raw proof를
     # 재계산한다. 어떤 hand-written score/boolean도 이 단계에서는 읽지 않는다.
-    canonical = _canonical_cfg(args.config, bootstrap_sha, ledger_sha)
+    canonical = _canonical_cfg(
+        args.config, bootstrap_sha, ledger_sha, loss_alpha=loss_alpha
+    )
     validate_canonical_pretrain_prerequisites(canonical, repo_root=REPO_ROOT)
     print(
         "[campaign prerequisite] PASS — "

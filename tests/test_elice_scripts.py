@@ -1300,6 +1300,25 @@ def test_bootstrap_default_is_environment_data_only_without_legacy_runner():
     assert "학습은 시작하지 않음" in text
 
 
+def test_legacy_launchers_require_an_explicit_acknowledgement():
+    pretrain = subprocess.run(
+        ["bash", str(ELICE_SCRIPTS[3])],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    parallel = subprocess.run(
+        ["bash", str(ELICE_SCRIPTS[2])],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert pretrain.returncode == 2
+    assert parallel.returncode == 2
+    assert "canonical tiny" in pretrain.stderr
+    assert "legacy base/tiny" in parallel.stderr
+
+
 def _make_fake_runner(
     tmp_path: Path,
     *,
@@ -1350,6 +1369,7 @@ def test_parallel_runner_does_not_overwrite_existing_log(tmp_path: Path):
     result = subprocess.run(
         ["bash", "scripts/elice/run_parallel_models.sh"],
         cwd=root,
+        env={**os.environ, "DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC": "1"},
         capture_output=True,
         text=True,
         timeout=10,
@@ -1368,6 +1388,7 @@ def test_parallel_runner_reports_immediate_process_exit(tmp_path: Path):
     result = subprocess.run(
         ["bash", "scripts/elice/run_parallel_models.sh"],
         cwd=root,
+        env={**os.environ, "DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC": "1"},
         capture_output=True,
         text=True,
         timeout=15,
@@ -1397,6 +1418,7 @@ def test_parallel_runner_rolls_back_survivor_on_partial_start_failure(tmp_path: 
     result = subprocess.run(
         ["bash", "scripts/elice/run_parallel_models.sh"],
         cwd=root,
+        env={**os.environ, "DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC": "1"},
         capture_output=True,
         text=True,
         timeout=15,

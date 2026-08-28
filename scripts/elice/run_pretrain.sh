@@ -1,18 +1,32 @@
 #!/bin/bash
-# 사전학습 실행 (Elice) — 세션 끊김 대비 nohup + 로그 tee.
-# 사용: bash scripts/elice/run_pretrain.sh [config(기본 configs/train_pretrain.yaml)]
-# GPU 수를 감지해 2장 이상이면 torchrun DDP 로 실행한다.
+# legacy 사전학습 진단 실행기 — canonical tiny에는 사용 금지.
+# 이 파일은 historical base/legacy P/S 결과를 재현·진단할 때만 보존한다.
+# canonical tiny는 docs/05_training_elice.md의 bootstrap/ledger/alpha/CUBLAS 명령만 쓴다.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 VENV_PYTHON="$PWD/.venv/bin/python"
 VENV_TORCHRUN="$PWD/.venv/bin/torchrun"
+
+if [ "${1:-}" != "--legacy-diagnostic" ] || [ "$#" -ne 2 ]; then
+  echo "사용법: DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC=1 bash scripts/elice/run_pretrain.sh --legacy-diagnostic configs/train_pretrain.yaml" >&2
+  echo "[중단] canonical tiny는 이 legacy 실행기로 시작할 수 없습니다." >&2
+  exit 2
+fi
+if [ "${DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC:-}" != "1" ]; then
+  echo "[중단] legacy 진단 실행은 DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC=1을 명시해야 합니다." >&2
+  exit 2
+fi
+CONFIG="$2"
+if [ "$CONFIG" != "configs/train_pretrain.yaml" ]; then
+  echo "[중단] 이 실행기는 legacy configs/train_pretrain.yaml만 허용합니다: $CONFIG" >&2
+  exit 2
+fi
 
 if [ ! -x "$VENV_PYTHON" ]; then
   echo "[오류] $VENV_PYTHON 없음 — setup_env.sh 를 먼저 실행하세요." >&2
   exit 1
 fi
 
-CONFIG="${1:-configs/train_pretrain.yaml}"
 NGPU=$("$VENV_PYTHON" -c "import torch; print(torch.cuda.device_count())")
 STAMP=$(date +%Y%m%d_%H%M%S)
 LOG="runs/train_${STAMP}.log"

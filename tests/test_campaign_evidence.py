@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import importlib.util
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,6 +26,48 @@ from deep_anc.train.campaign_evidence import (
     validate_gradient_budget_receipt,
 )
 from deep_anc.train.evaluation_contract import snapshot_regular_file
+
+
+ISSUER_SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "train"
+    / "issue_canonical_pretrain_prerequisite.py"
+)
+
+
+def _issuer_module():
+    spec = importlib.util.spec_from_file_location("_campaign_issuer", ISSUER_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("alpha", "literal"),
+    [(0.7, "0.7"), (0.85, "0.85"), (1.0, "1.0")],
+)
+def test_issuer_resolves_canonical_config_with_the_selected_alpha(
+    monkeypatch: pytest.MonkeyPatch, alpha: float, literal: str
+) -> None:
+    """winner가 기본 0.7이 아니어도 issuer/100k 계약이 같은 alpha를 쓴다."""
+
+    module = _issuer_module()
+    captured: list[str] = []
+
+    def fake_load(_config, overrides):
+        captured.extend(overrides)
+        return {"fixture": True}
+
+    monkeypatch.setattr(module, "load_train_config", fake_load)
+    module._canonical_cfg(
+        "configs/train_pretrain_tiny.yaml",
+        "a" * 64,
+        "b" * 64,
+        loss_alpha=alpha,
+    )
+    assert f"loss.nmse_cvar_alpha={literal}" in captured
 
 
 def test_g0_publisher_keeps_only_raw_model_and_batch_not_manual_metric(tmp_path):

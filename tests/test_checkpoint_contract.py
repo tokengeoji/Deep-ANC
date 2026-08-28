@@ -37,6 +37,7 @@ from deep_anc.train.campaign_prerequisite import (
 import deep_anc.train.campaign_prerequisite as campaign_prerequisite_module
 from deep_anc.train.campaign_evidence import PILOT_SELECTION_RULE
 from deep_anc.train.a100_pretrain_smoke import (
+    A100_MIN_USABLE_MEMORY_BYTES,
     A100_PRETRAIN_SMOKE_ROLE,
     SMOKE_ROOT,
     build_a100_pretrain_smoke_artifacts,
@@ -45,6 +46,8 @@ from deep_anc.train.a100_pretrain_smoke import (
     build_a100_pretrain_smoke_target,
     finalize_a100_pretrain_smoke_receipt,
 )
+import deep_anc.train.a100_pretrain_smoke as a100_smoke_module
+from deep_anc.train.evaluation_contract import snapshot_regular_file
 from deep_anc.train.completion_receipt import (
     validate_completion_receipt,
     write_completion_receipt,
@@ -68,6 +71,60 @@ from deep_anc.train.trainer import (
 
 _BOOTSTRAP_SHA = "a" * 64
 _PREREQUISITE_SHA = "d" * 64
+
+
+def _a100_environment_payload(*, total_memory_bytes: int) -> dict:
+    return {
+        "python": "fixture",
+        "torch": "2.5.1+cu121",
+        "torch_cuda": "12.1",
+        "cuda_available": True,
+        "device_count": 1,
+        "devices": [
+            {
+                "index": 0,
+                "name": "NVIDIA A100 80GB PCIe",
+                "capability": [8, 0],
+                "total_memory_bytes": total_memory_bytes,
+            }
+        ],
+        "deterministic_algorithms": True,
+        "cudnn_benchmark": False,
+        "cudnn_deterministic": True,
+        "cublas_workspace_config": ":4096:8",
+    }
+
+
+def test_a100_environment_accepts_actual_nominal_80gb_usable_memory(tmp_path):
+    """PyTorch가 79.4 GiB로 보고하는 실제 Elice A100 80GB PCIe를 허용한다."""
+
+    path = tmp_path / "environment.json"
+    path.write_text(
+        json.dumps(
+            _a100_environment_payload(total_memory_bytes=85_293_072_384),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert (
+        a100_smoke_module._validate_environment(snapshot_regular_file(path))["devices"][0]
+        ["total_memory_bytes"]
+        == 85_293_072_384
+    )
+
+    path.write_text(
+        json.dumps(
+            _a100_environment_payload(
+                total_memory_bytes=A100_MIN_USABLE_MEMORY_BYTES - 1
+            ),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="world1/CUDA/결정론"):
+        a100_smoke_module._validate_environment(snapshot_regular_file(path))
 
 
 def _load_bound_canonical(

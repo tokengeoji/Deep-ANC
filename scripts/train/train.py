@@ -17,9 +17,6 @@ from deep_anc.config import load_train_config          # noqa: E402
 from deep_anc.train.finetune_readiness import (        # noqa: E402
     require_finetune_readiness,
 )
-from deep_anc.train.a100_pretrain_smoke import (       # noqa: E402
-    A100_PRETRAIN_SMOKE_ROLE,
-)
 from deep_anc.train.process_lock import (               # noqa: E402
     LockHeldError,
     ProcessLock,
@@ -27,17 +24,14 @@ from deep_anc.train.process_lock import (               # noqa: E402
     resolve_run_dir,
 )
 from deep_anc.train.trainer import (                   # noqa: E402
+    STRICT_RUN_ROLES,
     Trainer,
     preflight_canonical_resume,
 )
 
 
 def requires_same_run_lock(cfg: dict) -> bool:
-    return str(cfg.get("experiment_role", "")) in {
-        "canonical_pretrain",
-        "canonical_finetune",
-        A100_PRETRAIN_SMOKE_ROLE,
-    } or any(
+    return str(cfg.get("experiment_role", "")) in STRICT_RUN_ROLES or any(
         bool(cfg.get(name, False))
         for name in (
             "require_measured_primary_path",

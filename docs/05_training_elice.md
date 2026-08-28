@@ -142,7 +142,7 @@ bootstrap은 `results/provenance/decoder_audit.json`을 먼저 만들고
 기존 `data/manifests/` v3 세대는 forensic/diagnostic 자료로 보존하며 canonical 설정이 읽지
 않는다. bootstrap 종료 후 noise QA, recorded QA, 전체 pytest와 readiness를 다시 실행한다.
 strict P/S·transfer/public corpus가 모두 정상이고 canonical init만 없는 상태가
-**14/15 PASS**다. 그보다 적으면 학습을 시작하지 않는다.
+**15/16 PASS**다. 그보다 적으면 학습을 시작하지 않는다.
 
 ## 5. 사전학습 계약 선택
 
@@ -159,8 +159,11 @@ gain/polarity/EQ와 input-only mic noise만 켜고, 1차 실행의 session mixin
 alpha ∈ {0.7, 1.0}, lambda_frame = 0.0
 ```
 
-test는 열지 않고 recorded val만 사용한다. 차이가 0.2 dB 이내거나 alpha 1.0이 불안정하면
-alpha 0.85(`lambda_frame=0`)를 추가한다. 계속 동률이면 단순한 alpha 0.7을 선택한다.
+test는 열지 않고 recorded val만 사용한다. 차이가 0.2 dB 이내이면
+alpha 0.85(`lambda_frame=0`)를 추가한다. alpha 1.0의 non-finite/실행 실패는 현재
+"불안정"이라는 수기 표기로 0.85를 자동 승인하지 않는다. pre-forward model·batch·RNG를
+재실행해 검증하는 immutable failure receipt가 준비되기 전까지는 canonical을 차단하고 raw를
+보존한다. 계속 동률이면 단순한 alpha 0.7을 선택한다.
 frame은 170 ms metric으로 계속 기록해 후보 비교·원인 분석에 사용한다. 고정 local pass
 threshold는 아직 증거가 없으므로 성능 주장에는 쓰지 않으며, signed frame gradient를
 되살리려면 one-sided/item-wise v2 guard와 별도 control evidence가 필요하다.
@@ -171,9 +174,26 @@ pilot/probe checkpoint는
 `configs/train_pretrain_tiny.yaml`은 canonical A100 한 장 전용이다. 실행 디렉터리는 계약 SHA와
 seed에서 파생하며 기존 경로를 덮어쓰지 않는다.
 
+아래 값은 모두 같은 Elice exact checkout에서 읽고, `ALPHA`는 raw pilot selection으로
+유도한 값만 쓴다. bare `train.py --config ...`는 의도적으로 fail-closed한다.
+
 ```bash
-.venv/bin/python scripts/train/train.py --config configs/train_pretrain_tiny.yaml
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+BOOT=$(sha256sum data/manifests/elice_bootstrap_receipt.json | awk '{print $1}')
+LEDGER=$(sha256sum results/training_prerequisites/canonical_pretrain.json | awk '{print $1}')
+ALPHA=0.7  # raw pilot winner(0.7/0.85/1.0) 값으로 교체
+
+.venv/bin/python scripts/train/train.py \
+  --config configs/train_pretrain_tiny.yaml \
+  --set data.bootstrap_receipt_sha256="$BOOT" \
+  --set campaign_prerequisite_sha256="$LEDGER" \
+  --set loss.nmse_cvar_alpha="$ALPHA"
 ```
+
+`scripts/elice/run_pretrain.sh`, `run_parallel_models.sh`, `queue_gpu0.yaml`,
+`queue_gpu1.yaml`은 historical legacy diagnostic 전용이며 canonical 명령으로 사용할 수 없다.
+실행하려면 별도의 legacy acknowledgement가 필요하고, canonical evidence·init·성능 근거로
+승격되지 않는다.
 
 자동 resume은 없다. 동일한 `experiment_contract_sha256`와 global sample index/RNG 상태를 가진
 같은 실행의 `last.pt`만 명시적으로 재개한다.
@@ -181,6 +201,9 @@ seed에서 파생하며 기존 경로를 덮어쓰지 않는다.
 ```bash
 .venv/bin/python scripts/train/train.py \
   --config configs/train_pretrain_tiny.yaml \
+  --set data.bootstrap_receipt_sha256="$BOOT" \
+  --set campaign_prerequisite_sha256="$LEDGER" \
+  --set loss.nmse_cvar_alpha="$ALPHA" \
   --resume runs/<canonical-contract-seed>/ckpt/last.pt
 ```
 
@@ -189,7 +212,7 @@ recorded-val `best.pt`, best metric/step 관계를 결속해야 init 자격이 �
 
 ## 6. 공식 파인튜닝과 test
 
-canonical 100k `best.pt`를 `init_ckpt`로 명시하고 readiness **15/15 PASS**를 먼저 확인한다.
+canonical 100k `best.pt`를 `init_ckpt`로 명시하고 readiness **16/16 PASS**를 먼저 확인한다.
 
 ```bash
 INIT_CKPT=runs/<canonical-pretrain>/ckpt/best.pt

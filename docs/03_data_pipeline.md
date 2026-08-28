@@ -102,7 +102,7 @@ Stage-2 커리큘럼으로 한 축씩 켠다.
 .venv/bin/python scripts/data/make_recorded_manifest.py
 # 전체 파일/메타/클리핑/무음/분할 누수 QA — PASS 전에는 학습 금지
 .venv/bin/python scripts/data/validate_recorded_sessions.py
-# canonical init과 transfer trust anchor를 지정하고 readiness 15/15 뒤 pipeline 실행
+# canonical init과 transfer trust anchor를 지정하고 readiness 16/16 뒤 pipeline 실행
 .venv/bin/python scripts/train/run_finetune_pipeline.py \
   --config configs/train_finetune.yaml \
   --set data.digital_primary_path_mode=measured \

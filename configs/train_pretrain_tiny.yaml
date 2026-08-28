@@ -64,8 +64,10 @@ resume: null
 seed: 20260803
 
 # pilot은 frame-metric-only(lambda_frame=0)로 고정하고 alpha∈{0.7,1.0}를 비교한다.
-# 차이가 0.2dB 이내이거나 alpha=1.0이 불안정할 때만 alpha=0.85를 추가한다. signed
-# frame-CVaR 0.5/0.2는 fixed-batch control에서 영출력 붕괴를 재현해 승인 후보가 아니다.
+# 차이가 0.2dB 이내일 때만 alpha=0.85를 추가한다. alpha=1.0 non-finite/실행 실패는
+# 재현 가능한 immutable failure receipt가 생기기 전까지 0.85 fallback의 근거가 아니며
+# canonical을 막는다. signed frame-CVaR 0.5/0.2는 fixed-batch control에서 영출력 붕괴를
+# 재현해 승인 후보가 아니다.
 # 각 후보는 100k schedule을 바꾸지 않고
 # `--set experiment_role=loss_pilot --set init_eligible=false \
 # --set run_until_step=20000`으로 같은 초반 곡선을 비교한다. role과 두 loss
