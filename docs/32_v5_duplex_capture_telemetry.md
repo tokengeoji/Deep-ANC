@@ -4,6 +4,11 @@
 PortAudio callback primitive다. `sounddevice`를 import하지 않고 상위 계층이 검증한
 backend와 장치 번호를 주입한다.
 
+성공 telemetry schema의 단일 코드 권위는
+`deep_anc.audio_duplex_v5.DUPLEX_TELEMETRY_SCHEMA`이며 현재 값은
+`fullband_causal_v5_duplex_telemetry_v3`다. 소비자는 문자열을 별도로 복제하지 않고 이
+상수를 사용해야 한다.
+
 고정 실행 계약은 48 kHz, 256 frame, low latency, 입력 2채널 exact `<i4`, 출력
 2채널 exact `<i2`다. 검증과 output 제출까지 성공 commit된 callback은 sequence,
 software cursor 시작점, frame 수,
@@ -17,6 +22,23 @@ PortAudio xrun status 증거와 hardware sample-slip 권위는 다르다. schema
 `portaudio_xrun_status_witness=true`, `hardware_sample_slip_authority=false`를 고정한다.
 따라서 이 primitive만으로 live
 plant 또는 training authority를 열 수 없다.
+
+v3 성공/실패 telemetry는 상위 adapter가 넘긴 exact nonnegative int
+`resolved_input_device`와 `resolved_output_device`를 항상 포함한다. 문자열, bool, 음수 또는
+암묵적 정수 변환은 Stream open 전에 거부한다. raw publisher는 이 값을 현재 hardware
+binding의 PortAudio device와 다시 대조해야 한다.
+
+또한 성공/실패 모두 `capture_monotonic_started`, `capture_monotonic_completed`, 두 값에서
+계산한 `capture_monotonic_elapsed_seconds`, 실제 `watchdog_grace_seconds`를 포함한다. caller가
+작성한 UTC 시작/완료 시각은 capture duration 권위가 아니다. raw publisher는 monotonic elapsed를
+계획 frame 수/48 kHz와 watchdog 상한에 대조해야 한다.
+
+v3 성공 반환은 callback 배열뿐 아니라 `submitted_frames`, 빈
+`canonical_invalid_reasons`, `stream_stop_error/stream_abort_error/stream_close_error`
+각각 `null`, `normal_stop_completed=true`, `output_stop_confirmed=true`를 포함한다.
+또한 실제 제출 `<i2 [frames,2]` PCM과 capture/submitted exact bool valid mask를 함께
+반환한다. offline 소비자는 이 전체 exact key 집합, PCM dtype/shape/value, 두 mask의
+all-true를 모두 검증해야 한다. frame 수만 같은 임의 telemetry는 허용하지 않는다.
 
 priming callback은 금지한다. 정상 완료는 `stop(ignore_errors=False)` 후 close하고,
 실패만 `abort(ignore_errors=False)` 후 close한다. 구조와 timestamp를 모두 검증한 뒤

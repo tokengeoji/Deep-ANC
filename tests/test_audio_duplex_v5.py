@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from deep_anc.audio_duplex_v5 import (
+    DUPLEX_TELEMETRY_SCHEMA,
     DuplexCaptureFailure,
     STATUS_INPUT_OVERFLOW,
     capture_duplex_v5,
@@ -122,10 +123,55 @@ def test_normal_exact_zero_status_and_stop():
         backend.kwargs["channels"],
     ) == (48_000, 256, ("low", "low"), (2, 2))
     assert np.all(telemetry["callback_status_bitmask"] == 0)
+    assert telemetry["schema"] == DUPLEX_TELEMETRY_SCHEMA
+    assert telemetry["resolved_input_device"] == 1
+    assert telemetry["resolved_output_device"] == 2
+    assert telemetry["capture_monotonic_completed"] >= telemetry["capture_monotonic_started"]
+    assert telemetry["capture_monotonic_elapsed_seconds"] == pytest.approx(
+        telemetry["capture_monotonic_completed"]
+        - telemetry["capture_monotonic_started"]
+    )
+    assert telemetry["watchdog_grace_seconds"] == 2.0
     assert np.array_equal(telemetry["actual_submitted_pcm"], pcm())
-    assert backend.calls[-2:] == [("stop", False), ("close", False)]
+    assert telemetry["portaudio_xrun_status_witness"] is True
     assert telemetry["hardware_sample_slip_authority"] is False
+    assert telemetry["watchdog_coverage"] == (
+        "host_wait_until_planned_frames_plus_grace_not_hardware_deadline_witness"
+    )
+    assert telemetry["submitted_frames"] == len(pcm())
+    assert telemetry["canonical_invalid_reasons"] == []
+    assert telemetry["stream_stop_error"] is None
+    assert telemetry["stream_abort_error"] is None
+    assert telemetry["stream_close_error"] is None
+    assert telemetry["normal_stop_completed"] is True
+    assert telemetry["output_stop_confirmed"] is True
+    assert telemetry["capture_valid_mask"].dtype == np.dtype(np.bool_)
+    assert telemetry["submitted_valid_mask"].dtype == np.dtype(np.bool_)
+    assert np.all(telemetry["capture_valid_mask"])
+    assert np.all(telemetry["submitted_valid_mask"])
+    assert backend.calls[-2:] == [("stop", False), ("close", False)]
     assert raw.dtype == np.dtype("<i4")
+
+
+@pytest.mark.parametrize("name,value", [("input_device", -1), ("output_device", -1), ("input_device", "1"), ("output_device", True)])
+def test_device_identity_is_exact_before_stream_open(name, value):
+    backend = Backend()
+    arguments = {"input_device": 1, "output_device": 2, name: value}
+    with pytest.raises(ValueError, match="device"):
+        capture_duplex_v5(backend, submitted_pcm=pcm(), **arguments)
+    assert backend.calls == []
+
+
+def test_failure_telemetry_always_carries_resolved_devices():
+    backend = Backend(frames=128)
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend)
+    assert caught.value.telemetry["resolved_input_device"] == 1
+    assert caught.value.telemetry["resolved_output_device"] == 2
+    assert caught.value.telemetry["capture_monotonic_completed"] >= (
+        caught.value.telemetry["capture_monotonic_started"]
+    )
+    assert caught.value.telemetry["capture_monotonic_elapsed_seconds"] >= 0.0
 
 
 def test_xrun_completes_then_invalid_with_actual_prefix():
@@ -180,7 +226,7 @@ def test_external_plan_copy_and_watchdog_prefix():
     assert np.array_equal(telemetry["actual_submitted_pcm"], pcm())
 
     backend = Backend(blocks=2)
-    ticks = iter([0.0, 99.0])
+    ticks = iter([0.0, 99.0, 99.0])
     with pytest.raises(DuplexCaptureFailure) as caught:
         run(backend, monotonic=lambda: next(ticks), sleep=lambda _: None)
     failure = caught.value

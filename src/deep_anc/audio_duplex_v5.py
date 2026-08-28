@@ -13,6 +13,7 @@ SAMPLE_RATE = 48_000
 BLOCK_SIZE = 256
 LATENCY = "low"
 CHANNELS = (2, 2)
+DUPLEX_TELEMETRY_SCHEMA = "fullband_causal_v5_duplex_telemetry_v3"
 STATUS_INPUT_UNDERFLOW = 1 << 0
 STATUS_INPUT_OVERFLOW = 1 << 1
 STATUS_OUTPUT_UNDERFLOW = 1 << 2
@@ -88,6 +89,10 @@ def capture_duplex_v5(
         raise ValueError("submitted_pcm은 exact <i2 [frames,2]여야 합니다")
     if len(planned) <= 0 or len(planned) % BLOCK_SIZE:
         raise ValueError("frame 수는 양수인 256의 배수여야 합니다")
+    if type(input_device) is not int or input_device < 0:
+        raise ValueError("input_device는 음이 아닌 exact int여야 합니다")
+    if type(output_device) is not int or output_device < 0:
+        raise ValueError("output_device는 음이 아닌 exact int여야 합니다")
     grace = float(watchdog_grace_seconds)
     if not np.isfinite(grace) or grace <= 0:
         raise ValueError("watchdog grace는 finite 양수여야 합니다")
@@ -104,6 +109,9 @@ def capture_duplex_v5(
     invalid: list[str] = []
     rows: list[tuple[Any, ...]] = []
     last_times = None
+    capture_monotonic_started = float(monotonic())
+    if not np.isfinite(capture_monotonic_started):
+        raise ValueError("capture monotonic start는 finite여야 합니다")
 
     def callback(indata, outdata, frames, time_info, status):  # noqa: ANN001
         nonlocal cursor, completed, callback_error, last_times
@@ -188,7 +196,7 @@ def capture_duplex_v5(
         stream = backend.Stream(
             samplerate=48_000,
             blocksize=256,
-            device=(int(input_device), int(output_device)),
+            device=(input_device, output_device),
             channels=(2, 2),
             dtype=("int32", "int16"),
             latency=("low", "low"),
@@ -196,7 +204,7 @@ def capture_duplex_v5(
             prime_output_buffers_using_stream_callback=False,
         )
         stream.start()
-        deadline = monotonic() + total / 48_000 + grace
+        deadline = capture_monotonic_started + total / 48_000 + grace
         while not completed:
             if callback_error:
                 raise RuntimeError(f"오디오 callback 실패: {callback_error}")
@@ -226,12 +234,19 @@ def capture_duplex_v5(
         except BaseException as exc:
             close_error = exc
 
+    capture_monotonic_completed = float(monotonic())
+    if not np.isfinite(capture_monotonic_completed):
+        failure = failure or ValueError("capture monotonic completion은 finite여야 합니다")
+    capture_monotonic_elapsed = capture_monotonic_completed - capture_monotonic_started
+    if not np.isfinite(capture_monotonic_elapsed) or capture_monotonic_elapsed < 0.0:
+        failure = failure or ValueError("capture monotonic elapsed는 finite nonnegative여야 합니다")
+
     def col(index: int, dtype: str) -> np.ndarray:
         return np.asarray([row[index] for row in rows], dtype=dtype)
 
     masks = col(6, "<u4")
     telemetry = {
-        "schema": "fullband_causal_v5_duplex_telemetry_v2",
+        "schema": DUPLEX_TELEMETRY_SCHEMA,
         "callback_frame_semantics": (
             "software_accounting_only_not_hardware_slip_witness"
         ),
@@ -244,6 +259,12 @@ def capture_duplex_v5(
         "block_size": 256,
         "latency": "low",
         "channels": [2, 2],
+        "resolved_input_device": input_device,
+        "resolved_output_device": output_device,
+        "capture_monotonic_started": capture_monotonic_started,
+        "capture_monotonic_completed": capture_monotonic_completed,
+        "capture_monotonic_elapsed_seconds": capture_monotonic_elapsed,
+        "watchdog_grace_seconds": grace,
         "input_dtype": "<i4",
         "output_dtype": "<i2",
         "callback_sequence": col(0, "<i8"),
