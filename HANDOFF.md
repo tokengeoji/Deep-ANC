@@ -2,9 +2,43 @@
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
 > 최종 갱신: 2026-08-29. 완료된 현장 검증 브랜치: `work/v8-rt5640-zero-duplex`.
-> 현재 하드웨어 admission 브랜치: `work/v12-synchronized-witness-admission`
-> (S32 transport 기준선: `work/v10b-rt5640-fullband-s32-admission`).
+> 현재 S32 capture admission 브랜치: `work/v13-rt5640-s32-capture-admission`
+> (external witness 기준선: `work/v12-synchronized-witness-admission`, S32 transport 기준선:
+> `work/v10b-rt5640-fullband-s32-admission`).
 > 현재 파일 기반 training readiness 감사: `docs/44_canonical_training_readiness_audit_20260829.md`.
+
+## 0-V13. RT5640 S32 capture admission (2026-08-29)
+
+### [가설]
+
+S32 disarmed callback success만으로 physical P/S·학습을 허용할 수 있다.
+
+### [근거]
+
+callback이 보존하는 planned/actual PCM은 application buffer의 bytes다. 실제 DAC voltage,
+output tap, shared clock은 이 배열만으로 보이지 않는다. legacy v5 S16 raw writer는 S32
+scale과 pre-arm evidence를 보존하지 않는다. 상세는 `docs/50_rt5640_s32_capture_admission_v10_3.md`다.
+
+### [확인 방법]
+
+`rt5640_s32_capture_admission_v10_3.py`는 sealed Q15→S32 plan SHA, all-true mask,
+pre-arm zero, xrun/status/error zero, exact callback sequence와 post-start hw_params/route/J511/
+occupancy receipt를 순수 재검산한다. PCM/ALSA/result file은 열지 않는다.
+
+### [결과]
+
+정상 result는 `S32_CAPTURE_TRANSPORT_PASS_ELECTRICAL_WITNESS_UNBOUND`로만 표지된다.
+partial failure는 raw 삭제·재측정 대신 `S32_CAPTURE_BLOCKED_PARTIAL_OR_INVALID`로 남긴다.
+모든 electrical/P/S/training/deployment authority는 false다.
+
+### [판정]
+
+**Confirmed — S32 application-buffer transport admission only.**
+
+### [다음 행동]
+
+actual RT5640 live adapter가 post-start receipt와 immutable S32 raw publisher를 제공해야
+한다. 그 뒤에도 external synchronized electrical witness가 없으면 P/S·학습은 열리지 않는다.
 
 ## 0-V12. external synchronized electrical witness admission (2026-08-29)
 
