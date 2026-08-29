@@ -1,9 +1,88 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-29. 현재 실패 분석·후속 설계 브랜치: `work/v7-nonaffine-clock`.
+> 최종 갱신: 2026-08-29. 현재 현장 검증 브랜치: `work/v8-rt5640-zero-duplex`.
 
-## 0-V7. v6 실제 결과와 현재 차단 상태 (2026-08-29, 최우선)
+## 0-V8. RT5640 exact-zero 동시 입출력 admission (2026-08-29, 최우선)
+
+### [가설]
+
+USB DAC를 쓰지 않고 APE `hw:APE,0` playback과 `hw:APE,1` capture를 동시에 열면,
+I2S1/I2S2의 같은 APE rate 계열에서 다음 fullband clock/electrical witness를 설계할 수 있는
+최소 transport가 성립할 가능성이 있다고 가정한다.
+
+### [근거]
+
+- 구현·테스트 commit:
+  `cb7c459c9fc3ee7ac5642838d5e236cd023f688d`
+  (`work/v8-rt5640-zero-duplex`, origin push 완료)
+- 전용 config: `configs/hardware_jetson_rt5640_zero_smoke.yaml`
+- live adapter: `scripts/jetson/audit_rt5640_zero_duplex.py`
+- 계약·안전 상세: `docs/41_rt5640_zero_duplex.md`
+- 실제 read-only ALSA fingerprint SHA-256:
+  `a5f20b5dad1e3eee11b5275ef0a2f2531a461e93dc01410d0868ebb8b34c2957`
+- 의도된 출력은 60초 동안 S32_LE bitwise zero이며 audible signal은 0초다. 다만 stream
+  open/close pop은 application buffer만으로 배제할 수 없어 물리 출력 분리가 필수다.
+
+### [확인 방법]
+
+1. callback 첫 부작용을 int32 output buffer 전체 zero-fill로 고정했다.
+2. constructor/start/watchdog/callback/stop/abort/close와 INT/TERM/HUP를 fault injection했다.
+3. current worktree/clean exact commit/venv/Python/numpy/yaml/tool/sounddevice/module SHA를
+   live 전후 결속한다.
+4. machine-global lock과 기존 repository audio lock을 함께 잡고 시스템 전체 PCM status와
+   `/dev/snd/pcm*` owner를 fail-closed 검사한다.
+5. Pulse APE profile `off`, 네 APE mux route, RT5640 driver, 동적 PortAudio ALSA mapping과
+   실행 중 hw_params `S32_LE/48 kHz/2ch/period 256`을 직접 확인한다.
+6. ALSA/mixer는 변경하지 않는다. 전후 raw snapshot을 보존하고, ALSA가 exact
+   `read volatile`로 선언한 numid 1132–1143의 12개 `Lane1..6 Ratio Int/Frac` value line만
+   sentinel로 정규화한 뒤 나머지를 byte-exact 비교한다. allowlist·metadata·일반 control
+   차이는 `STATE_UNCERTAIN`이다.
+7. raw NPZ를 post-snapshot보다 먼저 no-replace 보존하고, success receipt는 stream·snapshot·
+   signal handler·두 lock이 모두 정상 종료된 뒤에만 발행한다.
+
+### [결과]
+
+- v8 집중/entry contract 테스트 158개 PASS.
+- 전체 pytest는 1,807개를 수집해 exit 0으로 끝났다. 알려진 skip과 로컬에 Elice public
+  manifest 5종이 없다는 진단 warning만 있으며 새 FAIL은 없다.
+- 실제 장치 미개방 dry-run PASS, generation 미생성.
+- 실제 read-only gate: system PCM status 46개 전부 closed, PCM node 46개 owner 0,
+  Pulse APE profile `off`, 다음 route 4개 exact PASS.
+  - `I2S1 Mux=ADMAIF1`
+  - `ADMAIF1 Mux=I2S1`
+  - `ADMAIF2 Mux=I2S2`
+  - `I2S2 Mux=ADMAIF2`
+- 실제 장치 미개방 double snapshot은 raw `alsactl`의 12개 read-volatile 값만 달랐고,
+  volatile-normalized ALSA/amixer와 모든 nonvolatile state는 exact PASS했다.
+- `results/rt5640_zero_duplex/v1`은 아직 생성되지 않았다. 실제 PCM/Stream은 열지 않았다.
+
+### [판정]
+
+**코드·read-only admission은 PASS, 실제 transport는 NOT RUN.** 현재 성공 상한도
+`ZERO_DUPLEX_TRANSPORT_SMOKE_PASS`뿐이다. all-zero는 physical sample drop/add/reorder,
+shared clock, electrical route, P/S, lead, 감쇠 dB 또는 학습 적격성을 증명하지 않는다.
+
+따라서 현재도 canonical fullband pretrain/fine-tune은 **BLOCKED**다. 150–1600 Hz legacy
+Stage-1 준비와 혼동하지 않으며, 사용자가 요구한 2/4/8 kHz 고주파 성능 근거가 생기기 전
+학습을 열지 않는다.
+
+### [다음 행동]
+
+1. 사용자에게서 다음 실제 상태를 확인한 뒤 exact commit에서 60초 live를 한 번만 실행한다.
+   - J511–앰프 분리
+   - 앰프 전원 OFF
+   - 앰프 입력 분리
+   - AB13X–앰프 분리
+   - 사용자 입회
+2. PASS해도 곧바로 학습하지 않는다. 짧은 electrical/frame witness를 먼저 설계·검증한다.
+3. 그 뒤에만 저레벨 channel/polarity와 실제 덕트 fullband P/S를 한 연결 창에서 측정한다.
+4. 새 plant가 150–1600 Hz뿐 아니라 2/4/8 kHz consistency와 out-of-band do-no-harm를
+   통과하면 transfer manifest/Elice readiness를 새 exact commit에 다시 결속한다.
+5. 그 후 fullband loss pilot → canonical 100k pretrain → 50k measured fine-tune → unseen
+   speech/music/environment/machine 및 실제 natural sound G4를 실행한다.
+
+## 0-V7. v6 실제 결과와 현재 차단 상태 (2026-08-29, 이전 실패 근거)
 
 ### [가설]
 
