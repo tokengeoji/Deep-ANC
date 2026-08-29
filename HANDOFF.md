@@ -5,6 +5,54 @@
 > 현재 준비 브랜치: `work/v10-fullband-rt5640-contract`.
 > 현재 파일 기반 training readiness 감사: `docs/44_canonical_training_readiness_audit_20260829.md`.
 
+## 0-V11. full-octave v3 admission-only 차단 경계 (2026-08-29)
+
+### [가설]
+
+125 Hz--8 kHz 계약 primitive가 있다는 이유만으로 기존 Stage-1 Trainer, old P/S 또는
+legacy manifest에 연결해 학습을 열 위험이 있다.
+
+### [근거]
+
+- branch: `work/v11-full-octave-v3-admission`
+- read-only auditor: `src/deep_anc/train/full_octave_v3_admission.py`
+- config: `configs/full_octave_v3_admission.yaml`
+- command: `scripts/train/check_full_octave_v3_admission.py`
+- 경계 상세: `docs/45_full_octave_v3_admission_boundary.md`
+
+### [확인 방법]
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/train/check_full_octave_v3_admission.py --markdown
+```
+
+이 명령은 Trainer/GPU/ALSA/sounddevice/run directory를 열지 않는다. future raw와
+authority artifact가 생기면 file SHA, exact schema, raw→plant→population→batch→DNH
+cross-reference를 snapshot으로 다시 검사한다.
+
+### [결과]
+
+기본 config는 canonical v3 SHA만 PASS하고 fullband raw, causal P/S, population,
+family-balanced batch, DNH calibration 모두 `BLOCKED`를 보고한다. 또한 현재 branch에는
+causal `S*y` prefix adapter, v3 criterion factory/readiness, 7-octave + matched FxLMS
+evaluator가 없으므로, 모든 future artifact를 가정한 fixture도 `eligible=false`다.
+`scripts/train/train.py`는 이 admission-only config를 model/GPU/lock/run 생성 전에
+exit 2로 거부한다.
+
+### [판정]
+
+**Confirmed — safe admission boundary only.** 이 결과는 P/S, ANC attenuation, high-band
+performance 또는 Elice 학습 준비 PASS가 아니다. 지금 정확한 결과는 full-octave
+canonical training **BLOCKED**다.
+
+### [다음 행동]
+
+1. v10.3 S32 meter/raw-first publisher와 electrical witness를 무음 dry-run으로 완성한다.
+2. 승인된 한 연결 창에서 fresh 88.388--11,313.708 Hz P/S를 측정한다.
+3. corrected raw로 population/lineage/batch/DNH receipt를 발행한다.
+4. 그 후에만 별도 branch에서 v3 trainer/readiness/evaluator consumer를 구현하고 이 code
+   blocker를 대체한다.
+
 ## 0-V10. RT5640 full-octave static boundary (2026-08-29)
 
 ### [가설]
