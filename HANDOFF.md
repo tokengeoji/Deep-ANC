@@ -139,6 +139,19 @@ artifact SHA, 독립 raw projection, 정확한 출력 시간 및 authority 한�
 것뿐이다. USB DAC↔APE 독립 시간축과 2-input 공간 관측 한계 때문에 이 raw는
 P/S·lead·학습·ANC 감쇠·FxLMS 비교·quiet-zone 근거가 아니다.
 
+### 0.5 2026-08-29 RT5640/J511 common-clock 출력 후보 (아직 사용 불가)
+
+read-only ALSA/DT 감사에서 `APE PCM0 → ADMAIF1 → I2S1 → RT5640 → J511` route와
+APE PCM1/I2S2 ERR/REF route가 실제로 노출됐고, I2S1--6은 APE `PLL_A` 공유 후보임을
+확인했다. 따라서 USB AB13X의 adaptive/asynchronous endpoint보다 timing 구조상 유리할
+가능성은 있다. 그러나 현 J511 state는 세 번 모두 `None`, PCM은 closed, electrical/
+acoustic output witness와 hardware-frame identity는 모두 없다. 이 route는 즉시
+high-band P/S·학습·ANC 권한이 아니며 8-input quiet-zone acquisition의 대체도 아니다.
+
+근거·정확한 config SHA·무음 다음 gate는
+[`docs/59_20260829_rt5640_common_clock_route_audit.md`](docs/59_20260829_rt5640_common_clock_route_audit.md)에
+기록했다. J511 cable이 실제로 연결될 때만 `HP`/`HS` 세 번 일치부터 다시 확인한다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
