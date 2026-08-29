@@ -83,6 +83,13 @@ fixture-only가 아닌 artifact 없이는 **BLOCKED**를 유지하도록 코드�
   또는 terminal `PASS`에 성공 exit/학습/배포 authority를 주지 않는다. 실제 capture adapter
   O_EXCL provenance, full-octave P/S·lead, native lineage inventory, 완료 checkpoint·selection,
   독립 raw evaluator가 별도 authority로 생겨야 한다.
+- 2026-08-29 무음 실행 감사에서 v5 `--execute-live`가 false authority에도 backend로
+  진입할 수 있던 안전 결함을 수정했다. 이제 tracked
+  `fullband_causal_v5_live_capture_authority.json`의
+  `plan_live_capture_enabled=false`이면 CLI와 내부 `_execute_live()`가 모두
+  audio primitive/`sounddevice` import 전에 exit 2로 fail-closed한다. 회귀는 false
+  authority에서 execute/backend import가 각각 0회임을 검사한다. 이 변경은 live 권한을
+  여는 것이 아니라, 현재 `BLOCKED` 경계를 실제 실행에도 강제하는 것이다.
 - historical high-band raw
   `results/experimental_high_band/20260827_fullband/20260827_203328_1b24d0c2/`
   (raw SHA `46acda579a4ba7069844cc6824fcf4e475edc750d1b43a80cfe40a2e9ffe1ec7`)는

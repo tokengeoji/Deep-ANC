@@ -183,6 +183,11 @@ def _wire_fake_live(
     plan, submitted = build_plan_v5()
     events: list[str] = []
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_assert_live_capture_authority_enabled_before_execute",
+        lambda _args: None,
+    )
     monkeypatch.setattr(module, "build_plan_v5", lambda: (plan, submitted.copy()))
     monkeypatch.setattr(
         module,
@@ -366,6 +371,11 @@ def test_dirty_checkout_blocks_before_backend_import(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(
         module,
+        "_assert_live_capture_authority_enabled_before_execute",
+        lambda _args: None,
+    )
+    monkeypatch.setattr(
+        module,
         "_repository_execution_identity",
         lambda: (_ for _ in ()).throw(RuntimeError("dirty repository checkout")),
     )
@@ -432,6 +442,11 @@ def test_static_tamper_aborts_before_backend_import(
 ) -> None:
     module = _load_script(f"v5_static_tamper_{reason}")
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_assert_live_capture_authority_enabled_before_execute",
+        lambda _args: None,
+    )
     monkeypatch.setattr(module, "_repository_execution_identity", lambda: {})
     monkeypatch.setattr(
         module,
@@ -450,6 +465,11 @@ def test_wrong_resolved_device_aborts_before_audio_lock(
     module = _load_script("v5_wrong_device")
     plan, submitted = build_plan_v5()
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_assert_live_capture_authority_enabled_before_execute",
+        lambda _args: None,
+    )
     monkeypatch.setattr(module, "_repository_execution_identity", lambda: {})
     monkeypatch.setattr(module, "build_plan_v5", lambda: (plan, submitted.copy()))
     monkeypatch.setattr(module, "_static_contract_before_backend_import", lambda _a: _fake_static(plan))
@@ -500,6 +520,64 @@ def test_missing_meter_and_dry_run_do_not_import_backend(
     )
     assert module.main(["--dry-run"]) == 0
     assert calls == []
+
+
+def test_disabled_authority_blocks_main_before_execute_live_and_backend_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tracked authority가 capture-only이므로 main은 live code에 진입하면 안 된다."""
+
+    module = _load_script("v5_disabled_authority_main")
+    executed: list[object] = []
+    backend_imports: list[str] = []
+    real_import = module.importlib.import_module
+
+    monkeypatch.setattr(
+        module,
+        "_execute_live",
+        lambda args: executed.append(args) or 0,
+    )
+
+    def no_sounddevice(name: str):
+        if name == "sounddevice":
+            backend_imports.append(name)
+            raise AssertionError("disabled authority imported sounddevice")
+        return real_import(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", no_sounddevice)
+
+    assert (
+        module.main(
+            [
+                "--execute-live",
+                "--meter-raw",
+                "results/fullband_causal_v5/level_meter/meter_raw.npz",
+            ]
+        )
+        == 2
+    )
+    assert executed == []
+    assert backend_imports == []
+
+
+def test_disabled_authority_blocks_direct_execute_before_backend_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """내부 호출도 main 수준 authority gate를 우회할 수 없다."""
+
+    module = _load_script("v5_disabled_authority_direct")
+    backend_imports: list[str] = []
+    real_import = module.importlib.import_module
+
+    def no_sounddevice(name: str):
+        if name == "sounddevice":
+            backend_imports.append(name)
+            raise AssertionError("disabled authority imported sounddevice")
+        return real_import(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", no_sounddevice)
+    assert module._execute_live(_live_args(tmp_path)) == 2
+    assert backend_imports == []
 
 
 def test_external_receipt_offline_rejects_raw_array_splice(

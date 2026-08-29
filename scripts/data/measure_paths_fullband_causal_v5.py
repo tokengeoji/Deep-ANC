@@ -239,6 +239,45 @@ def _repository_relative(value: str | Path, *, label: str) -> str:
     return relative
 
 
+def _assert_live_capture_authority_enabled_before_execute(
+    args: argparse.Namespace,
+) -> None:
+    """sealed authority가 명시적으로 열기 전에는 live 출력을 거부한다.
+
+    현재 committed v5 authority는 의도적으로 capture-only다. bytes와
+    provenance가 내부적으로 일관되더라도 어댑터가 ``_execute_live`` 또는
+    audio backend import까지 도달하지 못하게 static contract와 별도로 막는다.
+    """
+
+    from deep_anc.dsp.fullband_live_authority_v5 import (
+        EXPECTED_LIVE_CAPTURE_AUTHORITY_FILE_SHA256,
+        EXPECTED_LIVE_CAPTURE_AUTHORITY_PAYLOAD_SHA256,
+        SEALED_LIVE_CAPTURE_AUTHORITY_RELATIVE_PATH,
+        load_exact_saved_live_capture_authority_v5,
+    )
+
+    authority_relative = _repository_relative(
+        args.live_authority, label="live authority"
+    )
+    if authority_relative != SEALED_LIVE_CAPTURE_AUTHORITY_RELATIVE_PATH:
+        raise ValueError("--live-authority가 sealed v5 authority path와 다릅니다")
+    loaded = load_exact_saved_live_capture_authority_v5(
+        REPO_ROOT / authority_relative,
+        repository_root=REPO_ROOT,
+        expected_file_sha256=EXPECTED_LIVE_CAPTURE_AUTHORITY_FILE_SHA256,
+        expected_payload_sha256=EXPECTED_LIVE_CAPTURE_AUTHORITY_PAYLOAD_SHA256,
+    )
+    authority = loaded.get("authority")
+    if not isinstance(authority, Mapping):
+        raise RuntimeError("sealed v5 authority payload가 없습니다")
+    if authority.get("plan_live_capture_enabled") is not True:
+        raise RuntimeError(
+            "assets/contracts/fullband_causal_v5_live_capture_authority.json의 "
+            "plan_live_capture_enabled=false이므로 --execute-live를 fail-closed "
+            "차단합니다"
+        )
+
+
 def _meter_contract_module() -> Any:
     module = importlib.import_module("deep_anc.dsp.fullband_v5_meter")
     required = (
@@ -467,6 +506,22 @@ def _offline_command(
 
 def _execute_live(args: argparse.Namespace) -> int:
     """exact 11.605333초 capture만 수행한다; 지연 분석은 절대 호출하지 않는다."""
+
+    # 직접 호출도 audio primitive와 아래의 명시적 sounddevice import보다 먼저 막는다.
+    try:
+        _assert_live_capture_authority_enabled_before_execute(args)
+    except (
+        AssertionError,
+        FileNotFoundError,
+        FileExistsError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as error:
+        print(f"[중단] v5 live authority gate 실패: {error}", file=sys.stderr)
+        print(SPEAKER_PREFLIGHT_ABORT_NOTICE, file=sys.stderr, flush=True)
+        return 2
 
     from deep_anc.audio_duplex_v5 import DuplexCaptureFailure, capture_duplex_v5
     from deep_anc.audio_io import capture_measurement_preflight_raw
@@ -871,6 +926,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.execute_live:
         if args.meter_raw is None:
             print("[중단] --execute-live에는 fresh --meter-raw가 필요합니다", file=sys.stderr)
+            return 2
+        try:
+            _assert_live_capture_authority_enabled_before_execute(args)
+        except (
+            AssertionError,
+            FileNotFoundError,
+            FileExistsError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            print(f"[중단] v5 live authority gate 실패: {error}", file=sys.stderr)
+            print(SPEAKER_PREFLIGHT_ABORT_NOTICE, file=sys.stderr, flush=True)
             return 2
         return _execute_live(args)
 
