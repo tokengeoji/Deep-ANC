@@ -178,6 +178,27 @@ clean linked worktree 7개와 stale registration을 Git으로 해제했고, `dev
 기록했다. 이 정리는 raw/model/data를 삭제하거나 `main`에 미검증 결과를 병합하지 않는다.
 최종 상태는 `main`(배포 기준선)과 `dev`(통합 개발선)만 유지한다.
 
+### 0.8 2026-08-29 실제 acquisition witness readiness 재감사
+
+현재 Jetson ALSA 장치와 full-octave fail-closed checker를 다시 대조했다. AB13X는
+playback 2채널/capture mono 1채널의 asynchronous USB endpoint이고, APE PCM1의 ERR/REF와
+같은 hardware frame을 증명하지 못한다. J511/RT5640은 output 후보일 뿐 최근 plug state가
+세 번 `None`이고 4-input electrical witness 또는 8-input quiet-zone acquisition을 만들지
+못한다. 따라서 current device set만으로 125 Hz--8 kHz canonical P/S·학습·배포를 여는 것은
+**BLOCKED**다.
+
+무출력 static checker는 `static_gate_pass=true`와 동시에
+`electrical_witness_pass=false`, `canonical_training_eligible=false`를 반환했고, 8-input
+physical bundle checker도 raw/plan/sidecar 부재로 정상적으로 exit 1 `BLOCKED`였다. 이는
+하드웨어 통과가 아니라 우회가 막혔다는 증거다. 최신 `dev` 전체 pytest는 0 FAIL이며 local
+canonical_v4 부재 RuntimeWarning 두 건만 남았다.
+
+정확한 실제 inventory, 4/8-input 최소 조건, safety tap 조건과 Stage-1의 별도 17세션
+순서는 [`docs/61_20260829_acquisition_witness_readiness.md`](docs/61_20260829_acquisition_witness_readiness.md)에
+기록했다. 현재 소프트웨어로 가능한 다음 단계는 새 Elice A100 exact bootstrap → DNS
+selection receipt → 17행 no-replace plan/dry-run이며, final high-band는 동기 acquisition
+topology 확정 전까지 녹음·학습으로 우회하지 않는다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
