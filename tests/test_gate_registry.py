@@ -22,6 +22,7 @@ import pytest
 
 from deep_anc.config import REPO_ROOT
 from deep_anc.ops.gate_registry import (
+    CANONICAL_FINETUNE_READINESS_GATE_IDS,
     GATES,
     GateDeclaration,
     declared_gate_ids,
@@ -31,10 +32,12 @@ from deep_anc.ops.gate_registry import (
 )
 
 
-# 게이트 id 를 문자열 리터럴로 들고 있어 스캔이 가능한 소스.
+# 게이트 id를 문자열 literal 또는 같은 scope의 단순 문자열 변수로 들고 있어
+# AST 스캔이 가능한 소스.
 _SCANNED_SOURCES = ("src/deep_anc/train/finetune_readiness.py",)
 # ⚠ 미선언 탐지는 이 **한 파일**에서만 돈다. ``discover_audit_gate_ids`` 가 찾는 것은
-# ``audit.fail("gate_id", …)`` 형태뿐이고, 나머지 15개 소유 파일은 게이트를
+# 정적 문자열 또는 단순 문자열 변수로 호출한 ``audit.fail/pass_``뿐이고, 나머지 15개
+# 소유 파일은 게이트를
 # ``raise ValueError`` / ``errors.append`` / 스크립트 종료코드로 표현하기 때문이다.
 # 즉 "게이트는 짝 없이 존재할 수 없다"는 **선언된 게이트에 대해서만** 참이고, 새
 # 게이트를 선언 없이 만드는 경로는 열려 있다 — 2026-08-06 에 실제로 그렇게 만들어진
@@ -125,6 +128,55 @@ def test_every_gate_in_the_source_is_declared():
         f"선언되지 않은 게이트가 있습니다: {missing} — "
         "deep_anc/ops/gate_registry.py 에 negative fixture 와 함께 선언하세요"
     )
+
+
+def test_variable_bound_audit_gate_ids_are_discovered(tmp_path):
+    """변수에 묶인 새 gate가 literal-only scan을 피해갈 수 없어야 한다."""
+
+    source = tmp_path / "variable_gate.py"
+    source.write_text(
+        "def check(audit):\n"
+        "    gate_id = 'variable_bound_gate'\n"
+        "    audit.fail(gate_id, 'fixture')\n"
+        "    audit.pass_(gate_id, 'fixture')\n",
+        encoding="utf-8",
+    )
+    assert discover_audit_gate_ids(source) == {"variable_bound_gate"}
+
+
+def test_canonical_finetune_readiness_authority_is_exactly_17_declared_gates():
+    """canonical 진입 점수의 분모와 gate identity를 함께 고정한다."""
+
+    expected = {
+        "config_fail_closed_flags",
+        "recorded_transfer_snapshot",
+        "absolute_objective_scope",
+        "measured_primary_mode",
+        "recorded_mix_ratio",
+        "official_secondary_path",
+        "official_primary_path",
+        "matched_path_measurement_conditions",
+        "path_delay_and_lead",
+        "completed_init_checkpoint",
+        "recorded_dataset_qa",
+        "recorded_alignment_integrity",
+        "recorded_statistical_power",
+        "recorded_subband_coverage",
+        "corpus_disjoint",
+        "measured_source_delay_agreement",
+        "plant_confidence_ceiling",
+    }
+    authority = tuple(CANONICAL_FINETUNE_READINESS_GATE_IDS)
+    assert len(authority) == 17
+    assert len(set(authority)) == 17
+    assert set(authority) == expected
+    assert expected <= declared_gate_ids()
+    assert all(
+        gate(gate_id).owner == "src/deep_anc/train/finetune_readiness.py"
+        for gate_id in authority
+    )
+    discovered = discover_audit_gate_ids(REPO_ROOT / _SCANNED_SOURCES[0])
+    assert expected <= discovered
 
 
 def test_every_declared_gate_has_a_failing_fixture():

@@ -13,11 +13,18 @@
 `P(z)`/`S(z)`와 독립 recorded test 전에는 어떤 NMSE도 덕트 물리 성능으로
 주장하지 않는다.
 
+이 문서의 기존 150–1600 Hz G4는 Stage-1 규약이다. 최종 광대역 판정은 2/4/8 kHz
+octave(식별 상단 11.314 kHz), 저역 양의 감쇠, 고역 matched FxLMS 우위, 네 family와
+Level-5 unseen, 최소 5개 ERR 위치를 추가로 요구한다. 권위는
+[`docs/18_broadband_anc_guardrails.md`](18_broadband_anc_guardrails.md)와
+`ControlBandContract v2`이며, Stage-1 G4 PASS를 최종 광대역 성공으로 해석하지 않는다.
+
 ## 1. 지표
 
 | 지표 | 정의 | 좋은 방향 |
 |---|---|---|
 | trusted-band NMSE(dB) | **150–1600Hz**에서 10·log₁₀(Σ|E|²/Σ|D|²) | 음수 ↓ |
+| strict trusted subband NMSE | 150–300 / 300–600 / 600–1000 / **1000–1600Hz**의 family별 평균·최악 10%·group bootstrap CI | 각 항목 음수 ↓ |
 | fullband NMSE(dB) | 전 주파수에서 10·log₁₀(Σe²/Σd²) | 음수 ↓ |
 | NMSE gap(dB) | trusted − fullband; 대역 집중 이득/대역 밖 행동 차이 | 0과 함께 해석 |
 | 감쇠(attenuation, dB) | −NMSE = 10·log₁₀(P_d/P_e) | 양수 ↑ |
@@ -82,9 +89,22 @@ control limit 0.10 조건의 역사적 baseline이며 현재 하드웨어에서 
   checkpoint의 resolved 스냅샷과 동일한 measured P/S/lead 설정 파일을 명시해야 한다.
 - `evaluate_recorded.py`는 checkpoint의 **resolved** model/data/duct만 사용하고 기본적으로
   `measured_primary_path` artifact만 허용한다. 이식 가능한 manifest의 group 누수를 다시
-  검사하고, 세션 가장자리 0.25초를 제외한 결정적 segment에서 `e=d+S·y`를 먼저 계산한 뒤
-  warmup 0.25초를 절단한다. trusted/fullband/gap, source family, 옥타브, 최악 10%와 G4
-  PASS/FAIL을 `metrics.md`+`metrics.npz`에 저장한다. surrogate는 명시적
+  검사하고, 세션 가장자리 0.25초를 제외한 1.5초 비중첩 segment를 session당 최대 64개까지
+  결정적으로 선택해 `e=d+S·y`를 먼저 계산한 뒤 canonical warmup을 절단한다. 공식 val/test는
+  이 64/1.5초/0.25초 모집단을 exact 강제하며 `--warmup-seconds`,
+  `--feedback-delay-samples` 및 표본 override는 diagnostic 실행에서만 허용한다.
+  persisted metrics의 hop·lead·delay 자기진술은 증거가 아니다. selection과 test completion이
+  checkpoint의 `model.hop`/전체 timing 계약, manifest sample rate, 각 session의 immutable
+  `session.json.timeline.aligned_lag_median_samples`, checkpoint 기본 feedback/warmup과
+  모든 결정론적 start의 exact set을 다시 계산해 대조한다. 따라서 적은 segment만 고른 뒤
+  lead/delay까지 함께 다시 쓰는 결과도 canonical G4를 통과할 수 없다.
+  trusted/fullband/gap, source family, 옥타브, 최악 10%와 G4
+  PASS/FAIL을 `metrics.md`+`metrics.npz`에 저장한다. 공식 150–1600Hz 결과는 반드시
+  **150–300 / 300–600 / 600–1000 / 1000–1600Hz**의 family별 target(`d`=ERR) coverage, 평균,
+  최악 10%, 독립 group bootstrap CI를 raw segment에서 함께 발행한다. 네 번째 부대역이
+  0dB 이상이거나 target(`d`=ERR) energy/그룹/CI가 부족하면 전체 평균이 좋아도 final PASS는 불가능하다.
+  target-energy density coverage threshold는 metrics에 raw density와 함께 남기며, canonical 적용 전
+  82세션 family×band 분포 audit으로 별도 정당화·계약 결속한다. surrogate는 명시적
   `--allow-surrogate` 진단만 가능하며 물리 성능으로 해석하지 않는다.
 
 공식 test는 이 스크립트를 임의로 직접 호출하지 않는다. `run_finetune_pipeline.py`가 val
@@ -116,7 +136,9 @@ cluster-bootstrap CI·latency/deadline/xrun을 함께 남긴다. `attenuation > 
 최종 OOD PASS 조건은 다음을 모두 만족해야 한다.
 
 1. trusted 150–1600Hz 평균과 모든 family 최악 10%가 0dB 미만이고, fullband 평균이 0dB
-   이하이다.
+   이하이다. 또한 각 family의 150–300 / 300–600 / 600–1000 / **1000–1600Hz**마다
+   target(`d`=ERR) coverage, 평균, 최악 10%, 95% group-bootstrap CI 상단이 모두 0dB
+   조건을 만족한다.
 2. 2/4/8kHz는 `trusted=False`로 숨기지 않고 별도 표에 싣는다. high-band P/S가 유효한
    경우 평균 감쇠가 양수이고, 어떤 경우에도 최악 10% 증폭이 1dB를 넘지 않아야 한다.
 3. 48kHz/256-sample 실시간에서 P99가 deadline(5.333ms)을 넘지 않고 deadline miss와 xrun이
@@ -266,7 +288,7 @@ ANC ON duty 0%였고, 무음 3-thread 진단도 256/low에서 miss 261·xrun 311
 | G1 경로 실측 | 동일 캡처의 `P(z)`/`S(z)` **동시 인터리브** 측정. 요구 대역(150–1600Hz) **모든 부대역** 일관성 ≥0.9406, 유지 반복 ≥8, **P−S 상대 τ 궤적이 상수**(편차 ≤3샘플), 타임베이스 드리프트 ≤2샘플/주기, 정렬 신뢰도 ≥0.95 | surrogate 이외 물리 주장 불가 |
 | G2 데이터 | 소스 family×대역 커버리지, 그룹 단위 8:1:1, 독립 recorded val/test, **재생→캡처 결맞음 coh²(source→ERR) ≥0.6 (150–600Hz)**, **합성 매니페스트 ∩ 실측 소스 = ∅** | 누수·환경 암기·**시간축 붕괴** 가능성 |
 | G3 파인튜닝 | `digital_primary_path_mode: measured`, measured 70% + synth 30%, P/S/lead 스냅샷 보존 | 표현 사전학습 상태 |
-| G4 독립 평가 | trusted **150–1600Hz** < 0dB와 fullband ≤0dB를 동시 통과, 소스별 **최악값** < 0dB, **대역 밖 do-no-harm**, 검정력·그룹 부트스트랩 CI. 판정은 **3값**(PASS/FAIL/**INCONCLUSIVE**) | 국소 개선 또는 대역 밖 증폭 |
+| G4 독립 평가 | trusted **150–1600Hz** < 0dB와 fullband ≤0dB를 동시 통과, source family별 **네 strict 부대역**(150–300/300–600/600–1000/**1000–1600Hz**)의 coverage·평균·최악 10%·group bootstrap CI, 소스별 최악값, **대역 밖 do-no-harm**. 판정은 **3값**(PASS/FAIL/**INCONCLUSIVE**) | 국소 개선·상위 trusted 부대역 실패 또는 대역 밖 증폭 |
 | G5 Jetson/실기 | artifact lead fail-fast 통과, P99 <3ms, watchdog/xrun 기록, FxLMS와 동일 세션 비교 | 배포 성능 주장 불가 |
 
 G0의 고정-batch 수치는 의도적 과적합 진단이지 일반화 성능이 아니다.

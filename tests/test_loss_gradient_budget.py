@@ -15,8 +15,9 @@ dict** 를 쓴다), 이 파일이 출하 설정을 그 측정에 걸어 둔다. 
 -----------
 이 smoke는 **현재 Trainer가 쓰는 strict S(z), 유도된 정착 절단, 대역**을 그대로
 쓴다. 고정 합성 파형의 ``∂L/∂y`` 비율은 정확성 회귀를 잡는 용도일 뿐, canonical
-승인값 자체는 아니다. canonical 전에는 실제 A100 batch/model 출력의 parameter-gradient
-evidence와 ``loss_start_sample``을 campaign ledger에 함께 결속해야 한다.
+승인값 자체는 아니다. canonical 전에는 실제 A100 batch/model 출력 ``y``에 대한
+output-gradient evidence와 ``loss_start_sample``을 campaign ledger에 함께 결속해야 한다.
+이 비율은 model parameter-gradient라고 부르면 안 된다.
 
 현재 ``frame`` 항은 별도 통제 실험에서 영출력 붕괴와 연관된 것으로 확인 중이다.
 이 파일은 그 항을 승인하지 않으며, 손실 정의에서 누락되지 않았다는 사실만 점검한다.
@@ -188,7 +189,8 @@ def test_other_terms_are_recorded_so_a_silent_drift_is_visible() -> None:
     """dnh 말고 다른 항이 목적함수를 덮는 것도 잡는다.
 
     frame은 현재 승인된 항이 아니다. 여기서는 strict+trim 경로에서 값이 기록되는지만
-    확인하고, 실제 parameter-gradient 방향/재가중은 A100 control evidence로 결정한다.
+    확인하고, 실제 model-output ``y`` gradient 방향/재가중은 A100 control evidence로
+    결정한다. parameter-gradient의 증거는 아니다.
     """
 
     budget = _budget(0.001)

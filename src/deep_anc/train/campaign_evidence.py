@@ -24,37 +24,181 @@ from typing import Any
 import numpy as np
 import torch
 
-from ..config import CANONICAL_LOSS_GRID, loss_selection_sha256
+from ..config import (
+    CANONICAL_DETERMINISM_POLICY,
+    CANONICAL_LOSS_GRID,
+    CANONICAL_LOSS_PILOT_STEPS,
+    CANONICAL_MEASURED_PROBE_POLICY,
+    CANONICAL_MEASURED_PROBE_STEPS,
+    CANONICAL_RECORDED_MANIFEST,
+    canonical_recorded_manifest_for_data,
+    loss_selection_sha256,
+    validate_canonical_training_policy,
+)
 from ..data.primary_path import resolve_digital_primary_path
-from ..dsp.nonlinear import RandomNonlinear
-from ..dsp.secondary_path import DifferentiableSecondaryPath, load_secondary_path
-from ..dsp.timing import BandPlan, PlantDelays, TrainingTimingContract, handoff_samples_from_config
+from ..dsp.secondary_path import load_secondary_path
+from ..dsp.timing import PlantDelays, TrainingTimingContract, handoff_samples_from_config
 from ..losses import ANCLoss
 from ..models import build_model
+from .criterion_factory import (
+    CriterionAdmission,
+    admit_criterion_config,
+    build_criterion_from_config,
+)
 from .evaluation_contract import (
     FileSnapshot,
     publish_directory_noreplace,
     snapshot_regular_file,
+    validate_persisted_g4_metrics,
     write_json_exclusive,
 )
 from .experiment_contract import (
     build_experiment_contract,
     validate_embedded_experiment_contract,
 )
+from .checkpoint import validate_world1_cuda_rng
 
 
-EVIDENCE_SCHEMA_VERSION = 1
+# v2부터 G0 receipt가 실제 학습 프로세스의 PyTorch/cuDNN/CUBLAS 결정론
+# environment snapshot을 SHA로 결속한다. exact-key 검증만으로도 구 receipt를
+# 거부할 수 있지만, 같은 schema 번호로 의미가 달라지면 외부 감사자가 구분할 수
+# 없으므로 명시적으로 세대를 올린다. gradient receipt도 같은 campaign evidence
+# 세대에 속하므로 새 campaign에서 함께 재발행한다.
+EVIDENCE_SCHEMA_VERSION = 2
 G0_RECEIPT_KIND = "campaign_g0_overfit"
+FAILED_G0_RECEIPT_KIND = "campaign_g0_overfit_failed_diagnostic"
+G0_DETERMINISM_ENVIRONMENT_KIND = "campaign_g0_determinism_environment"
 GRADIENT_RECEIPT_KIND = "campaign_gradient_budget"
-PILOT_STEPS = 20_000
-MEASURED_PROBE_STEPS = 5_000
+PREPILOT_GRADIENT_RECEIPT_KIND = "campaign_prepilot_dnh_output_gradient"
+FAILED_G0_GRADIENT_RECEIPT_KIND = "campaign_failed_g0_dnh_output_gradient_diagnostic"
+# Gradient receipt v3부터 이 증거가 model parameter-gradient가 아니라 손실의
+# ``model output y``에 대한 L2 gradient norm 비율임을 schema에 명시한다. G0와
+# gradient receipt는 서로 다른 의미 세대이므로 G0 schema를 불필요하게 올리지 않는다.
+GRADIENT_RECEIPT_SCHEMA_VERSION = 3
+DNH_GRADIENT_DOMAIN = "model_output_y"
+DNH_GRADIENT_NORM = "global_l2"
+DNH_GRADIENT_SHARE_MIN = 0.2
+DNH_GRADIENT_SHARE_MAX = 0.4
+DNH_GRADIENT_TARGET = 0.3
+DNH_GRADIENT_RECOMMENDATION_RULE = (
+    "keep_if_in_range_else_linear_scale_to_target_then_recompute_v1"
+)
+PILOT_STEPS = CANONICAL_LOSS_PILOT_STEPS
+MEASURED_PROBE_STEPS = CANONICAL_MEASURED_PROBE_STEPS
 G0_STEPS = 500
 G0_BATCH_SIZE = 4
 G0_THRESHOLD_EXCLUSIVE_DB = -6.0
 PILOT_TIE_MARGIN_DB = 0.2
-PILOT_SELECTION_RULE = "recorded_val_worst10_margin_0.2_db_v1"
-CANONICAL_RECORDED_VAL_MANIFEST = "data/manifests/recorded_regrouped.jsonl"
+PILOT_SELECTION_RULE = (
+    "alpha_specific_g0_dnh_precalibrated_measured_probe_"
+    "recorded_val_worst_g4_gate_margin_0.2_db_v4"
+)
+MEASURED_PROBE_SELECTION_SCORE = (
+    "measured_probe_recorded_val_worst_g4_gate_margin_db"
+)
+CANONICAL_RECORDED_VAL_MANIFEST = CANONICAL_RECORDED_MANIFEST
 _SHA256 = "0123456789abcdef"
+
+# canonical_pretrain의 campaign prerequisite는 이 evidence들로부터 나중에
+# 발행되며, measured probe init/recorded manifest는 역할별 입력이다. 나머지
+# artifact는 pilot/probe/canonical 100k가 한 byte도 다르면 안 되는 공통 학습 입력이다.
+_ROLE_SPECIFIC_ARTIFACTS = frozenset(
+    {"campaign_prerequisite", "init_checkpoint", "recorded_manifest"}
+)
+
+
+def snapshot_g0_determinism_environment() -> dict[str, Any]:
+    """G0 모델을 실제로 계산하는 프로세스의 결정론 backend 상태를 캡처한다.
+
+    config에 ``determinism_policy``가 적혀 있다는 사실은 실행 상태의 증거가 아니다.
+    특히 ``diagnostic_overfit`` 역할은 일반 진단에서는 결정론 backend를 강제하지
+    않으므로, 공식 G0 evidence 경로가 이 live 상태를 별도 결속해야 한다.
+    """
+
+    return {
+        "schema_version": int(CANONICAL_DETERMINISM_POLICY["schema_version"]),
+        "kind": G0_DETERMINISM_ENVIRONMENT_KIND,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "torch_use_deterministic_algorithms": bool(
+            torch.are_deterministic_algorithms_enabled()
+        ),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    }
+
+
+def validate_g0_determinism_environment(
+    value: object, *, label: str = "campaign G0 determinism environment"
+) -> dict[str, Any]:
+    """live/persisted G0 결정론 상태를 canonical 단일 정책과 exact 대조한다."""
+
+    environment = _exact_keys(
+        value,
+        {
+            "schema_version",
+            "kind",
+            "cuda_available",
+            "torch_use_deterministic_algorithms",
+            "cudnn_benchmark",
+            "cudnn_deterministic",
+            "cublas_workspace_config",
+        },
+        label=label,
+    )
+    policy = CANONICAL_DETERMINISM_POLICY
+    if (
+        type(environment["schema_version"]) is not int
+        or environment["schema_version"] != int(policy["schema_version"])
+        or environment["kind"] != G0_DETERMINISM_ENVIRONMENT_KIND
+    ):
+        raise ValueError(f"{label} schema/kind가 다릅니다")
+    if type(environment["cuda_available"]) is not bool:
+        raise ValueError(f"{label} cuda_available은 bool이어야 합니다")
+    if (
+        environment["torch_use_deterministic_algorithms"]
+        is not policy["torch_use_deterministic_algorithms"]
+        or environment["cudnn_benchmark"] is not policy["cudnn_benchmark"]
+        or environment["cudnn_deterministic"]
+        is not policy["cudnn_deterministic"]
+    ):
+        raise ValueError(f"{label}가 canonical 결정론 backend 상태가 아닙니다")
+    workspace = environment["cublas_workspace_config"]
+    allowed = set(policy["cublas_workspace_config_allowed"])
+    if bool(environment["cuda_available"]) and workspace not in allowed:
+        raise ValueError(
+            f"{label} CUDA 실행의 CUBLAS_WORKSPACE_CONFIG가 승인값이 아닙니다: "
+            f"{workspace!r}"
+        )
+    if not bool(environment["cuda_available"]) and workspace not in allowed | {None}:
+        raise ValueError(f"{label} CUBLAS_WORKSPACE_CONFIG가 잘못됐습니다: {workspace!r}")
+    return environment
+
+
+def configure_g0_evidence_determinism() -> dict[str, Any]:
+    """공식 G0 evidence 계산 전에 canonical 결정론 backend를 활성화한다.
+
+    CUDA의 cuBLAS workspace 값은 CUDA context 생성 뒤 바꾸면 효력이 보장되지
+    않는다. 따라서 호출자가 프로세스 시작 환경으로 승인값을 제공하지 않았으면
+    여기서 값을 대신 채우지 않고 즉시 실패한다.
+    """
+
+    policy = CANONICAL_DETERMINISM_POLICY
+    workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if torch.cuda.is_available() and workspace not in set(
+        policy["cublas_workspace_config_allowed"]
+    ):
+        raise RuntimeError(
+            "공식 G0 CUDA evidence에는 프로세스 시작 전 "
+            "CUBLAS_WORKSPACE_CONFIG=:4096:8 또는 :16:8이 필요합니다"
+        )
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    return validate_g0_determinism_environment(
+        snapshot_g0_determinism_environment(),
+        label="campaign G0 live determinism environment",
+    )
 
 
 def _root(value: str | Path) -> Path:
@@ -230,7 +374,7 @@ def _reference_for_staged_file(root: Path, staging_file: Path, final_file: Path)
     }
 
 
-def publish_g0_evidence(
+def _publish_g0_evidence(
     *,
     repo_root: str | Path,
     output_dir: str | Path,
@@ -243,21 +387,44 @@ def publish_g0_evidence(
     require_nmse_db: float | None,
     nmse_only: bool,
     disable_loss_terms: list[str] | tuple[str, ...],
+    determinism_environment: dict[str, Any],
+    evidence_kind: str,
 ) -> Path:
-    """G0의 model+fixed batch만을 source-of-truth로 하는 immutable receipt를 발행한다.
+    """G0 model+fixed batch+live 결정론 상태를 지정된 kind로 봉인한다.
 
     수치 metric은 intentionally 저장하지 않는다. canonical validator는 final model과
-    batch에서 다시 forward하여 G0를 판정한다.
+    batch에서 다시 forward하여 G0를 판정한다. 실패 kind는 lambda 재추천 진단에만
+    쓰며 canonical validator가 구조적으로 거부한다.
     """
+
+    if evidence_kind not in {G0_RECEIPT_KIND, FAILED_G0_RECEIPT_KIND}:
+        raise ValueError(f"지원하지 않는 G0 evidence kind입니다: {evidence_kind!r}")
 
     if set(batch) != {"x", "d"}:
         raise ValueError("G0 evidence batch는 정확히 x,d여야 합니다")
     if not isinstance(model_state, dict) or not model_state:
         raise ValueError("G0 evidence model_state가 비었습니다")
+    # CLI는 학습 시작 전에 캡처한 값을 넘긴다. publisher를 직접 호출하더라도
+    # 현재 live 상태가 canonical 정책이 아니면 evidence directory를 만들기 전에
+    # 실패한다. 시작 상태를 true로 위조하고 마지막에 backend를 바꾸는 것도
+    # current snapshot exact 대조가 막는다.
+    started_environment = validate_g0_determinism_environment(
+        copy.deepcopy(determinism_environment),
+        label="campaign G0 start determinism environment",
+    )
+    final_environment = validate_g0_determinism_environment(
+        snapshot_g0_determinism_environment(),
+        label="campaign G0 publish determinism environment",
+    )
+    if final_environment != started_environment:
+        raise ValueError(
+            "campaign G0 학습 시작과 evidence 발행 시점의 결정론 backend 상태가 다릅니다"
+        )
 
     def build(root: Path, staging: Path, target: Path) -> None:
         checkpoint_file = staging / "checkpoint.pt"
         batch_file = staging / "batch.pt"
+        environment_file = staging / "environment.json"
         protocol = {
             "mode": str(mode),
             "primary_mode": str(primary_mode),
@@ -269,7 +436,7 @@ def publish_g0_evidence(
         }
         raw_checkpoint = {
             "schema_version": EVIDENCE_SCHEMA_VERSION,
-            "kind": G0_RECEIPT_KIND,
+            "kind": evidence_kind,
             "model": {
                 str(name): value.detach().cpu().contiguous().clone()
                 for name, value in model_state.items()
@@ -284,17 +451,106 @@ def publish_g0_evidence(
         }
         _write_torch_exclusive(checkpoint_file, raw_checkpoint)
         _write_torch_exclusive(batch_file, raw_batch)
+        _write_json_in_staging(environment_file, started_environment)
         receipt = {
             "schema_version": EVIDENCE_SCHEMA_VERSION,
-            "kind": G0_RECEIPT_KIND,
+            "kind": evidence_kind,
             "checkpoint": _reference_for_staged_file(
                 root, checkpoint_file, target / checkpoint_file.name
             ),
             "batch": _reference_for_staged_file(root, batch_file, target / batch_file.name),
+            "environment": _reference_for_staged_file(
+                root, environment_file, target / environment_file.name
+            ),
         }
         _write_json_in_staging(staging / "receipt.json", receipt)
 
     return _publish_evidence_directory(repo_root, output_dir, build=build) / "receipt.json"
+
+
+def publish_g0_evidence(
+    *,
+    repo_root: str | Path,
+    output_dir: str | Path,
+    cfg: dict[str, Any],
+    model_state: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    steps: int,
+    mode: str,
+    primary_mode: str,
+    require_nmse_db: float | None,
+    nmse_only: bool,
+    disable_loss_terms: list[str] | tuple[str, ...],
+    determinism_environment: dict[str, Any],
+) -> Path:
+    """NMSE < -6 dB를 통과한 G0의 campaign-eligible raw receipt를 발행한다."""
+
+    return _publish_g0_evidence(
+        repo_root=repo_root,
+        output_dir=output_dir,
+        cfg=cfg,
+        model_state=model_state,
+        batch=batch,
+        steps=steps,
+        mode=mode,
+        primary_mode=primary_mode,
+        require_nmse_db=require_nmse_db,
+        nmse_only=nmse_only,
+        disable_loss_terms=disable_loss_terms,
+        determinism_environment=determinism_environment,
+        evidence_kind=G0_RECEIPT_KIND,
+    )
+
+
+def publish_failed_g0_evidence(
+    *,
+    repo_root: str | Path,
+    output_dir: str | Path,
+    cfg: dict[str, Any],
+    model_state: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    steps: int,
+    mode: str,
+    primary_mode: str,
+    require_nmse_db: float | None,
+    nmse_only: bool,
+    disable_loss_terms: list[str] | tuple[str, ...],
+    determinism_environment: dict[str, Any],
+) -> Path:
+    """실패한 G0를 lambda 진단 전용 kind로 봉인한다.
+
+    이 receipt는 :func:`validate_g0_receipt`와 schema-v7 campaign ledger가 절대
+    승인하지 않는다. 실패 checkpoint의 weight를 init으로 전이하는 경로도 제공하지
+    않는다. 허용되는 유일한 소비자는 다음 fresh G0 contract를 위한 DNH output-y
+    gradient 추천이다.
+    """
+
+    return _publish_g0_evidence(
+        repo_root=repo_root,
+        output_dir=output_dir,
+        cfg=cfg,
+        model_state=model_state,
+        batch=batch,
+        steps=steps,
+        mode=mode,
+        primary_mode=primary_mode,
+        require_nmse_db=require_nmse_db,
+        nmse_only=nmse_only,
+        disable_loss_terms=disable_loss_terms,
+        determinism_environment=determinism_environment,
+        evidence_kind=FAILED_G0_RECEIPT_KIND,
+    )
+
+
+def _gradient_calibration_policy() -> dict[str, Any]:
+    return {
+        "gradient_domain": DNH_GRADIENT_DOMAIN,
+        "gradient_norm": DNH_GRADIENT_NORM,
+        "accepted_share_min": DNH_GRADIENT_SHARE_MIN,
+        "accepted_share_max": DNH_GRADIENT_SHARE_MAX,
+        "target_share": DNH_GRADIENT_TARGET,
+        "recommendation_rule": DNH_GRADIENT_RECOMMENDATION_RULE,
+    }
 
 
 def publish_gradient_budget_evidence(
@@ -302,27 +558,167 @@ def publish_gradient_budget_evidence(
     repo_root: str | Path,
     output_dir: str | Path,
     checkpoint: str | Path,
-    batch: dict[str, torch.Tensor],
+    batch_artifact: str | Path,
 ) -> Path:
-    """pilot checkpoint와 fixed batch를 결속한 gradient-budget receipt를 발행한다."""
+    """pilot checkpoint와 authoritative G0 batch를 결속한 gradient receipt를 발행한다.
 
-    if set(batch) != {"x", "d"}:
-        raise ValueError("gradient evidence batch는 정확히 x,d여야 합니다")
+    batch를 새로 직렬화하거나 복제하지 않는다. 모든 alpha의 G0가 공유한 exact
+    artifact path/SHA를 직접 참조해야 post-pilot에서 유리한 batch를 바꿔 끼울 수 없다.
+    receipt에는 사람이 계산한 share나 추천 λ를 넣지 않고 validator가 현재 λ와 필요 시
+    선형 추천 λ의 gradient를 같은 raw bytes에서 다시 계산한다.
+    """
+
     root = _root(repo_root)
     checkpoint_ref = snapshot_reference(root, checkpoint, label="gradient checkpoint")
+    batch_ref = snapshot_reference(
+        root,
+        batch_artifact,
+        label="authoritative common G0 gradient batch",
+    )
 
-    def build(base: Path, staging: Path, target: Path) -> None:
-        batch_file = staging / "batch.pt"
-        raw_batch = {
-            name: value.detach().cpu().contiguous().clone()
-            for name, value in batch.items()
-        }
-        _write_torch_exclusive(batch_file, raw_batch)
+    def build(_base: Path, staging: Path, _target: Path) -> None:
         receipt = {
-            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "schema_version": GRADIENT_RECEIPT_SCHEMA_VERSION,
             "kind": GRADIENT_RECEIPT_KIND,
             "checkpoint": checkpoint_ref,
-            "batch": _reference_for_staged_file(base, batch_file, target / batch_file.name),
+            "batch": batch_ref,
+            "calibration_policy": _gradient_calibration_policy(),
+        }
+        _write_json_in_staging(staging / "receipt.json", receipt)
+
+    return _publish_evidence_directory(root, output_dir, build=build) / "receipt.json"
+
+
+def publish_prepilot_gradient_evidence(
+    *,
+    repo_root: str | Path,
+    output_dir: str | Path,
+    g0_receipt: str | Path,
+) -> Path:
+    """approved-G0 raw checkpoint/batch를 alpha별 pre-pilot calibration에 결속한다.
+
+    이 publisher는 G0의 성능 PASS를 주장하지 않는다. G0 receipt와 그 안의
+    checkpoint/batch reference가 같은 bytes인지 봉인하며, campaign validator가
+    G0 trusted NMSE와 DNH output-gradient share를 모두 다시 계산한다.
+    """
+
+    root = _root(repo_root)
+    g0_ref = snapshot_reference(root, g0_receipt, label="pre-pilot G0 receipt")
+    g0_snapshot = snapshot_from_reference(
+        root, g0_ref, label="pre-pilot G0 receipt"
+    )
+    g0 = _exact_keys(
+        _json_snapshot(g0_snapshot, label="pre-pilot G0 receipt"),
+        {"schema_version", "kind", "checkpoint", "batch", "environment"},
+        label="pre-pilot G0 receipt",
+    )
+    if (
+        g0["schema_version"] != EVIDENCE_SCHEMA_VERSION
+        or g0["kind"] != G0_RECEIPT_KIND
+    ):
+        raise ValueError("pre-pilot source가 canonical G0 receipt가 아닙니다")
+    # publisher 시점에도 nested references를 실제로 열어 dangling/resealed G0가
+    # calibration pathname을 차지하지 못하게 한다. 성능/정책은 validator가 재검산한다.
+    snapshot_from_reference(root, g0["checkpoint"], label="pre-pilot G0 checkpoint")
+    snapshot_from_reference(root, g0["batch"], label="pre-pilot G0 batch")
+
+    def build(_base: Path, staging: Path, _target: Path) -> None:
+        receipt = {
+            "schema_version": GRADIENT_RECEIPT_SCHEMA_VERSION,
+            "kind": PREPILOT_GRADIENT_RECEIPT_KIND,
+            "g0_receipt": g0_ref,
+            "checkpoint": g0["checkpoint"],
+            "batch": g0["batch"],
+            "calibration_policy": _gradient_calibration_policy(),
+        }
+        _write_json_in_staging(staging / "receipt.json", receipt)
+
+    return _publish_evidence_directory(root, output_dir, build=build) / "receipt.json"
+
+
+def publish_failed_g0_gradient_recommendation(
+    *,
+    repo_root: str | Path,
+    output_dir: str | Path,
+    failed_g0_receipt: str | Path,
+    calibration: dict[str, Any],
+) -> Path:
+    """실패 G0의 다음 fresh-run lambda 추천을 진단 전용 receipt로 봉인한다.
+
+    이 kind는 pre-pilot 승인 kind와 의도적으로 다르다. 따라서 계산 결과가
+    0.2--0.4 범위여도 campaign prerequisite의 G0/gradient gate를 열 수 없다.
+    저장된 숫자는 편의를 위한 claim일 뿐이며 원본 checkpoint/batch와 정책도 함께
+    SHA 결속되어 재계산할 수 있다.
+    """
+
+    root = _root(repo_root)
+    g0_ref = snapshot_reference(
+        root, failed_g0_receipt, label="failed G0 diagnostic receipt"
+    )
+    g0_snapshot = snapshot_from_reference(
+        root, g0_ref, label="failed G0 diagnostic receipt"
+    )
+    g0 = _exact_keys(
+        _json_snapshot(g0_snapshot, label="failed G0 diagnostic receipt"),
+        {"schema_version", "kind", "checkpoint", "batch", "environment"},
+        label="failed G0 diagnostic receipt",
+    )
+    if (
+        g0["schema_version"] != EVIDENCE_SCHEMA_VERSION
+        or g0["kind"] != FAILED_G0_RECEIPT_KIND
+    ):
+        raise ValueError("lambda 추천 source가 failed-G0 diagnostic receipt가 아닙니다")
+    snapshot_from_reference(
+        root, g0["checkpoint"], label="failed G0 diagnostic checkpoint"
+    )
+    snapshot_from_reference(root, g0["batch"], label="failed G0 diagnostic batch")
+    snapshot_from_reference(
+        root, g0["environment"], label="failed G0 diagnostic environment"
+    )
+    expected_calibration_keys = {
+        "gradient_domain",
+        "gradient_norm",
+        "accepted_share_min",
+        "accepted_share_max",
+        "target_share",
+        "recommendation_rule",
+        "approved",
+        "current_lambda_dnh",
+        "current_share",
+        "recommended_lambda_dnh",
+        "recommended_share",
+        "current_budget",
+        "recommended_budget",
+    }
+    claim = _exact_keys(
+        copy.deepcopy(calibration),
+        expected_calibration_keys,
+        label="failed G0 gradient calibration claim",
+    )
+    for key, expected in _gradient_calibration_policy().items():
+        if claim.get(key) != expected:
+            raise ValueError(
+                f"failed G0 gradient calibration claim.{key}가 정책과 다릅니다"
+            )
+    # allow_nan=False는 diagnostic receipt에도 NaN/Inf claim이 들어가는 것을 막는다.
+    try:
+        claim = json.loads(json.dumps(claim, sort_keys=True, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("failed G0 gradient calibration claim이 finite JSON이 아닙니다") from exc
+    if not isinstance(claim.get("approved"), bool):
+        raise ValueError("failed G0 gradient calibration claim.approved가 bool이 아닙니다")
+
+    def build(_base: Path, staging: Path, _target: Path) -> None:
+        receipt = {
+            "schema_version": GRADIENT_RECEIPT_SCHEMA_VERSION,
+            "kind": FAILED_G0_GRADIENT_RECEIPT_KIND,
+            "failed_g0_receipt": g0_ref,
+            "checkpoint": g0["checkpoint"],
+            "batch": g0["batch"],
+            "calibration_policy": _gradient_calibration_policy(),
+            "calibration_claim": claim,
+            "campaign_eligible": False,
+            "required_next_action": "fresh_g0_from_scratch",
         }
         _write_json_in_staging(staging / "receipt.json", receipt)
 
@@ -382,56 +778,21 @@ def _device() -> torch.device:
 
 
 def _build_criterion(
-    cfg: dict[str, Any], *, root: Path, model: torch.nn.Module, device: torch.device
+    cfg: dict[str, Any],
+    *,
+    root: Path,
+    model: torch.nn.Module,
+    device: torch.device,
+    admission: CriterionAdmission | None = None,
 ) -> tuple[ANCLoss, int]:
-    data = cfg.get("data")
-    duct = cfg.get("duct")
-    loss = cfg.get("loss")
-    if not isinstance(data, dict) or not isinstance(duct, dict) or not isinstance(loss, dict):
-        raise ValueError("evidence checkpoint resolved data/duct/loss config가 없습니다")
-    secondary_cfg = duct.get("secondary_path")
-    if not isinstance(secondary_cfg, dict) or not secondary_cfg.get("npz"):
-        raise ValueError("evidence checkpoint secondary_path.npz가 없습니다")
-    fs = int(data.get("sample_rate", 0))
-    secondary = load_secondary_path(
-        repo_path(root, str(secondary_cfg["npz"]), label="evidence secondary path")
-    )
-    if int(secondary.sample_rate) != fs:
-        raise ValueError("evidence secondary path sample rate가 config와 다릅니다")
-    perturb = data.get("plant_perturbation") or {}
-    plant = DifferentiableSecondaryPath(
-        secondary,
-        handoff_extra_samples=handoff_samples_from_config(duct),
-        delay_jitter_range=tuple(perturb.get("delay_jitter_range", [0, 0])),
-        gain_db_range=tuple(perturb.get("gain_db", [0.0, 0.0])),
-        tilt_db_per_octave_range=tuple(
-            perturb.get("gain_tilt_db_per_octave", [0.0, 0.0])
-        ),
-        allpass_perturb=bool(perturb.get("allpass_perturb", False)),
-        seed=int(cfg.get("seed", 0)) + 17,
-    ).to(device)
-    nonlinear_cfg = data.get("nonlinear") or {}
-    nonlinear = RandomNonlinear(
-        nonlinear_cfg.get("sef_eta_choices", [10.0]),
-        tuple(nonlinear_cfg.get("drive_range", [1.0, 1.0])),
-        hardclip_prob=float(nonlinear_cfg.get("hardclip_prob", 0.0)),
-        seed=int(cfg.get("seed", 0)) + 29,
-    )
-    band = BandPlan.resolve(
-        plant_trusted_band_hz=secondary.trusted_band_hz(),
-        duct_cfg=duct,
-        sample_rate=fs,
-    )
-    criterion = ANCLoss(
-        plant,
-        loss,
-        fs,
-        nonlinear=nonlinear,
-        cutoff_hz=float((duct.get("acoustics") or {}).get("plane_wave_cutoff_hz", 1633.0)),
-        target_band_hz=band.target.as_tuple(),
-        trusted_band_hz=band.optimize.as_tuple(),
+    bundle = build_criterion_from_config(
+        cfg,
+        repo_root=root,
         limiter_limit=float(model.limit),
-    ).to(device)
+        device=device,
+        admission=admission,
+    )
+    criterion = bundle.criterion
     criterion.eval()
     return criterion, int(cfg.get("loss_start_sample", -1))
 
@@ -439,9 +800,20 @@ def _build_criterion(
 def _recompute_metrics(
     cfg: dict[str, Any], model_state: object, batch: dict[str, torch.Tensor], *, root: Path, label: str
 ) -> dict[str, float]:
+    admission = admit_criterion_config(
+        cfg,
+        repo_root=root,
+        require_bound=True,
+    )
     device = _device()
     model = _load_model_state(cfg, model_state, label=label, device=device)
-    criterion, loss_start_sample = _build_criterion(cfg, root=root, model=model, device=device)
+    criterion, loss_start_sample = _build_criterion(
+        cfg,
+        root=root,
+        model=model,
+        device=device,
+        admission=admission,
+    )
     if loss_start_sample < 0:
         raise ValueError(f"{label} loss_start_sample이 없습니다")
     x, d = batch["x"].to(device), batch["d"].to(device)
@@ -461,11 +833,40 @@ def _recompute_metrics(
 
 
 def _recompute_gradient_budget(
-    cfg: dict[str, Any], model_state: object, batch: dict[str, torch.Tensor], *, root: Path, label: str
+    cfg: dict[str, Any],
+    model_state: object,
+    batch: dict[str, torch.Tensor],
+    *,
+    root: Path,
+    label: str,
+    lambda_dnh_override: float | None = None,
 ) -> dict[str, float]:
+    criterion_cfg = cfg
+    if lambda_dnh_override is not None:
+        value = float(lambda_dnh_override)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{label} λ_dnh override가 finite 양수가 아닙니다")
+        criterion_cfg = copy.deepcopy(cfg)
+        loss = criterion_cfg.get("loss")
+        if not isinstance(loss, dict):
+            raise ValueError(f"{label} loss config가 없습니다")
+        loss["lambda_dnh"] = value
+    admission = admit_criterion_config(
+        criterion_cfg,
+        repo_root=root,
+        require_bound=True,
+    )
     device = _device()
-    model = _load_model_state(cfg, model_state, label=label, device=device)
-    criterion, loss_start_sample = _build_criterion(cfg, root=root, model=model, device=device)
+    model = _load_model_state(
+        criterion_cfg, model_state, label=label, device=device
+    )
+    criterion, loss_start_sample = _build_criterion(
+        criterion_cfg,
+        root=root,
+        model=model,
+        device=device,
+        admission=admission,
+    )
     if loss_start_sample < 0:
         raise ValueError(f"{label} loss_start_sample이 없습니다")
     with torch.no_grad():
@@ -485,6 +886,103 @@ def _recompute_gradient_budget(
             raise ValueError(f"{label} gradient budget.{key}가 non-finite입니다")
         result[str(key)] = numeric
     return result
+
+
+def calibrate_dnh_output_gradient(
+    cfg: dict[str, Any],
+    model_state: object,
+    batch: dict[str, torch.Tensor],
+    *,
+    repo_root: str | Path,
+    label: str = "DNH output-gradient calibration",
+) -> dict[str, Any]:
+    """현재 λ를 승인하거나, 범위 밖이면 다음 full rerun용 λ를 추천한다.
+
+    이 함수가 재는 것은 ``‖λ·∂L_dnh/∂y‖ / ‖∂L_nmse/∂y‖``이며
+    parameter-gradient가 아니다. 선택된 checkpoint와 고정 batch의 모델 출력 ``y``를
+    고정하므로 DNH share는 λ에 선형이다. 범위 밖일 때만 중앙값 0.3으로 선형
+    scaling한 뒤 **실제 ANCLoss를 다시 만들어 재계산**한다. 현재 값이 이미
+    0.2–0.4이면 target 0.3에 맞춘다는 이유로 계약을 불필요하게 바꾸지 않는다.
+
+    반환된 recommendation은 현재 campaign을 승인하지 않는다. ``approved``가 false면
+    issuer는 차단되고, config를 추천값으로 바꾼 뒤 G0/pilot/probe 전체를 새 계약으로
+    다시 실행해야 한다.
+    """
+
+    loss = cfg.get("loss")
+    if not isinstance(loss, dict):
+        raise ValueError(f"{label} checkpoint loss config가 없습니다")
+    current_lambda = float(loss.get("lambda_dnh", float("nan")))
+    if not math.isfinite(current_lambda) or current_lambda <= 0.0:
+        raise ValueError(f"{label} checkpoint λ_dnh가 finite 양수가 아닙니다")
+
+    root = _root(repo_root)
+    current_budget = _recompute_gradient_budget(
+        cfg,
+        model_state,
+        batch,
+        root=root,
+        label=f"{label} current",
+    )
+    current_share = float(current_budget.get("dnh", float("nan")))
+    if not math.isfinite(current_share) or current_share <= 0.0:
+        raise ValueError(
+            f"{label} 현재 model-output y DNH share가 finite 양수가 아닙니다: "
+            f"{current_share!r}. 힌지가 비활성인 출력에는 선형 λ 추천을 정의할 수 없습니다"
+        )
+
+    approved = DNH_GRADIENT_SHARE_MIN <= current_share <= DNH_GRADIENT_SHARE_MAX
+    recommended_lambda = current_lambda
+    recommended_budget = current_budget
+    if not approved:
+        recommended_lambda = current_lambda * DNH_GRADIENT_TARGET / current_share
+        if not math.isfinite(recommended_lambda) or recommended_lambda <= 0.0:
+            raise ValueError(f"{label} 선형 추천 λ_dnh가 finite 양수가 아닙니다")
+        recommended_budget = _recompute_gradient_budget(
+            cfg,
+            model_state,
+            batch,
+            root=root,
+            label=f"{label} recommended",
+            lambda_dnh_override=recommended_lambda,
+        )
+
+    recommended_share = float(recommended_budget.get("dnh", float("nan")))
+    if not math.isfinite(recommended_share) or not (
+        DNH_GRADIENT_SHARE_MIN
+        <= recommended_share
+        <= DNH_GRADIENT_SHARE_MAX
+    ):
+        raise ValueError(
+            f"{label} 추천 λ 실제 재계산 share가 승인 범위가 아닙니다: "
+            f"lambda={recommended_lambda!r}, share={recommended_share!r}"
+        )
+    if not approved and not math.isclose(
+        recommended_share,
+        DNH_GRADIENT_TARGET,
+        rel_tol=1.0e-4,
+        abs_tol=1.0e-6,
+    ):
+        raise ValueError(
+            f"{label} 선형 추천을 실제 재계산했지만 target share와 다릅니다: "
+            f"target={DNH_GRADIENT_TARGET}, recomputed={recommended_share!r}"
+        )
+
+    return {
+        "gradient_domain": DNH_GRADIENT_DOMAIN,
+        "gradient_norm": DNH_GRADIENT_NORM,
+        "accepted_share_min": DNH_GRADIENT_SHARE_MIN,
+        "accepted_share_max": DNH_GRADIENT_SHARE_MAX,
+        "target_share": DNH_GRADIENT_TARGET,
+        "recommendation_rule": DNH_GRADIENT_RECOMMENDATION_RULE,
+        "approved": approved,
+        "current_lambda_dnh": current_lambda,
+        "current_share": current_share,
+        "recommended_lambda_dnh": recommended_lambda,
+        "recommended_share": recommended_share,
+        "current_budget": current_budget,
+        "recommended_budget": recommended_budget,
+    }
 
 
 def _validate_timing(cfg: dict[str, Any], *, root: Path, label: str) -> None:
@@ -542,28 +1040,71 @@ def _validate_timing(cfg: dict[str, Any], *, root: Path, label: str) -> None:
         raise ValueError(f"{label} d_noise_delay_samples가 primary path와 다릅니다")
 
 
+def _common_training_artifacts(artifacts: object, *, label: str) -> dict[str, dict]:
+    if not isinstance(artifacts, dict):
+        raise ValueError(f"{label} experiment contract artifact가 없습니다")
+    common = {
+        str(name): item
+        for name, item in artifacts.items()
+        if str(name) not in _ROLE_SPECIFIC_ARTIFACTS
+    }
+    if not common:
+        raise ValueError(f"{label} 공통 학습 input artifact가 비었습니다")
+    return common
+
+
+def _validate_current_artifact(
+    name: str, item: object, *, root: Path, label: str
+) -> FileSnapshot:
+    """embedded artifact identity와 현재 pathname bytes를 같은 snapshot으로 대조한다."""
+
+    if not isinstance(item, dict) or set(item) != {
+        "path",
+        "exists",
+        "size_bytes",
+        "sha256",
+    }:
+        raise ValueError(f"{label} {name} artifact fingerprint가 불완전합니다")
+    if item.get("exists") is not True:
+        raise ValueError(f"{label} {name} artifact가 stamp 시점에 존재하지 않았습니다")
+    path = repo_path(root, str(item.get("path", "")), label=f"{label} {name}")
+    snapshot = snapshot_regular_file(path)
+    if len(snapshot.content) != int(item.get("size_bytes", -1)):
+        raise ValueError(f"{label} {name} size가 embedded contract와 다릅니다")
+    if snapshot.sha256 != str(item.get("sha256", "")):
+        raise ValueError(f"{label} {name} bytes가 embedded contract와 다릅니다")
+    return snapshot
+
+
 def _target_contract_and_artifacts(
     canonical_cfg: dict[str, Any], *, root: Path
 ) -> dict[str, Any]:
     contract = validate_embedded_experiment_contract(canonical_cfg)
-    artifacts = contract.get("artifacts")
-    if not isinstance(artifacts, dict):
-        raise ValueError("canonical experiment contract artifact가 없습니다")
-    for name in ("primary_path", "secondary_path"):
-        item = artifacts.get(name)
-        if not isinstance(item, dict) or not item.get("exists") or not item.get("sha256"):
-            raise ValueError(f"canonical experiment contract {name} artifact가 불완전합니다")
-        # artifact contract가 현재 pathname bytes까지 여전히 가리키는지 확인한다.
-        configured = (
-            ((canonical_cfg.get("duct") or {}).get("digital_reference") or {}).get("primary_path_npz")
-            if name == "primary_path"
-            else ((canonical_cfg.get("duct") or {}).get("secondary_path") or {}).get("npz")
+    artifacts = _common_training_artifacts(
+        contract.get("artifacts"), label="canonical"
+    )
+    required = {
+        "primary_path",
+        "secondary_path",
+        "rir_bank",
+        "bootstrap_receipt",
+        "transfer_manifest",
+        "source_manifest_generation",
+        "recorded_holdout",
+    }
+    missing = required - set(artifacts)
+    if missing:
+        raise ValueError(
+            "canonical experiment contract의 필수 학습 artifact가 없습니다: "
+            f"{sorted(missing)}"
         )
-        snapshot = snapshot_regular_file(
-            repo_path(root, str(configured), label=f"canonical {name}")
-        )
-        if snapshot.sha256 != str(item["sha256"]):
-            raise ValueError(f"canonical {name} bytes가 embedded experiment contract와 다릅니다")
+    source_manifests = {
+        name for name in artifacts if name.startswith("source_manifest:")
+    }
+    if not source_manifests:
+        raise ValueError("canonical source manifest artifact가 비었습니다")
+    for name, item in sorted(artifacts.items()):
+        _validate_current_artifact(name, item, root=root, label="canonical")
     return contract
 
 
@@ -605,47 +1146,97 @@ def _validate_source_and_artifacts(
     ):
         if not expected_input.get(key) or observed_input.get(key) != expected_input.get(key):
             raise ValueError(f"{label} input generation {key}가 canonical과 다릅니다")
-    expected_artifacts = canonical_contract.get("artifacts") or {}
-    observed_artifacts = evidence_contract.get("artifacts") or {}
-    for name in ("primary_path", "secondary_path"):
-        expected = expected_artifacts.get(name) or {}
-        observed = observed_artifacts.get(name) or {}
-        if not expected.get("sha256") or observed.get("sha256") != expected.get("sha256"):
-            raise ValueError(f"{label} {name} SHA가 canonical과 다릅니다")
+    expected_artifacts = _common_training_artifacts(
+        canonical_contract.get("artifacts"), label="canonical"
+    )
+    observed_artifacts = _common_training_artifacts(
+        evidence_contract.get("artifacts"), label=label
+    )
+    if observed_artifacts != expected_artifacts:
+        changed = sorted(
+            name
+            for name in set(expected_artifacts) | set(observed_artifacts)
+            if observed_artifacts.get(name) != expected_artifacts.get(name)
+        )
+        raise ValueError(
+            f"{label} 공통 학습 artifact가 canonical과 다릅니다: {changed}"
+        )
+    # embedded digest가 유효해도 stamp 이후 pathname bytes가 바뀌었을 수 있다.
+    # 모든 public manifest/RIR/holdout/bootstrap/transfer/P/S를 지금 다시 연다.
+    for name, item in sorted(observed_artifacts.items()):
+        _validate_current_artifact(name, item, root=root, label=label)
     return evidence_contract
 
 
+def _loss_candidate_identity(
+    loss: object, *, label: str
+) -> tuple[float, float, float]:
+    """후보 identity=(alpha, frame, lambda_dnh)를 strict float로 유도한다."""
+
+    if not isinstance(loss, dict):
+        raise ValueError(f"{label} loss config가 없습니다")
+    identity = (
+        float(loss.get("nmse_cvar_alpha", float("nan"))),
+        float(loss.get("lambda_frame", float("nan"))),
+        float(loss.get("lambda_dnh", float("nan"))),
+    )
+    if not all(math.isfinite(item) for item in identity) or identity[2] <= 0.0:
+        raise ValueError(f"{label} loss alpha/frame/lambda_dnh가 finite 양수가 아닙니다")
+    pair = identity[:2]
+    if pair not in {(float(a), float(b)) for a, b in CANONICAL_LOSS_GRID}:
+        raise ValueError(f"{label} loss alpha×frame이 승인 grid가 아닙니다")
+    return identity
+
+
 def _validate_loss(
-    evidence_cfg: dict[str, Any], canonical_cfg: dict[str, Any], *, label: str,
-    allow_any_grid_alpha: bool,
-    expected_pair: tuple[float, float] | None,
-) -> tuple[float, float]:
+    evidence_cfg: dict[str, Any],
+    canonical_cfg: dict[str, Any],
+    *,
+    label: str,
+    allow_any_candidate: bool,
+    expected_identity: tuple[float, float, float] | None,
+) -> tuple[float, float, float]:
     observed = evidence_cfg.get("loss")
     expected = canonical_cfg.get("loss")
     if not isinstance(observed, dict) or not isinstance(expected, dict):
         raise ValueError(f"{label} loss config가 없습니다")
     if set(observed) != set(expected):
         raise ValueError(f"{label} loss key 집합이 canonical과 다릅니다")
-    pair = (
-        float(observed.get("nmse_cvar_alpha", float("nan"))),
-        float(observed.get("lambda_frame", float("nan"))),
-    )
-    if not all(math.isfinite(item) for item in pair):
-        raise ValueError(f"{label} loss alpha/frame이 non-finite입니다")
+    identity = _loss_candidate_identity(observed, label=label)
     for key, value in expected.items():
-        if key == "nmse_cvar_alpha" and allow_any_grid_alpha:
+        if key in {"nmse_cvar_alpha", "lambda_dnh"} and (
+            allow_any_candidate or expected_identity is not None
+        ):
             continue
         if observed.get(key) != value:
             raise ValueError(f"{label} loss.{key}가 canonical과 다릅니다")
-    if allow_any_grid_alpha:
-        if pair not in {(float(a), float(b)) for a, b in CANONICAL_LOSS_GRID}:
-            raise ValueError(f"{label} loss alpha×frame이 승인 grid가 아닙니다")
-    if expected_pair is not None and pair != expected_pair:
-        raise ValueError(f"{label} loss alpha×frame이 pilot winner와 다릅니다")
+    if expected_identity is not None and identity != expected_identity:
+        raise ValueError(
+            f"{label} loss (alpha,frame,lambda_dnh)가 expected candidate와 다릅니다"
+        )
     digest = str(evidence_cfg.get("loss_selection_sha256", ""))
     if digest != loss_selection_sha256(observed):
         raise ValueError(f"{label} loss_selection_sha256가 embedded loss와 다릅니다")
-    return pair
+    return identity
+
+
+def _validate_measured_probe_distribution_policy(
+    evidence_cfg: dict[str, Any],
+    canonical_cfg: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    """probe의 70:30 정책과 현재 recorded generation manifest를 함께 고정한다."""
+
+    expected_manifest = canonical_recorded_manifest_for_data(
+        canonical_cfg.get("data") or {}
+    )
+    for key, required in CANONICAL_MEASURED_PROBE_POLICY.items():
+        expected = expected_manifest if key == "recorded_manifest" else required
+        if evidence_cfg.get(key) != expected:
+            raise ValueError(
+                f"{label} {key}가 measured 70:30 probe policy와 다릅니다"
+            )
 
 
 def _validate_derivative_cfg(
@@ -658,9 +1249,15 @@ def _validate_derivative_cfg(
     role: str,
     primary_mode: str,
     embedded: bool,
-    expected_pair: tuple[float, float] | None = None,
-    allow_any_grid_alpha: bool = False,
-) -> tuple[dict[str, Any], tuple[float, float]]:
+    expected_identity: tuple[float, float, float] | None = None,
+    allow_any_candidate: bool = False,
+) -> tuple[dict[str, Any], tuple[float, float, float]]:
+    # checkpoint가 스스로 주장하는 embedded contract를 먼저 검증한 뒤 role policy
+    # 전체를 재실행한다. 일부 필드 수기 비교만으로는 optimizer/schedule/batch/data
+    # augmentation을 바꾼 derivative가 ledger 후보가 될 수 있다.
+    if embedded:
+        validate_embedded_experiment_contract(evidence_cfg)
+    validate_canonical_training_policy(copy.deepcopy(evidence_cfg))
     if str(evidence_cfg.get("experiment_role", "")) != role:
         raise ValueError(f"{label} experiment_role이 {role!r}가 아닙니다")
     if evidence_cfg.get("init_eligible") is not False:
@@ -704,12 +1301,16 @@ def _validate_derivative_cfg(
         raise ValueError(f"{label} loss_start_sample이 canonical과 다릅니다")
     if int(evidence_cfg.get("seed", -1)) != int(canonical_cfg.get("seed", -2)):
         raise ValueError(f"{label} seed가 canonical과 다릅니다")
-    pair = _validate_loss(
+    if role == "measured_probe":
+        _validate_measured_probe_distribution_policy(
+            evidence_cfg, canonical_cfg, label=label
+        )
+    identity = _validate_loss(
         evidence_cfg,
         canonical_cfg,
         label=label,
-        allow_any_grid_alpha=allow_any_grid_alpha,
-        expected_pair=expected_pair,
+        allow_any_candidate=allow_any_candidate,
+        expected_identity=expected_identity,
     )
     _validate_timing(evidence_cfg, root=root, label=label)
     contract = _validate_source_and_artifacts(
@@ -720,7 +1321,7 @@ def _validate_derivative_cfg(
         label=label,
         embedded=embedded,
     )
-    return contract, pair
+    return contract, identity
 
 
 def validate_g0_receipt(
@@ -729,6 +1330,7 @@ def validate_g0_receipt(
     repo_root: str | Path,
     canonical_cfg: dict[str, Any],
     canonical_contract: dict[str, Any] | None = None,
+    expected_identity: tuple[float, float, float] | None = None,
 ) -> dict[str, Any]:
     """G0 receipt의 raw final model/batch로 trusted NMSE를 다시 계산한다."""
 
@@ -737,13 +1339,22 @@ def validate_g0_receipt(
     receipt_snapshot = snapshot_from_reference(root, receipt_reference, label="campaign G0 receipt")
     receipt = _exact_keys(
         _json_snapshot(receipt_snapshot, label="campaign G0 receipt"),
-        {"schema_version", "kind", "checkpoint", "batch"},
+        {"schema_version", "kind", "checkpoint", "batch", "environment"},
         label="campaign G0 receipt",
     )
     if receipt["schema_version"] != EVIDENCE_SCHEMA_VERSION or receipt["kind"] != G0_RECEIPT_KIND:
         raise ValueError("campaign G0 receipt schema/kind가 다릅니다")
     checkpoint_snapshot = snapshot_from_reference(root, receipt["checkpoint"], label="campaign G0 checkpoint")
     batch_snapshot = snapshot_from_reference(root, receipt["batch"], label="campaign G0 batch")
+    environment_snapshot = snapshot_from_reference(
+        root, receipt["environment"], label="campaign G0 determinism environment"
+    )
+    environment = validate_g0_determinism_environment(
+        _json_snapshot(
+            environment_snapshot, label="campaign G0 determinism environment"
+        ),
+        label="campaign G0 persisted determinism environment",
+    )
     raw = _exact_keys(
         _torch_snapshot(checkpoint_snapshot, label="campaign G0 checkpoint"),
         {"schema_version", "kind", "model", "cfg", "step", "protocol"},
@@ -778,7 +1389,7 @@ def validate_g0_receipt(
         or protocol["disable_loss_terms"] != []
     ):
         raise ValueError("campaign G0 protocol이 승인된 500-step nominal control이 아닙니다")
-    _validate_derivative_cfg(
+    _, identity = _validate_derivative_cfg(
         cfg,
         canonical_cfg=canonical_cfg,
         canonical_contract=contract,
@@ -787,7 +1398,8 @@ def validate_g0_receipt(
         role="diagnostic_overfit",
         primary_mode="secondary_surrogate",
         embedded=False,
-        allow_any_grid_alpha=True,
+        expected_identity=expected_identity,
+        allow_any_candidate=expected_identity is None,
     )
     batch = _load_batch(batch_snapshot, label="campaign G0", exact_batch_size=G0_BATCH_SIZE)
     metrics = _recompute_metrics(cfg, raw["model"], batch, root=root, label="campaign G0")
@@ -801,8 +1413,11 @@ def validate_g0_receipt(
         "receipt": receipt_snapshot,
         "checkpoint": checkpoint_snapshot,
         "batch": batch_snapshot,
+        "environment": environment_snapshot,
+        "determinism_environment": environment,
         "nmse_trusted_db": nmse,
         "metrics": metrics,
+        "identity": identity,
     }
 
 
@@ -907,6 +1522,13 @@ def _validate_recorded_metrics(
 ) -> float:
     """recorded-val raw NPZ의 provenance와 selection metric을 직접 확인한다."""
 
+    checkpoint_state = _torch_snapshot(checkpoint_snapshot, label=f"{label} checkpoint")
+    if not isinstance(checkpoint_state, dict) or not isinstance(
+        checkpoint_state.get("cfg"), dict
+    ):
+        raise ValueError(f"{label} checkpoint에 resolved cfg가 없습니다")
+    checkpoint_cfg = checkpoint_state["cfg"]
+
     with _npz(metrics_snapshot, label=label) as data:
         observed = {
             "split": str(_npz_scalar(data, "split", label=label)),
@@ -928,6 +1550,19 @@ def _validate_recorded_metrics(
         }
         if observed != expected:
             raise ValueError(f"{label} recorded-val metrics provenance가 raw checkpoint/manifest와 다릅니다")
+        # campaign 선택도 final G4와 같은 raw population/family/octave/
+        # strict-subband 감사기를 통과한다. 20k pilot은 surrogate 물리이므로
+        # 실제 덕트 PASS를 주장할 수는 없지만, 추린 session 배열이나
+        # 1000–1600 Hz 부대역을 생략한 수기 NPZ로 winner를 만들 수도 없다.
+        persisted = validate_persisted_g4_metrics(
+            data,
+            expected_split="val",
+            manifest_bytes=manifest_snapshot.content,
+            manifest_path=manifest_snapshot.path,
+            checkpoint_cfg=checkpoint_cfg,
+            canonical=True,
+            surrogate_diagnostic=expected_surrogate,
+        )
         target_artifacts = canonical_contract.get("artifacts") or {}
         for key, artifact in (
             ("primary_path_sha256", target_artifacts.get("primary_path") or {}),
@@ -985,7 +1620,49 @@ def _validate_recorded_metrics(
             "g4_worst_octave_worst10_db",
         ):
             _metric_float(data, key, label=label)
-    return trusted["worst10_mean_db"]
+    if not math.isclose(
+        float(persisted["trusted"]["worst10_mean_db"]),
+        trusted["worst10_mean_db"],
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):  # pragma: no cover - 동일 raw 계산식 불변식
+        raise RuntimeError("campaign/central G4 trusted worst10 재계산이 갈라졌니다")
+
+    # 절대 목표는 저역 평균 하나가 아니라 모든 source family와
+    # 1000–1600 Hz를 포함한 모든 strict 부대역, fullband,
+    # out-of-band do-no-harm을 동시에 지키는 것이다. 그러므로 candidate
+    # score도 각 G4 경계(0 dB, do-no-harm만 허용 증폭 1 dB)로부터의
+    # 최악 margin을 쓴다. 낮을수록 좋고 0 이상은 어느 gate인가 실패다.
+    strict = persisted["strict_subband"]
+    strict_flags = strict["flags"]
+    if not (
+        strict_flags["g4_trusted_subband_coverage_pass"]
+        and strict_flags["g4_trusted_subband_power_pass"]
+    ):
+        raise ValueError(
+            f"{label} candidate selection에 필요한 family×strict-subband "
+            "target-energy/group coverage가 부족합니다"
+        )
+    score_components = {
+        "trusted_mean": float(persisted["trusted"]["mean_db"]),
+        "trusted_worst10": float(persisted["trusted"]["worst10_mean_db"]),
+        "fullband_mean": float(persisted["fullband"]["mean_db"]),
+        "worst_family_mean": float(np.max(persisted["source_trusted_mean_db"])),
+        "worst_family_worst10": float(
+            np.max(persisted["source_trusted_worst10_db"])
+        ),
+        "worst_family_ci_hi": float(np.max(persisted["source_ci_hi_db"])),
+        "worst_strict_subband_mean": float(np.max(strict["mean_db"])),
+        "worst_strict_subband_worst10": float(np.max(strict["worst10_db"])),
+        "worst_strict_subband_ci_hi": float(np.max(strict["ci_hi_db"])),
+        # attenuation는 +가 감쇠, -가 증폭이다. 허용 증폭 threshold를
+        # 빼서 다른 0-dB gate와 같은 방향/경계로 바꾼다.
+        "do_no_harm": -float(persisted["worst_octave_db"])
+        - float(persisted["threshold_db"]),
+    }
+    if not all(math.isfinite(value) for value in score_components.values()):
+        raise ValueError(f"{label} candidate G4 selection margin에 NaN/Inf가 있습니다")
+    return max(score_components.values())
 
 
 def _validate_pilot_checkpoint_pair(
@@ -997,7 +1674,7 @@ def _validate_pilot_checkpoint_pair(
     expected_role: str,
     expected_primary_mode: str,
     expected_steps: int,
-    expected_pair: tuple[float, float] | None,
+    expected_identity: tuple[float, float, float] | None,
     label: str,
 ) -> dict[str, Any]:
     """best/last/recorded-val three-way provenance을 하나의 derivative run으로 닫는다."""
@@ -1013,16 +1690,26 @@ def _validate_pilot_checkpoint_pair(
     manifest_snapshot = snapshot_from_reference(repo_root, row["manifest"], label=f"{label} manifest")
     if best_snapshot.path.name != "best.pt" or last_snapshot.path.name != "last.pt":
         raise ValueError(f"{label}는 best.pt와 last.pt raw checkpoint를 가리켜야 합니다")
+    expected_manifest_value = canonical_recorded_manifest_for_data(
+        canonical_cfg.get("data") or {}
+    )
     expected_manifest = repo_path(
-        repo_root, CANONICAL_RECORDED_VAL_MANIFEST, label=f"{label} canonical recorded manifest"
+        repo_root,
+        expected_manifest_value,
+        label=f"{label} canonical recorded manifest",
     )
     if manifest_snapshot.path != expected_manifest:
-        raise ValueError(f"{label} manifest는 canonical recorded_regrouped.jsonl이어야 합니다")
+        raise ValueError(
+            f"{label} manifest는 current recorded generation의 canonical manifest여야 "
+            f"합니다: {expected_manifest_value}"
+        )
     best = _load_checkpoint(best_snapshot, label=f"{label} best checkpoint")
     last = _load_checkpoint(last_snapshot, label=f"{label} last checkpoint")
+    validate_world1_cuda_rng(best, label=f"{label} best checkpoint")
+    validate_world1_cuda_rng(last, label=f"{label} last checkpoint")
     best_cfg = best["cfg"]
     last_cfg = last["cfg"]
-    best_contract, pair = _validate_derivative_cfg(
+    best_contract, identity = _validate_derivative_cfg(
         best_cfg,
         canonical_cfg=canonical_cfg,
         canonical_contract=canonical_contract,
@@ -1031,10 +1718,10 @@ def _validate_pilot_checkpoint_pair(
         role=expected_role,
         primary_mode=expected_primary_mode,
         embedded=True,
-        expected_pair=expected_pair,
-        allow_any_grid_alpha=expected_pair is None,
+        expected_identity=expected_identity,
+        allow_any_candidate=expected_identity is None,
     )
-    last_contract, last_pair = _validate_derivative_cfg(
+    last_contract, last_identity = _validate_derivative_cfg(
         last_cfg,
         canonical_cfg=canonical_cfg,
         canonical_contract=canonical_contract,
@@ -1043,11 +1730,33 @@ def _validate_pilot_checkpoint_pair(
         role=expected_role,
         primary_mode=expected_primary_mode,
         embedded=True,
-        expected_pair=pair,
-        allow_any_grid_alpha=False,
+        expected_identity=identity,
+        allow_any_candidate=False,
     )
-    if best_contract["sha256"] != last_contract["sha256"] or pair != last_pair:
-        raise ValueError(f"{label} best/last experiment contract 또는 loss pair가 다릅니다")
+    if (
+        best_contract["sha256"] != last_contract["sha256"]
+        or identity != last_identity
+    ):
+        raise ValueError(
+            f"{label} best/last experiment contract 또는 loss candidate identity가 다릅니다"
+        )
+    if expected_role == "measured_probe":
+        recorded_item = (best_contract.get("artifacts") or {}).get(
+            "recorded_manifest"
+        )
+        recorded_snapshot = _validate_current_artifact(
+            "recorded_manifest",
+            recorded_item,
+            root=repo_root,
+            label=label,
+        )
+        if (
+            recorded_snapshot.path != manifest_snapshot.path
+            or recorded_snapshot.sha256 != manifest_snapshot.sha256
+        ):
+            raise ValueError(
+                f"{label} training recorded_manifest가 recorded-val manifest와 다릅니다"
+            )
     best_step = _checkpoint_step(best, label=f"{label} best checkpoint")
     last_step = _checkpoint_step(last, label=f"{label} last checkpoint")
     if last_step != expected_steps or int(last_cfg.get("run_until_step", -1)) != expected_steps:
@@ -1078,7 +1787,7 @@ def _validate_pilot_checkpoint_pair(
         "manifest_snapshot": manifest_snapshot,
         "best": best,
         "last": last,
-        "pair": pair,
+        "identity": identity,
         "score_db": score,
         "contract_sha256": str(best_contract["sha256"]),
     }
@@ -1090,6 +1799,7 @@ def validate_loss_pilot_candidate(
     repo_root: str | Path,
     canonical_cfg: dict[str, Any],
     canonical_contract: dict[str, Any] | None = None,
+    expected_identity: tuple[float, float, float] | None = None,
     label: str = "loss pilot candidate",
 ) -> dict[str, Any]:
     root = _root(repo_root)
@@ -1102,7 +1812,7 @@ def validate_loss_pilot_candidate(
         expected_role="loss_pilot",
         expected_primary_mode="secondary_surrogate",
         expected_steps=PILOT_STEPS,
-        expected_pair=None,
+        expected_identity=expected_identity,
         label=label,
     )
     if int(result["best"]["cfg"].get("run_until_step", -1)) != PILOT_STEPS:
@@ -1113,9 +1823,17 @@ def validate_loss_pilot_candidate(
 
 
 def select_loss_pilot(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    """raw recorded-val score에서만 20k loss pilot winner를 유도한다.
+    """20k pilot별 5k measured-probe recorded-val score로 winner를 유도한다.
 
-    0.7/1.0의 차이가 0.2 dB 이내면 0.85 raw run이 **반드시** 있어야 한다.
+    이 함수에 넘기는 ``score_db``는 surrogate 20k pilot 점수가 아니라,
+    각 pilot best.pt를 init으로 사용한 5k measured 70:30 probe의
+    recorded-val 최악 G4 gate margin이어야 한다. 이 점수는 trusted/fullband,
+    family, strict 부대역, do-no-harm 중 경계에 가장 가까운 항목이다.
+    ``selection_score_source``를
+    강제해 pilot 점수를 실수로 다시 선택 근거로 쓰는 경로를 닫는다.
+
+    measured probe의 0.7/1.0 차이가 0.2 dB 이내면 0.85의 20k+5k
+    raw chain이 **반드시** 있어야 한다.
     이어서 최저점과 0.2 dB 이내인 후보가 여러 개면 사전 규칙대로 0.7을 택한다.
     alpha=1.0의 '불안정' 분기는 현재 immutable raw failure receipt schema가 없으므로
     의도적으로 자동 승격하지 않는다. malformed/non-finite artifact는 evidence가 아니라
@@ -1124,43 +1842,402 @@ def select_loss_pilot(candidates: list[dict[str, Any]]) -> dict[str, Any]:
 
     if not isinstance(candidates, list) or not candidates:
         raise ValueError("loss pilot candidate가 비었습니다")
-    by_pair: dict[tuple[float, float], dict[str, Any]] = {}
+    by_alpha: dict[float, dict[str, Any]] = {}
     for candidate in candidates:
-        pair = tuple(candidate.get("pair", ()))
-        if len(pair) != 2:
-            raise ValueError("loss pilot derived pair가 없습니다")
-        pair = (float(pair[0]), float(pair[1]))
+        if not isinstance(candidate, dict):
+            raise ValueError("loss pilot candidate가 mapping이 아닙니다")
+        if candidate.get("selection_score_source") != MEASURED_PROBE_SELECTION_SCORE:
+            raise ValueError(
+                "loss selection score는 후보별 measured-probe recorded-val에서 "
+                "유도되어야 합니다"
+            )
+        identity = tuple(candidate.get("identity", ()))
+        if len(identity) != 3:
+            raise ValueError(
+                "loss pilot derived (alpha,frame,lambda_dnh) identity가 없습니다"
+            )
+        identity = (
+            float(identity[0]),
+            float(identity[1]),
+            float(identity[2]),
+        )
+        alpha, frame, lambda_dnh = identity
+        if (
+            not all(math.isfinite(item) for item in identity)
+            or lambda_dnh <= 0.0
+            or (alpha, frame)
+            not in {(float(a), float(b)) for a, b in CANONICAL_LOSS_GRID}
+        ):
+            raise ValueError("loss pilot candidate identity가 승인 grid/finite λ가 아닙니다")
         score = float(candidate.get("score_db", float("nan")))
-        if pair in by_pair or not math.isfinite(score):
-            raise ValueError("loss pilot pair 중복 또는 non-finite recorded-val score")
-        by_pair[pair] = candidate
-    base = {(0.7, 0.0), (1.0, 0.0)}
-    optional = (0.85, 0.0)
-    pairs = set(by_pair)
-    if not base.issubset(pairs) or pairs - (base | {optional}):
-        raise ValueError("loss pilot candidate 집합이 승인 alpha×frame grid와 다릅니다")
-    base_gap = abs(float(by_pair[(0.7, 0.0)]["score_db"]) - float(by_pair[(1.0, 0.0)]["score_db"]))
+        if alpha in by_alpha or not math.isfinite(score):
+            raise ValueError("loss pilot alpha 중복 또는 non-finite recorded-val score")
+        by_alpha[alpha] = candidate
+    base = {0.7, 1.0}
+    optional = 0.85
+    alphas = set(by_alpha)
+    if not base.issubset(alphas) or alphas - (base | {optional}):
+        raise ValueError("loss pilot candidate 집합이 승인 alpha grid와 다릅니다")
+    base_gap = abs(
+        float(by_alpha[0.7]["score_db"])
+        - float(by_alpha[1.0]["score_db"])
+    )
     needs_alpha_085 = base_gap <= PILOT_TIE_MARGIN_DB
-    if needs_alpha_085 != (optional in pairs):
+    if needs_alpha_085 != (optional in alphas):
         raise ValueError(
             "loss pilot 0.7/1.0 margin과 alpha=0.85 candidate 집합이 다릅니다: "
             f"gap={base_gap:.6f} dB, margin={PILOT_TIE_MARGIN_DB:.1f} dB"
         )
-    best_score = min(float(row["score_db"]) for row in by_pair.values())
-    tied = {
-        pair
-        for pair, row in by_pair.items()
+    best_score = min(float(row["score_db"]) for row in by_alpha.values())
+    tied_alphas = {
+        alpha
+        for alpha, row in by_alpha.items()
         if float(row["score_db"]) <= best_score + PILOT_TIE_MARGIN_DB
     }
-    winner_pair = (0.7, 0.0) if (0.7, 0.0) in tied else min(
-        tied, key=lambda pair: (float(by_pair[pair]["score_db"]), pair)
+    winner_alpha = 0.7 if 0.7 in tied_alphas else min(
+        tied_alphas,
+        key=lambda alpha: (float(by_alpha[alpha]["score_db"]), alpha),
+    )
+    winner_identity = tuple(by_alpha[winner_alpha]["identity"])
+    return {
+        "winner_identity": winner_identity,
+        "winner": by_alpha[winner_alpha],
+        "base_gap_db": base_gap,
+        "used_alpha_085": optional in alphas,
+        "candidates": [by_alpha[alpha] for alpha in sorted(by_alpha)],
+    }
+
+
+def _validate_gradient_calibration_policy(value: object, *, label: str) -> None:
+    policy = _exact_keys(
+        value,
+        {
+            "gradient_domain",
+            "gradient_norm",
+            "accepted_share_min",
+            "accepted_share_max",
+            "target_share",
+            "recommendation_rule",
+        },
+        label=label,
+    )
+    if policy != _gradient_calibration_policy():
+        raise ValueError(f"{label}가 승인 계약과 다릅니다")
+
+
+def _validate_calibration_claim(
+    claim: object, expected: dict[str, Any], *, label: str
+) -> None:
+    """저장 claim이 raw 재계산과 수치적으로 같은지 엄격 비교한다."""
+
+    observed = _exact_keys(claim, set(expected), label=label)
+    for key, expected_value in expected.items():
+        observed_value = observed[key]
+        if isinstance(expected_value, dict):
+            expected_budget = expected_value
+            observed_budget = _exact_keys(
+                observed_value, set(expected_budget), label=f"{label}.{key}"
+            )
+            for budget_key, budget_value in expected_budget.items():
+                value = observed_budget[budget_key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f"{label}.{key}.{budget_key}가 수치가 아닙니다")
+                if not math.isfinite(float(value)) or not math.isclose(
+                    float(value),
+                    float(budget_value),
+                    rel_tol=1.0e-6,
+                    abs_tol=1.0e-9,
+                ):
+                    raise ValueError(
+                        f"{label}.{key}.{budget_key}가 raw 재계산과 다릅니다"
+                    )
+        elif isinstance(expected_value, bool):
+            if type(observed_value) is not bool or observed_value is not expected_value:
+                raise ValueError(f"{label}.{key}가 raw 재계산과 다릅니다")
+        elif isinstance(expected_value, (int, float)):
+            if isinstance(observed_value, bool) or not isinstance(
+                observed_value, (int, float)
+            ):
+                raise ValueError(f"{label}.{key}가 수치가 아닙니다")
+            if not math.isfinite(float(observed_value)) or not math.isclose(
+                float(observed_value),
+                float(expected_value),
+                rel_tol=1.0e-6,
+                abs_tol=1.0e-9,
+            ):
+                raise ValueError(f"{label}.{key}가 raw 재계산과 다릅니다")
+        elif observed_value != expected_value:
+            raise ValueError(f"{label}.{key}가 raw 재계산과 다릅니다")
+
+
+def validate_failed_g0_gradient_recommendation(
+    receipt_reference: object,
+    *,
+    repo_root: str | Path,
+) -> dict[str, Any]:
+    """failed-G0 recommendation receipt를 재계산하되 campaign 자격은 반환하지 않는다."""
+
+    root = _root(repo_root)
+    receipt_snapshot = snapshot_from_reference(
+        root, receipt_reference, label="failed G0 gradient recommendation receipt"
+    )
+    receipt = _exact_keys(
+        _json_snapshot(
+            receipt_snapshot, label="failed G0 gradient recommendation receipt"
+        ),
+        {
+            "schema_version",
+            "kind",
+            "failed_g0_receipt",
+            "checkpoint",
+            "batch",
+            "calibration_policy",
+            "calibration_claim",
+            "campaign_eligible",
+            "required_next_action",
+        },
+        label="failed G0 gradient recommendation receipt",
+    )
+    if (
+        receipt["schema_version"] != GRADIENT_RECEIPT_SCHEMA_VERSION
+        or receipt["kind"] != FAILED_G0_GRADIENT_RECEIPT_KIND
+        or receipt["campaign_eligible"] is not False
+        or receipt["required_next_action"] != "fresh_g0_from_scratch"
+    ):
+        raise ValueError("failed G0 gradient recommendation의 진단 전용 계약이 다릅니다")
+    _validate_gradient_calibration_policy(
+        receipt["calibration_policy"],
+        label="failed G0 gradient recommendation policy",
+    )
+    g0_snapshot = snapshot_from_reference(
+        root, receipt["failed_g0_receipt"], label="failed G0 diagnostic receipt"
+    )
+    g0 = _exact_keys(
+        _json_snapshot(g0_snapshot, label="failed G0 diagnostic receipt"),
+        {"schema_version", "kind", "checkpoint", "batch", "environment"},
+        label="failed G0 diagnostic receipt",
+    )
+    if (
+        g0["schema_version"] != EVIDENCE_SCHEMA_VERSION
+        or g0["kind"] != FAILED_G0_RECEIPT_KIND
+    ):
+        raise ValueError("recommendation source가 failed G0 diagnostic kind가 아닙니다")
+    checkpoint_snapshot = snapshot_from_reference(
+        root, receipt["checkpoint"], label="failed G0 recommendation checkpoint"
+    )
+    batch_snapshot = snapshot_from_reference(
+        root, receipt["batch"], label="failed G0 recommendation batch"
+    )
+    nested_checkpoint = snapshot_from_reference(
+        root, g0["checkpoint"], label="failed G0 nested checkpoint"
+    )
+    nested_batch = snapshot_from_reference(
+        root, g0["batch"], label="failed G0 nested batch"
+    )
+    if (
+        checkpoint_snapshot.path != nested_checkpoint.path
+        or checkpoint_snapshot.sha256 != nested_checkpoint.sha256
+        or batch_snapshot.path != nested_batch.path
+        or batch_snapshot.sha256 != nested_batch.sha256
+    ):
+        raise ValueError("failed G0 recommendation raw checkpoint/batch가 source와 다릅니다")
+    environment_snapshot = snapshot_from_reference(
+        root, g0["environment"], label="failed G0 diagnostic environment"
+    )
+    validate_g0_determinism_environment(
+        _json_snapshot(environment_snapshot, label="failed G0 diagnostic environment"),
+        label="failed G0 diagnostic persisted environment",
+    )
+    raw = _exact_keys(
+        _torch_snapshot(checkpoint_snapshot, label="failed G0 diagnostic checkpoint"),
+        {"schema_version", "kind", "model", "cfg", "step", "protocol"},
+        label="failed G0 diagnostic checkpoint",
+    )
+    if (
+        raw["schema_version"] != EVIDENCE_SCHEMA_VERSION
+        or raw["kind"] != FAILED_G0_RECEIPT_KIND
+    ):
+        raise ValueError("failed G0 diagnostic checkpoint schema/kind가 다릅니다")
+    protocol = _exact_keys(
+        raw["protocol"],
+        {
+            "mode",
+            "primary_mode",
+            "steps",
+            "batch_size",
+            "require_nmse_db",
+            "nmse_only",
+            "disable_loss_terms",
+        },
+        label="failed G0 diagnostic protocol",
+    )
+    if (
+        protocol["mode"] != "nominal"
+        or protocol["primary_mode"] != "secondary_surrogate"
+        or int(protocol["steps"]) != G0_STEPS
+        or int(raw["step"]) != G0_STEPS
+        or int(protocol["batch_size"]) != G0_BATCH_SIZE
+        or protocol["require_nmse_db"] != G0_THRESHOLD_EXCLUSIVE_DB
+        or protocol["nmse_only"] is not False
+        or protocol["disable_loss_terms"] != []
+    ):
+        raise ValueError("failed G0 diagnostic protocol이 공식 G0 control과 다릅니다")
+    cfg = raw["cfg"]
+    if not isinstance(cfg, dict):
+        raise ValueError("failed G0 diagnostic cfg가 mapping이 아닙니다")
+    validate_canonical_training_policy(copy.deepcopy(cfg))
+    if (
+        str(cfg.get("experiment_role", "")) != "diagnostic_overfit"
+        or cfg.get("init_eligible") is not False
+        or cfg.get("contract_run_dir") is not False
+    ):
+        raise ValueError("failed G0 diagnostic cfg 역할/eligibility가 다릅니다")
+    identity = _loss_candidate_identity(cfg.get("loss"), label="failed G0 diagnostic")
+    _validate_timing(cfg, root=root, label="failed G0 diagnostic")
+    batch = _load_batch(
+        batch_snapshot,
+        label="failed G0 diagnostic",
+        exact_batch_size=G0_BATCH_SIZE,
+    )
+    metrics = _recompute_metrics(
+        cfg, raw["model"], batch, root=root, label="failed G0 diagnostic"
+    )
+    nmse = float(metrics.get("nmse_trusted_db", float("nan")))
+    if not math.isfinite(nmse) or nmse < G0_THRESHOLD_EXCLUSIVE_DB:
+        raise ValueError(
+            "failed G0 diagnostic raw model/batch가 실제로는 G0 실패가 아닙니다: "
+            f"nmse={nmse!r} dB"
+        )
+    calibration = calibrate_dnh_output_gradient(
+        cfg,
+        raw["model"],
+        batch,
+        repo_root=root,
+        label="failed G0 diagnostic recommendation",
+    )
+    _validate_calibration_claim(
+        receipt["calibration_claim"],
+        calibration,
+        label="failed G0 gradient calibration claim",
     )
     return {
-        "winner_pair": winner_pair,
-        "winner": by_pair[winner_pair],
-        "base_gap_db": base_gap,
-        "used_alpha_085": optional in pairs,
-        "candidates": [by_pair[pair] for pair in sorted(by_pair)],
+        "receipt": receipt_snapshot,
+        "failed_g0_receipt": g0_snapshot,
+        "checkpoint": checkpoint_snapshot,
+        "batch": batch_snapshot,
+        "nmse_trusted_db": nmse,
+        "identity": identity,
+        "calibration": calibration,
+        "campaign_eligible": False,
+    }
+
+
+def validate_prepilot_gradient_receipt(
+    receipt_reference: object,
+    *,
+    repo_root: str | Path,
+    canonical_cfg: dict[str, Any],
+    g0_receipt_reference: object,
+    expected_identity: tuple[float, float, float],
+    canonical_contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """alpha별 approved G0에서 pilot 전 현재 λ의 output-gradient를 승인한다."""
+
+    root = _root(repo_root)
+    contract = canonical_contract or _target_contract_and_artifacts(
+        canonical_cfg, root=root
+    )
+    receipt_snapshot = snapshot_from_reference(
+        root, receipt_reference, label="pre-pilot gradient receipt"
+    )
+    receipt = _exact_keys(
+        _json_snapshot(receipt_snapshot, label="pre-pilot gradient receipt"),
+        {
+            "schema_version",
+            "kind",
+            "g0_receipt",
+            "checkpoint",
+            "batch",
+            "calibration_policy",
+        },
+        label="pre-pilot gradient receipt",
+    )
+    if (
+        receipt["schema_version"] != GRADIENT_RECEIPT_SCHEMA_VERSION
+        or receipt["kind"] != PREPILOT_GRADIENT_RECEIPT_KIND
+    ):
+        raise ValueError("pre-pilot gradient receipt schema/kind가 다릅니다")
+    _validate_gradient_calibration_policy(
+        receipt["calibration_policy"], label="pre-pilot gradient calibration policy"
+    )
+    expected_g0 = snapshot_from_reference(
+        root, g0_receipt_reference, label="candidate G0 receipt"
+    )
+    embedded_g0 = snapshot_from_reference(
+        root, receipt["g0_receipt"], label="pre-pilot embedded G0 receipt"
+    )
+    if (
+        embedded_g0.path != expected_g0.path
+        or embedded_g0.sha256 != expected_g0.sha256
+    ):
+        raise ValueError("pre-pilot gradient receipt가 candidate G0 receipt와 다릅니다")
+
+    g0 = validate_g0_receipt(
+        receipt["g0_receipt"],
+        repo_root=root,
+        canonical_cfg=canonical_cfg,
+        canonical_contract=contract,
+        expected_identity=expected_identity,
+    )
+    checkpoint_snapshot = snapshot_from_reference(
+        root, receipt["checkpoint"], label="pre-pilot gradient checkpoint"
+    )
+    batch_snapshot = snapshot_from_reference(
+        root, receipt["batch"], label="pre-pilot gradient batch"
+    )
+    if (
+        checkpoint_snapshot.path != g0["checkpoint"].path
+        or checkpoint_snapshot.sha256 != g0["checkpoint"].sha256
+        or batch_snapshot.path != g0["batch"].path
+        or batch_snapshot.sha256 != g0["batch"].sha256
+    ):
+        raise ValueError("pre-pilot gradient raw checkpoint/batch가 G0와 다릅니다")
+
+    raw = _exact_keys(
+        _torch_snapshot(checkpoint_snapshot, label="pre-pilot gradient checkpoint"),
+        {"schema_version", "kind", "model", "cfg", "step", "protocol"},
+        label="pre-pilot gradient checkpoint",
+    )
+    batch = _load_batch(
+        batch_snapshot,
+        label="pre-pilot gradient",
+        exact_batch_size=G0_BATCH_SIZE,
+    )
+    calibration = calibrate_dnh_output_gradient(
+        raw["cfg"],
+        raw["model"],
+        batch,
+        repo_root=root,
+        label="pre-pilot gradient",
+    )
+    if calibration["approved"] is not True:
+        raise ValueError(
+            "alpha별 pre-pilot strict-S λ_dnh model-output y gradient share가 "
+            f"승인 범위 {DNH_GRADIENT_SHARE_MIN:.1f}–"
+            f"{DNH_GRADIENT_SHARE_MAX:.1f}가 아닙니다: "
+            f"identity={expected_identity!r}, "
+            f"share={calibration['current_share']!r}. 해당 alpha의 G0부터 "
+            f"재실행할 추천 λ={calibration['recommended_lambda_dnh']!r}, "
+            f"실제 재계산 share={calibration['recommended_share']!r}"
+        )
+    return {
+        "receipt": receipt_snapshot,
+        "g0": g0,
+        "checkpoint": checkpoint_snapshot,
+        "batch": batch_snapshot,
+        "identity": expected_identity,
+        "gradient_share": float(calibration["current_share"]),
+        "calibration": calibration,
     }
 
 
@@ -1170,25 +2247,61 @@ def validate_gradient_budget_receipt(
     repo_root: str | Path,
     canonical_cfg: dict[str, Any],
     expected_checkpoint_sha256: str,
-    expected_pair: tuple[float, float],
+    expected_identity: tuple[float, float, float],
+    expected_batch_path: str | Path,
+    expected_batch_sha256: str,
     canonical_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """selected pilot raw checkpoint/batch에서 DNH gradient share를 재계산한다."""
+    """selected pilot raw checkpoint/batch에서 DNH output-gradient를 재계산한다.
+
+    승인 대상은 checkpoint에 이미 박힌 **현재 λ**다. 현재 share가 0.2–0.4이면
+    그대로 유지하고, 범위 밖이면 재현 가능한 다음-run 추천값까지 실제 재계산하지만
+    이 receipt로 현재 campaign을 승인하지 않는다.
+    """
 
     root = _root(repo_root)
     contract = canonical_contract or _target_contract_and_artifacts(canonical_cfg, root=root)
     receipt_snapshot = snapshot_from_reference(root, receipt_reference, label="gradient budget receipt")
     receipt = _exact_keys(
         _json_snapshot(receipt_snapshot, label="gradient budget receipt"),
-        {"schema_version", "kind", "checkpoint", "batch"},
+        {
+            "schema_version",
+            "kind",
+            "checkpoint",
+            "batch",
+            "calibration_policy",
+        },
         label="gradient budget receipt",
     )
-    if receipt["schema_version"] != EVIDENCE_SCHEMA_VERSION or receipt["kind"] != GRADIENT_RECEIPT_KIND:
+    if (
+        receipt["schema_version"] != GRADIENT_RECEIPT_SCHEMA_VERSION
+        or receipt["kind"] != GRADIENT_RECEIPT_KIND
+    ):
         raise ValueError("gradient budget receipt schema/kind가 다릅니다")
+    _validate_gradient_calibration_policy(
+        receipt["calibration_policy"], label="gradient budget calibration policy"
+    )
     checkpoint_snapshot = snapshot_from_reference(root, receipt["checkpoint"], label="gradient budget checkpoint")
     if checkpoint_snapshot.sha256 != _sha(expected_checkpoint_sha256, label="gradient expected checkpoint SHA"):
         raise ValueError("gradient budget checkpoint가 selected loss pilot winner와 다릅니다")
     batch_snapshot = snapshot_from_reference(root, receipt["batch"], label="gradient budget batch")
+    authoritative_batch_path = repo_path(
+        root,
+        expected_batch_path,
+        label="authoritative common G0 batch",
+    )
+    authoritative_batch_sha256 = _sha(
+        expected_batch_sha256,
+        label="authoritative common G0 batch SHA",
+    )
+    if (
+        batch_snapshot.path != authoritative_batch_path
+        or batch_snapshot.sha256 != authoritative_batch_sha256
+    ):
+        raise ValueError(
+            "selected-20k gradient receipt batch가 모든 candidate가 공유한 "
+            "authoritative G0 fixed batch path/SHA와 다릅니다"
+        )
     raw = _load_checkpoint(checkpoint_snapshot, label="gradient budget checkpoint")
     cfg = raw["cfg"]
     _validate_derivative_cfg(
@@ -1200,25 +2313,34 @@ def validate_gradient_budget_receipt(
         role="loss_pilot",
         primary_mode="secondary_surrogate",
         embedded=True,
-        expected_pair=expected_pair,
+        expected_identity=expected_identity,
     )
     _finite_checkpoint_model(raw, cfg=cfg, label="gradient budget checkpoint")
     batch = _load_batch(batch_snapshot, label="gradient budget", exact_batch_size=G0_BATCH_SIZE)
-    budget = _recompute_gradient_budget(
-        cfg, raw["model"], batch, root=root, label="gradient budget"
+    calibration = calibrate_dnh_output_gradient(
+        cfg,
+        raw["model"],
+        batch,
+        repo_root=root,
+        label="gradient budget",
     )
-    share = float(budget.get("dnh", float("nan")))
-    if not math.isfinite(share) or not 0.2 <= share <= 0.4:
+    share = float(calibration["current_share"])
+    if calibration["approved"] is not True:
         raise ValueError(
-            "strict-S lambda_dnh raw gradient share가 승인 범위 0.2–0.4가 아닙니다: "
-            f"{share!r}"
+            "strict-S λ_dnh model-output y gradient share가 승인 범위 "
+            f"{DNH_GRADIENT_SHARE_MIN:.1f}–{DNH_GRADIENT_SHARE_MAX:.1f}가 "
+            f"아닙니다: current_lambda={calibration['current_lambda_dnh']!r}, "
+            f"share={share!r}. 다음 full G0/pilot/probe 재실행 추천 λ="
+            f"{calibration['recommended_lambda_dnh']!r}, 실제 재계산 share="
+            f"{calibration['recommended_share']!r}"
         )
     return {
         "receipt": receipt_snapshot,
         "checkpoint": checkpoint_snapshot,
         "batch": batch_snapshot,
         "gradient_share": share,
-        "budget": budget,
+        "budget": calibration["current_budget"],
+        "calibration": calibration,
     }
 
 
@@ -1227,7 +2349,7 @@ def validate_measured_probe(
     *,
     repo_root: str | Path,
     canonical_cfg: dict[str, Any],
-    expected_pair: tuple[float, float],
+    expected_identity: tuple[float, float, float],
     expected_init_checkpoint_sha256: str,
     canonical_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1242,7 +2364,7 @@ def validate_measured_probe(
     )
     init_snapshot = snapshot_from_reference(root, row["init_checkpoint"], label="measured probe init checkpoint")
     if init_snapshot.sha256 != _sha(expected_init_checkpoint_sha256, label="measured probe expected init SHA"):
-        raise ValueError("measured probe init checkpoint가 selected pilot winner와 다릅니다")
+        raise ValueError("measured probe init checkpoint가 corresponding 20k pilot best와 다릅니다")
     pair_result = _validate_pilot_checkpoint_pair(
         {key: row[key] for key in ("best_checkpoint", "last_checkpoint", "metrics", "manifest")},
         repo_root=root,
@@ -1251,9 +2373,25 @@ def validate_measured_probe(
         expected_role="measured_probe",
         expected_primary_mode="measured",
         expected_steps=MEASURED_PROBE_STEPS,
-        expected_pair=expected_pair,
+        expected_identity=expected_identity,
         label="measured probe",
     )
+    probe_contract = validate_embedded_experiment_contract(
+        pair_result["best"]["cfg"]
+    )
+    embedded_init = _validate_current_artifact(
+        "init_checkpoint",
+        (probe_contract.get("artifacts") or {}).get("init_checkpoint"),
+        root=root,
+        label="measured probe",
+    )
+    if (
+        embedded_init.path != init_snapshot.path
+        or embedded_init.sha256 != init_snapshot.sha256
+    ):
+        raise ValueError(
+            "measured probe embedded init artifact가 selected pilot snapshot과 다릅니다"
+        )
     saved_init = pair_result["best"]["cfg"].get("init_ckpt")
     if not saved_init:
         raise ValueError("measured probe best checkpoint에 init_ckpt가 없습니다")
@@ -1275,24 +2413,45 @@ __all__ = [
     "CANONICAL_RECORDED_VAL_MANIFEST",
     "EVIDENCE_SCHEMA_VERSION",
     "G0_BATCH_SIZE",
+    "G0_DETERMINISM_ENVIRONMENT_KIND",
     "G0_RECEIPT_KIND",
     "G0_STEPS",
     "G0_THRESHOLD_EXCLUSIVE_DB",
+    "DNH_GRADIENT_DOMAIN",
+    "DNH_GRADIENT_NORM",
+    "DNH_GRADIENT_RECOMMENDATION_RULE",
+    "DNH_GRADIENT_SHARE_MAX",
+    "DNH_GRADIENT_SHARE_MIN",
+    "DNH_GRADIENT_TARGET",
+    "FAILED_G0_GRADIENT_RECEIPT_KIND",
+    "FAILED_G0_RECEIPT_KIND",
     "GRADIENT_RECEIPT_KIND",
+    "GRADIENT_RECEIPT_SCHEMA_VERSION",
     "MEASURED_PROBE_STEPS",
+    "MEASURED_PROBE_SELECTION_SCORE",
     "PILOT_STEPS",
     "PILOT_SELECTION_RULE",
     "PILOT_TIE_MARGIN_DB",
+    "PREPILOT_GRADIENT_RECEIPT_KIND",
+    "calibrate_dnh_output_gradient",
+    "configure_g0_evidence_determinism",
     "make_campaign_evidence_reference",
+    "publish_failed_g0_evidence",
+    "publish_failed_g0_gradient_recommendation",
     "publish_g0_evidence",
     "publish_gradient_budget_evidence",
+    "publish_prepilot_gradient_evidence",
     "repo_path",
     "select_loss_pilot",
     "snapshot_from_reference",
     "snapshot_reference",
+    "snapshot_g0_determinism_environment",
     "validate_g0_receipt",
     "validate_canonical_evidence_target",
+    "validate_failed_g0_gradient_recommendation",
     "validate_gradient_budget_receipt",
+    "validate_g0_determinism_environment",
     "validate_loss_pilot_candidate",
     "validate_measured_probe",
+    "validate_prepilot_gradient_receipt",
 ]

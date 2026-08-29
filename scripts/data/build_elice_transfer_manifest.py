@@ -29,6 +29,12 @@ from deep_anc.data.transfer_contract import (  # noqa: E402
     _walk_recorded_tree,
     validate_transfer_manifest,
 )
+from deep_anc.data.recorded_generation import (  # noqa: E402
+    COMBINED_SESSION_COUNT,
+    PARENT_MANIFEST,
+    RecordedGenerationError,
+    validate_recorded_generation,
+)
 
 
 OUTPUT = "data/manifests/elice_transfer_manifest.json"
@@ -62,7 +68,7 @@ def _entry(relative: str, role: str, *, repo_root: Path) -> dict[str, object]:
     }
 
 
-def build_payload(args: argparse.Namespace, *, repo_root: Path) -> dict[str, object]:
+def _build_payload_v1(args: argparse.Namespace, *, repo_root: Path) -> dict[str, object]:
     canonical_holdout = "data/manifests/recorded_holdout.json"
     holdout_summary = validate_holdout_contract(
         repo_root / canonical_holdout,
@@ -236,6 +242,143 @@ def build_payload(args: argparse.Namespace, *, repo_root: Path) -> dict[str, obj
     }
 
 
+def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str, object]:
+    generation_relative = _relative(
+        args.recorded_generation,
+        field="recorded_generation",
+        prefix="data/manifests/recorded_generations/",
+    )
+    generation_snapshot = read_regular_file_snapshot(
+        repo_root / generation_relative,
+        root=repo_root,
+        label="recorded generation transfer source",
+    )
+    try:
+        generation = validate_recorded_generation(
+            repo_root / generation_relative,
+            repo_root=repo_root,
+            expected_sha256=generation_snapshot.sha256,
+            require_source_files=True,
+        )
+    except RecordedGenerationError as exc:
+        raise TransferContractError(f"recorded generation 검증 실패: {exc}") from exc
+
+    legacy_values = dict(vars(args))
+    legacy_values["recorded_root"] = "data/recorded"
+    legacy_values["recorded_manifest"] = PARENT_MANIFEST
+    legacy_values["recorded_generation"] = None
+    legacy = _build_payload_v1(argparse.Namespace(**legacy_values), repo_root=repo_root)
+    files = [dict(item) for item in legacy["files"]]
+    parent_manifest_entries = [
+        item for item in files if item["role"] == "recorded_manifest"
+    ]
+    if len(parent_manifest_entries) != 1:
+        raise TransferContractError("legacy parent recorded manifest role이 유일하지 않습니다")
+    parent_manifest_entries[0]["role"] = "parent_recorded_manifest"
+
+    additions = generation.get("additions")
+    combined = generation.get("combined")
+    recorded_manifest_ref = generation.get("recorded_manifest")
+    if (
+        not isinstance(additions, dict)
+        or not isinstance(combined, dict)
+        or not isinstance(recorded_manifest_ref, dict)
+        or not isinstance(additions.get("source_plan"), dict)
+    ):
+        raise TransferContractError("recorded generation summary가 불완전합니다")
+    additions_root = str(additions.get("root"))
+    additions_files, additions_sessions = _walk_recorded_tree(
+        repo_root / additions_root, repo_root=repo_root
+    )
+    if additions_sessions != generation.get("addition_session_count"):
+        raise TransferContractError("recorded generation additions session 수가 다릅니다")
+    files.extend(
+        _entry(relative, "recorded", repo_root=repo_root)
+        for relative in sorted(additions_files)
+    )
+    combined_manifest = str(recorded_manifest_ref.get("path"))
+    source_plan = str(additions["source_plan"].get("path"))
+    files.extend(
+        [
+            _entry(combined_manifest, "recorded_manifest", repo_root=repo_root),
+            _entry(generation_relative, "recorded_generation", repo_root=repo_root),
+            _entry(source_plan, "recorded_source_plan", repo_root=repo_root),
+        ]
+    )
+    source_selection = (
+        additions.get("source_selection", {})
+        .get("external_dns_speech_selection", {})
+    )
+    selection_refs = (
+        source_selection.get("bundle_files", [])
+        if isinstance(source_selection, dict)
+        else []
+    )
+    for index, ref in enumerate(selection_refs):
+        if (
+            not isinstance(ref, dict)
+            or set(ref) != {"path", "sha256", "size"}
+            or not isinstance(ref.get("path"), str)
+        ):
+            raise TransferContractError(
+                f"recorded DNS selection bundle ref #{index}가 유효하지 않습니다"
+            )
+        entry = _entry(
+            str(ref["path"]), "recorded_source_selection", repo_root=repo_root
+        )
+        if entry["sha256"] != ref.get("sha256") or entry["size"] != ref.get("size"):
+            raise TransferContractError(
+                f"recorded DNS selection bundle ref #{index} path/SHA/size 불일치"
+            )
+        files.append(entry)
+    if len({str(item["path"]) for item in files}) != len(files):
+        raise TransferContractError("schema v2 transfer files에 중복 path가 있습니다")
+    files.sort(key=lambda item: str(item["path"]))
+    recorded_entries = [item for item in files if item["role"] == "recorded"]
+    parent_recorded = legacy["recorded"]
+    if not isinstance(parent_recorded, dict):
+        raise TransferContractError("legacy parent recorded aggregate가 없습니다")
+    return {
+        "schema_version": 2,
+        "files": files,
+        "recorded": {
+            "root": "recorded_generation",
+            "parent_root": "data/recorded",
+            "additions_root": additions_root,
+            "generation_manifest": generation_relative,
+            "session_count": COMBINED_SESSION_COUNT,
+            "file_count": len(recorded_entries),
+            "total_bytes": sum(int(entry["size"]) for entry in recorded_entries),
+            "aggregate_sha256": _canonical_recorded_aggregate(recorded_entries),
+            "source_metadata_file_count": parent_recorded[
+                "source_metadata_file_count"
+            ],
+            "source_metadata_snapshot_sha256": parent_recorded[
+                "source_metadata_snapshot_sha256"
+            ],
+            "source_content_snapshot_sha256": parent_recorded[
+                "source_content_snapshot_sha256"
+            ],
+        },
+        "rir_bank": legacy["rir_bank"],
+        "recorded_manifest": combined_manifest,
+        "recorded_generation": generation_relative,
+        "lineage_tracks": legacy["lineage_tracks"],
+        "librispeech_chapters_metadata": legacy[
+            "librispeech_chapters_metadata"
+        ],
+        "esc50_metadata": legacy["esc50_metadata"],
+        "canonical_provenance": legacy["canonical_provenance"],
+        "strict_ps": legacy["strict_ps"],
+    }
+
+
+def build_payload(args: argparse.Namespace, *, repo_root: Path) -> dict[str, object]:
+    if getattr(args, "recorded_generation", None):
+        return _build_payload_v2(args, repo_root=repo_root)
+    return _build_payload_v1(args, repo_root=repo_root)
+
+
 def _publish_no_replace(path: Path, data: bytes, *, repo_root: Path) -> None:
     expected = repo_root / OUTPUT
     if Path(os.path.abspath(path)) != Path(os.path.abspath(expected)):
@@ -279,6 +422,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--recorded-manifest",
         default="data/manifests/recorded_regrouped.jsonl",
+    )
+    parser.add_argument(
+        "--recorded-generation",
+        default=None,
+        help=(
+            "parent 82 + additions 17을 봉인한 generation.json. 지정하면 transfer schema v2와 "
+            "combined 99 manifest를 사용합니다"
+        ),
     )
     parser.add_argument(
         "--lineage-tracks",

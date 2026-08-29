@@ -16,6 +16,39 @@ from .a100_pretrain_smoke import A100_PRETRAIN_SMOKE_ROLE
 from .evaluation_contract import FileSnapshot, snapshot_regular_file
 
 
+WORLD1_CUDA_RNG_ROLES = frozenset(
+    {
+        "loss_pilot",
+        "measured_probe",
+        "canonical_pretrain",
+        "canonical_finetune",
+        A100_PRETRAIN_SMOKE_ROLE,
+    }
+)
+
+
+def validate_world1_cuda_rng(state: dict, *, label: str) -> None:
+    """A100 world=1 공식 학습 artifact의 CUDA RNG를 exactly-one으로 강제한다."""
+
+    cfg = state.get("cfg") if isinstance(state, dict) else None
+    role = str(cfg.get("experiment_role", "")) if isinstance(cfg, dict) else ""
+    if role not in WORLD1_CUDA_RNG_ROLES:
+        return
+    rng = state.get("rng")
+    cuda_rng = rng.get("cuda") if isinstance(rng, dict) else None
+    if not isinstance(cuda_rng, list) or len(cuda_rng) != 1:
+        raise ValueError(
+            f"{label} ({role})에는 A100 world1 CUDA RNG state가 정확히 하나 필요합니다"
+        )
+    cuda_state = cuda_rng[0]
+    if (
+        not isinstance(cuda_state, torch.Tensor)
+        or cuda_state.dtype != torch.uint8
+        or cuda_state.ndim != 1
+    ):
+        raise ValueError(f"{label} ({role}) CUDA RNG tensor schema가 잘못됐습니다")
+
+
 def _require_finite_nested(name: str, value) -> None:
     if isinstance(value, torch.Tensor):
         if value.numel() and not bool(torch.isfinite(value).all().item()):
@@ -53,11 +86,28 @@ def _validate_rng_preview(rng: object) -> None:
 
 
 def _validate_training_state_preview(value: object) -> None:
-    if not isinstance(value, dict) or int(value.get("schema_version", -1)) != 1:
+    if not isinstance(value, dict):
         raise ValueError("resume checkpoint training_state schema가 없습니다")
+    schema = int(value.get("schema_version", -1))
+    if schema == 1:
+        expected_keys = {"schema_version", "plant_rng", "nonlinear_rng"}
+    elif schema == 2:
+        expected_keys = {
+            "schema_version", "plant_rng_kind", "plant_rng", "nonlinear_rng"
+        }
+        if (
+            value.get("plant_rng_kind")
+            != "not_applicable_frozen_causal_fir"
+            or value.get("plant_rng") is not None
+        ):
+            raise ValueError("resume checkpoint frozen causal plant RNG marker가 다릅니다")
+    else:
+        raise ValueError("resume checkpoint training_state schema가 없습니다")
+    if schema == 2 and set(value) != expected_keys:
+        raise ValueError("resume checkpoint training_state key 집합이 exact하지 않습니다")
     for key in ("plant_rng", "nonlinear_rng"):
         state = value.get(key)
-        if key == "nonlinear_rng" and state is None:
+        if (key == "nonlinear_rng" or schema == 2) and state is None:
             continue
         if not isinstance(state, dict):
             raise ValueError(f"resume checkpoint {key} 상태가 없습니다")
@@ -164,17 +214,7 @@ def validate_resume_checkpoint_preview(
     ):
         raise ValueError("resume checkpoint best_metric이 유효하지 않습니다")
     _validate_rng_preview(state.get("rng"))
-    saved_cfg = saved_cfg_preview
-    if str(saved_cfg.get("experiment_role", "")) in {
-        "canonical_pretrain",
-        "canonical_finetune",
-        A100_PRETRAIN_SMOKE_ROLE,
-    }:
-        cuda_rng = state["rng"].get("cuda")
-        if not isinstance(cuda_rng, list) or len(cuda_rng) != 1:
-            raise ValueError(
-                "canonical A100 world1 resume에는 정확히 한 CUDA RNG state가 필요합니다"
-            )
+    validate_world1_cuda_rng(state, label="resume checkpoint")
     _validate_training_state_preview(state.get("training_state"))
 
 
@@ -319,4 +359,5 @@ __all__ = [
     "read_checkpoint_state",
     "save_checkpoint",
     "validate_resume_checkpoint_preview",
+    "validate_world1_cuda_rng",
 ]

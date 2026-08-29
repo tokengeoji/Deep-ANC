@@ -23,6 +23,10 @@ from deep_anc.eval.recorded import (
     validate_resolved_checkpoint,
     write_recorded_metrics,
 )
+from deep_anc.eval.trusted_subbands import (
+    MIN_GROUPS_PER_FAMILY,
+    validate_strict_trusted_subband_metrics,
+)
 
 
 FS = 8_000
@@ -235,6 +239,57 @@ def test_recorded_segments_are_finite_deterministic_and_apply_lead(tmp_path):
     assert resolve_warmup_samples(data, FS) == 2_000
 
 
+def test_recorded_segments_accept_regrouped_manifest_and_verify_immutable_pool_group(
+    tmp_path,
+):
+    """lineage component는 bootstrap group이고 session.json은 원 pool group이다."""
+
+    session = _session(tmp_path, "regrouped", group="original-pool", family="speech")
+    entry = {
+        **_entry(
+            session,
+            "test",
+            "regrouped",
+            "speech-lineage-component-0001",
+            "speech",
+        ),
+        "source_pool_group_id": "original-pool",
+    }
+    data = {
+        "sample_rate": FS,
+        "segment_seconds": 8 / FS,
+        "reference_mode": "digital",
+        "digital_reference_lead_samples": 0,
+        "closed_loop": {"feedback_delay_samples": [0, 0]},
+    }
+
+    segments = list(
+        iter_recorded_segments(
+            [entry],
+            data,
+            model_hop=4,
+            max_segments_per_session=1,
+            edge_trim_seconds=0.0,
+            allow_legacy_source_timeline=True,
+        )
+    )
+    assert len(segments) == 1
+    assert segments[0].group_id == "speech-lineage-component-0001"
+
+    entry["source_pool_group_id"] = "different-original-pool"
+    with pytest.raises(ValueError, match="source-pool group"):
+        list(
+            iter_recorded_segments(
+                [entry],
+                data,
+                model_hop=4,
+                max_segments_per_session=1,
+                edge_trim_seconds=0.0,
+                allow_legacy_source_timeline=True,
+            )
+        )
+
+
 def test_recorded_segments_default_edge_trim_skips_session_boundaries(tmp_path):
     session = _session(
         tmp_path, "long", group="g1", family="environment", samples=5_000
@@ -410,6 +465,17 @@ def _tone(samples: int, hz: float, *, amplitude: float = 1.0) -> np.ndarray:
     return (amplitude * np.sin(2 * np.pi * hz * time)).astype(np.float32)
 
 
+def _strict_trusted_program(samples: int, *, amplitude: float = 1.0) -> np.ndarray:
+    """공식 G4 네 부대역 모두에 target 에너지를 갖는 deterministic fixture."""
+
+    # 256 samples @ 8 kHz의 FFT bin에 정확히 맞춰, 부대역 coverage가 filter tail이나
+    # numerical floor가 아니라 실제 source 성분으로 성립하는 것을 보인다.
+    return sum(
+        (_tone(samples, hz, amplitude=amplitude / 4.0) for hz in (250.0, 500.0, 750.0, 1250.0)),
+        np.zeros(samples, dtype=np.float32),
+    ).astype(np.float32)
+
+
 def _powered_segments(
     samples: int = 256,
     *,
@@ -427,7 +493,9 @@ def _powered_segments(
     segments: list[RecordedSegment] = []
     for family_index, family in enumerate(families):
         for group_index in range(groups_per_family):
-            d = _tone(samples, 500.0, amplitude=1.0 + 0.05 * group_index)
+            d = _strict_trusted_program(
+                samples, amplitude=1.0 + 0.05 * group_index
+            )
             segments.append(
                 RecordedSegment(
                     x=np.stack([gain * d, np.zeros_like(d)]),
@@ -448,7 +516,7 @@ def _context(secondary: SecondaryPathData, plant: DifferentiableSecondaryPath, m
         cfg={"model": {"hop": 4}, "data": {}, "duct": {}},
         device=torch.device("cpu"),
         sample_rate=FS,
-        trusted_band_hz=(100.0, 1_000.0),
+        trusted_band_hz=(150.0, 1_600.0),
         physics_status="measured_primary_path",
         reference_mode="digital",
         digital_reference_lead_samples=1,
@@ -469,6 +537,10 @@ def _write(tmp_path, result, context, name="out"):
         context=context,
         feedback_delay_samples=1,
         allow_surrogate=False,
+        model_hop=int(context.cfg["model"]["hop"]),
+        max_segments_per_session=1,
+        segment_seconds=float(result["segment_samples"]) / float(context.sample_rate),
+        canonical_sampling=False,
         edge_trim_samples=2_000,
         warmup_samples=0,
     )
@@ -483,7 +555,7 @@ def _evaluate(segments, *, octave_bands_hz=(500.0, 2_000.0), model=None, seconda
         plant,
         segments,
         sample_rate=FS,
-        trusted_band_hz=(100.0, 1_000.0),
+        trusted_band_hz=(150.0, 1_600.0),
         octave_bands_hz=list(octave_bands_hz),
         batch_size=4,
         warmup_samples=0,
@@ -505,6 +577,9 @@ def test_metrics_markdown_and_npz_include_source_octave_and_worst10(tmp_path):
     assert "S(z) 적용 후 절단" in report
     assert "계열별 그룹 부트스트랩 신뢰구간" in report
     with np.load(archive, allow_pickle=False) as saved:
+        strict = validate_strict_trusted_subband_metrics(
+            saved, min_groups=MIN_GROUPS_PER_FAMILY
+        )
         assert set(saved["source_family"].tolist()) == {"music", "speech"}
         assert saved["octave_center_hz"].tolist() == [500.0, 2_000.0]
         assert str(saved["physics_status"]) == "measured_primary_path"
@@ -513,6 +588,8 @@ def test_metrics_markdown_and_npz_include_source_octave_and_worst10(tmp_path):
         assert bool(saved["g4_do_no_harm_pass"])
         assert bool(saved["g4_power_pass"])
         assert bool(saved["g4_ci_pass"])
+        assert strict["flags"]["g4_trusted_subband_pass"]
+        assert strict["flags"]["g4_upper_trusted_subband_pass"]
         assert int(saved["edge_trim_samples"]) == 2_000
         assert int(saved["warmup_samples"]) == 0
         # CI 가 실제로 정의됐고 상단이 0 아래여야 한다.
@@ -523,6 +600,131 @@ def test_metrics_markdown_and_npz_include_source_octave_and_worst10(tmp_path):
         assert json.loads(str(saved["plant_fingerprint_json"]))["physics_status"] == (
             "measured_primary_path"
         )
+
+
+def test_g4_rejects_aggregate_pass_when_upper_trusted_subband_amplifies(tmp_path):
+    """150–1600 Hz 평균이 좋아도 1000–1600 Hz 증폭은 G4 FAIL이다.
+
+    네 부대역의 target 전력은 같지만 upper band에만 +3 dB 이상 NMSE를 만든다.
+    따라서 aggregate trusted/fullband은 여전히 음수인데, 새 부대역 게이트가 없으면
+    바로 PASS하던 반례다.
+    """
+
+    class UpperTrustedAmplifier(torch.nn.Module):
+        def forward(self, x):
+            length = x.shape[-1]
+            spectrum = torch.fft.rfft(x[:, :1], dim=-1)
+            frequencies = torch.fft.rfftfreq(
+                length, d=1.0 / FS, device=x.device
+            )
+            upper_mask = ((frequencies >= 1_000.0) & (frequencies <= 1_600.0)).view(
+                1, 1, -1
+            )
+            upper = torch.fft.irfft(spectrum * upper_mask, n=length, dim=-1)
+            # 전체 target은 0.5배 residual(-6.02dB)로 남기되 upper 성분만 다시
+            # 1배 더해 1.5배 residual(+3.52dB)로 만든다. 따라서 aggregate는
+            # 여전히 감소하지만 upper strict band만 악화되고 OOB는 0.5배 감소한다.
+            return -0.5 * x[:, :1] + upper
+
+    segments = []
+    for segment in _powered_segments():
+        out_of_band = _tone(segment.d.size, 2_000.0, amplitude=0.25)
+        target = segment.d + out_of_band
+        segments.append(
+            RecordedSegment(
+                x=np.stack([target, np.zeros_like(target)]),
+                d=target,
+                session_id=segment.session_id,
+                group_id=segment.group_id,
+                source_family=segment.source_family,
+                start_sample=segment.start_sample,
+            )
+        )
+    result, context = _evaluate(segments, model=UpperTrustedAmplifier())
+    markdown, archive = _write(tmp_path, result, context)
+
+    report = markdown.read_text(encoding="utf-8")
+    assert "G4 종합: FAIL" in report
+    assert "1000–1600Hz" in report
+    with np.load(archive, allow_pickle=False) as saved:
+        # 반례의 핵심: aggregate는 좋지만 upper trusted subband는 나쁘다.
+        assert bool(saved["g4_trusted_pass"])
+        assert bool(saved["g4_fullband_pass"])
+        assert not bool(saved["g4_trusted_subband_pass"])
+        assert not bool(saved["g4_upper_trusted_subband_pass"])
+        # DNH는 trusted 내부 실패를 중복 판정하지 않고 대역 밖만 본다. 전체 FAIL은
+        # 아래 strict 1000–1600Hz gate가 만들고, 2kHz DNH는 독립적으로 안전하다.
+        assert bool(saved["g4_do_no_harm_pass"])
+        upper_index = saved["trusted_subband_hz"].tolist().index([1000.0, 1600.0])
+        assert np.all(
+            saved["source_trusted_subband_nmse_mean_db"][:, upper_index] >= 0.0
+        )
+        assert np.all(
+            saved["source_trusted_subband_nmse_worst10_mean_db"][:, upper_index]
+            >= 0.0
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    (
+        ("n_segments", lambda value: value.astype(np.float64)),
+        ("source_family", lambda value: np.arange(value.size, dtype=np.int64)),
+        (
+            "per_segment_trusted_subband_coverage",
+            lambda value: value.astype(np.int64),
+        ),
+        (
+            "source_trusted_subband_nmse_mean_db",
+            lambda value: value.astype(np.int64),
+        ),
+        ("g4_trusted_subband_pass", lambda value: value.astype(np.int64)),
+    ),
+)
+def test_strict_subband_validator_rejects_wrong_dtypes(tmp_path, field, mutate):
+    """숫자로 cast 가능한 위조도 원시 G4 schema로 수용하지 않는다."""
+
+    result, context = _evaluate(_powered_segments())
+    _, archive = _write(tmp_path, result, context)
+    with np.load(archive, allow_pickle=False) as saved:
+        payload = {key: np.asarray(saved[key]) for key in saved.files}
+    payload[field] = mutate(payload[field])
+    forged = tmp_path / f"wrong_dtype_{field}.npz"
+    np.savez_compressed(forged, **payload)
+    with np.load(forged, allow_pickle=False) as saved:
+        with pytest.raises(ValueError, match="dtype|scalar|배열"):
+            validate_strict_trusted_subband_metrics(
+                saved, min_groups=MIN_GROUPS_PER_FAMILY
+            )
+
+
+def test_g4_is_inconclusive_when_upper_trusted_subband_has_no_target_energy(tmp_path):
+    """전체 평균이 좋아도 1000–1600 Hz target이 없으면 canonical PASS가 아니다."""
+
+    segments = []
+    for family_index, family in enumerate(("speech", "music")):
+        for group_index in range(GROUPS_PER_FAMILY):
+            target = _tone(256, 250.0, amplitude=1.0 + 0.05 * group_index)
+            segments.append(
+                RecordedSegment(
+                    x=np.stack([target, np.zeros_like(target)]),
+                    d=target,
+                    session_id=f"{family}_session_{group_index}",
+                    group_id=f"{family}_group_{group_index}",
+                    source_family=family,
+                    start_sample=family_index,
+                )
+            )
+
+    result, context = _evaluate(segments)
+    markdown, archive = _write(tmp_path, result, context)
+
+    assert "G4 종합: INCONCLUSIVE" in markdown.read_text(encoding="utf-8")
+    with np.load(archive, allow_pickle=False) as saved:
+        assert bool(saved["g4_trusted_pass"])
+        assert not bool(saved["g4_trusted_subband_coverage_pass"])
+        assert not bool(saved["g4_upper_trusted_subband_pass"])
+        assert not bool(saved["g4_pass"])
 
 
 def test_g4_rejects_out_of_band_amplifier(tmp_path):

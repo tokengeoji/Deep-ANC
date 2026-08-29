@@ -385,6 +385,13 @@ PortAudio 에 float 변환을 맡기면 풀스케일 규약이 장치마다 달�
 MAX_PROBE_CLIP_RATIO = 0.005
 """마이크 자가진단 **상한**. QA 의 ``max_clip_ratio`` 와 같은 자리에서, 재생 **전에** 본다."""
 
+MAX_RECORDING_OUTPUT_PEAK = 0.15
+"""실측 source 세션의 noise-output peak 안전 상한.
+
+기존 82세션과 source-pool file playback이 검증된 peak 0.15를 넘겨 스피커/앰프를
+구동하지 않는다. CLI가 이 값을 완화할 수 없고 program별 worst-case factor를 적용한다.
+"""
+
 MIN_PROBE_DBFS = -80.0
 """마이크 자가진단 **하한**. 이보다 조용하면 무신호로 본다.
 
@@ -420,6 +427,78 @@ def input_rail_gate(
     return bool(max(ratios, default=0.0) <= float(max_clip_ratio)), ratios
 
 
+def capture_measurement_preflight_raw(
+    sd,
+    hardware: dict,
+    *,
+    seconds: float = 1.5,
+) -> tuple[np.ndarray, dict]:
+    """출력 장치를 열지 않는 official measurement input-only preflight.
+
+    기존 ``seconds``는 settle을 포함한 총 입력 capture 시간이다. 앞 0.5초를 버리고
+    남은 exact int32 owned raw와 공용 analyzer 기반 report를 반환한다.
+    """
+
+    duration = float(seconds)
+    if not np.isfinite(duration) or duration <= 0.5:
+        raise ValueError("measurement preflight seconds는 settle 0.5초보다 길어야 합니다")
+    if isinstance(hardware.get("output"), dict):
+        assert_measurement_pcm_unoccupied(hardware)
+    input_cfg = hardware.get("input")
+    if not isinstance(input_cfg, dict):
+        raise ValueError("measurement input hardware 설정이 필요합니다")
+    fs_value = hardware.get("sample_rate")
+    if type(fs_value) is not int or fs_value <= 0:
+        raise ValueError("measurement sample_rate는 양의 exact int여야 합니다")
+    fs = fs_value
+    card = str(input_cfg["card"])
+    assert_capture_clock_undisturbed(card)
+    device = resolve_alsa_portaudio_device(card, input_cfg["pcm"], "input", 2)
+    if type(device) is not int or device < 0:
+        raise RuntimeError("resolved input device는 음이 아닌 exact int여야 합니다")
+    check_settings = getattr(sd, "check_input_settings", None)
+    if callable(check_settings):
+        check_settings(
+            device=device, samplerate=fs, channels=2, dtype=MEASUREMENT_DTYPE[0]
+        )
+
+    total_frames = int(duration * fs)
+    settle_frames = int(0.5 * fs)
+    probe = sd.rec(
+        total_frames,
+        samplerate=fs,
+        channels=2,
+        dtype=MEASUREMENT_DTYPE[0],
+        device=device,
+    )
+    sd.wait()
+    observed = np.asarray(probe)
+    if observed.dtype != np.dtype("<i4") or observed.shape != (total_frames, 2):
+        raise RuntimeError(
+            "measurement preflight raw는 요청한 exact <i4 [frames,2]여야 합니다"
+        )
+    raw = np.array(observed[settle_frames:], dtype="<i4", copy=True, order="C")
+    analyzed = analyze_int32_input_probe(
+        raw,
+        min_rms_dbfs=MIN_PROBE_DBFS,
+        max_clip_ratio=MAX_PROBE_CLIP_RATIO,
+    )
+    probe_float = pcm_int32_to_float32(raw)
+    rail_ok, rail_ratios = input_rail_gate(probe_float)
+    report = {
+        **analyzed,
+        "passed": bool(
+            rail_ok and all(channel["valid"] is True for channel in analyzed["channels"])
+        ),
+        "rail_ratios": rail_ratios,
+        "resolved_input_device": device,
+        "sample_rate_hz": fs,
+        "capture_seconds_including_settle": duration,
+        "settle_frames_excluded": settle_frames,
+    }
+    return raw, report
+
+
 def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5) -> list[float]:
     """스피커를 울리기 **전에** 실기 전제조건을 전부 확인한다. 하나라도 깨지면 예외.
 
@@ -431,25 +510,13 @@ def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5
     ``tests/test_audio_entry_contract.py`` 가 거부한다.
     """
 
-    if isinstance(hardware.get("output"), dict):
-        assert_measurement_pcm_unoccupied(hardware)
-
-    card = hardware["input"]["card"]
-    assert_capture_clock_undisturbed(card)
-
-    device = resolve_alsa_portaudio_device(card, hardware["input"]["pcm"], "input", 2)
-    probe = sd.rec(
-        int(seconds * int(hardware["sample_rate"])),
-        samplerate=int(hardware["sample_rate"]),
-        channels=2,
-        dtype=MEASUREMENT_DTYPE[0],
-        device=device,
+    _, report = capture_measurement_preflight_raw(sd, hardware, seconds=seconds)
+    ratios = list(report["rail_ratios"])
+    analyzer_clipped = any(
+        float(channel["clip_ratio"]) > MAX_PROBE_CLIP_RATIO
+        for channel in report["channels"]
     )
-    sd.wait()
-    settle = int(0.5 * int(hardware["sample_rate"]))
-    probe_f = pcm_int32_to_float32(probe[settle:])
-    ok, ratios = input_rail_gate(probe_f)
-    if not ok:
+    if any(float(value) > MAX_PROBE_CLIP_RATIO for value in ratios) or analyzer_clipped:
         raise RuntimeError(
             f"마이크 입력이 풀스케일에 붙어 있습니다 (레일 비율 "
             f"{ratios[0]:.4f}/{ratios[1]:.4f} > {MAX_PROBE_CLIP_RATIO}). "
@@ -458,7 +525,7 @@ def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5
         )
 
     # 하한 — 상한만 보면 반쪽이다. 무신호 마이크도 "레일 아님" 으로 통과한다.
-    levels = [rms_dbfs(probe_f[:, ch]) for ch in range(probe_f.shape[1])]
+    levels = [float(channel["rms_dbfs"]) for channel in report["channels"]]
     dead = [ch for ch, db in enumerate(levels) if db < MIN_PROBE_DBFS]
     if dead:
         detail = " / ".join(f"ch{ch} {levels[ch]:.1f} dBFS" for ch in range(len(levels)))
@@ -468,4 +535,11 @@ def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5
             "이 상태로 계측하면 숫자가 음향과 무관해집니다. "
             "입력단 전원·배선(J30 핀 접촉)과 I2S 클록을 확인한 뒤 다시 실행하세요."
         )
+    stuck = [
+        int(channel["channel"])
+        for channel in report["channels"]
+        if channel["stuck"] is True
+    ]
+    if stuck:
+        raise RuntimeError(f"마이크 입력 raw code가 고정되어 있습니다: 채널 {stuck}")
     return ratios

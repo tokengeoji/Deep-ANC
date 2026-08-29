@@ -102,11 +102,17 @@ Stage-2 커리큘럼으로 한 축씩 켠다.
 .venv/bin/python scripts/data/make_recorded_manifest.py
 # 전체 파일/메타/클리핑/무음/분할 누수 QA — PASS 전에는 학습 금지
 .venv/bin/python scripts/data/validate_recorded_sessions.py
-# canonical init과 transfer trust anchor를 지정하고 readiness 16/16 뒤 pipeline 실행
+# canonical init과 같은 Elice generation/loss winner를 명시하고 readiness 17/17 뒤 pipeline 실행
+BOOT=$(sha256sum data/manifests/elice_bootstrap_receipt.json | awk '{print $1}')
+ALPHA=<canonical-pretrain ledger의 0.7/0.85/1.0 winner>
+LAMBDA_DNH=<같은 winner identity의 approved lambda_dnh>
 .venv/bin/python scripts/train/run_finetune_pipeline.py \
   --config configs/train_finetune.yaml \
   --set data.digital_primary_path_mode=measured \
-  --set init_ckpt=runs/<canonical-pretrain>/ckpt/best.pt
+  --set init_ckpt=runs/<canonical-pretrain>/ckpt/best.pt \
+  --set data.bootstrap_receipt_sha256="$BOOT" \
+  --set loss.nmse_cvar_alpha="$ALPHA" \
+  --set loss.lambda_dnh="$LAMBDA_DNH"
 ```
 
 2026-08-03 빠져 있던 pin17(REF L/R)을 재연결한 뒤 ERR/REF는 −46dBFS대, clip 0%로
@@ -148,6 +154,42 @@ manifest도 raw content SHA와 canonical holdout SHA를 결속하고 recorded와
 clipping, `session.json`, source 필요 여부, group 누수, family×required-split 커버리지를 검사하고
 `recorded_qa.md`+`recorded_qa.json`을 남긴다. 기본 게이트를 완화하는
 `--allow-incomplete-family-coverage`는 진단용이며 최종 G2 판정에는 쓰지 않는다.
+
+그 다음 `audit_recorded_subband_coverage.py`가 ANC target(`d`=ERR)의
+150–300/300–600/600–1000/1000–1600Hz 에너지 coverage를 train/val/test 전부에서
+family×lineage group 단위로 전수 감사한다. canonical report는
+`results/data_audit/recorded_subband_coverage/<coverage-contract-sha256>.json`이며 schema·자체
+digest뿐 아니라 현재 manifest path/bytes/size/SHA, `TrainingTimingContract` SHA, lead, warmup,
+hop, `segment_seconds`, hop 정렬 후 실제 `segment_samples`, density 하한 0.25와 독립 그룹
+하한 4에 exact 결속된다(schema v3). bootstrap은 generation-keyed
+report를 no-replace로 한 번 만들고, 기존 같은 generation 파일은 WAV를 재읽지 않고 재검증한다.
+새 녹음/manifest/timing은 새 contract SHA 경로를 발행하므로 이전 immutable report를 삭제하거나
+덮어쓰지 않는다.
+
+canonical 표본 상한은 `max_segments_per_session=64`다. 70초 세션에서 양끝
+0.25초를 제외한 사실상 모든 비중첩 segment를 보며, 8개 균등 표본이 놓친 짧은
+고역 구간 때문에 필요 이상의 재녹음을 요구하지 않도록 한다. 이 값은 감사와
+`evaluate_recorded.py` 공식 CLI가 같은 단일 상수를 사용하므로 coverage와 G4의
+population이 다르지 않다. density/group 임계를 낮춘 것이 아니다.
+
+공식 val/test metrics도 같은 모집단 계약을 재검산한다. NPZ의 hop·lead·delay 숫자를
+자기진술로 믿지 않고 checkpoint `model.hop`/`TrainingTimingContract`와 각 manifest session의
+immutable `session.json.timeline.aligned_lag_median_samples`를 함께 읽어 lead와 모든 결정론적
+start exact set을 다시 유도한다. checkpoint 기본 feedback 중앙값, PlantSettle과 기본 warmup,
+유효 metric 길이도 exact 일치해야 한다. `--warmup-seconds`/`--feedback-delay-samples`와
+64/1.5초/0.25초 외 표본 override는 명시적 diagnostic에서만 가능하고 selection/test에 쓰지 못한다.
+
+bootstrap receipt schema v2는 그 report의 상대경로·file SHA·semantic manifest/timing/contract
+SHA와 PASS/FAIL을 포함한다. readiness는 별도 채널로 전달된 `data.bootstrap_receipt_sha256`
+아래 이 binding을 현재 report bytes와 대조한다. 따라서 ignored results 파일의 payload와
+자체 digest를 함께 다시 봉인해도 학습 gate를 열 수 없다. 누락·구형·변조 report와 coverage
+FAIL은 모두 readiness를 차단한다.
+
+2026-08-28 64-segment 실제 감사에서 82세션은 train 2행, val 5행,
+test 5행이 부족해 이 게이트가 FAIL이다. 1000–1600Hz의 train
+machine/speech, val 전 계열, test 전 계열과 600–1000Hz의 val speech/test
+machine이 그룹 하한 4를 채우지 못했다. 임계값을 낮추는 대신 해당 계열·대역의
+새 독립 원본을 짧게 추가 녹음해야 한다.
 `evaluate_recorded.py`도 오디오 장치를 열지 않으며 checkpoint의 resolved model/data/duct와
 measured P/S/lead만 사용한다. surrogate는 `--allow-surrogate`를 명시한 진단 외에는 거부한다.
 

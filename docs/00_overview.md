@@ -24,6 +24,13 @@
 기존 P/S와 checkpoint는 strict provenance와 150–1600 Hz 계약을 만족하지 않아
 diagnostic-only다. 새 strict P/S, 데이터 계보, Elice public corpus와 canonical tiny 100k init을
 모두 확보하기 전에는 surrogate checkpoint의 dB를 실제 덕트 감쇠로 해석하지 않는다.
+단계별 PASS/FAIL/BLOCKED 의미와 절대 중단 조건은
+[canonical 파인튜닝 강제 가드레일](16_canonical_finetune_guardrails.md)을 따른다.
+2/4/8 kHz까지의 최종 목표와 matched FxLMS 우위·공간 검증은
+[광대역 Deep-ANC 강제 가드레일](18_broadband_anc_guardrails.md)을 추가로 따른다.
+125 Hz 옥타브의 하단 누락을 복구한 최종 역할은
+[광대역 v3 전 옥타브 계약](27_broadband_v3_full_octave_contract.md)을 따른다. 기존
+150 Hz 하단 광대역-v2는 구조·진단 역할로 보존하며 125 Hz 성능 근거로 승격하지 않는다.
 
 ## 시스템 전체 그림
 
@@ -50,6 +57,8 @@ diagnostic-only다. 새 strict P/S, 데이터 계보, Elice public corpus와 can
 | **Stage-1A** | digital-ref, secondary surrogate | G0와 loss pilot 뒤 tiny 100k canonical pretrain | 표현 학습만 |
 | **Stage-1B** | digital-ref, measured P/S | recorded 70%+synthetic 30% open-loop 50k와 one-shot G4 | 독립 G4 PASS 범위만 주장 |
 | **Stage-2** | natural-crest challenge | 완전 미사용 4-family challenge | challenge PASS 뒤에만 배포 후보 |
+| **광대역-v2(진단)** | digital-ref, 150–11.314kHz | 기존 구조·fixture 보존 | 125Hz 옥타브 전체 성능 주장 금지 |
+| **광대역-v3(최종)** | digital-ref, 88.388Hz–11.314kHz | 125Hz–8kHz 전 옥타브 + 저역 guard + 고역 matched FxLMS 우위 + 다점 검증 | 별도 v3 P/S·데이터·G4 PASS 범위만 주장 |
 | **후속** | closed-loop/acoustic-ref | 다중 plant·비선형·외부 소음 | 별도 실측 게이트 뒤 주장 |
 
 같은 코드베이스를 사용하지만 단계 전환에는 config 변경만으로 충분하지 않다.

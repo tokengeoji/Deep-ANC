@@ -21,9 +21,17 @@ from .holdout_contract import (
     reject_symlink_components,
     validate_holdout_contract,
 )
+from .recorded_generation import (
+    COMBINED_SESSION_COUNT,
+    PARENT_MANIFEST,
+    RecordedGenerationError,
+    validate_recorded_generation,
+)
+from .source_trust import SourceTrustError, exact_clean_source_evidence
 
 
 TRANSFER_SCHEMA_VERSION = 1
+TRANSFER_GENERATION_SCHEMA_VERSION = 2
 EXPECTED_RECORDED_SESSIONS = 82
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -36,6 +44,10 @@ _ROLES = frozenset(
         "strict_primary_npz",
         "strict_secondary_npz",
         "recorded_manifest",
+        "parent_recorded_manifest",
+        "recorded_generation",
+        "recorded_source_plan",
+        "recorded_source_selection",
         "lineage_tracks",
         "librispeech_chapters_metadata",
         "esc50_metadata",
@@ -53,6 +65,10 @@ _ROLE_PREFIXES = {
     "strict_primary_npz": "assets/measured/",
     "strict_secondary_npz": "assets/measured/",
     "recorded_manifest": "data/manifests/",
+    "parent_recorded_manifest": "data/manifests/",
+    "recorded_generation": "data/manifests/recorded_generations/",
+    "recorded_source_plan": "data/source_plans/recorded_additions/",
+    "recorded_source_selection": "data/source_plans/recorded_additions/",
     "lineage_tracks": "data/raw/music/fma_metadata/",
     "librispeech_chapters_metadata": "data/raw/speech/LibriSpeech/",
     "esc50_metadata": "data/raw/noise/esc50/ESC-50-master/meta/",
@@ -75,8 +91,12 @@ class RecordedTrainingSnapshot:
     bootstrap_receipt: FileSnapshot | None
     transfer_manifest: FileSnapshot
     recorded_manifest: FileSnapshot
+    recorded_generation: FileSnapshot | None
+    recorded_generation_summary: dict[str, Any] | None
     recorded_aggregate_sha256: str
     recorded_files: dict[str, FileSnapshot]
+    recorded_subband_coverage_report: FileSnapshot | None
+    recorded_subband_coverage_receipt: dict[str, Any] | None
 
     def _relative_recorded_path(self, path: str | Path) -> str:
         candidate = Path(os.path.abspath(os.fspath(path)))
@@ -234,10 +254,22 @@ def _canonical_recorded_aggregate(entries: list[dict[str, object]]) -> str:
 def _no_replace_head_commit(repo_root: Path) -> str:
     """receipt의 bootstrap commit을 현재 checkout과 no-replace로 교차검증한다."""
 
-    environment = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
         value = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            [
+                "git",
+                f"--git-dir={repo_root / '.git'}",
+                f"--work-tree={repo_root}",
+                "-c",
+                f"core.worktree={repo_root}",
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ],
             cwd=repo_root,
             env=environment,
             check=True,
@@ -313,8 +345,13 @@ def validate_transfer_manifest(
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TransferContractError(f"transfer manifest JSON 오류: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != TRANSFER_SCHEMA_VERSION:
-        raise TransferContractError("transfer manifest schema_version은 1이어야 합니다")
+    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
+    if (
+        type(schema_version) is not int
+        or schema_version
+        not in {TRANSFER_SCHEMA_VERSION, TRANSFER_GENERATION_SCHEMA_VERSION}
+    ):
+        raise TransferContractError("transfer manifest schema_version은 1 또는 2여야 합니다")
     raw_files = payload.get("files")
     if not isinstance(raw_files, list) or not raw_files:
         raise TransferContractError("transfer manifest files가 비었습니다")
@@ -339,7 +376,12 @@ def validate_transfer_manifest(
         size = raw_entry["size"]
         if role not in _ROLES:
             raise TransferContractError(f"files[{index}].role이 허용 목록 밖입니다: {role!r}")
-        if not relative.startswith(_ROLE_PREFIXES[str(role)]):
+        role_prefix_ok = relative.startswith(_ROLE_PREFIXES[str(role)])
+        if role == "recorded" and schema_version == TRANSFER_GENERATION_SCHEMA_VERSION:
+            role_prefix_ok = relative.startswith("data/recorded/") or relative.startswith(
+                "data/recorded_additions/"
+            )
+        if not role_prefix_ok:
             raise TransferContractError(
                 f"files[{index}] path가 role={role!r} 허용 prefix 밖입니다: {relative}"
             )
@@ -377,8 +419,32 @@ def validate_transfer_manifest(
     for role in ("strict_ps_raw", "strict_ps_analysis"):
         if not by_role[role]:
             raise TransferContractError(f"{role} 증거가 하나 이상 필요합니다")
-    if by_role["recorded_manifest"] != ["data/manifests/recorded_regrouped.jsonl"]:
-        raise TransferContractError("recorded_manifest role은 canonical regrouped JSONL 1개여야 합니다")
+    if schema_version == TRANSFER_SCHEMA_VERSION:
+        if by_role["recorded_manifest"] != [PARENT_MANIFEST]:
+            raise TransferContractError(
+                "schema v1 recorded_manifest role은 canonical regrouped JSONL 1개여야 합니다"
+            )
+        if any(
+            by_role[role]
+            for role in (
+                "parent_recorded_manifest",
+                "recorded_generation",
+                "recorded_source_plan",
+                "recorded_source_selection",
+            )
+        ):
+            raise TransferContractError("schema v1에는 recorded generation role을 넣을 수 없습니다")
+    else:
+        if len(by_role["recorded_manifest"]) != 1:
+            raise TransferContractError("schema v2 combined recorded_manifest는 정확히 1개여야 합니다")
+        if by_role["parent_recorded_manifest"] != [PARENT_MANIFEST]:
+            raise TransferContractError(
+                "schema v2 parent_recorded_manifest는 기존 82세션 manifest여야 합니다"
+            )
+        if len(by_role["recorded_generation"]) != 1 or len(by_role["recorded_source_plan"]) != 1:
+            raise TransferContractError(
+                "schema v2 recorded_generation/source_plan role은 각각 정확히 1개여야 합니다"
+            )
     if by_role["lineage_tracks"] != ["data/raw/music/fma_metadata/tracks.csv"]:
         raise TransferContractError("lineage_tracks role은 canonical FMA tracks.csv 1개여야 합니다")
     if by_role["librispeech_chapters_metadata"] != [
@@ -447,6 +513,80 @@ def validate_transfer_manifest(
 
     if payload.get("recorded_manifest") != by_role["recorded_manifest"][0]:
         raise TransferContractError("recorded_manifest pointer와 role이 다릅니다")
+    generation_summary: dict[str, Any] | None = None
+    if schema_version == TRANSFER_GENERATION_SCHEMA_VERSION:
+        generation_pointer = payload.get("recorded_generation")
+        if generation_pointer != by_role["recorded_generation"][0]:
+            raise TransferContractError("recorded_generation pointer와 role이 다릅니다")
+        generation_entry = next(
+            entry for entry in entries if entry["path"] == generation_pointer
+        )
+        try:
+            generation_summary = validate_recorded_generation(
+                root / str(generation_pointer),
+                repo_root=root,
+                expected_sha256=str(generation_entry["sha256"]),
+                require_source_files=False,
+            )
+        except RecordedGenerationError as exc:
+            raise TransferContractError(f"recorded generation 검증 실패: {exc}") from exc
+        combined_ref = generation_summary["recorded_manifest"]
+        additions_summary = generation_summary["additions"]
+        if (
+            not isinstance(combined_ref, dict)
+            or combined_ref.get("path") != by_role["recorded_manifest"][0]
+            or combined_ref.get("sha256")
+            != next(
+                entry["sha256"]
+                for entry in entries
+                if entry["path"] == by_role["recorded_manifest"][0]
+            )
+            or not isinstance(additions_summary, dict)
+            or not isinstance(additions_summary.get("source_plan"), dict)
+            or additions_summary["source_plan"].get("path")
+            != by_role["recorded_source_plan"][0]
+            or additions_summary["source_plan"].get("sha256")
+            != next(
+                entry["sha256"]
+                for entry in entries
+                if entry["path"] == by_role["recorded_source_plan"][0]
+            )
+        ):
+            raise TransferContractError(
+                "schema v2 combined manifest/source plan이 recorded generation과 다릅니다"
+            )
+        source_selection = (
+            additions_summary.get("source_selection", {})
+            .get("external_dns_speech_selection", {})
+        )
+        expected_selection = sorted(
+            str(item.get("path"))
+            for item in source_selection.get("bundle_files", [])
+            if isinstance(item, dict)
+        ) if isinstance(source_selection, dict) else []
+        if sorted(by_role["recorded_source_selection"]) != expected_selection:
+            raise TransferContractError(
+                "schema v2 recorded_source_selection role이 generation DNS bundle과 다릅니다"
+            )
+        selection_refs = {
+            str(item.get("path")): item
+            for item in source_selection.get("bundle_files", [])
+            if isinstance(item, dict)
+        } if isinstance(source_selection, dict) else {}
+        for path in expected_selection:
+            entry = next(
+                (item for item in entries if str(item.get("path")) == path),
+                None,
+            )
+            ref = selection_refs[path]
+            if (
+                not isinstance(entry, dict)
+                or entry.get("sha256") != ref.get("sha256")
+                or entry.get("size") != ref.get("size")
+            ):
+                raise TransferContractError(
+                    "schema v2 DNS selection bundle path/SHA/size가 generation과 다릅니다"
+                )
     if payload.get("lineage_tracks") != by_role["lineage_tracks"][0]:
         raise TransferContractError("lineage_tracks pointer와 role이 다릅니다")
     if (
@@ -487,8 +627,13 @@ def validate_transfer_manifest(
     ):
         raise TransferContractError("canonical recorded-tree metadata 증거가 유효하지 않습니다")
     entry_by_path = {str(entry["path"]): entry for entry in entries}
+    lineage_manifest_path = (
+        by_role["recorded_manifest"][0]
+        if schema_version == TRANSFER_SCHEMA_VERSION
+        else by_role["parent_recorded_manifest"][0]
+    )
     if (
-        entry_by_path[by_role["recorded_manifest"][0]]["sha256"]
+        entry_by_path[lineage_manifest_path]["sha256"]
         != lineage_summary.get("regrouped_manifest_sha256")
         or entry_by_path[by_role["lineage_tracks"][0]]["sha256"]
         != lineage_summary.get("tracks_csv_sha256")
@@ -556,46 +701,86 @@ def validate_transfer_manifest(
 
     recorded_entries = [entry for entry in entries if entry["role"] == "recorded"]
     recorded = payload.get("recorded")
-    if not isinstance(recorded, dict) or set(recorded) != {
-        "aggregate_sha256",
-        "file_count",
-        "root",
-        "session_count",
-        "source_metadata_file_count",
-        "source_metadata_snapshot_sha256",
-        "source_content_snapshot_sha256",
-        "total_bytes",
-    }:
-        raise TransferContractError("recorded aggregate 구조가 불완전합니다")
-    if recorded.get("root") != "data/recorded":
-        raise TransferContractError("recorded.root는 data/recorded여야 합니다")
-    tree_files, actual_sessions = _walk_recorded_tree(
-        root / "data/recorded", repo_root=root
-    )
     declared_recorded_paths = {str(entry["path"]) for entry in recorded_entries}
+    aggregate = _canonical_recorded_aggregate(recorded_entries)
+    if schema_version == TRANSFER_SCHEMA_VERSION:
+        expected_recorded_keys = {
+            "aggregate_sha256",
+            "file_count",
+            "root",
+            "session_count",
+            "source_metadata_file_count",
+            "source_metadata_snapshot_sha256",
+            "source_content_snapshot_sha256",
+            "total_bytes",
+        }
+        if not isinstance(recorded, dict) or set(recorded) != expected_recorded_keys:
+            raise TransferContractError("schema v1 recorded aggregate 구조가 불완전합니다")
+        if recorded.get("root") != "data/recorded":
+            raise TransferContractError("schema v1 recorded.root는 data/recorded여야 합니다")
+        tree_files, actual_sessions = _walk_recorded_tree(
+            root / "data/recorded", repo_root=root
+        )
+        if lineage_tree_file_count != len(recorded_entries):
+            raise TransferContractError(
+                "canonical provenance recorded-tree file_count와 transfer exact 파일 집합이 다릅니다: "
+                f"provenance={lineage_tree_file_count}, transfer={len(recorded_entries)}"
+            )
+        expected_recorded = {
+            "root": "data/recorded",
+            "session_count": EXPECTED_RECORDED_SESSIONS,
+            "file_count": len(recorded_entries),
+            "total_bytes": sum(int(entry["size"]) for entry in recorded_entries),
+            "aggregate_sha256": aggregate,
+            "source_metadata_file_count": lineage_tree_file_count,
+            "source_metadata_snapshot_sha256": lineage_tree_sha256,
+            "source_content_snapshot_sha256": lineage_tree_content_sha256,
+        }
+        expected_sessions = EXPECTED_RECORDED_SESSIONS
+    else:
+        assert generation_summary is not None
+        additions_summary = generation_summary["additions"]
+        parent_summary = generation_summary["parent"]
+        if not isinstance(additions_summary, dict) or not isinstance(parent_summary, dict):
+            raise TransferContractError("recorded generation parent/additions summary가 없습니다")
+        parent_root = str(parent_summary.get("root"))
+        additions_root = str(additions_summary.get("root"))
+        parent_files, parent_sessions = _walk_recorded_tree(root / parent_root, repo_root=root)
+        additions_files, additions_sessions = _walk_recorded_tree(
+            root / additions_root, repo_root=root
+        )
+        tree_files = parent_files | additions_files
+        actual_sessions = parent_sessions + additions_sessions
+        parent_declared = {
+            path for path in declared_recorded_paths if path.startswith(parent_root + "/")
+        }
+        if parent_declared != parent_files or len(parent_files) != lineage_tree_file_count:
+            raise TransferContractError(
+                "schema v2 parent 82 exact 파일 집합이 holdout anchor와 다릅니다"
+            )
+        expected_recorded = {
+            "root": "recorded_generation",
+            "parent_root": parent_root,
+            "additions_root": additions_root,
+            "generation_manifest": by_role["recorded_generation"][0],
+            "session_count": COMBINED_SESSION_COUNT,
+            "file_count": len(recorded_entries),
+            "total_bytes": sum(int(entry["size"]) for entry in recorded_entries),
+            "aggregate_sha256": aggregate,
+            "source_metadata_file_count": lineage_tree_file_count,
+            "source_metadata_snapshot_sha256": lineage_tree_sha256,
+            "source_content_snapshot_sha256": lineage_tree_content_sha256,
+        }
+        expected_sessions = COMBINED_SESSION_COUNT
+        if not isinstance(recorded, dict) or set(recorded) != set(expected_recorded):
+            raise TransferContractError("schema v2 recorded aggregate 구조가 불완전합니다")
     if tree_files != declared_recorded_paths:
         missing = sorted(tree_files - declared_recorded_paths)[:5]
         extra = sorted(declared_recorded_paths - tree_files)[:5]
         raise TransferContractError(
             f"recorded tree와 manifest exact 파일 집합이 다릅니다: missing={missing}, extra={extra}"
         )
-    aggregate = _canonical_recorded_aggregate(recorded_entries)
-    if lineage_tree_file_count != len(recorded_entries):
-        raise TransferContractError(
-            "canonical provenance recorded-tree file_count와 transfer exact 집합이 다릅니다: "
-            f"provenance={lineage_tree_file_count}, transfer={len(recorded_entries)}"
-        )
-    expected_recorded = {
-        "root": "data/recorded",
-        "session_count": EXPECTED_RECORDED_SESSIONS,
-        "file_count": len(recorded_entries),
-        "total_bytes": sum(int(entry["size"]) for entry in recorded_entries),
-        "aggregate_sha256": aggregate,
-        "source_metadata_file_count": lineage_tree_file_count,
-        "source_metadata_snapshot_sha256": lineage_tree_sha256,
-        "source_content_snapshot_sha256": lineage_tree_content_sha256,
-    }
-    if actual_sessions != EXPECTED_RECORDED_SESSIONS or recorded != expected_recorded:
+    if actual_sessions != expected_sessions or recorded != expected_recorded:
         raise TransferContractError(
             f"recorded aggregate 불일치: sessions={actual_sessions}, "
             f"expected={expected_recorded}, declared={recorded}"
@@ -611,6 +796,12 @@ def validate_transfer_manifest(
         "_validated_recorded_manifest_snapshot": validated_file_snapshots[
             by_role["recorded_manifest"][0]
         ],
+        "_validated_recorded_generation_snapshot": (
+            None
+            if schema_version == TRANSFER_SCHEMA_VERSION
+            else validated_file_snapshots[by_role["recorded_generation"][0]]
+        ),
+        "_validated_recorded_generation_summary": generation_summary,
         "_validated_recorded_file_snapshots": {
             str(entry["path"]): validated_file_snapshots[str(entry["path"])]
             for entry in recorded_entries
@@ -636,6 +827,8 @@ def bind_recorded_transfer_config(
     expected_receipt_sha = data_cfg.get("bootstrap_receipt_sha256")
     receipt_snapshot: FileSnapshot | None = None
     receipt_payload: dict[str, Any] | None = None
+    coverage_snapshot: FileSnapshot | None = None
+    coverage_receipt: dict[str, Any] | None = None
     if receipt_value is not None or expected_receipt_sha is not None:
         if receipt_value != "data/manifests/elice_bootstrap_receipt.json":
             raise TransferContractError(
@@ -669,17 +862,21 @@ def bind_recorded_transfer_config(
             )
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise TransferContractError(f"bootstrap receipt JSON 오류: {exc}") from exc
-        if not isinstance(receipt_payload, dict) or set(receipt_payload) != {
+        receipt_schema = receipt_payload.get("schema_version") if isinstance(receipt_payload, dict) else None
+        expected_receipt_keys = {
             "schema_version",
             "expected_commit",
             "canonical_holdout",
             "transfer_manifest",
             "recorded_aggregate_sha256",
             "environment",
-        }:
+        }
+        if receipt_schema == 2:
+            expected_receipt_keys.add("recorded_subband_coverage")
+        if not isinstance(receipt_payload, dict) or set(receipt_payload) != expected_receipt_keys:
             raise TransferContractError("bootstrap receipt schema/필드가 불완전합니다")
         if (
-            receipt_payload.get("schema_version") != 1
+            receipt_schema not in {1, 2}
             or not isinstance(receipt_payload.get("expected_commit"), str)
             or not _COMMIT_RE.fullmatch(str(receipt_payload["expected_commit"]))
         ):
@@ -690,6 +887,14 @@ def bind_recorded_transfer_config(
                 "bootstrap receipt expected_commit과 현재 no-replace git HEAD가 다릅니다: "
                 f"receipt={receipt_payload['expected_commit']}, current={current_commit}"
             )
+        try:
+            exact_clean_source_evidence(
+                root, expected_commit=str(receipt_payload["expected_commit"])
+            )
+        except SourceTrustError as exc:
+            raise TransferContractError(
+                f"bootstrap receipt clean exact source 재검증 실패: {exc}"
+            ) from exc
         holdout_receipt = receipt_payload.get("canonical_holdout")
         transfer_receipt = receipt_payload.get("transfer_manifest")
         environment_receipt = receipt_payload.get("environment")
@@ -727,6 +932,81 @@ def bind_recorded_transfer_config(
             )
         ):
             raise TransferContractError("bootstrap receipt trust-chain 필드가 유효하지 않습니다")
+        if receipt_schema == 2:
+            raw_coverage = receipt_payload.get("recorded_subband_coverage")
+            coverage_keys = {
+                "path",
+                "sha256",
+                "evidence_sha256",
+                "manifest_sha256",
+                "training_timing_contract_sha256",
+                "coverage_contract_sha256",
+                "all_requested_splits_pass",
+            }
+            if (
+                not isinstance(raw_coverage, dict)
+                or set(raw_coverage) != coverage_keys
+                or not isinstance(raw_coverage.get("path"), str)
+                or not str(raw_coverage["path"]).startswith(
+                    "results/data_audit/recorded_subband_coverage/"
+                )
+                or not str(raw_coverage["path"]).endswith(".json")
+                or any(
+                    not isinstance(raw_coverage.get(key), str)
+                    or not _SHA256_RE.fullmatch(str(raw_coverage[key]))
+                    for key in (
+                        "sha256",
+                        "evidence_sha256",
+                        "manifest_sha256",
+                        "training_timing_contract_sha256",
+                        "coverage_contract_sha256",
+                    )
+                )
+                or Path(str(raw_coverage["path"])).stem
+                != str(raw_coverage["coverage_contract_sha256"])
+                or not isinstance(raw_coverage.get("all_requested_splits_pass"), bool)
+            ):
+                raise TransferContractError(
+                    "bootstrap receipt recorded_subband_coverage 필드가 유효하지 않습니다"
+                )
+            try:
+                coverage_snapshot = read_regular_file_snapshot(
+                    root / str(raw_coverage["path"]),
+                    root=root,
+                    label="bootstrap recorded subband coverage report",
+                )
+            except HoldoutContractError as exc:
+                raise TransferContractError(str(exc)) from exc
+            if coverage_snapshot.sha256 != raw_coverage["sha256"]:
+                raise TransferContractError(
+                    "bootstrap 이후 recorded subband coverage report가 변경됐습니다"
+                )
+            assert coverage_snapshot.data is not None
+            try:
+                coverage_payload = json.loads(
+                    coverage_snapshot.data.decode("utf-8"),
+                    object_pairs_hook=_object_without_duplicates,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise TransferContractError(
+                    f"recorded subband coverage report JSON 오류: {exc}"
+                ) from exc
+            for receipt_key, report_key in (
+                ("evidence_sha256", "evidence_sha256"),
+                ("manifest_sha256", "manifest"),
+                ("training_timing_contract_sha256", "training_timing_contract_sha256"),
+                ("coverage_contract_sha256", "coverage_contract_sha256"),
+                ("all_requested_splits_pass", "all_requested_splits_pass"),
+            ):
+                report_value = coverage_payload.get(report_key)
+                if report_key == "manifest" and isinstance(report_value, dict):
+                    report_value = report_value.get("sha256")
+                if report_value != raw_coverage[receipt_key]:
+                    raise TransferContractError(
+                        "bootstrap coverage receipt와 report semantic field가 다릅니다: "
+                        f"{receipt_key}"
+                    )
+            coverage_receipt = dict(raw_coverage)
         try:
             freeze_snapshot = read_regular_file_snapshot(
                 root / str(environment_receipt["freeze_receipt"]),
@@ -804,6 +1084,39 @@ def bind_recorded_transfer_config(
     manifest_snapshot = summary["_validated_transfer_manifest_snapshot"]
     recorded_manifest_snapshot = summary["_validated_recorded_manifest_snapshot"]
     recorded_files = summary["_validated_recorded_file_snapshots"]
+    recorded_generation_snapshot = summary.get(
+        "_validated_recorded_generation_snapshot"
+    )
+    recorded_generation_summary = summary.get(
+        "_validated_recorded_generation_summary"
+    )
+    declared_generation = data_cfg.get("recorded_generation")
+    declared_generation_sha = data_cfg.get("recorded_generation_sha256")
+    if isinstance(recorded_generation_snapshot, FileSnapshot):
+        generation_relative = recorded_generation_snapshot.path.relative_to(root).as_posix()
+        if declared_generation in (None, "") and declared_generation_sha in (None, ""):
+            # bootstrap receipt의 외부 SHA -> transfer SHA -> generation FileSnapshot은
+            # 이미 하나의 검증된 trust chain이다. schema v2에서 같은 값을 모든 runner
+            # CLI에 반복 입력하게 하지 않고 이 snapshot에서 원자 materialize한다.
+            data_cfg["recorded_generation"] = generation_relative
+            data_cfg["recorded_generation_sha256"] = recorded_generation_snapshot.sha256
+        elif declared_generation in (None, "") or declared_generation_sha in (None, ""):
+            raise TransferContractError(
+                "schema v2 recorded_generation path/SHA는 둘 다 비우거나 둘 다 exact여야 합니다"
+            )
+        elif (
+            declared_generation != generation_relative
+            or declared_generation_sha != recorded_generation_snapshot.sha256
+        ):
+            raise TransferContractError(
+                "schema v2 transfer의 data.recorded_generation/path SHA가 검증값과 다릅니다: "
+                f"expected=({generation_relative},{recorded_generation_snapshot.sha256}), "
+                f"declared=({declared_generation},{declared_generation_sha})"
+            )
+    elif declared_generation not in (None, "") or declared_generation_sha not in (None, ""):
+        raise TransferContractError(
+            "schema v1 transfer에 data.recorded_generation 선언을 결합할 수 없습니다"
+        )
     if (
         not isinstance(manifest_snapshot, FileSnapshot)
         or not isinstance(recorded_manifest_snapshot, FileSnapshot)
@@ -818,8 +1131,20 @@ def bind_recorded_transfer_config(
         bootstrap_receipt=receipt_snapshot,
         transfer_manifest=manifest_snapshot,
         recorded_manifest=recorded_manifest_snapshot,
+        recorded_generation=(
+            recorded_generation_snapshot
+            if isinstance(recorded_generation_snapshot, FileSnapshot)
+            else None
+        ),
+        recorded_generation_summary=(
+            dict(recorded_generation_summary)
+            if isinstance(recorded_generation_summary, dict)
+            else None
+        ),
         recorded_aggregate_sha256=aggregate,
         recorded_files=dict(recorded_files),
+        recorded_subband_coverage_report=coverage_snapshot,
+        recorded_subband_coverage_receipt=coverage_receipt,
     )
 
 

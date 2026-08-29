@@ -60,9 +60,9 @@ sha256sum "$INCOMING/archive.bin"
 Drive 링크에서 내려받은 파일이 재압축·재인코딩되었거나 SHA가 없으면 canonical 학습에
 사용하지 않는다. 특히 MP3는 decoder warning 여부까지 원본 파일별로 audit해야 한다.
 
-## 현재 실행에 대한 처리
+## 2026-08-27 당시 실행에 대한 처리
 
-현재 Elice loss pilot은 20k 후보를 순차 실행 중이다. pilot 완료 전에는 위 downloader를
+당시 Elice loss pilot은 20k 후보를 순차 실행 중이었다. pilot 완료 전에는 위 downloader를
 실행하지 않는다. 완료 후에도 반복되는 `libmpg123` 경고의 원본을 먼저 분류하고, 문제가
 확인되면 해당 raw/manifest를 새 SHA로 재생성한 뒤에야 probe·canonical pretrain을 연다.
 Jetson으로 public corpus를 되받아 복제하거나 Git에 raw·토큰을 올리는 경로는 사용하지 않는다.

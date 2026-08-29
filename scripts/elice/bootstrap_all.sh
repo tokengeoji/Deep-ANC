@@ -20,6 +20,10 @@
 # Azure blob 은 연결당 속도제한이 있어 반드시 pget.py(병렬 range)로 받는다.
 set -euo pipefail
 export GIT_NO_REPLACE_OBJECTS=1
+# 이 실행이 새 cache를 만들지 않게 한다. 구버전 bootstrap/pytest가 이미
+# 남긴 protected-root cache는 DNS selector가 exact source 검증 후 import 전에
+# repository 밖 no-overwrite quarantine으로 이동하며 자동 삭제하지 않는다.
+export PYTHONDONTWRITEBYTECODE=1
 
 # --no-update: 필수. 현재 HEAD가 expected commit과 다르면 즉시 실패한다. 실행 중 pull은
 # 하지 않는다. 구버전 스크립트가 자신을 업데이트한 뒤 계속 실행되는 경로를 금지한다.
@@ -260,12 +264,20 @@ fi
 HOLDOUT_MANIFEST="$REPO/data/manifests/recorded_holdout.json"
 HOLDOUT_VALIDATOR="$REPO/src/deep_anc/data/holdout_contract.py"
 TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"
-TRANSFER_VALIDATOR_MODULE="deep_anc.data.transfer_contract"
 # Canonical 학습은 raw 전수 decoder audit과 한 세대로 발행한 v4 manifest만 읽는다.
 # audit 원본은 결과 증거로 보존하고, prepare transaction이 같은 bytes를 canonical
 # directory에 복사해 sidecar와 결속한다.
 CANONICAL_MANIFEST_DIR="data/manifests/canonical_v4"
 DECODER_AUDIT_REPORT="results/provenance/decoder_audit.json"
+RECORDED_QA_JSON="data/manifests/recorded_qa.json"
+RECORDED_QA_MD="data/manifests/recorded_qa.md"
+RECORDED_SUBBAND_COVERAGE_REPORT_DIR="results/data_audit/recorded_subband_coverage"
+RECORDED_MANIFEST=""
+RECORDED_MANIFEST_SHA256=""
+RECORDED_SESSION_COUNT=""
+RECORDED_TRANSFER_SCHEMA=""
+RECORDED_GENERATION=""
+RECORDED_GENERATION_SHA256=""
 
 verify_exact_checkout() {
   local current_commit hidden_flags replace_refs
@@ -378,18 +390,138 @@ verify_canonical_bundle() {
 }
 
 verify_transfer_bundle() {
+  local resolved schema_version selected_manifest selected_manifest_sha256
+  local session_count validated_transfer_sha256 file_count generation_path
+  local generation_sha256 extra
   if [ ! -s "$TRANSFER_MANIFEST" ]; then
     echo "[오류] Jetson immutable transfer manifest가 없습니다: $TRANSFER_MANIFEST" >&2
     return 1
   fi
-  if ! PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO/src" python3 -B -m \
-      "$TRANSFER_VALIDATOR_MODULE" \
-      --path "$TRANSFER_MANIFEST" \
-      --repo-root "$REPO" \
-      --expected-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256"; then
+  if ! resolved=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO/src" python3 -B - \
+      "$TRANSFER_MANIFEST" "$REPO" "$EXPECTED_TRANSFER_MANIFEST_SHA256" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from deep_anc.data.holdout_contract import FileSnapshot
+from deep_anc.data.recorded_generation import COMBINED_SESSION_COUNT
+from deep_anc.data.transfer_contract import (
+    EXPECTED_RECORDED_SESSIONS,
+    TransferContractError,
+    validate_transfer_manifest,
+)
+
+transfer_path = Path(sys.argv[1])
+root = Path(os.path.abspath(sys.argv[2]))
+expected_sha256 = sys.argv[3]
+try:
+    summary = validate_transfer_manifest(
+        transfer_path,
+        repo_root=root,
+        expected_sha256=expected_sha256,
+    )
+    recorded_manifest = summary.get("_validated_recorded_manifest_snapshot")
+    generation = summary.get("_validated_recorded_generation_snapshot")
+    if not isinstance(recorded_manifest, FileSnapshot) or recorded_manifest.data is None:
+        raise TransferContractError(
+            "transfer 검증 결과에 recorded manifest bytes snapshot이 없습니다"
+        )
+    if generation is None:
+        schema_version = 1
+        expected_sessions = EXPECTED_RECORDED_SESSIONS
+        generation_relative = "-"
+        generation_sha256 = "-"
+    elif isinstance(generation, FileSnapshot):
+        schema_version = 2
+        expected_sessions = COMBINED_SESSION_COUNT
+        try:
+            generation_relative = generation.path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise TransferContractError(
+                "검증된 recorded generation report가 저장소 밖입니다"
+            ) from exc
+        generation_sha256 = generation.sha256
+    else:
+        raise TransferContractError(
+            "transfer 검증 결과의 recorded generation snapshot이 유효하지 않습니다"
+        )
+    session_count = summary.get("recorded_session_count")
+    if type(session_count) is not int or session_count != expected_sessions:
+        raise TransferContractError(
+            "transfer 검증 결과의 recorded schema/session 수가 일치하지 않습니다: "
+            f"schema={schema_version}, sessions={session_count!r}, "
+            f"expected={expected_sessions}"
+        )
+    try:
+        relative = recorded_manifest.path.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise TransferContractError(
+            "검증된 recorded manifest가 저장소 밖입니다"
+        ) from exc
+    if not relative or any(character in relative for character in "\t\r\n"):
+        raise TransferContractError(
+            "검증된 recorded manifest 경로를 shell에 안전하게 전달할 수 없습니다"
+        )
+    if (
+        not generation_relative
+        or any(character in generation_relative for character in "\t\r\n")
+        or not generation_sha256
+        or any(character in generation_sha256 for character in "\t\r\n")
+    ):
+        raise TransferContractError(
+            "검증된 recorded generation path/SHA를 shell에 안전하게 전달할 수 없습니다"
+        )
+except (OSError, TransferContractError) as exc:
+    print(f"[오류] {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(
+    f"{schema_version}\t{relative}\t{recorded_manifest.sha256}\t"
+    f"{session_count}\t{summary['manifest_sha256']}\t{summary['file_count']}\t"
+    f"{generation_relative}\t{generation_sha256}"
+)
+PY
+  ); then
     echo "[오류] recorded/RIR/strict P·S immutable transfer bundle 검증 실패." >&2
     return 1
   fi
+  if [[ "$resolved" == *$'\n'* ]]; then
+    echo "[오류] transfer validator 선택 결과가 단일 행이 아닙니다." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r schema_version selected_manifest selected_manifest_sha256 \
+    session_count validated_transfer_sha256 file_count generation_path \
+    generation_sha256 extra <<<"$resolved"
+  if [[ ! "$schema_version" =~ ^(1|2)$ ]] || [ -z "$selected_manifest" ] || \
+     [[ ! "$selected_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+     [[ ! "$session_count" =~ ^[0-9]+$ ]] || \
+     [ "$validated_transfer_sha256" != "$EXPECTED_TRANSFER_MANIFEST_SHA256" ] || \
+     [[ ! "$file_count" =~ ^[0-9]+$ ]] || [ -n "$extra" ] || \
+     { [ "$schema_version" = "1" ] && \
+       { [ "$generation_path" != "-" ] || [ "$generation_sha256" != "-" ]; }; } || \
+     { [ "$schema_version" = "2" ] && \
+       { [ -z "$generation_path" ] || \
+         [[ ! "$generation_sha256" =~ ^[0-9a-f]{64}$ ]]; }; }; then
+    echo "[오류] transfer validator의 recorded manifest 선택 결과가 유효하지 않습니다." >&2
+    return 1
+  fi
+  if [ -n "$RECORDED_MANIFEST" ] && \
+     { [ "$RECORDED_TRANSFER_SCHEMA" != "$schema_version" ] || \
+       [ "$RECORDED_MANIFEST" != "$selected_manifest" ] || \
+       [ "$RECORDED_MANIFEST_SHA256" != "$selected_manifest_sha256" ] || \
+       [ "$RECORDED_SESSION_COUNT" != "$session_count" ] || \
+       [ "$RECORDED_GENERATION" != "$generation_path" ] || \
+       [ "$RECORDED_GENERATION_SHA256" != "$generation_sha256" ]; }; then
+    echo "[오류] 실행 중 검증된 recorded manifest 선택 결과가 바뀌었습니다." >&2
+    return 1
+  fi
+  RECORDED_TRANSFER_SCHEMA=$schema_version
+  RECORDED_MANIFEST=$selected_manifest
+  RECORDED_MANIFEST_SHA256=$selected_manifest_sha256
+  RECORDED_SESSION_COUNT=$session_count
+  RECORDED_GENERATION=$generation_path
+  RECORDED_GENERATION_SHA256=$generation_sha256
+  echo "[transfer] immutable bundle 확인: manifest_sha256=$validated_transfer_sha256, files=$file_count, recorded_schema=$RECORDED_TRANSFER_SCHEMA, recorded_manifest=$RECORDED_MANIFEST, recorded_manifest_sha256=$RECORDED_MANIFEST_SHA256, recorded_sessions=$RECORDED_SESSION_COUNT, recorded_generation=$RECORDED_GENERATION, recorded_generation_sha256=$RECORDED_GENERATION_SHA256"
 }
 
 hardware_storage_preflight() {
@@ -1208,10 +1340,18 @@ else
     --out "$DECODER_AUDIT_REPORT" \
     --allow-rejections
 fi
+recorded_generation_prepare_args=()
+if [ "$RECORDED_TRANSFER_SCHEMA" = "2" ]; then
+  recorded_generation_prepare_args=(
+    --recorded-generation "$RECORDED_GENERATION"
+    --expected-recorded-generation-sha256 "$RECORDED_GENERATION_SHA256"
+  )
+fi
 "$VENV_PYTHON" scripts/data/prepare_noise_pool.py \
   --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
   --recorded-source-pool-csv data/source_pool_v2/sources.csv \
   --recorded-source-pool-csv data/source_pool/sources.csv \
+  "${recorded_generation_prepare_args[@]}" \
   --out "$CANONICAL_MANIFEST_DIR" \
   --decoder-audit "$DECODER_AUDIT_REPORT" \
   --hash-workers "$RAW_HASH_WORKERS"
@@ -1243,8 +1383,32 @@ fi
   --manifest-dir "$CANONICAL_MANIFEST_DIR" \
   --out "$CANONICAL_MANIFEST_DIR/dataset_qa.md"
 
+# transferred recorded bytes의 전수 QA를 먼저 끝낸 뒤, 같은 manifest/timing으로 strict
+# 부대역 target coverage를 한 번만 FFT 감사한다. coverage FAIL(종료 1)은 현재 데이터의
+# 유효한 진단 증거이므로 report를 보존하고 bootstrap을 계속하되, readiness가 학습을
+# 차단한다. 구조·provenance 오류(종료 2)는 bootstrap 자체를 즉시 중단한다.
+"$VENV_PYTHON" scripts/data/validate_recorded_sessions.py \
+  --manifest "$RECORDED_MANIFEST" \
+  --data-config configs/data_sim.yaml \
+  --out-md "$RECORDED_QA_MD" \
+  --out-json "$RECORDED_QA_JSON"
+set +e
+"$VENV_PYTHON" scripts/data/audit_recorded_subband_coverage.py \
+  --config configs/train_pretrain_tiny.yaml \
+  --manifest "$RECORDED_MANIFEST" \
+  --canonical-out-dir "$RECORDED_SUBBAND_COVERAGE_REPORT_DIR"
+coverage_status=$?
+set -e
+if [ "$coverage_status" -gt 1 ]; then
+  echo "[오류] recorded strict 부대역 coverage report 생성/재검증 실패" >&2
+  exit 1
+fi
+if [ "$coverage_status" -eq 1 ]; then
+  echo "[차단 증거] recorded strict 부대역 coverage가 부족합니다. bootstrap은 증거 보존을 위해 계속하지만 readiness/학습은 FAIL이어야 합니다." >&2
+fi
+
 echo "=== [5/6] 검증 (pytest) ==="
-"$VENV_PYTHON" -m pytest -q
+"$VENV_PYTHON" -B -m pytest -q
 
 echo "=== [6/6] 환경·데이터 준비 완료 (학습은 시작하지 않음) ==="
 if ! verify_exact_checkout || ! verify_canonical_bundle || ! environment_complete; then
@@ -1255,7 +1419,8 @@ BOOTSTRAP_RECEIPT="$REPO/data/manifests/elice_bootstrap_receipt.json"
 if ! PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO/src" "$VENV_PYTHON" -B - \
     "$REPO" "$EXPECTED_COMMIT" "$EXPECTED_HOLDOUT_SHA256" \
     "$TRANSFER_MANIFEST" "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
-    "$ENVIRONMENT_RECEIPT" "$BOOTSTRAP_RECEIPT" <<'PY'
+    "$ENVIRONMENT_RECEIPT" "$BOOTSTRAP_RECEIPT" \
+    "$RECORDED_SUBBAND_COVERAGE_REPORT_DIR" "$RECORDED_MANIFEST" <<'PY'
 import hashlib
 import json
 import os
@@ -1265,7 +1430,13 @@ from pathlib import Path
 
 import torch
 
-from deep_anc.data.holdout_contract import read_regular_file_snapshot
+from deep_anc.config import load_train_config
+from deep_anc.data.holdout_contract import FileSnapshot, read_regular_file_snapshot
+from deep_anc.data.recorded_subband_coverage import (
+    build_recorded_subband_coverage_contract,
+    recorded_subband_coverage_report_path,
+    validate_recorded_subband_coverage_report,
+)
 from deep_anc.data.transfer_contract import validate_transfer_manifest
 
 root = Path(os.path.abspath(sys.argv[1]))
@@ -1275,6 +1446,10 @@ transfer_path = Path(sys.argv[4])
 expected_transfer_sha = sys.argv[5]
 environment_path = Path(sys.argv[6])
 output = Path(sys.argv[7])
+coverage_directory = Path(sys.argv[8])
+if not coverage_directory.is_absolute():
+    coverage_directory = root / coverage_directory
+selected_recorded_manifest = sys.argv[9]
 
 # receipt를 쓰기 직전 transfer 전체를 다시 같은 validator로 hash한다. 이 결과의
 # recorded aggregate만 resolved config가 신뢰할 수 있다.
@@ -1285,14 +1460,66 @@ summary = validate_transfer_manifest(
 )
 if summary["canonical_holdout_sha256"] != expected_holdout_sha:
     raise SystemExit("canonical holdout SHA가 bootstrap trust anchor와 다릅니다")
+validated_recorded_manifest = summary.get("_validated_recorded_manifest_snapshot")
+if (
+    not isinstance(validated_recorded_manifest, FileSnapshot)
+    or validated_recorded_manifest.data is None
+):
+    raise SystemExit("receipt 작성 시 validated recorded manifest snapshot이 없습니다")
+try:
+    validated_recorded_relative = validated_recorded_manifest.path.relative_to(
+        root
+    ).as_posix()
+except ValueError as exc:
+    raise SystemExit("receipt 작성 시 validated recorded manifest가 저장소 밖입니다") from exc
+if validated_recorded_relative != selected_recorded_manifest:
+    raise SystemExit(
+        "receipt 직전 transfer 재검증의 recorded manifest가 QA/coverage 선택과 다릅니다: "
+        f"selected={selected_recorded_manifest}, validated={validated_recorded_relative}"
+    )
 environment = read_regular_file_snapshot(
     environment_path,
     root=root,
     label="Elice environment freeze receipt",
     capture_bytes=False,
 )
+coverage_cfg = load_train_config(
+    root / "configs/train_pretrain_tiny.yaml",
+    [
+        "experiment_role=diagnostic_overfit",
+        "init_eligible=false",
+        "contract_run_dir=false",
+        "run_until_step=500",
+        "data.digital_primary_path_mode=measured",
+    ],
+)
+coverage_manifest = validated_recorded_manifest
+coverage_contract = build_recorded_subband_coverage_contract(
+    manifest_path=coverage_manifest.path,
+    manifest_content=coverage_manifest.data,
+    data_cfg=coverage_cfg["data"],
+    model_hop=int(coverage_cfg["model"]["hop"]),
+)
+coverage_path = recorded_subband_coverage_report_path(
+    coverage_directory, coverage_contract
+)
+coverage_summary = validate_recorded_subband_coverage_report(
+    coverage_path,
+    manifest_path=coverage_manifest.path,
+    data_cfg=coverage_cfg["data"],
+    model_hop=int(coverage_cfg["model"]["hop"]),
+    required_families=("speech", "music", "environment", "machine"),
+    configured_min_groups_per_family=4,
+)
+coverage_snapshot = read_regular_file_snapshot(
+    coverage_path,
+    root=root,
+    label="recorded subband coverage report",
+)
+assert coverage_snapshot.data is not None
+coverage_payload = json.loads(coverage_snapshot.data.decode("utf-8"))
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "expected_commit": expected_commit,
     "canonical_holdout": {
         "path": "data/manifests/recorded_holdout.json",
@@ -1303,6 +1530,21 @@ payload = {
         "sha256": expected_transfer_sha,
     },
     "recorded_aggregate_sha256": summary["recorded_aggregate_sha256"],
+    "recorded_subband_coverage": {
+        "path": coverage_path.relative_to(root).as_posix(),
+        "sha256": coverage_snapshot.sha256,
+        "evidence_sha256": coverage_payload["evidence_sha256"],
+        "manifest_sha256": coverage_summary["manifest_sha256"],
+        "training_timing_contract_sha256": coverage_payload[
+            "training_timing_contract_sha256"
+        ],
+        "coverage_contract_sha256": coverage_payload[
+            "coverage_contract_sha256"
+        ],
+        "all_requested_splits_pass": coverage_summary[
+            "all_requested_splits_pass"
+        ],
+    },
     "environment": {
         "freeze_receipt": ".venv/environment-freeze.txt",
         "freeze_receipt_sha256": environment.sha256,

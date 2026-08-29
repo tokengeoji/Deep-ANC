@@ -1,7 +1,10 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-28. 작업 브랜치: `fix/finetune-readiness-repair`.
+> 최종 갱신: 2026-08-28. 현행 작업 브랜치: `work/broadband-anc-v2`.
+> 기준선 `fix/finetune-readiness-repair`는 `49dd6c7bcfa99fa7565fa3130779f5b1e6388476`에
+> 그대로 보존한다. 과거 `work/high-frequency-validation`의 `d4b0c0a`는 diagnostic-only로
+> 보존하며 현행 작업선에 merge하지 않는다.
 
 ## 0. 현재 결론
 
@@ -15,6 +18,329 @@
 
 과거 `pretrain_*_corrected`, `finetune_tiny`, legacy P/S는 삭제하지 않지만 모두
 diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사용하지 않는다.
+
+### 2026-08-28 최신 실행 상태 (아래 누적 기록보다 우선)
+
+현행 pushed HEAD는 `work/broadband-anc-v2`의
+`ec27098839a94a21d24044e1d1f881435ccabd47`이다. 최근 독립 격리 커밋은 다음과 같다.
+
+- `6f113f4`: 광대역 source population의 실제 로컬 가용성을 8 physical/7 objective
+  대역별로 감사. 12,298 후보 중 2,949개만 로컬에서 bounded decode됐고 canonical
+  후보는 0이다. missing 9,349개와 lineage/split 교차는 Elice raw 재구축 전 blocker다.
+- `2f9e7ec`: 11.605333초/557,056-frame v5 persistently-exciting 측정 신호와
+  fixture-only raw/offline publisher를 봉인. plan SHA는
+  `32a79b3700b457dc40373dc4dd0969301287baea7100b1ec5edd86ea907ee127`, PCM SHA는
+  `c18416e4066556479fd317659d908c215e6662d08f5bfa9d50e4ac63971c4aff`다.
+  live authority는 여전히 `None`이며 실제 출력은 하지 않았다.
+- `ec27098`: 125/250/500/1000/2000/4000/8000 Hz 동일가중 baseline과 additive
+  worst guard를 가진 diagnostic v3 loss primitive. relative NMSE floor -80 dB와
+  CPU/CUDA exact-cancellation finite-gradient 회귀를 포함하지만 trainer admission에는
+  연결하지 않았다.
+
+이 절의 v5가 현행이다. 아래 누적 기록에 남은 **49.627초 multi-panel v5** 설명과
+`measure_paths_broadband_interleaved.py` followup은 폐기된 설계 기록이며 현재 live 명령이
+아니다. 이를 실행하거나 현행 plan으로 승격하지 않는다.
+
+Jetson 무출력 실제 확인에서는 ERR/REF 입력이 각각 약 -64.89/-68.77 dBFS로 살아 있었고,
+`/proc/asound/.../status`의 모든 PCM은 `closed`였다. PulseAudio는 control node만 열고
+PCM을 점유하지 않았다. 이 값은 연결·liveness 증거이지 P/S나 ANC 성능 증거가 아니다.
+
+현재 최우선 blocker는 두 개다.
+
+1. v5 exact PCM에서 waveform pilot로 공통 q를 구하고, central cyclic fit_a/fit_b에서
+   absolute/fractional P/S를 복원해 서로 다른 integer zeros와 compact FIR을 만드는
+   raw-bound live analyzer
+2. 모든 callback의 exact status/timestamp/actual submitted prefix를 보존하고
+   priming·xrun·partial failure·normal drain을 fail-closed로 처리하는 live capture adapter
+
+두 구현의 합성 fixture만 통과해서는 소리를 내지 않는다. exact plan/raw SHA 결속,
+독립 red-team, 전체 무음 dry-run 뒤에만 사용자에게 meter 20초 + v5 11.605초의 명령,
+스피커, 볼륨, 저장 경로를 먼저 보고하고 명시적 승인을 받는다. 현재 Elice 인스턴스와
+canonical pretrain/fine-tune 실행은 없으며, 이 두 물리 blocker와 public corpus authority가
+닫히기 전에는 새 GPU 인스턴스를 열지 않는다.
+
+### 2026-08-28 광대역-v2 작업선 즉시 상태
+
+현행 작업은 `work/broadband-anc-v2`에서만 진행한다. Stage-1 readiness 기준선과 과거
+high-frequency diagnostic branch는 움직이지 않는다. 현재 물리 성능 수치를 새로 주장할
+canonical checkpoint/raw ON-OFF session은 없다.
+
+| 축 | 현재 검증 결과 | 권위 판정 |
+|---|---|---|
+| Tiny 표현력 | 100 Hz--11.314 kHz delay-only deterministic structural G0 통과 | 구조 진단 PASS, 실제 덕트 성능 아님 |
+| runtime telemetry | callback timestamp/frame/completion, engine-step budget, fallback, xrun/ring/watchdog를 분리하고 무음 회귀 100개 통과 | 실제 session 없음; software 단독 authority 최대 INCONCLUSIVE |
+| source-v2 | compressed full-decode 계보, 3개 이상 component union, actual Q15 source/P-applied ERR 9×7 재계산 구현. 계약 SHA `0bb458d68ec2a00466a96a35bb1da3bc3ed13d5085b782aefb6cb4b849d58e8a` | 실제 source와 causal P가 없어 0/48 BLOCKED |
+| continuous causal P/S | actual-int16 continuous pilot + 독립 PE fit/holdout + 공통 q 설계를 검증 중 | live raw/7대역 stationarity·SNR 증거 전 BLOCKED |
+| 광대역 학습 | causal P·n, S·y의 prefix/state 및 artifact SHA admission을 별도 schema로 연결 중 | 실제 causal authority 전 시작 금지 |
+
+`PortAudio` callback 이전 capture period 유실은 Python timestamp만으로 증명하지 못한다.
+다만 이를 영구 하드웨어 blocker로 단정하지 않고, highband 결과와 독립인 continuous pilot,
+구간별 q/change-point 및 physical REF witness를 runtime receipt에 추가 검증한다. 구조 fixture나
+문서 문구로 이 판정을 PASS로 바꾸지 않는다.
+
+### 2026-08-28 최종 광대역 목표 전환 — 계약 배경과 누적 증거
+
+사용자는 최종 목표를 150–1600 Hz에 제한하지 않고, 저역을 유지하면서 2/4/8 kHz에서
+Deep-ANC가 matched FxLMS보다 우수함을 실제 덕트에서 증명하는 것으로 확정했다. 8 kHz는
+octave 중심이므로 v2 point-control 식별·데이터 상단은 11,313.708 Hz다. source family는
+speech/music/environment/machine 네 계열과 Level-5 unseen을 모두 유지한다.
+
+새 코드 authority는 `src/deep_anc/dsp/control_band_contract.py`, 운영 규범은
+`docs/18_broadband_anc_guardrails.md`다. 기존 150–1600 strict 계약과 자산은 Stage-1로
+보존하지만 최종 광대역 성공·init·배포 증거로 승격하지 않는다.
+
+실제 82세션을 `source_aligned.wav→mics.wav ERR ch0`, 각 5–65초, Welch/coherence
+8192/4096으로 전수 재계산한 diagnostic report는
+`results/data_audit/broadband_prerequisite_diagnostic_20260828.json`이다. file SHA-256은
+`c9bbad10c7b2f0fde658394023e7da7c7ed8757d7bfcb3950a8a25d085f0d4f9`, control-band
+contract SHA는 `eebdba2f82ee9e85cc117a612aa3ef592f43d6ebbd19f16a1207469fae103864`다.
+결과는 BLOCKED다.
+
+- 150–300/300–600/600–1000/1000–1600 Hz의 coherence median은
+  0.968/0.952/0.904/0.827이다.
+- 1600–2828/2828–5657/5657–11314 Hz는 0.592/0.220/0.018이다.
+- 같은 고역 세 구간의 ERR target-d density PASS는 3.7%/0%/0%, coherence+density
+  독립 group은 전체 기준 3/0/0이다. family×split 하한 4를 충족하지 못한다.
+- current strict P/S는 same-capture/lead=115 증거는 유효하지만 excitation upper가
+  P 1648/S 1640 Hz라 광대역 역할은 BLOCKED다.
+
+2026-08-27 fullband diagnostic raw
+`results/experimental_high_band/20260827_fullband/20260827_203328_1b24d0c2/raw_measurement.npz`
+는 2/4/8 kHz 에너지는 전달했으나 저장 계약에서 clock valid repeat가 0/64다. 임계를
+낮추거나 사후 clock band를 바꿔 official P/S로 승격하지 않는다.
+
+v4 multi-panel plan은 diagnostic-only로 강등했다. drive별 16 Hz grid의 3000-sample
+bulk-delay alias, strict drift의 panel 간 약 181-sample 누적, 결과 기반 ±16-sample stitch를
+공식 timing 증거로 사용할 수 없기 때문이다. 기존
+`results/data_audit/broadband_measurement_signal_plan_live_authority_v4_20260828.json`과 세 SHA는
+forensic 기록으로 보존하지만 live에서 거부한다.
+
+대체 v5 signal-only plan은 P/S 각각 0.25초 비주기 marker+0.125초 guard, 4초 warmup,
+panel당 63회, panel 사이 10-period 저역 anchor를 사용하며 block padding 포함 49.627초다.
+각 period의 **actual submitted int16 pilot spectrum**을 분모로 사용하고, 같은 bin의 반대
+DAC channel null을 actual DFT에서 absolute `≤1e-8`, main 대비 ratio `≤1e-12`로 강제한다.
+ERR/REF×P/S는 하나의 global ADC→DAC map에 동의해야 하며 11.314 kHz의 20 dB-grade
+residual/trajectory budget은 0.0675518903 sample, highband 결과 기반 phase repair는 exact 0이다. PortAudio time_info는
+monotonic/slip witness로만 저장한다. 제한된 measured tone은 finite causal history operator가
+아니므로 `measured_band_training_eligible=false`이고 상태는
+`blocked_until_fullband_persistently_exciting_causal_history`이며,
+1024-tap compact FIR은 항상 diagnostic-only다.
+
+**v5 live authority는 현재 `None`으로 잠겨 있고 실제 오디오는 0회다.** root의 exact
+file/payload/PCM SHA 검토 전에는 signal-only dry-run만 가능하다. 다음 순서는 v5 dry-run과
+offline publisher 최종 회귀 → 별도 persistently-exciting fullband causal P/S 식별 설계 검토 →
+사용자 승인 뒤 meter+측정 한 연결 창 → raw 분석 → THD/IMD → sub-sample alignment를 가진
+recorded v2 → loss/G4 v2다.
+광대역 직전 meter는 `set_amp_level.py --followup-mode broadband`에 exact v5 plan과 새
+`results/` raw session을 함께 넘긴다. 이 모드는 plan recipe/PCM과 no-replace target을
+sounddevice import 전에 검증하고, PASS fresh meter raw와 다섯 확인이 포함된
+`measure_paths_broadband_interleaved.py --execute-live` 명령만 출력한다. 기본 strict/
+bootstrap 후속 안내는 기존 복구 절차와 byte/의미 호환을 유지한다.
+광대역 meter raw에는 v5 authority의 exact 상대경로/file SHA/canonical payload SHA/PCM SHA,
+실제 hardware 상대경로/SHA, `verified_existing` level evidence 상대경로/SHA와 예정 raw target을
+`broadband_meter_followup_v1`로 봉인한다. meter는 stream open 직전·capture 종료 직후·명령
+출력 직전에 이 bytes/target을 다시 검증하고, live도 같은 metadata와 invocation을 exact
+교차검증한다. 따라서 semantic-equal byte 변조, 다른 evidence, 기본값으로 되돌아간 hardware,
+meter 도중 raw target 선점은 출력 전에 실패한다.
+기존 dense fullband 자극을 그대로 반복하지 않는다. NS/CS는 같은 USB DAC clock이므로 먼저
+sparse pilot+fractional q/no-slip을 검증하고, 실패할 때만 rollback 가능한 I2S DAC 공통-clock
+경로를 연다.
+
+THD/IMD도 signal-only 48.000초 계획까지 생성했다.
+`results/data_audit/broadband_nonlinearity_signal_plan_strict_v2_20260828.json`의 file SHA는
+`2d40ee05a1587f470a0de67eec35e765a58c8929cd07b89037be62aeb515e590`, PCM SHA는
+`59e8845f4ea898afbacba8afd030bec13f0005b571b78f20ac8329e695615d14`다. raw publisher와
+THD/IMD 분석 gate가 생기기 전에는 live 출력이 exit 2로 닫힌다.
+
+recorded v2 campaign receipt의 fail-closed 구조는
+`src/deep_anc/data/broadband_coverage_receipt.py`에 추가했다. native Nyquist, source/mics SHA,
+sub-sample alignment+clock witness, segment metric 재집계, 동일 source/lineage 독립-group 위장,
+split×family×7 subband group 하한을 모두 검사한다. 현재 82세션 진단 BLOCKED를 PASS로
+바꾸는 도구가 아니며 새 broadband v2 recording이 생긴 뒤에만 receipt를 발행한다.
+
+Synthetic public corpus의 native-Nyquist/lineage 1차 게이트도
+`src/deep_anc/data/synthetic_broadband_coverage.py`와
+`scripts/data/audit_synthetic_broadband_native.py`에 추가했다. split×family×7 subband마다
+독립 group 4개를 요구하며, built-in synthetic generator나 16 kHz 원본의 업샘플을
+8 kHz octave 증거로 세지 않는다. 현재 Jetson에는 `data/manifests/canonical_v4`가 없어
+BLOCKED이며, 기존 MIMII fan(16 kHz)은 native Nyquist 8 kHz라 마지막
+5657--11314 Hz machine cell을 원천적으로 채울 수 없다. Elice 새 세대에는 native
+high-rate machine 원본과 source spectral-density receipt가 추가로 필요하다.
+
+광대역 성능 판정의 pure raw-segment gate는
+`src/deep_anc/eval/broadband_point_control.py`에 추가했다. 같은 OFF/DL/FxLMS window만
+받아 family×7 subband의 target-d coverage, 양의 Deep-ANC 평균/worst10/cluster-CI를
+검사하고, 고역 세 구간은 DL−FxLMS 평균/worst10/paired cluster-CI 하단까지 0 dB 초과를
+요구한다. 저역 평균이 고역 실패를, 고역 평균이 저역 실패를 숨기는 fixture와 다점 ERR를
+단일 point로 평균내지 못하게 하는 fixture가 있다. 아직 test-once/provenance/runtime
+receipt writer와 연결하지 않았으므로 acoustic metric-only다.
+
+광대역 Jetson runtime gate는 `src/deep_anc/eval/broadband_runtime.py`에 분리했다.
+최소 30초 관측, P99 `<3ms`, max `<5.333ms`, 네 위치의 lead
+(plant/checkpoint/deployment/runtime) exact 일치와 miss/xrun/ring drop·add·backlog/
+fallback/watchdog/sample slip 0을 모두 요구한다. 이는 아직 실제 canonical broadband
+ONNX/runtime log가 없으므로 schema와 fixture만 PASS이며 현 모델의 고역 실시간 성능
+증거가 아니다.
+
+### 2026-08-28 현재 운영 상태와 강제 가드레일
+
+단계별 PASS/FAIL/BLOCKED, 저·고역·네 source family·latency·one-shot G4·배포 중단 조건은
+[`docs/16_canonical_finetune_guardrails.md`](docs/16_canonical_finetune_guardrails.md)가
+권위 인덱스다. `src/deep_anc/dsp/invariants.py`의 절대목표 family도
+speech/music/environment/machine 네 계열로 정합화했고, environment는 실제 canonical pool인
+DEMAND+ESC-50 비중으로 검사한다. 이 임계·family를 결과에 맞춰 낮추지 않는다.
+
+Elice 인스턴스는 광대역 P/S·데이터 blocker 때문에 당장 공식 학습을 시작할 수 없고 GPU가
+유휴였으므로 **삭제 가능으로 확정했다**. 삭제 전 고유 `manifests/results/runs`를 Google Drive
+`DeepANC/elice_snapshot_20260828/predelete_49dd6c7/manifests_results_runs.tar`에 직접 스트리밍했고,
+크기 479,846,400 bytes와 MD5 `b4d999c70ba4e1fc745490a15faaae23`를 Drive 객체에서 다시
+검증했다(SHA-256 `bfa3d7de91e747049eeebde99d844b87c4973bbfa1985a63e9c49cdc10542589`).
+약 36.4GiB public raw는 재다운로드 가능한 corpus라 이 archive에서 제외했다. 따라서 아래
+과거 Elice receipt/경로는 forensic 기록일 뿐 현재 살아 있는 인스턴스나 학습 프로세스로
+가정하지 않는다. 광대역 local blocker가 해결된 뒤 A100 80GB 인스턴스를 새 exact commit으로
+재구축한다.
+
+2026-08-28 이번 read-only SSH 재확인에서도 기존 tunnel
+`central-01.tcp.tunnel.elice.io:56230`은 key exchange 전에 원격이 연결을 닫았다. 따라서
+그 endpoint에는 실행 중 학습/GPU가 있다고 주장하지 않으며 반복 접속도 하지 않는다. 새
+인스턴스가 필요해지는 시점은 광대역 P/S·recorded/synthetic blocker와 exact source commit이
+모두 고정된 뒤다.
+
+기존 Elice bootstrap receipt는 이전 commit에 결속됐고 최신 v13 시도도 runtime plant test
+1건 실패로 receipt를 발행하지 못했으므로 재사용 금지다. 49dd6c7에서 `/tmp`에만 둔
+production-batch-96 current-loss G0는 500 step trusted NMSE **-7.239dB**, y_rms 0.03786,
+1.52 step/s로 진단 기준 `< -6dB`를 통과했다. 그러나
+`role=diagnostic_overfit`, `init_eligible=false`, deterministic backend false, receipt 없음,
+secondary-surrogate이므로 공식 G0나 실제 덕트 감쇠 수치가 아니다. 같은 batch SHA의
+NMSE-only/no-DNH 대조를 끝내고 로그를 diagnostic-only로 보존한다.
+
+같은 old exact checkout에서 alpha 1.0의 DNH 붕괴 경계를 좁히는 1,000-step 진단도
+끝냈다. 모두 `deterministic_algorithms=false`, `role=diagnostic_overfit`, init/G4 부적격이며
+실제 덕트 감쇠 dB가 아니다. measured-P fixed batch에서는 lambda_dnh 0.0001875,
+0.000375, 0.0005625, 0.00075가 각각 trusted NMSE -16.229, -16.075, -16.642,
+-16.329dB로 영출력 붕괴를 피했다. secondary-surrogate는 0.00075에서 약 0dB로 붕괴했지만
+0.0005625에서는 -13.404dB였고, RIR-surrogate 0.00075는 -12.861dB였다. 마지막 RIR 진단은
+로그상 lead=0이므로 strict lead=115 실험과 섞지 않는다. 이 결과는 붕괴가 lambda 하나만의
+함수가 아니라 plant 표현과 결합된다는 반증이며, 후보별 schema-v7 strict-S gradient gate를
+생략할 근거가 아니다.
+
+Jetson 보존 로그 SHA-256은 0.0001875 measured
+`bd74ed88ebd910b36254f0db907ff16fe2671c01c4a362b7fd420335132d4b44`, 0.000375 measured
+`343e7acec7a2c12f81744c933bb3942fce223fc6392e9162e9d67e3eba0951c8`, 0.0005625 measured
+`1b737f0a83a739101fc07c8ee75286325c8fdcfa150655b7d6d2fabfa50c9896`, 0.0005625
+secondary-surrogate `7d2943109f7b0f65bd92ca830e47fbdc8fc421a8acfba6029ef2c6ed964e755f`, 0.00075 measured
+`dbe63d597427a921de19ec1bb0e89da4db2749f62b6e8b50a9a0c88225c149ae`, 0.00075
+RIR-surrogate `c8b658ec2916ab8701b7cdc601d8e92799b5789b62d4ed9aae4cd1dcd127e06d`다. 원본은
+`results/diagnostic_gpu_keepalive/49dd6c7bcfa99fa7565fa3130779f5b1e6388476/`에 보존한다.
+
+공식 G0 evidence 경로는 실제 실행의 PyTorch/cuDNN/CUBLAS 결정론 상태를 시작·종료 시점과
+`environment.json` SHA로 결속하도록 복구했다. 무증거 diagnostic 경로는 이 evidence를
+발행할 수 없다.
+
+추가로 실제 원격 canonical_v4와 recorded holdout를 대조해 보수적 numeric identity 기준
+`dns_book` 340/5946/8201, `dns_reader` 422/652 교집합을 발견했다. 기존
+`namespace_disjoint_no_official_crosswalk` 정책은 이를 놓치므로 과거 15/17 기록은
+authoritative하지 않다. 공식 crosswalk를 사실로 단정하지 않되 false-negative를 막는
+cross-corpus numeric alias를 양쪽에 적용하고 public manifest를 재생성하기 전까지
+`corpus_disjoint`는 BLOCKED로 본다. 알려진 init·coverage·speech-lineage 세 blocker를
+적용한 현재 최대치는 **14/17**이다.
+
+마이크는 다시 연결됐지만 역사적 `highband-coverage-v1` 17세션은 **Stage-1
+600--1600 Hz 보충용**이지 2/4/8 kHz 광대역-v2 데이터가 아니다. 이 17개 plan의 exact
+source/start/split/lineage, 전체 무음 dry-run, PCM 점유 재확인, family별 예상 출력 시간이
+고정되기 전에는 Stage-1 추가 녹음도 열지 않는다. 최종 광대역-v2는 별도의 sub-sample
+alignment와 7대역 ERR target-d receipt를 가진 새 generation으로 수집한다. 기존 82세션과
+strict P/S raw는 그대로 보존한다.
+
+### 2026-08-28 canonical G4 raw 계약과 다음 Elice 실행
+
+공식 recorded val/test가 summary scalar만으로 PASS되는 경로를 닫았다. 현행 계약은
+다음을 모두 raw `metrics.npz`에서 다시 계산한다.
+
+- global trusted/fullband/gap per-segment 배열
+- speech/music/environment/machine의 session·lineage group별 평균, 최악 10%, cluster CI
+- 125/250/500/1000/**1600**/2000/4000/8000Hz의 8-center octave 감쇠
+- 150–300/300–600/600–1000/**1000–1600Hz** strict 부대역의 target(`d`=ERR)
+  energy-density coverage, family별 평균·최악 10%·독립 group CI
+- selected manifest의 모든 val/test session과 raw segment session의 전단사, 그리고 각
+  session의 family/group exact binding
+- checkpoint/experiment contract/selection/test capability/consumed marker SHA의 one-shot
+  ledger 결속
+
+대역 밖 do-no-harm은 trusted 내부 실패를 중복 집계하지 않고 125/2k/4k/8kHz만 본다.
+trusted 내부는 네 strict 부대역 게이트가 별도로 막는다. stored dtype·threshold·center·boolean도
+cast하지 않고 schema대로 검사한다. manifest session을 좋은 결과만 골라 생략하거나 running
+ledger와 metrics를 함께 변조해도 completion marker를 만들 수 없는 회귀 테스트가 있다.
+
+canonical data 설정은 declared public source manifest 누락을 synthetic fallback으로 바꾸지
+않고 즉시 실패한다. loss pilot은 정확히 20k, measured probe는 정확히 5k이며 pilot/probe/smoke/
+pretrain/finetune 역할마다 데이터 분포·증강·P/S·sampler·loss 계약을 고정한다. 전체 pytest는
+이 변경 worktree에서 0 FAIL로 통과했다. Elice로 넘길 exact source는 이 섹션을 포함한 branch
+HEAD를 push한 뒤 40자리 SHA로 다시 확인한다.
+
+현재 `configs/duct.yaml`의 strict P1386/S1245/lead115를 직접 다시 푼 인과 FIR 설계 상한은
+150–1600Hz 전대역 26.10dB, 최악 옥타브 17.28dB(125Hz)다. 이는 **모델의 실측 감쇠가 아니라
+플랜트의 이론적 상한**이다. readiness 선언 2.15dB는 strict 캡처가 독립 반복되지 않은 상태의
+보수적 prior로 유지하며 optimizer 성능을 제한하지 않는다. legacy P/S의 4.83/2.16dB를
+current strict 값으로 읽던 테스트는 제거하고 `configs/duct.yaml` 경로에서 재계산한다.
+
+Elice read-only preflight 결과 원격 `~/Deep_ANC`는 clean detached `49dd6c7...`, A100 80GB
+PCIe는 0MiB/0%로 유휴, 디스크 여유는 84,320,649,216 bytes(약 78.53GiB)였다. 학습·bootstrap
+프로세스는 없다. decoder audit file/internal SHA는 각각
+`7fb16a9b27e5115c458a61c4138173a35a198fec1d30c0437e42facee71fbec2` /
+`ceac538487ffe1414d433e3a83fdee11a0d17c204427cf8e7fed92bb73c2940f`로 canonical_v4와
+일치한다. 기존 bootstrap receipt는 old source에 결속됐으므로 재사용하지 않는다.
+
+현장 schema v2 coverage 감사는 manifest
+`ad5978f2ecd0dd2e9c1b3c8b286b0bf9868054b4071c66525a8b061ce3410575`, timing
+`1d6723bbfbad1371fab9d38e827c59789eba35a98fae67e478c44e1fdb0061db`에 결속됐고
+**FAIL**이다. 8개 균등 표본은 70초 세션의 고역 구간을 놓쳐 불필요한 재녹음을 유발하므로,
+canonical population과 공식 recorded evaluator를 `max_segments_per_session=64`로 함께
+고정했다. 현 세션 길이에서는 양끝 0.25초를 제외한 사실상 모든 비중첩 segment다.
+64-segment 결과의 부족 행은 train 2개, val 5개, test 5개다. 1000–1600Hz는
+train machine=3/speech=2, val environment=3/machine=3/music=2/speech=3,
+test environment=1/machine=2/music=2/speech=2 독립 그룹이다. 600–1000Hz는
+val speech=3과 test machine=2만 부족하다. 임계값 0.25 또는 그룹 하한 4를 낮추지 않는다.
+
+Jetson의 64-segment 실제 보고서는
+`results/data_audit/recorded_subband_coverage_fullscan_20260828.json`, coverage contract SHA
+`db305cf183caa7816a5d8abcbb44bfae4206873778cef218f973adb4607e3e55`, file SHA
+`00d705890799024cc00be12f8d39ef99bec5fa71a925005dcd9427f1f7da1f94`, semantic evidence SHA
+`cb80b78a84869628355bab3b553cd1b120ee1c99b4e6fa649efac551c680922f`다. 이는 부족 행을
+확인한 로컬 schema v2 진단 증거이며, 현행 readiness의 canonical 증거로는 재사용하지 않는다.
+현행 schema v3는 여기에 `segment_seconds=1.5`와 hop 정렬 후 실제 segment sample 수까지
+exact 결속한다. Elice bootstrap은 같은 manifest bytes/timing/threshold와 Elice 실제 경로에서
+schema v3 contract SHA를 유도하고, 그 이름의 canonical report를 no-replace로 발행해 receipt에
+결속해야 한다.
+과거 8-segment `98e9c4…` 보고서는 삭제하지 않되 canonical readiness 근거로
+재사용하지 않는다.
+
+report lifecycle은 고정 파일 덮어쓰기가 아니다.
+`results/data_audit/recorded_subband_coverage/<coverage-contract-sha256>.json`에 manifest/timing/
+threshold 세대별로 no-replace 발행한다. 새 녹음으로 manifest가 바뀌면 새 이름을 만들고 옛
+FAIL report는 그대로 보존한다. Elice bootstrap receipt schema v2가 report path/file SHA와
+manifest/timing/contract SHA를 외부 `bootstrap_receipt_sha256` 아래 결속하므로, ignored report를
+수정하고 자체 digest를 다시 봉인해도 readiness가 거부한다.
+
+공식 recorded val/test도 동일 모집단을 독립 재검산한다. max 64, segment 1.5초, edge
+0.25초뿐 아니라 checkpoint `model.hop`/timing/PlantSettle, 기본 feedback와 warmup,
+manifest sample rate, 각 session의 immutable `session.json` 정렬 지연, 모든 결정론적 start
+exact set을 metrics와 대조한다. 이 값의 CLI override는 diagnostic 전용이며 selection,
+campaign capability, test completion에는 사용할 수 없다.
+
+따라서 다음 순서는 새 HEAD push → Elice exact clean checkout → audit-reuse full bootstrap →
+public/recorded speech lineage를 독립 원본으로 복구한 뒤 **15/17 readiness**
+(의도된 FAIL: init + recorded subband coverage) 확인 → 부족 family×대역의
+독립 원본만 짧게 추가 녹음 → coverage PASS인 **16/17 readiness** →
+G0 500 step → alpha 0.7/1.0의 각 20k pilot+5k measured probe
+(필요하면 0.85 chain 추가) → measured-probe winner →
+selected-loss A100 exact-resume smoke → tiny 100k canonical pretrain → **17/17 readiness** → 50k
+measured fine-tune이다. 실제 val/test G4도 같은 raw coverage를 다시 검사하며 부족하면
+`INCONCLUSIVE`로 막는다.
+
+따라서 현재도 canonical 모델의 실제 덕트 2/4/8kHz 감쇠와 Level-5 unseen 일반화는 숫자로
+말할 수 없다. 2026-08-27 high-band 캡처는 clock witness 0개로 Invalid experiment이며,
+학습 후 마이크를 다시 연결해 승인된 짧은 OFF/ON raw 실험으로 따로 검증해야 한다.
 
 ### 2026-08-28 runtime physical timing audit
 
@@ -52,6 +378,11 @@ Elice transfer lineage 입력이라 보존했다.
 실제 여유 공간은 11,261,136,896 bytes (약 10.49 GiB)다. strict P/S raw/analysis·82
 recorded 세션·RIR·manifest는 삭제 대상이 아니다.
 
+후속 missing-list Drive 전송은 2026-08-28에 log 기준 343/343 파일,
+5.570 GiB 전송 완료로 종료됐다. 이것은 전송 프로세스 완료 증거일 뿐 고정 전체 목록의
+원격 file count/bytes와 `rclone check` 최종 PASS를 대신하지 않는다. 그 독립 검증 전에는
+추가 로컬 원본을 삭제하지 않는다.
+
 ### 2026-08-28 Elice v10 — 실제 cache-safe pre-init 증거
 
 Elice `~/Deep_ANC`에서 exact clean commit
@@ -72,22 +403,38 @@ Elice `~/Deep_ANC`에서 exact clean commit
 - 이 evidence는 데이터·환경·pre-init readiness만 증명한다. canonical init, campaign
   ledger, 실제 학습·덕트 ANC 성능은 아직 증명하지 않는다.
 
-### campaign prerequisite schema v5
+이 15/16은 당시 gate schema의 역사적 결과다. 현행 17-gate schema에서는
+`recorded_subband_coverage`뿐 아니라 보수적 numeric alias가 밝힌 speech lineage도
+복구해야 한다. 따라서 현재 상한은 14/17, speech lineage 복구 후 15/17,
+coverage PASS 후 16/17, canonical init 후에만 17/17이다. 역사적 receipt를 새
+canonical 학습 개시 근거로 승격하지 않는다.
+
+### campaign prerequisite schema v7
 
 canonical 100k를 열기 전에 수기 NMSE, gradient share, pilot score/winner 또는
-`passed=true`를 ledger에 적는 경로를 폐기했다. schema v5는 다음 raw artifact에서
+`passed=true`를 ledger에 적는 경로를 폐기했다. schema v7은 다음 raw artifact에서
 결론을 재계산한다.
 
-1. G0 final model state와 fixed batch의 trusted NMSE `< -6 dB`
-2. loss pilot `best.pt`/`last.pt`/recorded-val `metrics.npz`/manifest의 provenance와
-   raw per-segment trusted worst-10% score
-3. 선택 pilot `best.pt`와 fixed batch의 strict-S DNH gradient share `0.2–0.4`
-4. selected init에 결속한 measured 5k probe의 checkpoint·manifest·finite val metrics
-5. 선택 loss와 같은 A100 exact-resume smoke receipt
+1. **각 alpha·lambda_dnh identity별** G0 final model state와 같은 fixed batch의 trusted
+   NMSE `< -6 dB`
+2. 각 approved G0 checkpoint/batch에서 strict S·settle·150–1600 Hz를 사용해 현재 cfg
+   `lambda_dnh`의 model-output `y` gradient share를 재계산한 pre-pilot receipt. 현재 share
+   0.2–0.4만 PASS이며 추천값 자체는 PASS가 아니다.
+3. 각 identity의 loss pilot `best.pt`/`last.pt`/recorded-val `metrics.npz`/manifest
+4. 각 pilot `best.pt`를 exact init으로 결속한 measured 5k probe의
+   checkpoint·manifest·raw recorded-val metrics. 최종 winner와 0.2dB/0.85 판정은
+   이 probe 점수만 사용한다.
+5. 최종 winner pilot `best.pt`와 모든 candidate G0가 공유한 fixed-batch SHA 중
+   **winner G0의 authoritative artifact path/SHA 자체**로 strict-S DNH output-y gradient
+   share `0.2–0.4` 재검산(20k 동안 출력 분포 drift 확인). post-pilot용 새 batch나
+   동일 bytes의 별도 복제 경로도 거부한다.
+6. 선택된 `(alpha, lambda_frame, lambda_dnh)`와 같은 A100 exact-resume smoke receipt
 
-issuer와 canonical 100k 명령은 모두 raw pilot selection으로 유도된 같은
-`loss.nmse_cvar_alpha` float를 명시해야 한다. YAML 기본 alpha=0.7을 조용히 쓰지
-않으므로 winner가 0.85 또는 1.0일 때도 다른 계약으로 ledger를 발행할 수 없다.
+issuer와 canonical 100k 명령은 모두 raw measured-probe selection으로 유도된 같은
+`loss.nmse_cvar_alpha`와 `loss.lambda_dnh` float를 명시해야 한다. 한 λ를 모든 alpha에
+강제하지 않으며, YAML 시작값을 조용히 쓰지 않는다. 실패 G0는 별도 diagnostic kind로
+checkpoint/batch/environment를 봉인해 다음 fresh-G0 추천에만 쓸 수 있고, pilot/init 자격을
+절대 열지 않는다.
 
 Elice의 nominal A100 80GB PCIe는 PyTorch에서 driver-reserved memory를 뺀 약
 79.4GiB로 보인다. smoke runner와 receipt validator는 bootstrap과 동일하게
@@ -97,8 +444,9 @@ Elice의 nominal A100 80GB PCIe는 PyTorch에서 driver-reserved memory를 뺀 �
 
 새 source commit으로 전환하면 bootstrap receipt도 exact commit에 결속되어 바뀐다.
 따라서 위 v10 receipt를 다음 campaign의 anchor로 재사용하지 않고, 같은 raw/audit을
-새 exact commit에서 다시 full bootstrap하여 새 receipt와 15/16 readiness를 만든 뒤
-G0부터 시작한다.
+새 exact commit에서 다시 full bootstrap한다. speech lineage를 복구해 15/17을
+재현하고, coverage를 실제 추가 녹음으로 복구해 16/17이 되기 전에는
+G0를 시작하지 않는다. canonical init을 완료한 뒤에만 17/17이다.
 
 라이브 측정은 전체 테스트, 무음 dry-run, 장치 점유·CPU gate와 사용자 입회 뒤 실행했다.
 측정 종료 직후 오디오 스트림은 닫혔고 스피커 분리 안내를 출력했다.
@@ -166,8 +514,9 @@ G0부터 시작한다.
   push 완료됐다. 현재 준비 기준선은 clean 상태로 push된
   `fix/finetune-readiness-repair`의 HEAD이며, 실행에 사용할 exact SHA는
   `git rev-parse HEAD`로 확인한다. 브랜치별 범위는 `docs/08_dev_workflow.md §7`에 고정했다.
-- Elice receipt가 생긴 뒤 `check_finetune.py`의 외부 입력 차단은 해소됐지만, canonical
-  init checkpoint·campaign ledger가 아직 없어 readiness는 의도적으로 16/16이 아니다.
+- Elice receipt가 생긴 뒤 `check_finetune.py`의 외부 입력 차단은 해소됐지만,
+  speech lineage, strict 부대역 coverage, canonical init checkpoint·campaign ledger가
+  아직 없어 readiness는 의도적으로 17/17이 아니다.
 - 2026-08-27 고주파 진단 캡처는 공식 자산과 분리해 수행했지만 유효한 clock witness를
   만들지 못했다. `results/experimental_high_band/20260827_fullband/20260827_203328_1b24d0c2/`
   의 immutable raw에서 ERR/REF 공통 clock 유효 주기가 0개(최소 8, score≥0.995)로 판정되어
@@ -219,10 +568,10 @@ G0부터 시작한다.
   sentinel만 제한적으로 허용한다. 새 전체 pytest는 `/dev/shm`에서 exit 0이며 기존
   diagnostic manifest-missing RuntimeWarning 2건만 있다.
 - smoke는 pilot 선택 **뒤** 선택된 loss와 같은 semantic target으로 실행한다. runner의
-  `--loss-alpha {0.7,0.85,1.0}`는 YAML 복제가 아니라 resolved config에 float literal을
-  넣어 target/contract에 결속한다(특히 `1.0`을 정수 `1`로 바꾸지 않는다). 따라서 기본
-  alpha=0.7 smoke receipt를 0.85/1.0 canonical에 재사용할 수 없고, 선택된 alpha가
-  달라지면 그 값으로 새 smoke를 실행한다.
+  `--loss-alpha {0.7,0.85,1.0}`와 `--loss-lambda-dnh`는 YAML 복제가 아니라 resolved
+  config에 float literal을 넣어 target/contract에 결속한다(특히 `1.0`을 정수 `1`로
+  바꾸지 않는다). 따라서 기본 alpha/λ의 smoke receipt를 다른 winner identity에 재사용할
+  수 없고, 선택된 둘 중 하나라도 달라지면 새 smoke를 실행한다.
 - Elice의 decoder audit 뒤 raw SHA 재대조는 생략하지 않는다. 다만 다음 exact bootstrap에는
   `--raw-hash-workers 8`을 명시해 16 vCore A100 노드에서 independent same-FD SHA/size
   검증을 병렬화할 수 있다. 기본값은 1이고 1~32만 허용한다. executor는 입력 순서대로
@@ -333,7 +682,13 @@ G0부터 시작한다.
 - Elice bootstrap은 전체 40자리 commit, holdout SHA, transfer manifest SHA, `--no-update`를
   요구한다. dirty/숨김 index/graft/replace/symlink/byte mismatch는 다운로드 전에 실패한다.
 
-## 2. 지금부터의 로컬 실행 순서
+## 2. 역사적 복구 절차 — 현재 실행 금지
+
+> **2026-08-28 현재 이 절 전체는 일반적인 다음 단계가 아니다.** strict P/S와 그 raw/
+> analysis/level evidence는 이미 합격·보존됐고 상단 운영 상태가 권위다. 아래 명령은 그
+> artifact가 SHA 불일치·물리 배선 변경 등으로 **명시적으로 invalidated된 경우에만** 새
+> 계획·무음 dry-run·사용자 승인 뒤 복구할 때 참고한다. 현재 세션에서 strict P/S를 다시
+> 출력하거나 기존 transfer를 재발행하지 않는다.
 
 ### 2.1 코드·계보 게이트
 
@@ -366,7 +721,7 @@ git diff --check
 dry-run 뒤 위 세 경로가 생성되지 않았는지 확인한다. 그 다음 비밀정보·대용량·ignored data가
 staging에 없는지 검사하고 한국어 메시지로 commit/push한다. 커밋 메시지에 AI 표기를 넣지 않는다.
 
-### 2.2 strict P/S 라이브 측정
+### 2.2 strict P/S 라이브 재측정 — invalidation 시에만
 
 커밋·push 뒤에도 자동으로 소리를 내지 않는다. 먼저 read-only로 다음을 확인한다.
 
@@ -403,7 +758,11 @@ SHA, clock-q witness, fractional joint-LS+cubic crosscheck, compact round-trip,
 150–1600 Hz 모든 부대역 consistency ≥0.9406, kept repeats ≥8, 안정적인 P−S 상대 지연이다.
 임계값은 낮추지 않는다.
 
-## 3. 계보와 Elice 이관
+## 3. 역사적 strict 복구 뒤 계보·Elice 이관 — 현재 generation 절차 아님
+
+> 아래는 strict capture를 처음 만들던 당시의 82-only 이관 예시다. 현행 82+17
+> generation/transfer schema는 `docs/17_recorded_generation.md`와 상단 상태를 따른다.
+> 이 명령으로 현재 transfer manifest를 덮어쓰거나 되돌리지 않는다.
 
 strict P/S가 합격한 뒤 canonical transfer manifest를 만든다. 실제 capture 파일을 모두
 `--strict-raw`/`--strict-analysis`로 열거한다.
@@ -445,29 +804,39 @@ bash scripts/elice/bootstrap_all.sh \
 
 bootstrap은 torch `2.5.1+cu121`, CUDA 12.1 계약, A100, 저장공간, public raw 수량과 FMA
 metadata를 검증하고 manifest 6종을 untouched raw에서 재생성한다. noise/recorded QA,
-전체 pytest와 readiness까지 통과한 정상 사전학습 출발 상태는 init 하나만 FAIL인 15/16이다.
+전체 pytest와 readiness까지 통과해도 speech lineage 복구 전에는 14/17이다.
+lineage 복구 후 15/17, 추가 녹음으로 coverage PASS 후 init 하나만 FAIL인
+16/17, canonical init 후 17/17 순서를 건너뛰지 않는다.
 
 ## 4. 공식 학습 순서
 
 1. family→lineage component→session 균등 sampler와 공통 gain/polarity/EQ, input-only mic
    noise를 사용한다. session mixing과 lead jitter는 0이다.
-2. 고정 batch G0에서 trusted NMSE < −6 dB와 lead metadata를 확인한다.
-3. seed `20260803`, frame-metric-only(`lambda_frame=0`)의 `alpha∈{0.7,1.0}`을 20k
-   surrogate + 5k measured probe로 recorded val만 사용해 비교한다. 0.2 dB 이내
+2. 각 alpha별 현재 `lambda_dnh`로 고정 batch G0를 처음부터 실행해 trusted NMSE
+   < −6 dB와 lead metadata를 확인한다. 합격 G0의 같은 checkpoint/batch에서 strict S,
+   실제 settle 절단, 150–1600 Hz의 model-output `y` gradient share를 재계산해 현재 λ가
+   0.2–0.4일 때만 다음 단계로 간다. 범위 밖 추천 λ는 새 contract/fresh G0용 정보일
+   뿐이고 실패 checkpoint를 전이하지 않는다.
+3. seed `20260803`, frame-metric-only(`lambda_frame=0`)의 `alpha∈{0.7,1.0}`을 각자의
+   approved `lambda_dnh`와 함께 20k
+   surrogate + 5k measured probe로 실행하고 probe recorded val만 선택에 사용한다.
+   두 probe 점수가 0.2 dB 이내
    동률이면 alpha 0.85를 추가하고, 계속 동률이면 alpha 0.7을 택한다. alpha 1.0의
    non-finite/실행 실패는 immutable pre-forward witness를 재실행하는 failure receipt
    구현 전에는 fallback 근거로 쓰지 않고 canonical을 fail-closed한다.
    170ms frame metric은 candidate마다 기록해 비교·원인 분석에 사용한다. 고정 local
    pass threshold가 생기기 전에는 이 metric으로 성능 PASS를 주장하지 않는다. pilot checkpoint는
    init 자격이 없다.
-4. 선택된 pilot `best.pt`와 fixed batch에서 strict S의 `lambda_dnh` gradient 비중 0.2–0.4를
-   재계산한다. 같은 winner를 init으로 한 measured 5k probe의 completion/provenance와 finite
-   recorded-val metrics를 확인한다.
+4. 각 pilot `best.pt`를 init으로 한 measured 5k probe의 completion/provenance와
+   raw recorded-val metrics를 확인한다. probe 점수로 선택된 최종 winner의
+   pilot `best.pt`와 fixed batch에서 strict S의 `lambda_dnh` output-y gradient 비중
+   0.2–0.4를 재계산한다.
 5. 선택 계약의 A100 200–500 step exact-resume smoke에서 VRAM, 처리량/ETA, 중단·재개
-   수치등가를 먼저 확인한다. schema v5 issuer가 G0·pilot·gradient·probe·smoke raw artifact를
+   수치등가를 먼저 확인한다. schema v7 issuer가 후보별 G0/pre-pilot gradient/pilot/probe와
+   selected-20k gradient·smoke raw artifact를
    다시 검증해 canonical ledger를 no-replace 발행한 뒤에만 다음 단계로 간다.
 6. 선택 계약의 tiny를 새 run에서 100k 처음부터 사전학습한다.
-7. canonical init 지정 뒤 readiness 16/16을 확인하고 open-loop, recorded 70% + synthetic 30%,
+7. canonical init 지정 뒤 readiness 17/17을 확인하고 open-loop, recorded 70% + synthetic 30%,
    bf16 forward + FP32 loss, 50k fine-tune을 실행한다.
 8. checkpoint 선택은 recorded val만 사용한다. 선택을 고정한 뒤 test를 정확히 한 번 연다.
    경계 0.3 dB 이내 또는 INCONCLUSIVE일 때만 seed `20260903`의 100k+50k를 한 번 더 한다.
@@ -489,10 +858,13 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
 
 - Elice에서 새 exact commit으로 decoder 전수 audit → canonical_v4 manifest → QA/pytest/readiness를
   다시 실행하고, audit binding이 실제 raw/decoder 환경과 일치하는지 확인
-- frame-metric-only alpha 2개 20k pilot을 recorded val만으로 실행·선택
-- winner의 5k measured probe, 실제 A100 bf16 중단→resume 수치등가 smoke, G0·gradient
+- frame-metric-only alpha 2개 각각의 G0+strict-S output-y gradient share를 먼저
+  0.2–0.4로 승인한 뒤, 그 `(alpha,frame,lambda_dnh)` identity의 20k pilot+5k measured
+  probe를 recorded val만으로 실행·선택(필요 시 alpha 0.85 chain 추가)
+- 실제 A100 bf16 중단→resume 수치등가 smoke, 후보별 G0/pre-pilot gradient와
+  최종-winner post-pilot gradient
   ledger 작성 및 SHA 결속
-- canonical tiny 100k surrogate-pretrain init checkpoint 생성 후 readiness 16/16 확인
+- canonical tiny 100k surrogate-pretrain init checkpoint 생성 후 readiness 17/17 확인
 - canonical measured 50k fine-tune, 고정 checkpoint의 단 한 번 G4 평가
 - G4 PASS 뒤 natural-crest challenge 녹음·평가
 
@@ -512,8 +884,9 @@ G4와 crest challenge를 모두 통과하기 전에는 closed-loop, ONNX export/
   사용할 때의 임시 staging·비밀정보·SHA·manifest 재검증 절차를 `docs/14_elice_external_data_staging.md`
   에 기록했다. 현재 Elice raw가 이미 정상적으로 있으므로 pilot 중에는 downloader를
   실행하지 않는다.
-- 현재 branch HEAD는 외부 감사 기록과 후속 정리 변경을 포함한 최신 commit이다. Elice의
-  진행 중 pilot은 중단하지 않고 종료 뒤 이 branch의 exact commit으로 동기화한다.
+- 이 기록을 작성한 당시 branch HEAD는 외부 감사 기록과 후속 정리 변경을 포함한 최신
+  commit이었다. 당시 Elice에서 진행 중이던 pilot은 중단하지 않고 종료 뒤 해당 exact
+  commit으로 동기화하는 방침이었다. 현재 권위 HEAD와 작업은 이 문서 상단을 따른다.
 - 2026-08-27 22:03 KST read-only poll에서 Elice pilot parent PID 58467과 네 번째
   `alpha=1.0, lambda_frame=0.2` worker가 살아 있었고 로그는 약 9.3k/20k까지 진행됐다.
   A100 80GB는 GPU 56%, VRAM 6.6/81.9 GiB, Elice 디스크는 80 GiB 여유였다. 세 완료

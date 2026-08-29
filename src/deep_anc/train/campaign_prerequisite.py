@@ -10,6 +10,7 @@ from typing import Any
 
 from .evaluation_contract import FileSnapshot, snapshot_regular_file
 from .campaign_evidence import (
+    MEASURED_PROBE_SELECTION_SCORE,
     PILOT_SELECTION_RULE,
     select_loss_pilot,
     validate_canonical_evidence_target,
@@ -17,6 +18,7 @@ from .campaign_evidence import (
     validate_gradient_budget_receipt,
     validate_loss_pilot_candidate,
     validate_measured_probe,
+    validate_prepilot_gradient_receipt,
 )
 from .a100_pretrain_smoke import (
     SMOKE_ROOT,
@@ -25,7 +27,7 @@ from .a100_pretrain_smoke import (
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 CANONICAL_PATH = "results/training_prerequisites/canonical_pretrain.json"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -98,10 +100,8 @@ def validate_canonical_pretrain_ledger_payload(
         {
             "schema_version",
             "source",
-            "g0",
-            "gradient_budget",
             "loss_pilot_selection",
-            "measured_probe",
+            "gradient_budget",
             "a100_smoke_resume",
         },
         label="campaign prerequisite",
@@ -151,16 +151,12 @@ def validate_canonical_pretrain_ledger_payload(
     if source != expected_source or not all(expected_source.values()):
         raise ValueError("campaign prerequisite strict P/S/source/bootstrap identity가 다릅니다")
 
-    # schema v5는 사람이 적은 `all_finite`, NMSE, gradient share, score, winner,
+    # schema v7은 사람이 적은 `all_finite`, NMSE, gradient share, score, winner,
     # passed boolean을 받지 않는다. 각각 receipt/checkpoint/batch/metrics bytes에서
-    # 아래 validator가 다시 계산한다.
-    g0 = _exact_keys(ledger["g0"], {"receipt"}, label="campaign G0")
-    validate_g0_receipt(
-        g0["receipt"],
-        repo_root=root,
-        canonical_cfg=cfg,
-        canonical_contract=contract,
-    )
+    # 아래 validator가 다시 계산한다. 각 alpha는 자기 λ를 가진 identity
+    # (alpha,frame,lambda_dnh)이며 approved G0→pre-pilot output-gradient→20k
+    # surrogate→5k measured probe를 하나의 chain으로 묶는다. 한 λ를 모든
+    # alpha에 강제하지 않고, 최종 loss 선택은 probe recorded-val 점수만 사용한다.
 
     pilot = _exact_keys(
         ledger["loss_pilot_selection"],
@@ -171,49 +167,113 @@ def validate_canonical_pretrain_ledger_payload(
         raise ValueError("loss pilot selection rule이 승인 규칙과 다릅니다")
     if not isinstance(pilot["candidates"], list):
         raise ValueError("loss pilot candidates가 list가 아닙니다")
-    pilot_rows = [
-        validate_loss_pilot_candidate(
+    candidate_rows: list[dict[str, Any]] = []
+    # 각 G0 evidence directory가 같은 tensor bytes를 자체 보존할 수는 있지만 SHA는
+    # 모두 같아야 한다. winner G0의 concrete artifact를 authority로 고정하고,
+    # selected-20k drift receipt는 그 path+SHA 자체를 재사용해야 한다.
+    g0_batch_sha256: set[str] = set()
+    for index, raw in enumerate(pilot["candidates"]):
+        chain = _exact_keys(
             raw,
+            {"g0", "gradient_calibration", "pilot", "measured_probe"},
+            label=f"loss candidate chain[{index}]",
+        )
+        g0 = _exact_keys(
+            chain["g0"], {"receipt"}, label=f"candidate G0[{index}]"
+        )
+        g0_row = validate_g0_receipt(
+            g0["receipt"],
             repo_root=root,
             canonical_cfg=cfg,
             canonical_contract=contract,
+        )
+        g0_batch = g0_row["batch"]
+        g0_batch_sha256.add(str(g0_batch.sha256))
+        identity = tuple(g0_row["identity"])
+        gradient = _exact_keys(
+            chain["gradient_calibration"],
+            {"receipt"},
+            label=f"candidate gradient calibration[{index}]",
+        )
+        gradient_row = validate_prepilot_gradient_receipt(
+            gradient["receipt"],
+            repo_root=root,
+            canonical_cfg=cfg,
+            canonical_contract=contract,
+            g0_receipt_reference=g0["receipt"],
+            expected_identity=identity,
+        )
+        pilot_row = validate_loss_pilot_candidate(
+            chain["pilot"],
+            repo_root=root,
+            canonical_cfg=cfg,
+            canonical_contract=contract,
+            expected_identity=identity,
             label=f"loss pilot candidate[{index}]",
         )
-        for index, raw in enumerate(pilot["candidates"])
-    ]
-    selection = select_loss_pilot(pilot_rows)
-    winner_pair = tuple(selection["winner_pair"])
-    cfg_pair = (
+        if tuple(pilot_row["identity"]) != identity:
+            raise ValueError(
+                f"loss pilot candidate[{index}] identity가 G0/calibration과 다릅니다"
+            )
+        probe_row = validate_measured_probe(
+            chain["measured_probe"],
+            repo_root=root,
+            canonical_cfg=cfg,
+            canonical_contract=contract,
+            expected_identity=identity,
+            expected_init_checkpoint_sha256=pilot_row["best_snapshot"].sha256,
+        )
+        if tuple(probe_row["identity"]) != identity:
+            raise ValueError(
+                f"measured probe candidate[{index}] identity가 pilot과 다릅니다"
+            )
+        candidate_rows.append(
+            {
+                "identity": identity,
+                "score_db": float(probe_row["score_db"]),
+                "selection_score_source": MEASURED_PROBE_SELECTION_SCORE,
+                "g0": g0_row,
+                "gradient_calibration": gradient_row,
+                "pilot": pilot_row,
+                "measured_probe": probe_row,
+            }
+        )
+    if len(g0_batch_sha256) != 1:
+        raise ValueError(
+            "alpha별 G0가 같은 authoritative fixed batch SHA를 사용하지 않았습니다: "
+            f"{sorted(g0_batch_sha256)}"
+        )
+    selection = select_loss_pilot(candidate_rows)
+    winner_identity = tuple(selection["winner_identity"])
+    authoritative_g0_batch = selection["winner"]["g0"]["batch"]
+    cfg_identity = (
         float((cfg.get("loss") or {}).get("nmse_cvar_alpha")),
         float((cfg.get("loss") or {}).get("lambda_frame")),
+        float((cfg.get("loss") or {}).get("lambda_dnh")),
     )
-    if cfg_pair != winner_pair:
-        raise ValueError("raw recorded-val pilot winner와 canonical pretrain loss가 다릅니다")
+    if cfg_identity != winner_identity:
+        raise ValueError(
+            "raw measured-probe winner (alpha,frame,lambda_dnh)와 canonical "
+            "pretrain loss가 다릅니다"
+        )
 
+    # pre-pilot calibration은 잘못된 λ로 수시간 pilot을 쓰는 것을 막고,
+    # selected-20k 검사는 학습 뒤 출력 분포에서 share가 drift하지 않았는지 닫는다.
+    # 둘 중 하나도 다른 하나를 대체하지 않는다.
     gradient = _exact_keys(
-        ledger["gradient_budget"], {"receipt"}, label="gradient budget"
+        ledger["gradient_budget"], {"receipt"}, label="winner gradient budget"
     )
     validate_gradient_budget_receipt(
         gradient["receipt"],
         repo_root=root,
         canonical_cfg=cfg,
         canonical_contract=contract,
-        expected_checkpoint_sha256=selection["winner"]["best_snapshot"].sha256,
-        expected_pair=winner_pair,
-    )
-
-    probe = _exact_keys(
-        ledger["measured_probe"],
-        {"best_checkpoint", "last_checkpoint", "metrics", "manifest", "init_checkpoint"},
-        label="measured probe",
-    )
-    validate_measured_probe(
-        probe,
-        repo_root=root,
-        canonical_cfg=cfg,
-        canonical_contract=contract,
-        expected_pair=winner_pair,
-        expected_init_checkpoint_sha256=selection["winner"]["best_snapshot"].sha256,
+        expected_checkpoint_sha256=selection["winner"]["pilot"][
+            "best_snapshot"
+        ].sha256,
+        expected_identity=winner_identity,
+        expected_batch_path=authoritative_g0_batch.path,
+        expected_batch_sha256=authoritative_g0_batch.sha256,
     )
 
     smoke = _exact_keys(

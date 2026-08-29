@@ -8,6 +8,10 @@ segment_seconds: 1.5
 # 실수로 로컬/부분 전송 데이터를 공식 입력으로 쓰지 못하게 하는 fail-closed 값이다.
 bootstrap_receipt: data/manifests/elice_bootstrap_receipt.json
 bootstrap_receipt_sha256: null
+# 82-only transfer schema v1에서는 둘 다 null이다. 추가 17세션을 승격한 schema v2는
+# generation.json의 transfer-검증된 exact path/SHA를 CLI로 함께 주입해야 한다.
+recorded_generation: null
+recorded_generation_sha256: null
 
 # 레퍼런스 모드 [교차검증 C2 — 두 모드의 지연 물리가 다르다]
 #   digital : 소음원을 Jetson이 생성 → 출력버퍼 지연이 소음/상쇄 양경로에 공통 → 광대역 상쇄 가능
@@ -61,7 +65,8 @@ recorded_augment:
   mix_weight_range: [0.0, 0.7]
   lead_jitter_samples: 0.0
 
-# 소음원 구성 비율 — 키 이름 = data/manifests/<키>.jsonl 태그 (manifest 없으면 합성원 폴백)
+# 소음원 구성 비율 — 키 이름 = data/manifests/<키>.jsonl 태그. 누락 manifest의
+# synthetic fallback은 진단 모드에서만 명시적으로 가능하며 canonical은 fail-closed한다.
 # quiet zone 목표: 소음뿐 아니라 대화(음성)·음악까지 소스 분포에 포함 (digital-ref 는
 # 광대역 비정상 신호도 인과적 상쇄 가능 — docs/01 §3)
 source_mix_ratio:
@@ -88,6 +93,9 @@ source_mix_ratio_acoustic:
 # data/manifests의 legacy/진단 manifest를 기본값으로 되돌리면 decoder retry가
 # 불량 raw를 조용히 대체할 수 있으므로 canonical 학습 계약에서는 허용하지 않는다.
 noise_manifest_dir: data/manifests/canonical_v4
+# 누락된 declared source tag를 synthetic으로 대체하는 진단 escape hatch. canonical
+# pretrain/finetune/pilot/probe/smoke는 config policy가 true override까지 거부한다.
+allow_missing_source_manifests: false
 rir_bank: data/rir_bank/duct_rirs_v1.npz
 
 # 레벨/증강 랜덤화

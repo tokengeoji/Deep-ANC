@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """학습 진입점.
 
-  .venv/bin/python scripts/train/train.py --config configs/train_pretrain.yaml
-  .venv/bin/torchrun --nproc_per_node=2 scripts/train/train.py --config configs/train_pretrain.yaml
-  .venv/bin/python scripts/train/train.py --config configs/train_finetune.yaml --set stage=closed_loop
+Canonical pretrain/fine-tune은 bootstrap/campaign/init SHA anchor를 요구하므로
+설정 파일만 주어서는 실행되지 않는다. 실제 명령은
+``docs/05_training_elice.md``와 최신 ``HANDOFF.md``를 따른다.
+
+진단용 예시:
+  .venv/bin/python scripts/train/train.py \
+    --config configs/train_pretrain_tiny.yaml \
+    --set experiment_role=diagnostic_overfit --set init_eligible=false \
+    --set contract_run_dir=false --set run_until_step=500
 """
 
 import argparse

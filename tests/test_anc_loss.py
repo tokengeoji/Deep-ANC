@@ -346,8 +346,9 @@ def test_out_of_band_amplification_is_penalised() -> None:
     criterion = _dnh_criterion()
     _, metrics = criterion(y, d, perturb={"jitter": 0})
 
-    # 대역이 옥타브 경계(2828.4 Hz)에서 잘리므로 2000 Hz 순음은 [1633, 2828] 에 든다.
-    assert metrics["dnh_1633_2828_max_db"] == pytest.approx(20.0, abs=0.5)
+    # 1600 Hz 관측점을 추가한 현행 8-center 계약에서는 그 상단 옥타브 경계
+    # (2262.7 Hz)에서 먼저 잘리므로 2000 Hz 순음은 [1633, 2262]에 든다.
+    assert metrics["dnh_1633_2262_max_db"] == pytest.approx(20.0, abs=0.5)
     assert metrics["dnh"] > 0.0
 
     off = ANCLoss(

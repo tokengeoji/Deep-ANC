@@ -94,12 +94,13 @@ reference[t]에 대응하는 synthetic d 도달 시각
 실제 playback을 FIFO로 늦추는 인과적 스케줄이다. checkpoint/ONNX/runtime의 timing contract
 SHA가 다르면 오디오 시작 전에 거부한다. 과거 수동 lead artifact는 diagnostic-only다.
 
-`D_noise=1602`와 `assets/measured/primary_path_il.npz`는 현재 설정에 남은 **legacy 진단
-기준선**이며 training-ready 실측 P(z)로 인정되지 않는다. 새 P/S는 같은 strict 캡처에서
-48k/256/low, ERR0/REF1/NS0/CS1, observed submitted PCM, q+joint-LS+cubic 및 두 운영자 확인을
-모두 보존해야 한다 — `scripts/data/measure_paths_interleaved.py`. 저장된 옛 캡처를
-`scripts/data/reanalyse_paths_interleaved.py --dry-run`으로 읽는 것은 진단만 가능하고
-누락 provenance를 되살리거나 official로 승격하지 못한다.
+현재 `configs/duct.yaml`은 위 `capture_id=5ac13134…`의 strict P/S를
+가리킨다. `delay_samples`나 lead를 문서/명령에 수기 입력하지 않고
+NPZ와 `TrainingTimingContract`/`PlantDelays.lead()`에서만 유도한다.
+`assets/measured/*_path_il.npz`처럼 strict suffix가 없는 구형 파일과 구형
+`D_noise=1602`는 legacy 진단용으로만 보존한다. 옛 raw를
+`scripts/data/reanalyse_paths_interleaved.py --dry-run`으로 읽는 것은 누락
+provenance를 되살리거나 official로 승격하지 못한다.
 
 ### 현재 Stage-1의 P(z) 대용 정책
 
@@ -144,7 +145,7 @@ acoustic-ref 광대역이 되려면 전기적 총지연 < REF→CS 음향 전파
 - **평면파 컷오프 f_cut = c/(2a) = 343/(2×0.105) = 1,633Hz.**
   그 이상은 고차 모드가 전파되어 단일 CS/ERR 로는 단면 전체를 제어할 수 없다
   (마이크 1개가 단면을 대표하지 못함 → 제어 붕괴 위험).
-- 최종 1차 실험 목표 대역은 **80–1600Hz**(`realistic_target_band_hz`, 2026-08-05 에
+- Stage-1 실험 목표 대역은 **80–1600Hz**(`realistic_target_band_hz`, 2026-08-05 에
   80–800 에서 확대)이고, `S(z)` 가 신뢰되는 범위는 **150–1600Hz**(`consistency_band_hz`)다.
   Stage-1은 두 범위의 교집합인 **150–1600Hz** trusted NMSE를 최적화하고 fullband NMSE를
   do-no-harm 관측값으로 함께 기록한다.
@@ -159,8 +160,11 @@ acoustic-ref 광대역이 되려면 전기적 총지연 < REF→CS 음향 전파
 - ⚠ **대역을 넓힌 것과 고역이 좋아지는 것은 다르다.** 손실에 대역 밖 do-no-harm 항이
   없던 상태에서 실측 모델은 2–8kHz 를 **15–22dB 증폭**한다(docs/12 §4.7).
   손실 수정이 선행되지 않으면 대역만 넓히는 것은 오히려 150–600Hz 를 해칠 수 있다.
-- 8kHz+ 풀밴드는: ① S(z) 광대역 재보정 통과 ② 컷오프 이상 대역의
-  감쇠 한계 실측 확인 후 **연구 단계**로 진행한다 (모델·데이터는 48kHz 풀밴드 대응 완료).
+- 사용자가 확정한 최종 광대역-v2는 2/4/8kHz까지의 point-control과 matched FxLMS 우위를
+  요구한다. 8kHz octave 상단 11.314kHz까지 ① P/S multi-panel 재식별 ② sub-sample clock/
+  phase ③ 실제 ERR target-d data coverage ④ 다점 공간 실측을 통과한 뒤에만 연다. 상세는
+  `docs/18_broadband_anc_guardrails.md`다. 모델·데이터 shape가 48kHz를 지원한다는 사실은 이
+  네 물리 게이트를 대체하지 않는다.
 - 축방향 공진 70/210/350/489/629Hz — 이 주파수로 가진하면 큰 SPL 을 얻어
   시연 효과가 좋다 (70Hz 는 스피커 f_s 미만이라 재생 곤란, **210/350Hz 권장**).
 

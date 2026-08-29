@@ -137,9 +137,11 @@ K = S 벌크지연 + 스레드 핸드오프(256) − P 벌크지연
 | `hybrid_anc_tiny` | 1.16 M | 128 | 2 | 1·2·4·8 |
 | `hybrid_anc_base` | 5.99 M | 256 | 3 | 1·2·4·8·16 |
 
-모든 연산은 인과적이다. 스트리밍 상태(`enc_hist`, 블록별 상태, `dec_tail`)를 명시적으로
-들고 다니며, 오프라인 `forward` 와 블록 단위 `streaming_step` 의 수치 등가성을 테스트가
-강제한다.
+모든 연산은 **256-sample block을 먼저 수신한 실시간 경계**에서 인과적이다.
+인코더 첫 output phase는 같은 128-sample hop의 `x[+127]`까지 사용하므로
+sample-zero-lookahead는 아니며, 256-sample handoff가 timing contract에 포함된다.
+스트리밍 상태(`enc_hist`, 블록별 상태, `dec_tail`)를 명시적으로 들고 다니며,
+오프라인 `forward`와 블록 단위 `streaming_step`의 수치 등가성을 테스트가 강제한다.
 
 ### 2.3 손실 함수
 
@@ -274,12 +276,15 @@ G4 를 fullband 평균으로 대신할 수 없는 이유: NMSE 는 `d` 의 에�
 
 **미검증**
 
-- 현행 raw provenance를 갖춘 strict P/S가 아직 없다. legacy P/S는 readiness를 통과하지 못한다.
+- 현행 raw provenance를 갖춘 strict P/S는 측정·검증을 통과했지만, 이 strict P/S와
+  `lead=115`에 결속된 canonical checkpoint는 아직 없다. legacy P/S는 readiness를
+  통과하지 못한다.
 - 정정된 플랜트(`[150, 1600]` 대역)로 사전학습된 체크포인트가 아직 없다. 기존 체크포인트는
   모두 `[150, 600]` 대역·폐기된 2차경로에서 학습된 것이라 파인튜닝 진입 게이트를 통과하지
   못한다.
-- 합성 코퍼스 중 선언 비중 0.45 에 해당하는 원본(`dns_fullband`, `demand`, `machine`)이
-  아직 확보되지 않았다.
+- public raw는 Elice에 확보돼 있지만 새 exact commit의 bootstrap, cross-public speech
+  lineage 제거와 recorded 부대역 coverage 복구가 아직 끝나지 않았다. Jetson에 public
+  corpus를 다시 복제하지 않는다.
 - 따라서 **실기 상쇄 성능 수치는 아직 주장하지 않는다.**
 
 ---
@@ -407,13 +412,15 @@ canonical evidence가 이미 있는 이후 실행도 fresh meter가 필수다. �
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 BOOT=$(sha256sum data/manifests/elice_bootstrap_receipt.json | awk '{print $1}')
 LEDGER=$(sha256sum results/training_prerequisites/canonical_pretrain.json | awk '{print $1}')
-ALPHA=0.7  # raw pilot winner(0.7/0.85/1.0) 값으로 교체
+ALPHA=<raw-pilot-winner-alpha>
+LAMBDA_DNH=<같은-winner-identity의-approved-lambda_dnh>
 .venv/bin/python scripts/train/train.py --config configs/train_pretrain_tiny.yaml \
     --set data.bootstrap_receipt_sha256="$BOOT" \
     --set campaign_prerequisite_sha256="$LEDGER" \
-    --set loss.nmse_cvar_alpha="$ALPHA"
+    --set loss.nmse_cvar_alpha="$ALPHA" \
+    --set loss.lambda_dnh="$LAMBDA_DNH"
 
-# canonical 100k best.pt를 명시한 뒤 16/16 진입 게이트를 통과해야 시작된다.
+# canonical 100k best.pt를 명시한 뒤 17/17 진입 게이트를 통과해야 시작된다.
 INIT_CKPT=runs/<canonical-pretrain-contract>/ckpt/best.pt
 .venv/bin/python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
     --set data.digital_primary_path_mode=measured --set init_ckpt="$INIT_CKPT"
@@ -484,6 +491,7 @@ docs/            00 개요 · 01 지연 물리 · 02 하드웨어 · … · 12 �
 | [docs/02](docs/02_hardware_setup.md) | 하드웨어 배선과 점검 절차 |
 | [docs/04](docs/04_model_architecture.md) | 모델·스트리밍·ONNX 규약 |
 | [docs/07](docs/07_evaluation_protocol.md) | 평가 프로토콜과 게이트 |
+| [docs/16](docs/16_canonical_finetune_guardrails.md) | canonical 파인튜닝 강제 가드레일 |
 | [AGENTS.md](AGENTS.md) | 작업 규칙 |
 | [HANDOFF.md](HANDOFF.md) | 현재 진행 상태 (이 README 는 상태를 담지 않는다) |
 

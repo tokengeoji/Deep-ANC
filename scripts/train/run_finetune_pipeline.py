@@ -25,7 +25,6 @@ checkpoint의 계약과 완전한 optimizer/scheduler/RNG/data-stream 상태를 
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import io
 import json
@@ -51,10 +50,13 @@ from deep_anc.train.finetune_readiness import (  # noqa: E402
 from deep_anc.train.evaluation_contract import (  # noqa: E402
     CAPABILITY_ENV,
     canonical_test_ledger_paths,
+    classify_recorded_val_metrics as _classify_recorded_val_metrics,
     issue_test_capability,
     publish_directory_noreplace,
     read_json_snapshot,
+    seed_neutral_campaign_sha256 as _seed_neutral_campaign_sha256,
     snapshot_regular_file,
+    validate_checkpoint_recorded_manifest,
     write_json_exclusive,
 )
 from deep_anc.train.completion_receipt import validate_completion_receipt  # noqa: E402
@@ -270,82 +272,14 @@ def _sha256_file(path: Path) -> str:
 
 VAL_BORDERLINE_MARGIN_DB = 0.3
 OFFICIAL_FINETUNE_SEEDS = frozenset({20260803, 20260903})
-_CAMPAIGN_OPERATIONAL_KEYS = {
-    "seed",
-    "resume",
-    "run_until_step",
-    "ckpt_dir",
-    "resolved_contract_run_dir",
-    "experiment_contract",
-    "experiment_contract_sha256",
-}
-
-
 def seed_neutral_campaign_sha256(
     cfg: dict, *, _visited_init_sha: frozenset[str] = frozenset()
 ) -> str:
-    """seed/run 위치만 제거하고 init 계보까지 의미로 결속한 campaign digest."""
+    """공유 evaluation contract 구현으로 seed-neutral digest를 유도한다."""
 
-    contract = validate_embedded_experiment_contract(cfg)
-    semantic = copy.deepcopy(
-        {
-            key: value
-            for key, value in cfg.items()
-            if key not in _CAMPAIGN_OPERATIONAL_KEYS
-        }
+    return _seed_neutral_campaign_sha256(
+        cfg, _visited_init_sha=_visited_init_sha
     )
-    init_value = cfg.get("init_ckpt")
-    if init_value:
-        init_path = Path(str(init_value)).expanduser()
-        if not init_path.is_absolute():
-            init_path = REPO_ROOT / init_path
-        init_snapshot = snapshot_regular_file(init_path)
-        if init_snapshot.sha256 in _visited_init_sha:
-            raise ValueError("campaign init checkpoint 계보에 순환이 있습니다")
-        init_state = torch.load(
-            io.BytesIO(init_snapshot.content), map_location="cpu", weights_only=False
-        )
-        if not isinstance(init_state, dict) or not isinstance(
-            init_state.get("cfg"), dict
-        ):
-            raise ValueError("campaign init checkpoint에 resolved cfg가 없습니다")
-        init_cfg = init_state["cfg"]
-        semantic["init_ckpt"] = {
-            "experiment_role": init_cfg.get("experiment_role"),
-            "init_eligible": init_cfg.get("init_eligible"),
-            "loss_selection_sha256": init_cfg.get("loss_selection_sha256"),
-            "seed_neutral_campaign_sha256": seed_neutral_campaign_sha256(
-                init_cfg,
-                _visited_init_sha=_visited_init_sha | {init_snapshot.sha256},
-            ),
-        }
-    source = contract.get("source") or {}
-    artifact_identity = {
-        name: {
-            key: entry.get(key)
-            for key in ("exists", "size_bytes", "sha256")
-            if key in entry
-        }
-        for name, entry in sorted((contract.get("artifacts") or {}).items())
-        if name != "init_checkpoint" and isinstance(entry, dict)
-    }
-    payload = {
-        "schema_version": 1,
-        "semantic_config": semantic,
-        "source": {
-            "git_commit": source.get("git_commit"),
-            "source_tree_sha256": source.get("source_tree_sha256"),
-        },
-        "artifacts": artifact_identity,
-    }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _npz_scalar(data: np.lib.npyio.NpzFile, key: str) -> object:
@@ -357,78 +291,26 @@ def _npz_scalar(data: np.lib.npyio.NpzFile, key: str) -> object:
     return value.reshape(-1)[0].item()
 
 
-def classify_recorded_val_metrics(metrics_bytes: bytes) -> dict:
-    """모든 G4/CI 경계의 최소 여유로 clear-pass/fail/borderline을 판정한다."""
+def classify_recorded_val_metrics(
+    metrics_bytes: bytes,
+    *,
+    manifest_bytes: bytes | None = None,
+    manifest_path: Path | None = None,
+    checkpoint_cfg: dict | None = None,
+) -> dict:
+    """evaluation contract와 같은 fail-closed val G4 분류기를 사용한다.
 
-    try:
-        archive = np.load(io.BytesIO(metrics_bytes), allow_pickle=False)
-    except (OSError, ValueError) as exc:
-        raise ValueError("recorded-val metrics.npz가 손상됐습니다") from exc
-    with archive as data:
-        verdict = str(_npz_scalar(data, "g4_verdict"))
-        threshold = float(_npz_scalar(data, "g4_max_out_of_band_amplification_db"))
-        if not math.isfinite(threshold) or threshold <= 0.0:
-            raise ValueError("G4 do-no-harm threshold가 유효하지 않습니다")
-        margins = {
-            "trusted_mean_db": -float(_npz_scalar(data, "nmse_trusted_mean_db")),
-            "fullband_mean_db": -float(_npz_scalar(data, "nmse_fullband_mean_db")),
-            "worst_source_mean_db": -float(
-                _npz_scalar(data, "g4_worst_source_trusted_mean_db")
-            ),
-            "worst_source_worst10_db": -float(
-                _npz_scalar(data, "g4_worst_source_trusted_worst10_db")
-            ),
-            "do_no_harm_db": float(
-                _npz_scalar(data, "g4_worst_octave_worst10_db")
-            )
-            + threshold,
-        }
-        if "source_trusted_ci_hi_db" not in data.files:
-            raise ValueError("recorded-val bootstrap CI 상단이 없습니다")
-        ci_hi = np.asarray(data["source_trusted_ci_hi_db"], dtype=np.float64)
-        if ci_hi.size == 0 or not bool(np.isfinite(ci_hi).all()):
-            raise ValueError("recorded-val bootstrap CI 상단이 finite/nonempty가 아닙니다")
-        margins["worst_source_ci_hi_db"] = -float(np.max(ci_hi))
-        if not all(math.isfinite(value) for value in margins.values()):
-            raise ValueError("recorded-val G4 margin에 NaN/Inf가 있습니다")
-        flags = {
-            key: bool(_npz_scalar(data, key))
-            for key in (
-                "g4_trusted_pass",
-                "g4_fullband_pass",
-                "g4_source_pass",
-                "g4_do_no_harm_pass",
-                "g4_power_pass",
-                "g4_ci_pass",
-                "g4_pass",
-            )
-        }
-        selection_metric = float(
-            _npz_scalar(data, "nmse_trusted_worst10_mean_db")
-        )
-    if not math.isfinite(selection_metric):
-        raise ValueError("recorded-val 선택 지표가 non-finite")
-    minimum = min(margins.values())
-    near_boundary = any(
-        abs(value) <= VAL_BORDERLINE_MARGIN_DB for value in margins.values()
+    pipeline 내부의 옛 복제 구현은 전체 trusted 평균만 봐서 1000–1600 Hz가 빠진
+    legacy metrics에도 test capability를 열 수 있었다. val 선택과 test capability의
+    authority는 이 wrapper가 아니라 evaluation_contract 한 곳이다.
+    """
+
+    return _classify_recorded_val_metrics(
+        metrics_bytes,
+        manifest_bytes=manifest_bytes,
+        manifest_path=manifest_path,
+        checkpoint_cfg=checkpoint_cfg,
     )
-    numeric_pass = all(value >= 0.0 for value in margins.values())
-    discrete_pass = all(flags.values()) and verdict == "PASS"
-    if verdict == "INCONCLUSIVE" or near_boundary:
-        status = "borderline"
-    elif numeric_pass and discrete_pass:
-        status = "clear_pass"
-    else:
-        status = "clear_fail"
-    return {
-        "status": status,
-        "boundary_margin_db": VAL_BORDERLINE_MARGIN_DB,
-        "minimum_margin_db": minimum,
-        "margins_db": margins,
-        "g4_verdict": verdict,
-        "g4_flags": flags,
-        "selection_metric_db": selection_metric,
-    }
 
 
 def finalize_cross_seed_selection(
@@ -475,6 +357,9 @@ def finalize_cross_seed_selection(
         embedded = validate_embedded_experiment_contract(saved_cfg)
         if embedded["sha256"] != payload.get("experiment_contract_sha256"):
             raise ValueError("cross-seed embedded contract가 selection과 다릅니다")
+        validate_checkpoint_recorded_manifest(
+            saved_cfg, embedded, manifest_snapshot
+        )
         if saved_cfg.get("seed") != seed or selected.get("seed") != seed:
             raise ValueError("cross-seed selection/checkpoint seed가 다릅니다")
         calculated_campaign = seed_neutral_campaign_sha256(saved_cfg)
@@ -483,7 +368,12 @@ def finalize_cross_seed_selection(
             "seed_neutral_campaign_sha256"
         ) != declared_campaign:
             raise ValueError("cross-seed seed-neutral campaign digest가 손상됐습니다")
-        current_decision = classify_recorded_val_metrics(metrics_snapshot.content)
+        current_decision = classify_recorded_val_metrics(
+            metrics_snapshot.content,
+            manifest_bytes=manifest_snapshot.content,
+            manifest_path=manifest_snapshot.path,
+            checkpoint_cfg=saved_cfg,
+        )
         if decision != current_decision or payload.get("decision") != current_decision:
             raise ValueError("cross-seed val decision이 metrics bytes와 다릅니다")
         with np.load(io.BytesIO(metrics_snapshot.content), allow_pickle=False) as data:
@@ -525,7 +415,8 @@ def finalize_cross_seed_selection(
     first_seed = next(item for item in bundles if item["seed"] == 20260803)
     if first_seed["payload"]["selected"]["decision"].get("status") != "borderline":
         raise ValueError(
-            "seed 20260803이 borderline/INCONCLUSIVE로 second-seed 조건을 충족하지 않았습니다"
+            "seed 20260803이 numeric/CI borderline으로 second-seed 조건을 충족하지 "
+            "않았습니다; data INCONCLUSIVE는 추가 녹음 대상입니다"
         )
     eligible = [
         item
@@ -814,6 +705,9 @@ def freeze_recorded_val_selection(
             raise ValueError(
                 f"{checkpoint}: 후보 embedded experiment contract가 selection과 다릅니다"
             )
+        validate_checkpoint_recorded_manifest(
+            state["cfg"], embedded, manifest_snapshot
+        )
         seed = state["cfg"].get("seed")
         if not isinstance(seed, int) or seed not in OFFICIAL_FINETUNE_SEEDS:
             raise ValueError(f"{checkpoint}: 공식 fine-tune seed가 아닙니다: {seed!r}")
@@ -844,7 +738,12 @@ def freeze_recorded_val_selection(
             evaluated_contract_sha = str(
                 np.asarray(data["experiment_contract_sha256"]).reshape(-1)[0]
             )
-        decision = classify_recorded_val_metrics(metrics_snapshot.content)
+        decision = classify_recorded_val_metrics(
+            metrics_snapshot.content,
+            manifest_bytes=manifest_snapshot.content,
+            manifest_path=manifest_snapshot.path,
+            checkpoint_cfg=state["cfg"],
+        )
         metric = float(decision["selection_metric_db"])
         if evaluated_split != "val":
             raise ValueError(f"{metrics_path}: selection 입력 split이 val이 아닙니다")
@@ -1138,6 +1037,19 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
             val_status = str((selection.get("decision") or {}).get("status", ""))
+            if val_status == "inconclusive_data":
+                status.update(
+                    val_selection=selection.get("decision"),
+                    required_action="targeted_recording",
+                    test_capability_issued=False,
+                )
+                print(
+                    "[보류] val G4의 target energy 또는 독립 group이 부족합니다. "
+                    "같은 데이터의 second seed가 아니라 표시된 family/subband를 "
+                    "추가 녹음해야 합니다.",
+                    file=sys.stderr,
+                )
+                return status.finish("val_data_inconclusive", EXIT_NOT_READY)
             if int(cfg.get("seed", 0)) == 20260903:
                 status.update(
                     val_selection=selection.get("decision"),

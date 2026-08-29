@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,19 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert "--expected-decoder-audit-sha256" in text
     assert "--expected-decoder-audit-file-sha256" in text
     assert "verify_decoder_audit_reuse.py" in text
+    assert 'RECORDED_SUBBAND_COVERAGE_REPORT_DIR="results/data_audit/recorded_subband_coverage"' in text
+    recorded_qa_call = text.index(
+        '"$VENV_PYTHON" scripts/data/validate_recorded_sessions.py'
+    )
+    coverage_call = text.index(
+        '"$VENV_PYTHON" scripts/data/audit_recorded_subband_coverage.py'
+    )
+    assert "export PYTHONDONTWRITEBYTECODE=1" in text
+    pytest_call = text.index('"$VENV_PYTHON" -B -m pytest -q')
+    assert recorded_qa_call < coverage_call < pytest_call
+    assert '--canonical-out-dir "$RECORDED_SUBBAND_COVERAGE_REPORT_DIR"' in text
+    assert 'if [ "$coverage_status" -gt 1 ]' in text
+    assert 'if [ "$coverage_status" -eq 1 ]' in text
     assert "--raw-hash-workers" in text
     assert '--expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256"' in text
     assert "--expected-transfer-manifest-sha256" in text
@@ -105,6 +119,9 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert "grep -Fxq 'torch==2.5.1+cu121'" in text
     assert 'BOOTSTRAP_RECEIPT="$REPO/data/manifests/elice_bootstrap_receipt.json"' in text
     assert '"recorded_aggregate_sha256": summary["recorded_aggregate_sha256"]' in text
+    assert '"schema_version": 2' in text
+    assert '"recorded_subband_coverage": {' in text
+    assert '"coverage_contract_sha256": coverage_payload[' in text
     assert '"freeze_receipt_sha256": environment.sha256' in text
     assert "data.bootstrap_receipt" in text
     preflight_exit = text.index('if [ "$PREFLIGHT_ONLY" -eq 1 ]')
@@ -130,6 +147,174 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert '--set run_until_step="$PILOT_STEPS"' in search_runner
     assert 'eval_pilot_${artifact}' in search_runner
     assert "eta_probe.txt" in search_runner
+
+
+def test_bootstrap_uses_transfer_validated_recorded_manifest_for_all_evidence():
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    transfer_gate = text[
+        text.index("verify_transfer_bundle() {") : text.index(
+            "hardware_storage_preflight() {"
+        )
+    ]
+    receipt = text[text.index('BOOTSTRAP_RECEIPT="$REPO/') :]
+
+    assert 'RECORDED_MANIFEST=""' in text
+    assert 'RECORDED_GENERATION=""' in text
+    assert 'RECORDED_GENERATION_SHA256=""' in text
+    assert 'summary.get("_validated_recorded_manifest_snapshot")' in transfer_gate
+    assert 'summary.get("_validated_recorded_generation_snapshot")' in transfer_gate
+    assert "EXPECTED_RECORDED_SESSIONS" in transfer_gate
+    assert "COMBINED_SESSION_COUNT" in transfer_gate
+    assert "recorded schema/session 수가 일치하지 않습니다" in transfer_gate
+    assert "generation_relative = generation.path.relative_to(root).as_posix()" in transfer_gate
+    prepare_call = text.index('"$VENV_PYTHON" scripts/data/prepare_noise_pool.py')
+    validate_call = text.index('"$VENV_PYTHON" scripts/data/validate_noise_pool.py')
+    prepare_block = text[prepare_call - 500 : validate_call]
+    assert 'if [ "$RECORDED_TRANSFER_SCHEMA" = "2" ]; then' in prepare_block
+    assert '--recorded-generation "$RECORDED_GENERATION"' in prepare_block
+    assert (
+        '--expected-recorded-generation-sha256 "$RECORDED_GENERATION_SHA256"'
+        in prepare_block
+    )
+    assert '"${recorded_generation_prepare_args[@]}"' in prepare_block
+    assert text.count('--manifest "$RECORDED_MANIFEST"') == 2
+    assert "--manifest data/manifests/recorded_regrouped.jsonl" not in text
+    assert (
+        '"$RECORDED_SUBBAND_COVERAGE_REPORT_DIR" "$RECORDED_MANIFEST"'
+        in receipt
+    )
+    assert "selected_recorded_manifest = sys.argv[9]" in receipt
+    assert "validated_recorded_relative != selected_recorded_manifest" in receipt
+    assert "coverage_manifest = validated_recorded_manifest" in receipt
+    assert 'root / "data/manifests/recorded_regrouped.jsonl"' not in receipt
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_schema", "expected_manifest", "should_pass"),
+    [
+        (
+            "v1",
+            "1",
+            "data/manifests/recorded_regrouped.jsonl",
+            True,
+        ),
+        (
+            "v2",
+            "2",
+            "data/manifests/recorded_generations/generation-99/recorded.jsonl",
+            True,
+        ),
+        (
+            "v2-wrong-count",
+            "",
+            "",
+            False,
+        ),
+    ],
+)
+def test_bootstrap_transfer_selector_handles_v1_v2_and_count_mismatch(
+    tmp_path: Path,
+    mode: str,
+    expected_schema: str,
+    expected_manifest: str,
+    should_pass: bool,
+):
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    gate = text[
+        text.index("verify_transfer_bundle() {") : text.index(
+            "hardware_storage_preflight() {"
+        )
+    ]
+    program_start = gate.index("<<'PY'\n") + len("<<'PY'\n")
+    program_end = gate.index("\nPY\n", program_start)
+    program = gate[program_start:program_end]
+
+    stub_root = tmp_path / "stubs"
+    data_package = stub_root / "deep_anc/data"
+    data_package.mkdir(parents=True)
+    (stub_root / "deep_anc/__init__.py").write_text("", encoding="utf-8")
+    (data_package / "__init__.py").write_text("", encoding="utf-8")
+    (data_package / "holdout_contract.py").write_text(
+        """\
+class FileSnapshot:
+    def __init__(self, path, data=b"manifest", sha256="b" * 64):
+        self.path = path
+        self.data = data
+        self.sha256 = sha256
+""",
+        encoding="utf-8",
+    )
+    (data_package / "recorded_generation.py").write_text(
+        "COMBINED_SESSION_COUNT = 99\n",
+        encoding="utf-8",
+    )
+    (data_package / "transfer_contract.py").write_text(
+        """\
+from pathlib import Path
+from .holdout_contract import FileSnapshot
+
+EXPECTED_RECORDED_SESSIONS = 82
+
+class TransferContractError(ValueError):
+    pass
+
+def validate_transfer_manifest(path, *, repo_root, expected_sha256):
+    mode = Path(path).name
+    if mode == "v1":
+        relative = "data/manifests/recorded_regrouped.jsonl"
+        generation = None
+        sessions = 82
+    else:
+        relative = "data/manifests/recorded_generations/generation-99/recorded.jsonl"
+        generation = FileSnapshot(
+            Path(repo_root)
+            / "data/manifests/recorded_generations/generation-99/generation.json"
+        )
+        sessions = 82 if mode == "v2-wrong-count" else 99
+    return {
+        "_validated_recorded_manifest_snapshot": FileSnapshot(
+            Path(repo_root) / relative
+        ),
+        "_validated_recorded_generation_snapshot": generation,
+        "recorded_session_count": sessions,
+        "manifest_sha256": expected_sha256,
+        "file_count": 1,
+    }
+""",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(stub_root)
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", program, mode, str(tmp_path), "a" * 64],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if should_pass:
+        assert result.returncode == 0, result.stderr
+        fields = result.stdout.strip().split("\t")
+        expected_sessions = "82" if mode == "v1" else "99"
+        assert fields[:4] == [
+            expected_schema,
+            expected_manifest,
+            "b" * 64,
+            expected_sessions,
+        ]
+        assert fields[6:] == (
+            ["-", "-"]
+            if mode == "v1"
+            else [
+                "data/manifests/recorded_generations/generation-99/generation.json",
+                "b" * 64,
+            ]
+        )
+    else:
+        assert result.returncode == 1
+        assert "recorded schema/session 수가 일치하지 않습니다" in result.stderr
 
 
 def test_bootstrap_binds_full_decoder_audit_to_canonical_v4_manifest_generation():

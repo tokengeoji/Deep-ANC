@@ -415,13 +415,24 @@ ABSOLUTE_OBJECTIVE_BAND_HZ = (150.0, CONTROLLED_BAND_TOP_HZ)
 것을 주석 대신 **검사**로 만든 것이다.
 """
 
-REQUIRED_SOURCE_FAMILIES = ("speech", "music")
-"""절대목표 2(소음·음성·음악을 **모두** 제거)가 요구하는 소스 계열. **코드다.**
+REQUIRED_SOURCE_FAMILIES = ("speech", "music", "environment", "machine")
+"""절대목표 2가 요구하는 네 소스 계열. **설정이 아니라 코드다.**
 
-노이즈만 학습한 모델은 목표 2를 만족할 수 없다. 혼합비에서 이 계열들을 빼면
-``corpus_disjoint`` 는 통과하지만 목표는 달성 불가가 된다 — 게이트가 서로 반대
-방향으로 움직이던 지점이다.
+노이즈만 또는 speech/music만 학습한 모델은 사용자가 요구한 quiet-zone 목표를 만족할
+수 없다. 혼합비에서 이 계열들을 빼면 ``corpus_disjoint`` 는 통과하지만 목표는 달성
+불가가 된다 — 게이트가 서로 반대 방향으로 움직이던 지점이다.
 """
+
+REQUIRED_SOURCE_FAMILY_MIX_TAGS = {
+    "speech": ("speech",),
+    "music": ("music",),
+    # synthetic manifest 이름은 source-family 이름과 같지 않다. canonical v4에서
+    # environment는 DEMAND와 ESC-50 두 pool이 담당한다. `environment`라는 존재하지
+    # 않는 manifest key를 요구하면 정상 canonical config가 영구 차단된다.
+    "environment": ("demand", "esc50"),
+    "machine": ("machine",),
+}
+"""절대목표 family를 canonical source-mix tag로 해석하는 단일 출처."""
 
 MAX_STREAM_DELAY_ROBUST_STD_SAMPLES = delay_jitter_limit_for_band(
     CONTROLLED_BAND_TOP_HZ, MIN_STREAM_COHERENCE, 48_000.0

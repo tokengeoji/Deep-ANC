@@ -128,8 +128,10 @@ probe를 다시 실행한다. 이 결과를 이유로 Jetson 시스템 설정을
 .venv/bin/python scripts/bench/check_audio_input.py
 # recorded/acoustic-ref는 두 채널 모두 필수
 .venv/bin/python scripts/bench/check_audio_input.py --require-both
-# 3) 위 probe PASS 후 세션 도구 자체 점검 (noise/cancel 스피커는 무음)
-.venv/bin/python scripts/data/record_duct.py --program silence --seconds 10
+# 3) 세션 도구의 무변경 dry-run 뒤 무음 점검 (noise/cancel 스피커는 무음)
+.venv/bin/python scripts/data/record_duct.py --program silence --seconds 10 --dry-run
+.venv/bin/python scripts/data/record_duct.py --program silence --seconds 10 \
+    --confirm-user-present --confirm-volume-minimum --confirm-routing-and-geometry
 # 4) 무음 전체 루프 (스피커 소리 없음, 3-스레드 검증)
 .venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml \
     --set noise.type=silence --set engine.type=ort --run-seconds 10 \
@@ -144,6 +146,39 @@ probe를 다시 실행한다. 이 결과를 이유로 Jetson 시스템 설정을
 
 probe는 raw code 다양성, float 변환 RMS, peak, clipping을 함께 검사한다. 19:29 기준 두 채널
 모두 PASS했지만 출력 직전마다 다시 확인하고, 실패 시 `--force`나 재생으로 우회하지 않는다.
+
+### 짧은 보충 세션의 안전 수집
+
+`record_session_batch.py`의 CSV는 각 행에 `path,seconds,source_family,group_id`를 가지며,
+`lineage_key`가 없으면 `group_id`를 사용한다. split은 녹음 전에 각 행의 `split` 또는
+명시적 `--preassigned-split`로 정해야 한다. 15초를 포함해 길이와 대상 수는 CSV/`--limit`에서
+계획하며 코드에 고정하지 않는다. 먼저 아래처럼 dry-run으로 source-list exact SHA, 각 행의
+source SHA·lineage·split, audible/output-open/connected 예상 시간과 hard timeout을 확인한다.
+dry-run은 출력·입력 장치를 열지 않고 디렉터리나 progress 파일도 만들지 않는다.
+
+```bash
+.venv/bin/python scripts/data/record_session_batch.py \
+    --sources data/<사전_split_계획>.csv --limit <이번_연결창_세션수> --dry-run
+
+# 위 계획을 그대로 실행할 때만 세 확인을 붙인다.
+.venv/bin/python scripts/data/record_session_batch.py \
+    --sources data/<사전_split_계획>.csv --limit <이번_연결창_세션수> \
+    --confirm-user-present --confirm-volume-minimum --confirm-routing-and-geometry
+```
+
+기본값은 **재시도 없음**이다. 동일 소스를 다시 울려야 할 근거를 확인한 경우에만
+`--retry-once`를 명시한다. 각 자식 세션은 `seconds + settle +
+--session-timeout-overhead-seconds` hard timeout을 가지며 stdout/stderr가 터미널과
+`results/recording_logs/record_session_batch/`에 동시에 기록된다. file source의 선택 구간은
+CSV의 optional `start_seconds`(기본 0)까지 source-list SHA/행에 exact 결속되고, 해당 window가
+파일 길이를 넘으면 출력 전에 실패한다. noise-output peak는 공용 안전 상한 0.15보다 완화할 수
+없다. `record_duct.py`는 출력 stream이 닫히는 즉시
+분리 안내를 먼저 내고, xrun·길이·정렬·저장 실패 때 메모리에 남은 raw와 metadata를
+`results/recording_staging/record_duct/`에서 WAV SHA/size와 fsync를 마친 뒤 active tree로
+atomic no-replace 발행한다. 실패 staging은
+`results/recording_failures/record_duct/`의 새 no-replace 경로에 통째로 봉인한다. 다만 프로세스
+강제 종료·전원 손실·첫 callback 전 실패는 메모리 raw가 없어 metadata/log만 남을 수 있으므로,
+실패 직후 자동 재생하지 말고 해당 증거부터 오프라인 분석한다.
 
 ### Official P/S 연결 창 순서
 
@@ -247,11 +282,21 @@ adjacent-cycle 시간영역 관측은 주기당 약 **+620 ppm**을 보였고, 1
 cubic playback-grid 교차검증을 모두 통과해야 한다. ``+0.4 ppm/같은 Tegra 발진기``라는 이전
 결론은 이 raw 증거와 모순되어 폐기한다.
 
-현재 training-ready P/S는 **없다**. 새 측정은 48k/256/low, ERR0/REF1/NS0/CS1을 고정하고
-운영자가 볼륨 최저와 배선/기하를 각각 확인해야 한다. raw에는 실제 submitted int16 PCM과
-두 확인을 저장하고, q+joint-LS+cubic gate와 immutable raw/analysis SHA가 모두 통과해야 한다.
-옛 raw를 `--dry-run`으로 분석하는 것은 진단만 가능하며 `derived_not_observed` 결과나 누락된
-provenance를 official로 승격할 수 없다.
+현재 training-ready P/S는 2026-08-27의 같은 strict capture
+`5ac1313488c8434bb4d672a36503df59`에서 나온다.
+
+| 경로 | delay / bulk | 150–1600Hz consistency | repeats | 현재 용도 |
+|---|---:|---:|---:|---|
+| `primary_path_il_strict_5dc06fdd.npz` | 1386 / 1642 | 0.999821 | 19 | official P |
+| `secondary_path_il_strict_5dc06fdd.npz` | 1245 / 1501 | 0.999716 | 19 | official S |
+
+두 NPZ는 48k/256/low, ERR0/REF1/NS0/CS1, xrun/clip 0, observed submitted
+int16 PCM, 공통 raw/analysis SHA, clock-q witness, fractional joint-LS, cubic
+crosscheck와 compact round-trip을 같이 통과했다. handoff 256을 포함한
+lead는 두 NPZ에서 115로 유도된다. 이 측정은 150–1600Hz 플랜트
+식별을 증명하지만 2/4/8kHz 실제 ANC 감쇠를 증명하지는 않는다.
+옛 raw를 `--dry-run`으로 분석해도 누락 provenance를 official로
+승격할 수 없다.
 
 > [!CAUTION]
 > **`.orig` 백업본(전대역 S 0.781 / P 0.920)은 오염된 반복 5개를 포함한 값이다.**

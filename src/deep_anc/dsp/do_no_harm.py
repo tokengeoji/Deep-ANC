@@ -107,6 +107,11 @@ OCTAVE_BAND_CENTERS_HZ: tuple[float, ...] = (
     250.0,
     500.0,
     1000.0,
+    # 1600 Hz는 공식 trusted 상한과 맞닿은 별도 관측점이다. 1000 Hz와
+    # 2000 Hz만 두면 1000–1600 Hz high-band 실패가 aggregate/인접 octave
+    # 속으로 숨을 수 있다. persisted recorded G4는 이 eight-center schema를
+    # 정확히 요구하며, 과거 7-center artifact는 진단용일 뿐 canonical PASS가 아니다.
+    1600.0,
     2000.0,
     4000.0,
     8000.0,

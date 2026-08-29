@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -343,3 +344,50 @@ def test_precondition_checks_both_pcm_endpoints_before_recording(monkeypatch):
 
     with pytest.raises(RuntimeError, match="output PCM busy"):
         audio_io.assert_measurement_preconditions(_MustNotRecord(), hardware)
+
+
+def test_public_measurement_preflight_is_input_only_owned_and_analyzer_bound(
+    monkeypatch,
+):
+    import deep_anc.audio_io as audio_io
+
+    fs = 48_000
+    source = np.empty((int(1.5 * fs), 2), dtype="<i4")
+    rng = np.random.default_rng(7)
+    source[:] = np.rint(rng.normal(0.0, 2_000_000.0, source.shape)).astype("<i4")
+    calls = []
+
+    class InputOnly:
+        def check_input_settings(self, **kwargs):
+            calls.append(("check_input", kwargs))
+
+        def rec(self, frames, **kwargs):
+            calls.append(("rec", frames, kwargs))
+            return source
+
+        def wait(self):
+            calls.append(("wait",))
+
+    hardware = {
+        "sample_rate": fs,
+        "input": {"card": "APE", "pcm": 1},
+        "output": {"card": "Audio", "pcm": 0},
+    }
+    monkeypatch.setattr(audio_io, "assert_measurement_pcm_unoccupied", lambda _h: calls.append(("pcm",)))
+    monkeypatch.setattr(audio_io, "assert_capture_clock_undisturbed", lambda _c: calls.append(("clock",)))
+    monkeypatch.setattr(audio_io, "resolve_alsa_portaudio_device", lambda *_a, **_k: 4)
+    raw, report = audio_io.capture_measurement_preflight_raw(
+        InputOnly(), hardware, seconds=1.5
+    )
+    expected = audio_io.analyze_int32_input_probe(raw)
+    assert raw.dtype == np.dtype("<i4")
+    assert raw.shape == (48_000, 2)
+    assert raw.flags.c_contiguous and raw.flags.owndata
+    assert report["channels"] == expected["channels"]
+    assert report["frames"] == expected["frames"]
+    assert report["resolved_input_device"] == 4
+    assert calls[0:2] == [("pcm",), ("clock",)]
+    assert calls[2][0] == "check_input"
+    assert calls[3][0] == "rec"
+    source.fill(0)
+    assert np.any(raw != 0)
