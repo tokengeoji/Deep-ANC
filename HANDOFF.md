@@ -2,7 +2,89 @@
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
 > 최종 갱신: 2026-08-29. 완료된 현장 검증 브랜치: `work/v8-rt5640-zero-duplex`.
-> 현재 준비 브랜치: `work/v9-electrical-frame-witness`.
+> 현재 준비 브랜치: `work/v10-fullband-rt5640-contract`.
+
+## 0-V10. RT5640 full-octave static boundary (2026-08-29)
+
+### [가설]
+
+APE I2S2 input과 RT5640/J511 I2S1 output을 실제 P/S 측정에 쓰려면, USB AB13X/S16
+세대와 분리된 S32·125 Hz--8 kHz 계약부터 먼저 고정해야 한다.
+
+### [근거]
+
+- 새 static config: `configs/hardware_jetson_rt5640_fullband_v10.yaml`
+- 새 validator: `src/deep_anc/dsp/rt5640_fullband_static_v10.py`
+- 무음 확인 명령: `scripts/jetson/check_rt5640_fullband_static_v10.py`
+- canonical v3 digest:
+  `53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2`
+- v6는 `Audio,0` AB13X/S16 output, actual int16 PCM SHA, raw path 및 authority를
+  함께 봉인한다. v6 peak 98을 S32에 단순 cast하면 정규화 출력이 약 96.3 dB 작아져
+  level/P/S 계약이 무너진다.
+
+### [확인 방법]
+
+무음 static gate는 `APE,1`/`APE,0`, 48 kHz, 256, `low`, 양방향 S32, 80 Hz 이하--
+11,313.7084989848 Hz 이상 excitation, Q15→S32 exact 16-bit left shift, J511 live state
+`HP|HS` 선언, 그리고 legacy v6 re-label 금지를 동시에 검사한다. ALSA, sounddevice,
+PCM, mixer, 결과 파일을 열지 않는다.
+
+### [결과]
+
+focused test와 실제 무음 명령이 PASS했다. receipt는 config SHA
+`5fe219b4e2026d09fffc276aa5ad7e99a84e46e47bdcdefe08284e7af83ecfa4`를 결속했고,
+`audio_opened=false` 및 모든 P/S·electrical·training/deployment authority=false를
+명시했다.
+
+### [판정]
+
+**Confirmed — static contract only.** 이 PASS는 actual S32 signal plan/duplex,
+J511 반대편 앰프, frame identity, electrical witness, P/S, ANC 감쇠 또는 학습 준비를
+증명하지 않는다. receipt status는 의도적으로 `BLOCKED`다.
+
+### [다음 행동]
+
+1. v10.1에서 actual submitted S32 PCM plan·fail-closed duplex transport를 synthetic
+   fixture로 먼저 구현한다.
+2. external synchronous ADC/tap 또는 검증된 RT5640 TRRS capture의 electrical witness
+   health를 준비한다. 현재 J511=`None` PCM0 input은 rail/stuck이라 사용할 수 없다.
+3. 그 뒤 meter/dry-run, 한 번의 physical P/S window, v3 raw/analysis/plant authority를
+   순서대로 발행한다.
+
+## 0-DATA. 기존 local synthetic manifest 누수 재확인 (2026-08-29)
+
+### [가설]
+
+기존 local synthetic manifest를 새 fullband 학습에 재사용할 수 있다.
+
+### [근거]
+
+사용자 변경이 있는 `/home/capston/Deep_ANC` primary worktree의 실제 bytes를 read-only로
+대조했다. `recorded_holdout.json`의 speech clip SHA 174개 중 local LibriSpeech raw와
+일치하는 원본이 있고, `speech.jsonl`에는 holdout과 exact filename이 같은 8개
+(`2277-149896-0016` 등)가 들어 있다. `esc50.jsonl`도 recorded holdout과 environment
+58개, machine 24개의 basename/계보 중복을 보인다.
+
+### [확인 방법]
+
+holdout의 canonical source SHA와 각 untouched public raw/manifest의 SHA·source ID·artist/
+speaker/book/machine component를 새 manifest builder에서 다시 교집합 검사한다.
+
+### [결과]
+
+old `speech.jsonl`, `music.jsonl`, `esc50.jsonl`, `elice_transfer_manifest.json`은
+legacy diagnostic artifact다. 현 v10 worktree에는 canonical public raw/manifest가 없고,
+이 old bundle을 복사하거나 canonical으로 승격할 근거가 없다.
+
+### [판정]
+
+**Confirmed — old local synthetic/transfer bundle is training-ineligible.**
+
+### [다음 행동]
+
+새 P/S authority 이후 Elice에서 untouched public raw를 다시 받고, corrected holdout을
+먼저 적용한 뒤 six manifest를 재생성·QA한다. `prepare_noise_pool.py`의 holdout leakage
+gate를 우회하지 않는다.
 
 ## 0-V8. RT5640 exact-zero 동시 입출력 admission (2026-08-29, 최우선)
 
@@ -104,14 +186,12 @@ Stage-1 준비와 혼동하지 않으며, 사용자가 요구한 2/4/8 kHz 고�
 5. 그 후 fullband loss pilot → canonical 100k pretrain → 50k measured fine-tune → unseen
    speech/music/environment/machine 및 실제 natural sound G4를 실행한다.
 
-### Elice 병렬 상태 (2026-08-29 재확인)
+### Elice 상태 (2026-08-29 사용자 deprovision 확인)
 
-기록된 endpoint `central-01.tcp.tunnel.elice.io:56230`은 DNS/TCP까지는 도달하지만,
-비대화형 공개키 SSH가 key exchange 전에 원격 종료(`Connection closed by remote host`,
-exit 255)로 실패한다. 따라서 현 GPU 종류·사용률·디스크·public manifest·학습 실행 여부는
-**Inconclusive**이며, 학습이 실제로 돌아간다고 주장하지 않는다. 새 endpoint가 주어지면
-유효한 fullband P/S와 재발행 transfer manifest 뒤 exact checkout의 `--no-update
---preflight-only` bootstrap부터 다시 시작한다.
+사용자가 Elice 인스턴스를 직접 삭제했다. 따라서 이전 endpoint에는 재접속을 시도하지
+않으며, 현 GPU 종류·사용률·디스크·public manifest·학습 실행 여부는 **없음/미확인**이다.
+새 인스턴스는 valid fullband P/S, 재발행 transfer manifest, clean exact commit이 준비된
+뒤에만 만들고, 그 시점에 `--no-update --preflight-only` bootstrap부터 시작한다.
 
 ## 0-V7. v6 실제 결과와 현재 차단 상태 (2026-08-29, 이전 실패 근거)
 
