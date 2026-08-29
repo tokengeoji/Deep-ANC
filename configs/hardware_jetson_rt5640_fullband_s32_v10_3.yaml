@@ -1,0 +1,35 @@
+# RT5640 S32 full-octave 측정의 무음 level-control recipe.
+# 이 config는 train config도, P/S PASS evidence도 아니다.
+schema: rt5640_s32_fullband_meter_contract_v10_3
+hardware_static_config: configs/hardware_jetson_rt5640_fullband_v10.yaml
+
+fullband_v3:
+  control_band_contract_id: broadband_full_octave_88_11314_v3
+  control_band_contract_sha256: 53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2
+  health_bands_hz:
+    - [88.3883476483, 176.7766952966]
+    - [176.7766952966, 353.5533905933]
+    - [353.5533905933, 707.1067811865]
+    - [707.1067811865, 1414.2135623731]
+    - [1414.2135623731, 2828.4271247462]
+    - [2828.4271247462, 5656.8542494924]
+    - [5656.8542494924, 11313.7084989848]
+
+level_meter:
+  duration_seconds: 20.0
+  probe_peak_normalized: 0.003
+  control_band_hz: [150.0, 1600.0]
+  meter_target_dbfs: -50.1
+  meter_tolerance_db: 2.0
+  freshness_seconds: 600
+  raw_target_relative_path: results/rt5640_fullband_s32_v10_3/level_meter_raw.npz
+  disarmed_stream_required: true
+  immediate_disconnect_notice_required: true
+
+authority:
+  static_contract_only: true
+  level_control_only: true
+  full_octave_health_pass: false
+  plant_identification_pass: false
+  canonical_training_eligible: false
+  deployment_eligible: false

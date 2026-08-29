@@ -2,7 +2,9 @@
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
 > 최종 갱신: 2026-08-29. 완료된 현장 검증 브랜치: `work/v8-rt5640-zero-duplex`.
-> 현재 준비 브랜치: `work/v10-fullband-rt5640-contract`.
+> 현재 S32 capture admission 브랜치: `work/v13-rt5640-s32-capture-admission`
+> (external witness 기준선: `work/v12-synchronized-witness-admission`, S32 transport 기준선:
+> `work/v10b-rt5640-fullband-s32-admission`).
 > 현재 파일 기반 training readiness 감사: `docs/44_canonical_training_readiness_audit_20260829.md`.
 
 ## 0-V14. causal S·y prefix adapter 경계 (2026-08-29)
