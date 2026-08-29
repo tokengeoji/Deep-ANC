@@ -33,7 +33,24 @@
    surrogate pretrain → recorded fine-tune → one-shot physical G4**다. 어느 하나라도 없는
    상태에서 GPU 학습을 시작하거나 성능 수치를 주장하지 않는다.
 
-### 0.1 2026-08-29 스피커 분리 상태의 소프트웨어 경계 복구
+### 0.1 2026-08-29 짧은 출력 경로 진단 (ANC/P/S authority 아님)
+
+사용자 입회에서 `record_duct.py`의 300 Hz/3초/ANC OFF 진단을 두 번만
+실행했고, 각 출력 stream 종료 직후 분리 안내를 냈다. 첫 minimum 조건 raw는 신호가
+잡음 바닥에 묻혔고, 사용자 승인으로 gain을 최저 위치에서 한 단계 조정한 두 번째 raw에서는 300 Hz
+source→ERR coherence² `0.741641`, source→REF `0.730343`, ERR↔REF `0.992065`가
+관측됐다. 즉, 그 짧은 조건의 noise speaker→ERR/REF 물리 경로는 진단상 살아 있다.
+
+두 capture 모두 canonical collection plan이 없는 `unbound_diagnostic`이며,
+단일 tone은 150–700 Hz timeline witness를 제공하지 못해 `timeline_gate`가 정상적으로
+거부했다(`valid_window_ratio=0`). raw를 수정·승격·재측정하지 않고 failure artifact로
+보존한다. **이는 P/S, lead, ANC 감쇠, 고역, 모델 또는 quiet-zone 증거가 아니다.**
+파일 경로·SHA·독립 재계산·다음 안전 절차는
+[`docs/57_20260829_output_route_diagnostic.md`](docs/57_20260829_output_route_diagnostic.md)에
+기록했다. 다음 물리 출력은 strict/broadband 계획의 무음 dry-run과 별도 출력 창 보고 뒤에만
+실행한다.
+
+### 0.2 2026-08-29 스피커 분리 상태의 소프트웨어 경계 복구
 
 이번 작업에서는 오디오 장치를 열지 않았다. 다음은 실제 파일을 읽어 재확인했거나,
 fixture-only가 아닌 artifact 없이는 **BLOCKED**를 유지하도록 코드로 고정한 항목이다.
