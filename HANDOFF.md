@@ -124,6 +124,21 @@ fixture-only가 아닌 artifact 없이는 **BLOCKED**를 유지하도록 코드�
 acquisition adapter·high-rate public corpus·고역 recorded population·raw-bound trainer loader와
 독립 physical evaluator가 없다는 실제 blocker를 PASS로 바꾸지 않는다.
 
+### 0.4 2026-08-29 현재 장비 2/4/8 kHz 결합 진단 (P/S·ANC authority 아님)
+
+현재 meter의 고정 gain에서 48 kHz/256/low, peak `0.003`으로 각 2/4/8 kHz에
+input-only 2초→NS(ch0) 2초 tone→CS(ch1) 2초 tone을 한 번씩만 실행했다. 모든 raw는
+callback xrun/clip 0, 양채널 zero flush/stream close PASS였다. 2/4 kHz의 네
+NS/CS→ERR/REF 경로와 8 kHz의 CS→ERR·양 REF 경로는 단일-tone coupling detector를
+통과했다. 8 kHz NS→ERR은 +23.30 dB 상승이 있으나 절대 tone이 `-101.775 dBFS`라
+보수적 `-100 dBFS` floor에서 `UNRESOLVED`다. 재생을 반복하거나 임계값을 낮추지 않는다.
+
+artifact SHA, 독립 raw projection, 정확한 출력 시간 및 authority 한계는
+[`docs/58_20260829_highband_coupling_diagnostic.md`](docs/58_20260829_highband_coupling_diagnostic.md)에
+기록했다. 결론은 현재 speaker가 2/4/8 kHz를 전혀 내지 못한다는 주장이 반증됐다는
+것뿐이다. USB DAC↔APE 독립 시간축과 2-input 공간 관측 한계 때문에 이 raw는
+P/S·lead·학습·ANC 감쇠·FxLMS 비교·quiet-zone 근거가 아니다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
