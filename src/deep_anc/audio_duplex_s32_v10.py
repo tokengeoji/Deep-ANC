@@ -162,6 +162,7 @@ def capture_planned_s32_duplex(
 
     # caller가 capture 중 source array를 mutate해도 callback plan은 바뀌지 않는다.
     planned = np.array(source, dtype="<i4", copy=True, order="C")
+    planned.setflags(write=False)
     total = len(planned)
     planned_sha256 = _array_sha256(planned)
     captured = np.zeros((total, 2), dtype="<i4")
@@ -260,7 +261,7 @@ def capture_planned_s32_duplex(
             start = cursor
             stop = cursor + BLOCK_SIZE
             captured[start:stop] = np.array(source_block, dtype="<i4", copy=True, order="C")
-            actual[start:stop] = np.array(block, dtype="<i4", copy=True, order="C")
+            actual[start:stop] = np.array(sink, dtype="<i4", copy=True, order="C")
             capture_valid[start:stop] = True
             submitted_valid[start:stop] = True
             rows.append((len(rows), start, count, *times, mask))
