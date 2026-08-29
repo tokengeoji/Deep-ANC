@@ -1,7 +1,8 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-29. 현재 현장 검증 브랜치: `work/v8-rt5640-zero-duplex`.
+> 최종 갱신: 2026-08-29. 완료된 현장 검증 브랜치: `work/v8-rt5640-zero-duplex`.
+> 현재 준비 브랜치: `work/v9-electrical-frame-witness`.
 
 ## 0-V8. RT5640 exact-zero 동시 입출력 admission (2026-08-29, 최우선)
 
@@ -87,13 +88,17 @@ Stage-1 준비와 혼동하지 않으며, 사용자가 요구한 2/4/8 kHz 고�
 
 ### [다음 행동]
 
-1. PASS해도 곧바로 학습하지 않는다. J511 실제 출력과 I2S2 입력의 frame identity를 보일
-   별도 electrical/frame witness를 설계·구현·dry-run 검증한다. current all-zero raw는 이
-   권위를 만들지 않는다.
-2. 그 뒤에만 저레벨 channel/polarity와 실제 덕트 fullband P/S를 한 연결 창에서 측정한다.
-3. 새 plant가 150–1600 Hz뿐 아니라 2/4/8 kHz consistency와 out-of-band do-no-harm를
+1. PASS해도 곧바로 학습하지 않는다. v9의 read-only
+   `scripts/jetson/check_rt5640_j511.py`로 J511 plug state를 receipt에 결속한다.
+   실제 output cable을 붙인 경우 `HP`/`HS` state를 먼저 관측해 sealed expectation으로
+   만들며, `None`/미확인 상태에서 P/S 출력을 시작하지 않는다. 이 connector gate의
+   범위와 한계는 `docs/42_rt5640_j511_connection_gate.md`에 있다.
+2. J511 실제 출력과 I2S2 입력의 frame identity를 보일 별도 electrical/frame witness를
+   설계·구현·dry-run 검증한다. current all-zero raw는 이 권위를 만들지 않는다.
+3. 그 뒤에만 저레벨 channel/polarity와 실제 덕트 fullband P/S를 한 연결 창에서 측정한다.
+4. 새 plant가 150–1600 Hz뿐 아니라 2/4/8 kHz consistency와 out-of-band do-no-harm를
    통과하면 transfer manifest/Elice readiness를 새 exact commit에 다시 결속한다.
-4. 그 후 fullband loss pilot → canonical 100k pretrain → 50k measured fine-tune → unseen
+5. 그 후 fullband loss pilot → canonical 100k pretrain → 50k measured fine-tune → unseen
    speech/music/environment/machine 및 실제 natural sound G4를 실행한다.
 
 ## 0-V7. v6 실제 결과와 현재 차단 상태 (2026-08-29, 이전 실패 근거)
