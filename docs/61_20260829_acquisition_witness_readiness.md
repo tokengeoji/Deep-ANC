@@ -125,5 +125,9 @@ frame bridge가 없으면 충분하지 않다.
    speech selection receipt를 발행하면 재개할 수 있다. 그 뒤 no-replace 17행 plan과 PASS
    dry-run을 만들고, 예상 audible 255초(연결 상한 약 5분 48초)의 한 번의 수집 창에서만
    추가 session을 녹음한다.
-4. 17세션은 Stage-1 coverage 보강용일 뿐 2/4/8 kHz 또는 125 Hz--8 kHz final claim으로
+4. 현재 344파일/4,689,042,188-byte transfer manifest는 82세션 schema v1이다. 새 Elice의
+   `canonical_v4` 및 DNS selection을 여는 데는 쓸 수 있지만, canonical pretrain/fine-tune
+   입력으로 재사용하지 않는다. 17세션 수집 뒤에는 99세션 schema v2 transfer manifest를
+   no-replace로 재발행하고 additions를 같은 Elice에 검증 전송한 뒤 receipt를 다시 확인한다.
+5. 17세션은 Stage-1 coverage 보강용일 뿐 2/4/8 kHz 또는 125 Hz--8 kHz final claim으로
    승격하지 않는다.

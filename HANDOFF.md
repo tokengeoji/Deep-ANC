@@ -205,6 +205,12 @@ AB13X는 계속 2ch adaptive playback/mono asynchronous capture이며, J511 chec
 selection receipt → 17행 no-replace plan/dry-run이며, final high-band는 동기 acquisition
 topology 확정 전까지 녹음·학습으로 우회하지 않는다.
 
+현재 `elice_transfer_manifest.json`은 344파일·4,689,042,188 bytes의 82세션 schema v1
+bundle이다. 현 `dev`의 docs-only 변경은 bundle bytes를 무효화하지 않으므로 새 Elice의
+canonical_v4/DNS selection에는 쓸 수 있다. 그러나 이 bundle을 canonical 학습 입력으로
+재사용하지 않는다. DNS receipt를 받아 17세션을 수집한 뒤에는 99세션 schema v2 transfer를
+no-replace 재발행·검증 전송하고 새 receipt로 다시 결속해야 한다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
