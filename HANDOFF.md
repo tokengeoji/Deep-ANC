@@ -2,8 +2,52 @@
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
 > 최종 갱신: 2026-08-29. 완료된 현장 검증 브랜치: `work/v8-rt5640-zero-duplex`.
-> 현재 준비 브랜치: `work/v10-fullband-rt5640-contract`.
+> 현재 하드웨어 admission 브랜치: `work/v12-synchronized-witness-admission`
+> (S32 transport 기준선: `work/v10b-rt5640-fullband-s32-admission`).
 > 현재 파일 기반 training readiness 감사: `docs/44_canonical_training_readiness_audit_20260829.md`.
+
+## 0-V12. external synchronized electrical witness admission (2026-08-29)
+
+### [가설]
+
+외부 4-input ADC를 추가하면 현재 APE INMP441 ERR/REF와 output tap을 자동으로 같은
+시간축에 올릴 수 있다.
+
+### [근거]
+
+APE I2S2의 INMP441 ERR/REF와 별도 external ADC는 nominal 48 kHz 또는 USB/OS timestamp가
+같아도 physical frame identity가 생기지 않는다. 현재 legacy v5 raw는 2ch ERR/REF shape로
+고정되어 있어 4ch tap raw를 재라벨해 넣을 수도 없다. 상세는
+`docs/49_external_synchronous_adc_witness_admission.md`다.
+
+### [확인 방법]
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  scripts/jetson/check_external_electrical_witness_static.py
+```
+
+이 명령은 audio device를 열지 않는다. actual hardware가 생긴 뒤에는
+`single_acquisition_clock_all_four` 또는 `ape_external_hardware_frame_bridge` topology를
+별도 raw adapter가 native/canonical/analysis SHA와 actual S32 callback SHA에 결속해야 한다.
+
+### [결과]
+
+새 static schema는 ERR/REF/NOISE_TAP/CANCEL_TAP의 고유 4-role map, 48 kHz `<i4`, continuous
+frame counter, xrun/drop/add 0, aperiodic S32→two-tap frame identity, 11.314 kHz에서
+`≤0.0675518903 sample` interchannel residual, AGC/limiter off 및 safe tap을 요구한다.
+실행 결과는 `static_gate_pass=true`, `status=BLOCKED`, `audio_opened=false`다.
+
+### [판정]
+
+**Confirmed — fail-closed static requirement boundary.** 이 단계는 physical electrical
+witness, fullband P/S, training/deployment authority를 열지 않는다.
+
+### [다음 행동]
+
+ERR/REF까지 같은 acquisition clock으로 옮긴 4ch recorder 또는 APE↔external recorder의
+continuous BCLK/WS/absolute-frame bridge를 실제로 마련한다. final quiet-zone은
+`REF + NOISE_TAP + CANCEL_TAP + ERR 5 positions`의 8 input simultaneous profile이 필요하다.
 
 ## 0-HW. full-octave electrical witness·geometry 감사 (2026-08-29)
 
