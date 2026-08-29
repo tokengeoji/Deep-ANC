@@ -50,6 +50,18 @@ v3_raw_bound_execution_config
 따라서 `configs/full_octave_v3_admission.yaml`은 Trainer/GPU/DataLoader를 만들지 않으며,
 학습 권한을 발행하지 않는다.
 
+`configs/full_octave_v3_execution.yaml`의 형식상 완전해 보이는 non-fixture JSON/SHA chain도
+현재는 `BLOCKED_UNATTESTED_EXECUTION_PROVENANCE`다. `declared_sha_structure_valid=true`은
+선언된 file SHA/nonce/field 교차검사일 뿐 canonical execution permission이 아니다. 이를
+바꾸려면 다음 authority가 각각 독립적으로 필요하다.
+
+- typed P/S operator·raw·analysis validator와 operator/timing exact crosslink
+- typed raw/analysis/electrical witness validator
+- actual submitted PCM/callback telemetry 및 native↔canonical recipe/equality
+- plan nonce·device·session monotonic에 결속된 capture-adapter `O_EXCL` receipt
+- canonical finetune init checkpoint·experiment contract·recorded selection을 포함한
+  stage-specific training schema
+
 ## canonical 학습을 열기 위한 순서
 
 1. synchronized electrical witness를 포함한 raw-bound full-octave causal P/S

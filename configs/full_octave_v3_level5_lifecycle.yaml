@@ -1,0 +1,58 @@
+# Full-octave v3 Level-5 unseen physical challenge의 read-only lifecycle config.
+#
+# 기본 null 상태는 정상적으로 BLOCKED_UNATTESTED_MISSING_AUTHORITY다. 이 파일은 capture, playback, ANC ON, model
+# evaluation, capability 발급을 수행하지 않는다. canonical 100k+50k와 val selection으로
+# model/experiment contract를 먼저 고정한 뒤, 새 raw source manifest와 8-input physical
+# bundle을 실제 bytes/SHA로 채운다. 그러나 이 YAML 및 self-sealed JSON만으로는 READY/PASS가
+# 될 수 없다. physical bundle config SHA에 대한 official validator 재실행, independent raw
+# evaluator receipt 등 별도 authority 전에는 항상 BLOCKED_UNATTESTED_*다.
+schema: full_octave_v3_level5_lifecycle_config_v1
+role: post_lock_level5_unseen_physical_challenge_read_only
+
+control_band_contract:
+  id: broadband_full_octave_88_11314_v3
+  sha256: 53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2
+
+artifacts:
+  # selection 뒤 frozen checkpoint/controller/experiment contract를 한 JSON lock에 결속.
+  model_lock:
+    path: null
+    sha256: null
+  # immutable raw source identity manifests. training/validation/test/challenge의 모든
+  # record는 native/decoded bytes, source ID, lineage component/key를 직접 가리키며
+  # 각 manifest는 네 family를 모두 가진다.
+  training_raw_manifest:
+    path: null
+    sha256: null
+  validation_raw_manifest:
+    path: null
+    sha256: null
+  test_raw_manifest:
+    path: null
+    sha256: null
+  selection_raw_manifest:
+    path: null
+    sha256: null
+  # selection은 별도 split이 아니다. 반드시 validation_raw_manifest와 exact same SHA를
+  # 가리키는 alias여야 한다.
+  # 이 manifest만 model lock 이후에 만들어지며, train∪val∪test와 source ID,
+  # lineage component/key, native/decoded bytes SHA가 각각 0 교집합이어야 한다.
+  challenge_raw_manifest:
+    path: null
+    sha256: null
+  # full_octave_v3_physical_session_bundle checker의 non-fixture structural report를
+  # 가리킨다. 이 lifecycle은 report를 canonical P/S/ANC 성능으로 승격하지 않는다.
+  physical_bundle_lock:
+    path: null
+    sha256: null
+  # 아래 ledger 세 파일은 별도 future issuer/evaluator가 O_EXCL로 만든 것을 읽기만
+  # 한다. 이 CLI는 token 발급·소비·terminal receipt 작성을 절대 하지 않는다.
+  one_shot_capability:
+    path: null
+    sha256: null
+  one_shot_consumed_marker:
+    path: null
+    sha256: null
+  one_shot_receipt:
+    path: null
+    sha256: null

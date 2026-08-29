@@ -1,0 +1,62 @@
+# 이 파일은 현재 generic train.py에 넣는 train config가 아니다.
+#
+# 실제 full-octave physical artifact가 생긴 뒤에만 모든 path/sha256과 nonce를
+# 동시에 채운다. null 기본값은 `check_full_octave_v3_execution.py`에서 정상적인
+# BLOCKED다. non-fixture JSON/NPZ와 self-attested SHA를 모두 채워도 현행 checker에는
+# typed live P/S/raw/analysis/electrical witness validator와 capture-adapter trust root가
+# 없으므로 `BLOCKED_UNATTESTED_EXECUTION_PROVENANCE`이며 canonical 학습을 열 수 없다.
+# stage-specific finetune에는 canonical init checkpoint/experiment contract/recorded
+# selection도 별도 typed authority로 필요하다.
+schema: full_octave_v3_execution_config_v1
+role: raw_bound_preflight_no_trainer_no_audio
+execution_stage: canonical_pretrain
+execution_nonce_sha256: null
+
+control_band_contract:
+  id: broadband_full_octave_88_11314_v3
+  sha256: 53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2
+
+artifacts:
+  # fullband RT5640 S32 raw-first capture, not old USB/AB13X diagnostic raw.
+  fullband_raw_capture:
+    path: null
+    sha256: null
+  # causal plant authority가 정확히 가리키는 analysis bytes.
+  fullband_analysis:
+    path: null
+    sha256: null
+  causal_plant_authority:
+    path: null
+    sha256: null
+  # synchronized output witness receipt; binding receipt가 exact bytes를 참조한다.
+  electrical_witness_receipt:
+    path: null
+    sha256: null
+  # raw-bound P/S causal operator files. path가 아닌 SHA만 주장하는 것은 불가.
+  primary_causal_operator:
+    path: null
+    sha256: null
+  secondary_causal_operator:
+    path: null
+    sha256: null
+  population_authority:
+    path: null
+    sha256: null
+  family_balanced_batch_receipt:
+    path: null
+    sha256: null
+  dnh_gradient_calibration:
+    path: null
+    sha256: null
+  # full_octave_v3_raw_bound_binding_receipt_v1, fixture_only=false만 허용.
+  causal_plant_binding:
+    path: null
+    sha256: null
+  # marker full_octave_v3_train_config_binding_v1를 포함한 exact training YAML.
+  canonical_training_config:
+    path: null
+    sha256: null
+  # 다른 11 artifact bytes/path와 nonce를 결속한 execution receipt.
+  execution_receipt:
+    path: null
+    sha256: null

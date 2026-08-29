@@ -14,16 +14,62 @@
 현재 실제 장비에서 강하게 확인된 사실은 다음과 같다.
 
 1. RT5640 드라이버와 APE 카드는 존재하지만, 2026-08-29 무음 3회 probe에서
-   `CVB-RT Jack-state`는 모두 `None`이었다. 따라서 Jetson이 J511의 HP/HS 연결을 아직
-   감지하지 못했고, 출력·P/S·ANC ON 실험은 금지다. 케이블의 실제 J511 경로와 잭 종류를
-   물리적으로 확인한 뒤에만 다시 무음 probe한다.
-2. 현재 strict P/S는 150--1600 Hz 역할의 historical evidence일 뿐, 2/4/8 kHz 광대역
-   식별·학습·배포 authority가 아니다. 기존 checkpoint·ONNX·고역 결과도 canonical
+   `CVB-RT Jack-state`는 모두 `None`이었다. 이는 **J511 HP/HS 감지 실패**이며 USB DAC
+   출력 경로의 재생 가능/불가능을 뜻하지는 않는다. 어느 출력 경로도 현장 검증되지 않았고,
+   speaker가 분리된 동안에는 출력·P/S·ANC ON 실험을 하지 않는다. 다시 연결한 뒤에도
+   장치 점유 확인→무음 preflight→사용자 입회/최소 볼륨의 짧은 검증 창 순서를 지킨다.
+2. 현재 strict P/S는 150--1600 Hz **Stage-1에만 authoritative**하다. 2/4/8 kHz 광대역
+   식별·학습·배포 authority가 아니며, 기존 checkpoint·ONNX·고역 결과도 canonical
    성능 근거로 승격하지 않는다.
 3. 광대역 canonical 학습을 여는 최소 순서는 **동기화된 다채널 electrical witness 확보 →
    fail-closed P/S raw 분석 합격 → lineage-clean public/recorded manifest 합격 →
    surrogate pretrain → recorded fine-tune → one-shot physical G4**다. 어느 하나라도 없는
    상태에서 GPU 학습을 시작하거나 성능 수치를 주장하지 않는다.
+
+### 0.1 2026-08-29 스피커 분리 상태의 소프트웨어 경계 복구
+
+이번 작업에서는 오디오 장치를 열지 않았다. 다음은 실제 파일을 읽어 재확인했거나,
+fixture-only가 아닌 artifact 없이는 **BLOCKED**를 유지하도록 코드로 고정한 항목이다.
+
+- 82 recorded 세션은 현행 QA 기준 82/82, 95.67분, lineage component 교집합 0의
+  Stage-1 자료다. 그러나 실제 재감사
+  `results/audits/broadband_prerequisite_20260829_postrepair.json`에서
+  2.828--5.657/5.657--11.314 kHz joint independent group은 0이므로, full-octave
+  학습 자료로 승격하지 않는다.
+- `configs/full_octave_v3_execution.yaml`과
+  `scripts/train/check_full_octave_v3_execution.py`는 raw/analysis/witness/P-S
+  operator/population/sampler/DNH/non-fixture binding/training YAML/nonce receipt를
+  SHA로 교차 결속한다. 선언 SHA 구조가 모두 맞아도
+  `BLOCKED_UNATTESTED_EXECUTION_PROVENANCE`이며 성공 exit이나 Trainer·GPU·run directory를
+  만들지 않는다. typed P/S/raw/analysis/witness와 stage별 init 계약이 생기기 전에는
+  generic Stage-1 Trainer로 대체 실행하지 않는다.
+- `configs/full_octave_v3_physical_session_bundle.yaml`과
+  `scripts/data/check_full_octave_v3_physical_session_bundle.py`는 최종 quiet-zone
+  주장에 필요한 `REF + NOISE_TAP + CANCEL_TAP + ERR_0..ERR_4`의 8-input,
+  48 kHz/256/S32, BCLK/WS/absolute-frame witness, raw-first no-replace bundle만
+  선언 구조로 읽는다. 현재 null config는 audio/ALSA/GPU/network를 열지 않은
+  `BLOCKED`이며, non-fixture bytes가 맞아도
+  `BLOCKED_UNATTESTED_STRUCTURAL_RAW`와 nonzero다. 이 정보는 ANC/P/S/배포 authority가
+  아니며, capture adapter receipt·submitted PCM telemetry·native→canonical 변환 증거가
+  추가로 필요하다.
+- `configs/full_octave_v3_matched_campaign.yaml`의 OFF/DL/FxLMS Latin-square 비교와
+  `configs/full_octave_v3_level5_lifecycle.yaml`의 Level-5 미사용 source lifecycle은
+  선언된 SHA/순서가 맞아도 각각 `BLOCKED_UNATTESTED_PHYSICAL_PROVENANCE`,
+  `BLOCKED_UNATTESTED_*`로 유지한다. 현재 checker들은 self-attested JSON·checkpoint·raw
+  또는 terminal `PASS`에 성공 exit/학습/배포 authority를 주지 않는다. 실제 capture adapter
+  O_EXCL provenance, full-octave P/S·lead, native lineage inventory, 완료 checkpoint·selection,
+  독립 raw evaluator가 별도 authority로 생겨야 한다.
+- historical high-band raw
+  `results/experimental_high_band/20260827_fullband/20260827_203328_1b24d0c2/`
+  (raw SHA `46acda579a4ba7069844cc6824fcf4e475edc750d1b43a80cfe40a2e9ffe1ec7`)는
+  `design_band_hz=[60,8000]`이다. strict 재분석 승격은 immutable raw recipe가
+  현행 `[60,1650]` 및 required/consistency `[150,1600]`과 exact할 때만 허용하도록
+  보강했다. 따라서 sidecar marker 유무와 무관하게 이 diagnostic raw는 official P/S가
+  될 수 없다.
+
+이 구현들은 물리 측정 전 **오인 경로를 닫는** 소프트웨어 준비다. fullband raw P/S·8-input
+acquisition adapter·high-rate public corpus·고역 recorded population·raw-bound trainer loader와
+독립 physical evaluator가 없다는 실제 blocker를 PASS로 바꾸지 않는다.
 
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선

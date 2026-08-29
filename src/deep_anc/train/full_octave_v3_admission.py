@@ -7,8 +7,8 @@ full-octave P/S, 계보, sampler, DNH gradient 증거를 기존 150--1600 Hz 자
 config와 physical evidence가 없는 한 이 모듈은 학습을 허용하지 않는다.
 
 개별 implementation check는 ``PASS``일 수 있어도, 이 admission-only 경계의
-``eligible``은 항상 false다. raw-first artifact publisher와 raw-bound execution
-config가 함께 검증되기 전에는 여기서 학습을 열 수 없다.
+``eligible``은 항상 false다. raw-first artifact publisher와 별도 raw-bound execution
+envelope/receipt가 함께 검증되기 전에는 여기서 학습을 열 수 없다.
 """
 
 from __future__ import annotations
@@ -625,15 +625,16 @@ def audit_full_octave_v3_admission(
     )
     # 이 파일의 정확한 role은 admission-only다. consumer가 구현됐어도 여기서
     # Trainer/DataLoader/GPU를 만들거나 fixture JSON만으로 canonical training을
-    # 열 수 없다. raw-bound execution config/publisher는 physical P/S 이후 별도
-    # authority로 발행돼야 한다.
+    # 열 수 없다. 별도 execution envelope preflight는 존재하지만, 이 YAML 자체가
+    # 그 receipt를 대체하지 않는다.
     checks.append(
         _check(
             False,
             check_id="v3_raw_bound_execution_config",
             detail=(
-                "현재 YAML은 admission-only이며 raw-bound non-fixture binding, "
-                "실제 batch receipt 및 canonical execution config를 만들지 않습니다."
+                "현재 YAML은 admission-only입니다. 별도 execution envelope의 "
+                "non-fixture binding/actual batch receipt/nonce receipt가 없으므로 "
+                "canonical execution을 열 수 없습니다."
             ),
         )
     )
@@ -653,7 +654,7 @@ def audit_full_octave_v3_admission(
         "blockers": blockers,
         "next_required_implementation": (
             "새 full-octave causal P/S·population·batch·DNH artifact가 모두 raw-first로 "
-            "발행된 뒤, non-fixture binding과 canonical execution config를 별도 "
+            "발행된 뒤, non-fixture binding과 canonical execution envelope/receipt를 별도 "
             "authority로 발행하고 physical raw G4를 수행해야 합니다."
         ),
     }

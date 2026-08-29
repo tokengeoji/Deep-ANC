@@ -1,0 +1,35 @@
+# Full-octave v3 final quiet-zone physical campaign의 8-input raw-first bundle.
+#
+# 이 파일은 capture adapter나 학습 config가 아니다. 기본 null 상태는 정상적으로
+# BLOCKED이며, 기존 2ch/4ch/legacy raw나 fixture JSON을 채워 canonical authority를
+# 만들 수 없다. future capture는 predeclared O_EXCL plan -> native raw -> canonical raw
+# -> immutable sidecar 순서를 정확히 지킨 뒤 이 read-only checker로 검증한다.
+# 단, self-attested bytes/SHA/mtime 선언만으로는 O_EXCL adapter event, submitted PCM 및
+# callback telemetry, native↔canonical recipe/equality, typed P/S/raw/analysis/electrical
+# witness를 증명할 수 없다. 따라서 complete-looking future bundle도
+# `BLOCKED_UNATTESTED_STRUCTURAL_RAW`이며 success exit이 아니다.
+schema: full_octave_v3_physical_session_bundle_config_v1
+role: raw_first_eight_input_synchronized_physical_campaign_no_audio
+
+control_band_contract:
+  id: broadband_full_octave_88_11314_v3
+  sha256: 53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2
+  sample_rate_hz: 48000
+  block_size: 256
+
+artifacts:
+  # predeclared physical 8-input plan; plan 자체도 fixture_only=false만 허용.
+  capture_plan:
+    path: null
+    sha256: null
+  # 8ch interleaved S32LE raw only. NPZ/WAV/legacy AB13X S16은 허용하지 않는다.
+  native_raw:
+    path: null
+    sha256: null
+  canonical_raw:
+    path: null
+    sha256: null
+  # raw 이후 O_EXCL로 발행한 immutable session sidecar JSON.
+  session_sidecar:
+    path: null
+    sha256: null
