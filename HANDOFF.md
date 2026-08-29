@@ -73,6 +73,38 @@ training authority는 계속 false다.
 disarmed live stream/hw_params gate와 raw-first meter publisher를 구현·dry-run한 뒤,
 external electrical witness 준비가 끝난 한 연결 창에서만 20초 meter를 실행한다.
 
+## 0-V10.3b. post-start disarmed S32 transport (2026-08-29)
+
+### [가설]
+
+`Stream.start()` 뒤 callback으로 hw_params를 확인하면 nonzero PCM 전에 admission할 수 있다.
+
+### [근거]
+
+start 내부 callback이 먼저 실행될 수 있어 이 가설은 안전하지 않다. 새 backend-independent
+primitive `src/deep_anc/audio_duplex_s32_disarmed_v10_3.py`는 check가 성공하기 전 callback을
+exact-zero로 고정한다. 상세: `docs/48_rt5640_disarmed_s32_transport_v10_3.md`.
+
+### [확인 방법]
+
+focused fake-backend test는 start 내부 pre-arm callback zero, post-check exact plan,
+xrun/check/assignment/close fault re-zero와 partial mask를 모두 검사한다.
+
+### [결과]
+
+focused tests PASS. 이 module은 ALSA/sounddevice/PCM을 import/open하지 않았다.
+
+### [판정]
+
+**Confirmed — application buffer safety only.** actual hw_params/electrical/P/S authority는
+false다.
+
+### [다음 행동]
+
+real adapter가 stream-open hw_params/route/J511/occupancy를 mandatory check에 결속하고
+raw-first S32 publisher를 사용해야 한다. 그 adapter의 live execution은 모든 dry-run과
+external witness 준비 뒤 한 번의 승인 창에서만 한다.
+
 ## 0-V10. RT5640 full-octave static boundary (2026-08-29)
 
 ### [가설]
