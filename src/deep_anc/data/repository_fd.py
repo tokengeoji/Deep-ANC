@@ -22,17 +22,22 @@ import subprocess
 from typing import Any
 
 
-V5_EXTERNAL_POST_RECEIPT_SUFFIX = ".post_receipt.json"
+EXTERNAL_POST_RECEIPT_SUFFIX = ".post_receipt.json"
+V5_EXTERNAL_POST_RECEIPT_SUFFIX = EXTERNAL_POST_RECEIPT_SUFFIX
 
 
-def external_post_receipt_relative_path_v5(raw_relative_path: str) -> str:
-    """Return the canonical sibling receipt name without dropping raw suffix."""
+def external_post_receipt_relative_path(raw_relative_path: str) -> str:
+    """세대와 무관한 canonical sibling receipt 이름을 반환한다."""
 
     raw = canonical_relative_path(raw_relative_path, label="live raw path")
     path = PurePosixPath(raw)
-    return path.with_name(
-        path.name + V5_EXTERNAL_POST_RECEIPT_SUFFIX
-    ).as_posix()
+    return path.with_name(path.name + EXTERNAL_POST_RECEIPT_SUFFIX).as_posix()
+
+
+def external_post_receipt_relative_path_v5(raw_relative_path: str) -> str:
+    """기존 v5 public alias; 결과 bytes/path를 그대로 유지한다."""
+
+    return external_post_receipt_relative_path(raw_relative_path)
 
 
 def repository_execution_identity(
@@ -437,6 +442,7 @@ def publish_repository_bytes_noreplace(
     *,
     mode: int = 0o600,
     preserve_recovery_link: bool = False,
+    recovery_tag: str = "v5_raw",
 ) -> dict[str, Any]:
     """Publish bytes through held dirfds without replacement or symlink traversal.
 
@@ -448,6 +454,12 @@ def publish_repository_bytes_noreplace(
 
     if type(payload) is not bytes:
         raise TypeError("published payload는 bytes여야 합니다")
+    if (
+        type(recovery_tag) is not str
+        or not recovery_tag
+        or any(not (character.islower() or character.isdigit() or character == "_") for character in recovery_tag)
+    ):
+        raise ValueError("recovery_tag는 소문자/숫자/underscore만 허용합니다")
     root = repository_root(repository_root_path)
     relative = canonical_relative_path(relative_path, label="publish target")
     filename, chain = open_parent_chain(root, relative, create=True)
@@ -456,7 +468,7 @@ def publish_repository_bytes_noreplace(
     staging = f".{filename}.{token}.partial"
     descriptor = -1
     linked = False
-    recovery = f".{filename}.{token}.v5_raw_recovery"
+    recovery = f".{filename}.{token}.{recovery_tag}_recovery"
     try:
         try:
             os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
@@ -565,7 +577,7 @@ def publish_repository_bytes_noreplace(
         except OSError:
             if not linked:
                 raise
-        # A recovery evidence link is never removed here or by the v5 writer.
+        # A recovery evidence link is never removed here or by the generation writer.
         # Its continued existence is intentional even on successful publication.
         close_parent_chain(chain)
 
@@ -574,6 +586,7 @@ __all__ = [
     "RepositoryFileGuard",
     "assert_repository_target_fresh_nofollow",
     "canonical_relative_path",
+    "external_post_receipt_relative_path",
     "external_post_receipt_relative_path_v5",
     "close_parent_chain",
     "open_parent_chain",

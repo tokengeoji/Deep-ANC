@@ -1029,7 +1029,9 @@ def test_fake_backend_capture_publish_load_e2e(
 ) -> None:
     planned = _planned()
     backend = _LiveBackend(mode)
-    ticks = iter([100.0, 100.0 + FRAMES / 48_000.0])
+    ticks = iter(
+        [100.0, 100.0, 100.0, 100.0 + FRAMES / 48_000.0]
+    )
     try:
         capture = audio.capture_duplex_v5(
             backend,

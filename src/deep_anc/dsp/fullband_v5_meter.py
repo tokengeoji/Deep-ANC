@@ -75,8 +75,19 @@ def write_fullband_v5_meter_raw_atomic(
     metadata: dict[str, Any],
     submitted_output_pcm_int16: np.ndarray,
     input_raw_int32: np.ndarray,
+    _generation_label: str = "v5",
+    _recovery_tag: str = "v5_raw",
 ) -> dict[str, Any]:
-    """Publish v5 meter NPZ and receipt through guarded dirfd operations."""
+    """Publish meter NPZ and receipt through guarded dirfd operations.
+
+    두 private 인자는 v6 thin wrapper만 사용하며 기존 v5 호출의 bytes/path는 동일하다.
+    """
+
+    if (_generation_label, _recovery_tag) not in {
+        ("v5", "v5_raw"),
+        ("v6", "v6_raw"),
+    }:
+        raise ValueError("meter raw generation/recovery tag 조합이 유효하지 않습니다")
 
     root = Path(os.path.abspath(os.fspath(repository_root)))
     raw_relative = _lexical_repository_relative(
@@ -88,7 +99,7 @@ def write_fullband_v5_meter_raw_atomic(
         "retained_on_success_and_failure": True,
         "same_inode_hardlink_not_duplicate_capture": True,
         "path_and_sha_reported_by_writer": True,
-        "suffix": ".v5_raw_recovery",
+        "suffix": f".{_recovery_tag}_recovery",
     }
     stream = io.BytesIO()
     np.savez_compressed(
@@ -105,10 +116,11 @@ def write_fullband_v5_meter_raw_atomic(
         raw_relative,
         raw_bytes,
         preserve_recovery_link=True,
+        recovery_tag=_recovery_tag,
     )
     recovery_relative = raw_result.get("recovery_path")
     if not isinstance(recovery_relative, str):
-        raise RuntimeError("v5 meter raw recovery hardlink가 생성되지 않았습니다")
+        raise RuntimeError(f"{_generation_label} meter raw recovery hardlink가 생성되지 않았습니다")
     receipt_payload = _canonical_json(
         {
             "schema": BOOTSTRAP_METER_RECEIPT_SCHEMA,
@@ -120,7 +132,7 @@ def write_fullband_v5_meter_raw_atomic(
     # before guard acquisition fails the expected digest/inode comparison.
     try:
         with RepositoryFileGuard(
-            root, recovery_relative, label="v5 meter raw recovery"
+            root, recovery_relative, label=f"{_generation_label} meter raw recovery"
         ) as recovery_guard:
             recovery_snapshot = recovery_guard.snapshot()
             if (
@@ -128,9 +140,9 @@ def write_fullband_v5_meter_raw_atomic(
                 or recovery_snapshot["inode"] != raw_result["inode"]
                 or recovery_snapshot["bytes"] != raw_bytes
             ):
-                raise RuntimeError("v5 meter raw recovery inode 검증에 실패했습니다")
+                raise RuntimeError(f"{_generation_label} meter raw recovery inode 검증에 실패했습니다")
             with RepositoryFileGuard(
-                root, raw_relative, label="v5 meter raw"
+                root, raw_relative, label=f"{_generation_label} meter raw"
             ) as raw_guard:
                 raw_snapshot = raw_guard.snapshot()
                 if (
@@ -140,13 +152,13 @@ def write_fullband_v5_meter_raw_atomic(
                     or raw_snapshot["bytes"] != raw_bytes
                 ):
                     raise RuntimeError(
-                        "v5 meter raw publish 결과가 pinned inode와 다릅니다"
+                        f"{_generation_label} meter raw publish 결과가 pinned inode와 다릅니다"
                     )
                 receipt_result = publish_repository_bytes_noreplace(
                     root, receipt_relative, receipt_payload
                 )
                 with RepositoryFileGuard(
-                    root, receipt_relative, label="v5 meter receipt"
+                    root, receipt_relative, label=f"{_generation_label} meter receipt"
                 ) as receipt_guard:
                     receipt_snapshot = receipt_guard.snapshot()
                     if (
@@ -155,7 +167,7 @@ def write_fullband_v5_meter_raw_atomic(
                         or receipt_snapshot["inode"] != receipt_result["inode"]
                     ):
                         raise RuntimeError(
-                            "v5 meter receipt 최종 검증에 실패했습니다"
+                            f"{_generation_label} meter receipt 최종 검증에 실패했습니다"
                         )
                     raw_guard.verify()
                     receipt_guard.verify()
@@ -166,7 +178,7 @@ def write_fullband_v5_meter_raw_atomic(
                     receipt_guard.verify()
     except BaseException as error:
         raise RuntimeError(
-            "v5 meter raw/receipt durable publication 실패; 원본 recovery="
+            f"{_generation_label} meter raw/receipt durable publication 실패; 원본 recovery="
             f"{recovery_relative}: {error}"
         ) from error
     return {

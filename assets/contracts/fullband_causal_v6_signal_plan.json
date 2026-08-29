@@ -1,0 +1,524 @@
+{
+  "actual_submitted_pcm_sha256": "4e8a66b983af872192624bd6759282058cfe4a845460111a24bcd684b22551a3",
+  "design_contract": {
+    "actual_int16_meter_relative_power_db": [
+      -0.25,
+      0.0
+    ],
+    "block_size": 256,
+    "clock": {
+      "active_path_only": true,
+      "block_frames": 98304,
+      "blocks": 8,
+      "central_periods": 2,
+      "fixed_bins": [
+        109,
+        137,
+        181,
+        233,
+        277,
+        314,
+        359,
+        401
+      ],
+      "opposite_path_exact_zero": true,
+      "prefix_frames": 16384,
+      "suffix_frames": 16384
+    },
+    "contract_sha256": "12b81e622c0b269a9393cd2c60d78b78971bedcf5018ae6ce4478808e872bac2",
+    "duration_seconds": 24.576,
+    "pe": {
+      "block_frames": 65536,
+      "blocks": 6
+    },
+    "period_frames": 32768,
+    "sample_rate": 48000,
+    "schema": "fullband_causal_v6_design_contract_v1",
+    "submitted_peak_limit_pcm": 98,
+    "total_frames": 1179648
+  },
+  "schema": "fullband_causal_signal_plan_envelope_v6",
+  "signal_plan": {
+    "active_block_power_contract": {
+      "all_active_blocks_not_above_meter": true,
+      "clock_path_only_vs_meter_db": -0.0019486362483388544,
+      "official_meter_total_power": 2.4719371770819027e-06,
+      "pe_slot_count": 6,
+      "power_definition": "sum_channel_mean_square_actual_submitted_int16_normalized_by_32768",
+      "worst_pe_slot_vs_meter_db": -0.4354513906504307
+    },
+    "actual_submitted_dtype": "<i2",
+    "actual_submitted_pcm_sha256": "4e8a66b983af872192624bd6759282058cfe4a845460111a24bcd684b22551a3",
+    "actual_submitted_peak_pcm": 98,
+    "actual_submitted_shape": [
+      1179648,
+      2
+    ],
+    "block_size": 256,
+    "canonical_payload_sha256": "8b37213a13131a071e10527c948580c906dfd914a1134e98a640ead259ba42f7",
+    "canonical_training_eligible": false,
+    "clock_estimator_contract": {
+      "all_local_basins_refined": true,
+      "boundary_minimum_rejected": true,
+      "cubic_linear_endpoint_disagreement_max_samples": 0.06755189029558945,
+      "global_grid_max_step_ppm": 1.0,
+      "minimum_unique_basin_objective_ratio": 4.0,
+      "post_q_repeat_complex_agreement_min": 0.995,
+      "post_q_repeat_line_snr_min_db": 20.0,
+      "preoptimizer_fixed_line_snr_min_db": 20.0,
+      "search_bounds_ppm": [
+        -1000.0,
+        1000.0
+      ],
+      "terminal_phase_error_max_samples": 0.06755189029558946,
+      "view_endpoint_disagreement_max_samples": 0.05
+    },
+    "clock_excitation": {
+      "actual_fundamental_period_samples": 32768,
+      "actual_int16_period_pcm_sha256": "6c7e5eae6450a68578a9b8784ad4661ee44ed49f690328c76f0019d5c054b3bb",
+      "actual_line_to_guard_minimum_db": 34.297937268873376,
+      "actual_local_guard_max_abs_dft": 8021.755463579652,
+      "actual_path_only_total_power": 2.4708282921892533e-06,
+      "actual_selected_line_min_abs_dft": 416069.88437867473,
+      "bin_difference_gcd": 1,
+      "bin_gcd_with_period": 1,
+      "fixed_line_bins": [
+        109,
+        137,
+        181,
+        233,
+        277,
+        314,
+        359,
+        401
+      ],
+      "fixed_line_frequencies_hz": [
+        159.66796875,
+        200.68359375,
+        265.13671875,
+        341.30859375,
+        405.76171875,
+        459.9609375,
+        525.87890625,
+        587.40234375
+      ],
+      "line_count": 8,
+      "line_selection": "predeclared_from_pre_v6_observability_not_v6_raw",
+      "meter_relative_allowed_db": [
+        -0.25,
+        0.0
+      ],
+      "official_meter_total_power": 2.4719371770819027e-06,
+      "opposite_path_exact_zero_required": true,
+      "path_activation": "time_separated_one_path_only",
+      "path_only_vs_meter_db": -0.0019486362483388544,
+      "peak_pcm": 98
+    },
+    "duration_seconds": 24.576,
+    "holdout_access_policy": {
+      "clock_fit_epoch_rows": [
+        "fit_pre_0",
+        "fit_pre_0",
+        "fit_pre_1",
+        "fit_pre_1",
+        "fit_pre_2",
+        "fit_pre_2"
+      ],
+      "clock_fit_epochs": [
+        "fit_pre_0",
+        "fit_pre_1",
+        "fit_pre_2"
+      ],
+      "clock_terminal_validation_epoch": "terminal_post_holdout",
+      "operator_holdout_frame_ranges": [
+        [
+          851968,
+          917504
+        ],
+        [
+          917504,
+          983040
+        ]
+      ],
+      "operator_holdout_used_for_clock_fit_snr_basin_or_selection": false,
+      "terminal_clock_block_is_disjoint_from_operator_holdout": true,
+      "terminal_epoch_rows": [
+        "terminal_post_holdout",
+        "terminal_post_holdout"
+      ]
+    },
+    "layout": [
+      {
+        "active_channel": 0,
+        "actual_path_only_pcm_sha256": "8c38ad38dbd54f01a16d432062151d3509c24ee845fbe2aea7a7d73c6ecfd1cd",
+        "central_repeat_samples": 32768,
+        "central_repeat_starts": [
+          16384,
+          49152
+        ],
+        "epoch": "fit_pre_0",
+        "kind": "clock_block",
+        "opposite_channel_actual_max_abs_dft": 0.0,
+        "opposite_channel_exact_zero": true,
+        "path": "primary",
+        "prefix_samples": 16384,
+        "stage": "preterminal_fit",
+        "start_frame": 0,
+        "stop_frame": 98304,
+        "suffix_samples": 16384
+      },
+      {
+        "active_channel": 1,
+        "actual_path_only_pcm_sha256": "e2a08526fdd6e8038515def099ecd66bc5455f6cc125d683cb75cecb7ef0d498",
+        "central_repeat_samples": 32768,
+        "central_repeat_starts": [
+          114688,
+          147456
+        ],
+        "epoch": "fit_pre_0",
+        "kind": "clock_block",
+        "opposite_channel_actual_max_abs_dft": 0.0,
+        "opposite_channel_exact_zero": true,
+        "path": "secondary",
+        "prefix_samples": 16384,
+        "stage": "preterminal_fit",
+        "start_frame": 98304,
+        "stop_frame": 196608,
+        "suffix_samples": 16384
+      },
+      {
+        "active_channel": 0,
+        "actual_submitted_not_above_meter": true,
+        "actual_submitted_total_power": 2.236105501651764e-06,
+        "actual_submitted_vs_meter_db": -0.4354513906504307,
+        "central_start_frame": 212992,
+        "central_stop_frame": 245760,
+        "continuous_clock_pilot_present": false,
+        "kind": "near_white_pe_slot",
+        "official_meter_total_power": 2.4719371770819027e-06,
+        "opposite_channel_exact_zero": true,
+        "path": "primary",
+        "payload_pcm_sha256": "78e31ac488430715a2096fe81a10657c90ed28fb66577b9f9d02388d528fa704",
+        "peak_pcm": 49,
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "fit_a",
+        "start_frame": 196608,
+        "stop_frame": 262144
+      },
+      {
+        "active_channel": 1,
+        "actual_submitted_not_above_meter": true,
+        "actual_submitted_total_power": 2.236105501651764e-06,
+        "actual_submitted_vs_meter_db": -0.4354513906504307,
+        "central_start_frame": 278528,
+        "central_stop_frame": 311296,
+        "continuous_clock_pilot_present": false,
+        "kind": "near_white_pe_slot",
+        "official_meter_total_power": 2.4719371770819027e-06,
+        "opposite_channel_exact_zero": true,
+        "path": "secondary",
+        "payload_pcm_sha256": "e9398696266cd90a4c531d41cc12a75e155371e08bc0999210161eb7b357a4be",
+        "peak_pcm": 49,
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "fit_a",
+        "start_frame": 262144,
+        "stop_frame": 327680
+      },
+      {
+        "active_channel": 0,
+        "actual_path_only_pcm_sha256": "8c38ad38dbd54f01a16d432062151d3509c24ee845fbe2aea7a7d73c6ecfd1cd",
+        "central_repeat_samples": 32768,
+        "central_repeat_starts": [
+          344064,
+          376832
+        ],
+        "epoch": "fit_pre_1",
+        "kind": "clock_block",
+        "opposite_channel_actual_max_abs_dft": 0.0,
+        "opposite_channel_exact_zero": true,
+        "path": "primary",
+        "prefix_samples": 16384,
+        "stage": "preterminal_fit",
+        "start_frame": 327680,
+        "stop_frame": 425984,
+        "suffix_samples": 16384
+      },
+      {
+        "active_channel": 1,
+        "actual_path_only_pcm_sha256": "e2a08526fdd6e8038515def099ecd66bc5455f6cc125d683cb75cecb7ef0d498",
+        "central_repeat_samples": 32768,
+        "central_repeat_starts": [
+          442368,
+          475136
+        ],
+        "epoch": "fit_pre_1",
+        "kind": "clock_block",
+        "opposite_channel_actual_max_abs_dft": 0.0,
+        "opposite_channel_exact_zero": true,
+        "path": "secondary",
+        "prefix_samples": 16384,
+        "stage": "preterminal_fit",
+        "start_frame": 425984,
+        "stop_frame": 524288,
+        "suffix_samples": 16384
+      },
+      {
+        "active_channel": 0,
+        "actual_submitted_not_above_meter": true,
+        "actual_submitted_total_power": 2.236105501651764e-06,
+        "actual_submitted_vs_meter_db": -0.4354513906504307,
+        "central_start_frame": 540672,
+        "central_stop_frame": 573440,
+        "continuous_clock_pilot_present": false,
+        "kind": "near_white_pe_slot",
+        "official_meter_total_power": 2.4719371770819027e-06,
+        "opposite_channel_exact_zero": true,
+        "path": "primary",
+        "payload_pcm_sha256": "5408bbb55583032ade5c072f87f344aa96c2c049e59c354bb850e5da1d066c4a",
+        "peak_pcm": 49,
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "fit_b",
+        "start_frame": 524288,
+        "stop_frame": 589824
+      },
+      {
+        "active_channel": 1,
+        "actual_submitted_not_above_meter": true,
+        "actual_submitted_total_power": 2.236105501651764e-06,
+        "actual_submitted_vs_meter_db": -0.4354513906504307,
+        "central_start_frame": 606208,
+        "central_stop_frame": 638976,
+        "continuous_clock_pilot_present": false,
+        "kind": "near_white_pe_slot",
+        "official_meter_total_power": 2.4719371770819027e-06,
+        "opposite_channel_exact_zero": true,
+        "path": "secondary",
+        "payload_pcm_sha256": "1f0f0fce90c4a1104700aed0a6513368ed1e078cc5b1ac84f9a817826e173355",
+        "peak_pcm": 49,
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "fit_b",
+        "start_frame": 589824,
+        "stop_frame": 655360
+      },
+      {
+        "active_channel": 0,
+        "actual_path_only_pcm_sha256": "8c38ad38dbd54f01a16d432062151d3509c24ee845fbe2aea7a7d73c6ecfd1cd",
+        "central_repeat_samples": 32768,
+        "central_repeat_starts": [
+          671744,
+          704512
+        ],
+        "epoch": "fit_pre_2",
+        "kind": "clock_block",
+        "opposite_channel_actual_max_abs_dft": 0.0,
+        "opposite_channel_exact_zero": true,
+        "path": "primary",
+        "prefix_samples": 16384,
+        "stage": "preterminal_fit",
+        "start_frame": 655360,
+        "stop_frame": 753664,
+        "suffix_samples": 16384
+      },
+      {
+        "active_channel": 1,
+        "actual_path_only_pcm_sha256": "e2a08526fdd6e8038515def099ecd66bc5455f6cc125d683cb75cecb7ef0d498",
+        "central_repeat_samples": 32768,
+        "central_repeat_starts": [
+          770048,
+          802816
+        ],
+        "epoch": "fit_pre_2",
+        "kind": "clock_block",
+        "opposite_channel_actual_max_abs_dft": 0.0,
+        "opposite_channel_exact_zero": true,
+        "path": "secondary",
+        "prefix_samples": 16384,
+        "stage": "preterminal_fit",
+        "start_frame": 753664,
+        "stop_frame": 851968,
+        "suffix_samples": 16384
+      },
+      {
+        "active_channel": 0,
+        "actual_submitted_not_above_meter": true,
+        "actual_submitted_total_power": 2.236105501651764e-06,
+        "actual_submitted_vs_meter_db": -0.4354513906504307,
+        "central_start_frame": 868352,
+        "central_stop_frame": 901120,
+        "continuous_clock_pilot_present": false,
+        "kind": "near_white_pe_slot",
+        "official_meter_total_power": 2.4719371770819027e-06,
+        "opposite_channel_exact_zero": true,
+        "path": "primary",
+        "payload_pcm_sha256": "ae6132289f2bb7a925a8db588eb9c9a497a353e05443f2b6ddeca89463d70d48",
+        "peak_pcm": 49,
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "holdout",
+        "start_frame": 851968,
+        "stop_frame": 917504
+      },
+      {
+        "active_channel": 1,
+        "actual_submitted_not_above_meter": true,
+        "actual_submitted_total_power": 2.236105501651764e-06,
+        "actual_submitted_vs_meter_db": -0.4354513906504307,
+        "central_start_frame": 933888,
+        "central_stop_frame": 966656,
+        "continuous_clock_pilot_present": false,
+        "kind": "near_white_pe_slot",
+        "official_meter_total_power": 2.4719371770819027e-06,
+        "opposite_channel_exact_zero": true,
+        "path": "secondary",
+        "payload_pcm_sha256": "0b62a8b3ac809a0a1b045b23b5a8d015b4abda6efa8b691acadca8be5b5071fd",
+        "peak_pcm": 49,
+        "post_boundary_exclusion_samples": 16384,
+        "pre_boundary_exclusion_samples": 16384,
+        "role": "holdout",
+        "start_frame": 917504,
+        "stop_frame": 983040
+      },
+      {
+        "active_channel": 0,
+        "actual_path_only_pcm_sha256": "8c38ad38dbd54f01a16d432062151d3509c24ee845fbe2aea7a7d73c6ecfd1cd",
+        "central_repeat_samples": 32768,
+        "central_repeat_starts": [
+          999424,
+          1032192
+        ],
+        "epoch": "terminal_post_holdout",
+        "kind": "clock_block",
+        "opposite_channel_actual_max_abs_dft": 0.0,
+        "opposite_channel_exact_zero": true,
+        "path": "primary",
+        "prefix_samples": 16384,
+        "stage": "terminal_validation",
+        "start_frame": 983040,
+        "stop_frame": 1081344,
+        "suffix_samples": 16384
+      },
+      {
+        "active_channel": 1,
+        "actual_path_only_pcm_sha256": "e2a08526fdd6e8038515def099ecd66bc5455f6cc125d683cb75cecb7ef0d498",
+        "central_repeat_samples": 32768,
+        "central_repeat_starts": [
+          1097728,
+          1130496
+        ],
+        "epoch": "terminal_post_holdout",
+        "kind": "clock_block",
+        "opposite_channel_actual_max_abs_dft": 0.0,
+        "opposite_channel_exact_zero": true,
+        "path": "secondary",
+        "prefix_samples": 16384,
+        "stage": "terminal_validation",
+        "start_frame": 1081344,
+        "stop_frame": 1179648,
+        "suffix_samples": 16384
+      }
+    ],
+    "live_authority": null,
+    "period_samples": 32768,
+    "publisher_contract": {
+      "capture_writer_bound": false,
+      "live_capture_authority": null,
+      "must_not_exist_before_capture": true,
+      "raw_npz_schema": "fullband_causal_live_raw_v6_v1",
+      "raw_session_relative_path": "results/fullband_causal_v6/raw_capture.npz",
+      "role": "signal_only_no_raw_writer_in_this_module"
+    },
+    "raw_session_relative_path": "results/fullband_causal_v6/raw_capture.npz",
+    "role": "pure_signal_only_no_audio_no_publisher",
+    "sample_rate": 48000,
+    "schema": "fullband_causal_time_separated_clock_v6",
+    "v5_builder_schema_and_default_raw_preserved": true
+  },
+  "support_1024_condition_receipt": {
+    "actual_submitted_pcm_sha256": "4e8a66b983af872192624bd6759282058cfe4a845460111a24bcd684b22551a3",
+    "canonical_payload_sha256": "211f581296d9d99927241a08c7a1096615246d68fe6702db8ff241cf1f582034",
+    "condition_scope": "exact finite-support periodic normal matrix X^T X; not an acoustic transfer condition",
+    "fit_roles": [
+      "fit_a",
+      "fit_b"
+    ],
+    "joint_fit_condition_number": 1.964953906309,
+    "longer_supports": {
+      "2048": "NOT_AUDITED_NO_CLAIM",
+      "4096": "NOT_AUDITED_NO_CLAIM",
+      "8192": "NOT_AUDITED_NO_CLAIM"
+    },
+    "maximum_allowed": 20.0,
+    "maximum_eigenvalue": 220096155.2048,
+    "minimum_eigenvalue": 112010848.9559,
+    "numeric_canonicalization": {
+      "absolute_grid_decimals_below_1e_minus_10": 12,
+      "applied_after_unrounded_gate_decision": true,
+      "non_tiny_float_significant_digits": 13,
+      "purpose": "BLAS_reduction_order_independent_receipt_bytes",
+      "schema": "fullband_v6_condition_numeric_canonicalization_v1"
+    },
+    "operator_definition": {
+      "coefficient_path_order": [
+        "primary",
+        "secondary"
+      ],
+      "equivalent_frequency_phase": "exp(-j*2*pi*k*zeros/period)",
+      "operator": "two_row_two_input_periodic_convolution_finite_support",
+      "period_samples": 32768,
+      "row_order": [
+        "primary_slot",
+        "secondary_slot"
+      ],
+      "shift_convention": "x_shifted[n]=x[(n-zeros_before_fir) mod period]",
+      "support_samples": 1024,
+      "zeros_before_fir_samples": {
+        "primary": 0,
+        "secondary": 0
+      }
+    },
+    "operator_definition_sha256": "1d7f89c74f4b72f7ec5b46657007559a8728ad35d7ffeef67aa154044bc24d5b",
+    "operator_normal_vector_relative_error": 0.0,
+    "operator_quadratic_form_crosscheck_passed": true,
+    "operator_quadratic_form_maximum_allowed": 1e-10,
+    "operator_quadratic_form_probe_receipts": [
+      {
+        "normal_vector_relative_error": 0.0,
+        "probe_index": 0,
+        "quadratic_form_relative_error": 0.0
+      },
+      {
+        "normal_vector_relative_error": 0.0,
+        "probe_index": 1,
+        "quadratic_form_relative_error": 0.0
+      },
+      {
+        "normal_vector_relative_error": 0.0,
+        "probe_index": 2,
+        "quadratic_form_relative_error": 0.0
+      },
+      {
+        "normal_vector_relative_error": 0.0,
+        "probe_index": 3,
+        "quadratic_form_relative_error": 0.0
+      }
+    ],
+    "operator_quadratic_form_relative_error": 0.0,
+    "passed": true,
+    "periodic_normal_matrix_gram_condition_number": 1.964953906309,
+    "role_condition_numbers": {
+      "fit_a": 2.772512848301,
+      "fit_b": 3.19702139832
+    },
+    "schema": "fullband_causal_exact_gram_condition_v6",
+    "signal_plan_payload_sha256": "8b37213a13131a071e10527c948580c906dfd914a1134e98a640ead259ba42f7",
+    "support_samples": 1024,
+    "zeros_before_fir_samples": [
+      0,
+      0
+    ]
+  }
+}

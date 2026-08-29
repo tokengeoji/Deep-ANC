@@ -71,18 +71,24 @@ def _tv(value: Any, name: str) -> float:
     return float(raw)
 
 
-def capture_duplex_v5(
+def _capture_duplex(
     backend: Any,
     *,
     submitted_pcm: np.ndarray,
     input_device: int,
     output_device: int,
+    telemetry_schema: str,
+    include_pre_open_telemetry: bool,
     pre_open_check: Callable[[], None] | None = None,
     watchdog_grace_seconds: float = 2.0,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     on_output_closed: Callable[[bool], None] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    if not isinstance(telemetry_schema, str) or not telemetry_schema:
+        raise ValueError("duplex telemetry schema는 비어 있지 않은 문자열이어야 합니다")
+    if type(include_pre_open_telemetry) is not bool:
+        raise ValueError("include_pre_open_telemetry는 exact bool이어야 합니다")
     planned = np.asarray(submitted_pcm)
     if (
         planned.dtype != np.dtype("<i2")
@@ -112,9 +118,11 @@ def capture_duplex_v5(
     invalid: list[str] = []
     rows: list[tuple[Any, ...]] = []
     last_times = None
-    capture_monotonic_started = float(monotonic())
-    if not np.isfinite(capture_monotonic_started):
-        raise ValueError("capture monotonic start는 finite여야 합니다")
+    pre_open_monotonic_started = float(monotonic())
+    if not np.isfinite(pre_open_monotonic_started):
+        raise ValueError("pre-open monotonic start는 finite여야 합니다")
+    pre_open_monotonic_completed = pre_open_monotonic_started
+    capture_monotonic_started: float | None = None
 
     def callback(indata, outdata, frames, time_info, status):  # noqa: ANN001
         nonlocal cursor, completed, callback_error, last_times
@@ -197,8 +205,19 @@ def capture_duplex_v5(
     signal_scope.__enter__()
     try:
         try:
-            if pre_open_check:
-                pre_open_check()
+            try:
+                if pre_open_check:
+                    pre_open_check()
+            finally:
+                completed_candidate = float(monotonic())
+                if (
+                    not np.isfinite(completed_candidate)
+                    or completed_candidate < pre_open_monotonic_started
+                ):
+                    raise ValueError(
+                        "pre-open monotonic completion은 finite nondecreasing이어야 합니다"
+                    )
+                pre_open_monotonic_completed = completed_candidate
             stream = backend.Stream(
                 samplerate=48_000,
                 blocksize=256,
@@ -209,6 +228,15 @@ def capture_duplex_v5(
                 callback=callback,
                 prime_output_buffers_using_stream_callback=False,
             )
+            started_candidate = float(monotonic())
+            if (
+                not np.isfinite(started_candidate)
+                or started_candidate < pre_open_monotonic_completed
+            ):
+                raise ValueError(
+                    "capture monotonic start는 Stream.start 직전 finite 값이어야 합니다"
+                )
+            capture_monotonic_started = started_candidate
             stream.start()
             deadline = capture_monotonic_started + total / 48_000 + grace
             while not completed:
@@ -249,11 +277,17 @@ def capture_duplex_v5(
     finally:
         signal_scope.__exit__(None, None, None)
 
-    try:
-        capture_monotonic_completed = float(monotonic())
-    except BaseException as exc:
-        failure = failure or exc
+    if capture_monotonic_started is None:
+        # Stream.start 전 실패에는 capture window가 존재하지 않는다. 기존 v5 finite
+        # failure telemetry 호환을 위해 pre-open 종료점의 zero-duration으로 표시한다.
+        capture_monotonic_started = pre_open_monotonic_completed
         capture_monotonic_completed = capture_monotonic_started
+    else:
+        try:
+            capture_monotonic_completed = float(monotonic())
+        except BaseException as exc:
+            failure = failure or exc
+            capture_monotonic_completed = capture_monotonic_started
     if not np.isfinite(capture_monotonic_completed):
         failure = failure or ValueError("capture monotonic completion은 finite여야 합니다")
     capture_monotonic_elapsed = capture_monotonic_completed - capture_monotonic_started
@@ -265,7 +299,7 @@ def capture_duplex_v5(
 
     masks = col(6, "<u4")
     telemetry = {
-        "schema": DUPLEX_TELEMETRY_SCHEMA,
+        "schema": telemetry_schema,
         "callback_frame_semantics": (
             "software_accounting_only_not_hardware_slip_witness"
         ),
@@ -319,6 +353,16 @@ def capture_duplex_v5(
         ),
         "output_stop_confirmed": bool(stream is None or close_error is None),
     }
+    if include_pre_open_telemetry:
+        telemetry.update(
+            {
+                "pre_open_monotonic_started": pre_open_monotonic_started,
+                "pre_open_monotonic_completed": pre_open_monotonic_completed,
+                "pre_open_monotonic_elapsed_seconds": (
+                    pre_open_monotonic_completed - pre_open_monotonic_started
+                ),
+            }
+        )
     errors = [
         error
         for error in (failure, stop_error, abort_error, close_error)
@@ -339,3 +383,32 @@ def capture_duplex_v5(
         "capture_valid_mask": cap_valid,
         "submitted_valid_mask": out_valid,
     }
+
+
+def capture_duplex_v5(
+    backend: Any,
+    *,
+    submitted_pcm: np.ndarray,
+    input_device: int,
+    output_device: int,
+    pre_open_check: Callable[[], None] | None = None,
+    watchdog_grace_seconds: float = 2.0,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    on_output_closed: Callable[[bool], None] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """기존 v5 public API와 telemetry schema를 byte-for-byte 유지한다."""
+
+    return _capture_duplex(
+        backend,
+        submitted_pcm=submitted_pcm,
+        input_device=input_device,
+        output_device=output_device,
+        telemetry_schema=DUPLEX_TELEMETRY_SCHEMA,
+        include_pre_open_telemetry=False,
+        pre_open_check=pre_open_check,
+        watchdog_grace_seconds=watchdog_grace_seconds,
+        monotonic=monotonic,
+        sleep=sleep,
+        on_output_closed=on_output_closed,
+    )

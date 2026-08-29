@@ -1,7 +1,29 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-28. 작업 브랜치: `fix/finetune-readiness-repair`.
+> 최종 갱신: 2026-08-29. 현재 실측 작업 브랜치: `work/v6-clock-checkpoints`.
+
+## 0-A. 2026-08-29 fullband causal v6 실측 준비
+
+기존 2026-08-27 고주파 raw는 공통 clock 유효 주기가 0개라 P/S를 발행하지 않은
+`Invalid experiment`였다. 이를 진단 수치로 승격하지 않고, 시간 분리 clock checkpoint
+8개와 near-white P/S slot 6개를 쓰는 v6 계약을 별도 브랜치에서 구현했다.
+
+- 48 kHz/256, exact 24.576초, ch0 primary와 ch1 secondary를 순차 구동한다.
+- 식별 gate는 88.388–11,313.708 Hz의 8개 물리 부대역을 모두 검사한다.
+- v5 telemetry schema v4는 유지하고 v6만 pre-open timing이 결속된 schema v2를 쓴다.
+- meter와 live/offline 모두 current clean commit·branch·실행 script SHA가 다르면 출력/분석
+  전에 거부한다.
+- success publisher는 immutable raw에서 분석을 독립 재실행해 caller 결과와 byte-exact일
+  때만 analysis/operator를 발행한다.
+- plan payload `8b37213a13131a071e10527c948580c906dfd914a1134e98a640ead259ba42f7`,
+  PCM `4e8a66b983af872192624bd6759282058cfe4a845460111a24bcd684b22551a3`다.
+- 세부 계약과 실행 순서는 `docs/39_fullband_causal_v6_clock_checkpoints.md`에 있다.
+
+아직 v6 실제 소리는 출력하지 않았고 raw/P/S도 없다. 전체 pytest, 무음 dry-run,
+비밀정보·diff 검사, clean commit/push를 완료한 뒤 exact 20초 meter와 24.576초 P/S를
+각각 한 번만 실행한다. 따라서 현 시점에 2/4/8 kHz 실제 ANC 감쇠 dB 또는 canonical
+학습 준비 완료를 주장하지 않는다.
 
 ## 0. 현재 결론
 

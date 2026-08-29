@@ -25,11 +25,14 @@ import numpy as np
 
 
 LIVE_RAW_SCHEMA = "fullband_causal_live_raw_v5_v1"
+LIVE_RAW_SCHEMA_V6 = "fullband_causal_live_raw_v6_v1"
 PREFLIGHT_REPORT_SCHEMA = "fullband_input_preflight_report_v1"
 PREFLIGHT_IDENTITY_SCHEMA = "fullband_input_preflight_identity_v1"
 HARDWARE_BINDING_SCHEMA = "jetson_measurement_hardware_v1"
 SESSION_SCHEMA = "fullband_causal_v5_live_session_v1"
+SESSION_SCHEMA_V6 = "fullband_causal_v6_live_session_v1"
 POST_CAPTURE_BINDING_SCHEMA = "fullband_causal_v5_post_capture_binding_v1"
+POST_CAPTURE_BINDING_SCHEMA_V6 = "fullband_causal_v6_post_capture_binding_v1"
 WRITER_CONTRACT_SCHEMA = "fullband_live_raw_container_writer_v1"
 MAX_METER_AGE_SECONDS = 600.0
 TIME_TOLERANCE_SECONDS = 1.0e-3
@@ -194,10 +197,12 @@ POST_CAPTURE_BINDING_KEYS = {
 }
 
 
-def _audio_module() -> Any:
-    """공개 audio 계약을 런타임에 읽어 schema 문자열 복제를 피한다."""
+def _audio_module(generation: str = "v5") -> Any:
+    """세대별 공개 audio 계약을 런타임에 읽어 schema 문자열 복제를 피한다."""
 
-    module = importlib.import_module("deep_anc.audio_duplex_v5")
+    if generation not in {"v5", "v6"}:
+        raise ValueError("알 수 없는 duplex generation입니다")
+    module = importlib.import_module(f"deep_anc.audio_duplex_{generation}")
     required = (
         "DUPLEX_TELEMETRY_SCHEMA",
         "DuplexCaptureFailure",
@@ -207,14 +212,26 @@ def _audio_module() -> Any:
     )
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
-        raise RuntimeError(f"audio_duplex_v5 공개 계약이 부족합니다: {missing}")
+        raise RuntimeError(f"audio_duplex_{generation} 공개 계약이 부족합니다: {missing}")
     return module
 
 
-def _authority_module() -> Any:
-    """Raw admission의 trust root인 committed live authority 상수를 읽는다."""
+def _authority_module(plan_envelope_schema: str | None = None) -> Any:
+    """Raw admission의 trust root를 plan-envelope schema로 명시 선택한다.
 
-    module = importlib.import_module("deep_anc.dsp.fullband_live_authority_v5")
+    인자가 없는 기존 호출은 v5를 유지한다.  새 generation은 저장된 binding의
+    envelope schema가 정확히 일치할 때만 선택하며, import 실패를 v5 fallback으로
+    바꾸지 않는다.
+    """
+
+    v5 = importlib.import_module("deep_anc.dsp.fullband_live_authority_v5")
+    if plan_envelope_schema in (None, v5.PLAN_ENVELOPE_SCHEMA):
+        module = v5
+    else:
+        v6 = importlib.import_module("deep_anc.dsp.fullband_live_authority_v6")
+        if plan_envelope_schema != v6.PLAN_ENVELOPE_SCHEMA:
+            raise ValueError("알 수 없는 fullband plan-envelope schema입니다")
+        module = v6
     required = (
         "AUTHORITY_SCHEMA",
         "PLAN_ENVELOPE_SCHEMA",
@@ -233,6 +250,34 @@ def _authority_module() -> Any:
     if missing:
         raise RuntimeError(f"fullband live authority 공개 계약이 부족합니다: {missing}")
     return module
+
+
+def _generation_profile(bindings: Mapping[str, Any]) -> dict[str, Any]:
+    """동일 immutable writer가 허용하는 generation별 exact schema/path 계약."""
+
+    signal_plan = bindings.get("signal_plan")
+    if not isinstance(signal_plan, Mapping):
+        raise ValueError("generation profile에 signal_plan binding이 필요합니다")
+    authority = _authority_module(signal_plan.get("schema"))
+    if authority.__name__.endswith("fullband_live_authority_v5"):
+        return {
+            "authority": authority,
+            "audio": _audio_module("v5"),
+            "live_raw_schema": LIVE_RAW_SCHEMA,
+            "session_schema": SESSION_SCHEMA,
+            "post_capture_binding_schema": POST_CAPTURE_BINDING_SCHEMA,
+            "adapter_path": "scripts/data/measure_paths_fullband_causal_v5.py",
+        }
+    if authority.__name__.endswith("fullband_live_authority_v6"):
+        return {
+            "authority": authority,
+            "audio": _audio_module("v6"),
+            "live_raw_schema": LIVE_RAW_SCHEMA_V6,
+            "session_schema": SESSION_SCHEMA_V6,
+            "post_capture_binding_schema": POST_CAPTURE_BINDING_SCHEMA_V6,
+            "adapter_path": "scripts/data/measure_paths_fullband_causal_v6.py",
+        }
+    raise ValueError("지원하지 않는 fullband live authority module입니다")
 
 
 def _owned_array(value: Any) -> np.ndarray:
@@ -340,7 +385,8 @@ def _validate_bindings(value: Any) -> dict[str, Any]:
         if not isinstance(result[name]["schema"], str) or not result[name]["schema"]:
             raise ValueError(f"binding.{name}.schema가 필요합니다")
 
-    authority_contract = _authority_module()
+    profile = _generation_profile(result)
+    authority_contract = profile["authority"]
     measurement_contract = importlib.import_module("deep_anc.dsp.measurement_level")
     expected_schemas = {
         "signal_plan": authority_contract.PLAN_ENVELOPE_SCHEMA,
@@ -508,11 +554,12 @@ def _validate_post_binding(
     *,
     bindings: Mapping[str, Any],
     session: Mapping[str, Any],
+    profile: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
     binding = _exact_mapping(
         value, POST_CAPTURE_BINDING_KEYS, label="post_capture_binding"
     )
-    if binding["schema"] != POST_CAPTURE_BINDING_SCHEMA:
+    if binding["schema"] != profile["post_capture_binding_schema"]:
         raise ValueError("post_capture_binding.schema가 exact하지 않습니다")
     if type(binding["valid"]) is not bool:
         raise ValueError("post_capture_binding.valid는 exact bool이어야 합니다")
@@ -566,9 +613,11 @@ def _validate_post_binding(
     return checked, invalid
 
 
-def _validate_session(value: Any) -> tuple[dict[str, Any], list[str]]:
+def _validate_session(
+    value: Any, *, profile: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
     session = _exact_mapping(value, SESSION_KEYS, label="live raw session")
-    if session["schema"] != SESSION_SCHEMA:
+    if session["schema"] != profile["session_schema"]:
         raise ValueError("session.schema가 exact하지 않습니다")
     capture_id = session["capture_id"]
     if (
@@ -607,7 +656,7 @@ def _validate_session(value: Any) -> tuple[dict[str, Any], list[str]]:
         raise ValueError("session.repository_branch가 필요합니다")
     if session["repository_dirty"] is not False:
         raise ValueError("session.repository_dirty는 exact false여야 합니다")
-    if session["adapter_path"] != "scripts/data/measure_paths_fullband_causal_v5.py":
+    if session["adapter_path"] != profile["adapter_path"]:
         raise ValueError("session.adapter_path가 canonical adapter와 다릅니다")
     session["adapter_file_sha256"] = _sha256(
         session["adapter_file_sha256"], label="session.adapter_file_sha256"
@@ -764,8 +813,8 @@ def _prefix_length(mask: np.ndarray, *, label: str) -> int:
     return prefix
 
 
-def _telemetry_scalar_keys() -> set[str]:
-    return {
+def _telemetry_scalar_keys(*, telemetry_schema: str) -> set[str]:
+    keys = {
         "schema",
         "callback_frame_semantics",
         "portaudio_xrun_status_witness",
@@ -797,12 +846,34 @@ def _telemetry_scalar_keys() -> set[str]:
         "normal_stop_completed",
         "output_stop_confirmed",
     }
+    if telemetry_schema == _audio_module("v5").DUPLEX_TELEMETRY_SCHEMA:
+        return keys
+    if telemetry_schema == _audio_module("v6").DUPLEX_TELEMETRY_SCHEMA:
+        keys.update(
+            {
+                "pre_open_monotonic_started",
+                "pre_open_monotonic_completed",
+                "pre_open_monotonic_elapsed_seconds",
+            }
+        )
+    else:
+        raise ValueError("알 수 없는 duplex telemetry schema입니다")
+    return keys
 
 
 def _normalize_capture(
-    capture: Any,
+    capture: Any, *, expected_telemetry_schema: str,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any], str | None]:
-    audio = _audio_module()
+    if expected_telemetry_schema == _audio_module("v5").DUPLEX_TELEMETRY_SCHEMA:
+        generation = "v5"
+    elif expected_telemetry_schema == _audio_module("v6").DUPLEX_TELEMETRY_SCHEMA:
+        generation = "v6"
+    else:
+        raise ValueError("알 수 없는 expected duplex telemetry schema입니다")
+    audio = _audio_module(generation)
+    scalar_keys = _telemetry_scalar_keys(
+        telemetry_schema=expected_telemetry_schema
+    )
     if isinstance(capture, audio.DuplexCaptureFailure):
         telemetry = dict(capture.telemetry)
         captured = _owned_array(capture.captured_pcm)
@@ -815,7 +886,7 @@ def _normalize_capture(
             raise TypeError("capture는 capture_duplex_v5 성공 tuple 또는 DuplexCaptureFailure여야 합니다")
         captured = _owned_array(capture[0])
         telemetry = dict(capture[1]) if isinstance(capture[1], Mapping) else {}
-        expected_keys = _telemetry_scalar_keys() | set(TELEMETRY_ARRAY_FIELDS) | {
+        expected_keys = scalar_keys | set(TELEMETRY_ARRAY_FIELDS) | {
             "actual_submitted_pcm", "capture_valid_mask", "submitted_valid_mask"
         }
         if set(telemetry) != expected_keys:
@@ -824,7 +895,7 @@ def _normalize_capture(
         cap_mask = _owned_array(telemetry.pop("capture_valid_mask"))
         out_mask = _owned_array(telemetry.pop("submitted_valid_mask"))
         capture_exception = None
-    if set(telemetry) != (_telemetry_scalar_keys() | set(TELEMETRY_ARRAY_FIELDS)):
+    if set(telemetry) != (scalar_keys | set(TELEMETRY_ARRAY_FIELDS)):
         raise ValueError("duplex telemetry key 집합이 exact하지 않습니다")
     arrays = {
         "actual_submitted_pcm": actual,
@@ -847,7 +918,9 @@ def _validate_and_build_metadata(
     operator_confirmations: Mapping[str, Any],
     post_capture_binding: Mapping[str, Any],
 ) -> dict[str, Any]:
-    audio = _audio_module()
+    checked_bindings = _validate_bindings(bindings)
+    profile = _generation_profile(checked_bindings)
+    audio = profile["audio"]
     if set(arrays) != set(RAW_ARRAY_FIELDS):
         raise ValueError("live raw array key 집합이 exact하지 않습니다")
     planned = np.asarray(arrays["planned_submitted_pcm"])
@@ -914,7 +987,11 @@ def _validate_and_build_metadata(
         if not np.all(np.isfinite(values)) or np.any(np.diff(values) <= 0.0):
             raise ValueError(f"{name}가 finite strict-monotonic이 아닙니다")
 
-    scalar = _exact_mapping(telemetry, _telemetry_scalar_keys(), label="duplex telemetry scalar")
+    scalar = _exact_mapping(
+        telemetry,
+        _telemetry_scalar_keys(telemetry_schema=audio.DUPLEX_TELEMETRY_SCHEMA),
+        label="duplex telemetry scalar",
+    )
     if scalar["schema"] != audio.DUPLEX_TELEMETRY_SCHEMA:
         raise ValueError("duplex telemetry schema가 현재 audio public contract와 다릅니다")
     exact_contract = {
@@ -967,6 +1044,30 @@ def _validate_and_build_metadata(
         abs_tol=1.0e-9,
     ):
         raise ValueError("duplex monotonic elapsed 재계산이 다릅니다")
+    if audio.__name__.endswith("audio_duplex_v6"):
+        for name in (
+            "pre_open_monotonic_started",
+            "pre_open_monotonic_completed",
+            "pre_open_monotonic_elapsed_seconds",
+        ):
+            if type(scalar[name]) is not float or not math.isfinite(scalar[name]):
+                raise ValueError(f"v6 duplex telemetry {name}은 exact finite float여야 합니다")
+        pre_open_started = scalar["pre_open_monotonic_started"]
+        pre_open_completed = scalar["pre_open_monotonic_completed"]
+        pre_open_elapsed = scalar["pre_open_monotonic_elapsed_seconds"]
+        if (
+            pre_open_started < 0.0
+            or pre_open_completed < pre_open_started
+            or pre_open_elapsed < 0.0
+            or monotonic_started < pre_open_completed
+            or not math.isclose(
+                pre_open_completed - pre_open_started,
+                pre_open_elapsed,
+                rel_tol=0.0,
+                abs_tol=1.0e-9,
+            )
+        ):
+            raise ValueError("v6 duplex pre-open/capture monotonic 순서가 잘못됐습니다")
     status = callback_arrays["callback_status_bitmask"]
     xrun_count = int(np.count_nonzero(status & int(audio.STATUS_XRUN_MASK)))
     status_count = int(np.count_nonzero(status & int(audio.STATUS_PRESENT)))
@@ -991,7 +1092,6 @@ def _validate_and_build_metadata(
     ):
         raise ValueError("duplex telemetry termination_signal이 유효하지 않습니다")
 
-    checked_bindings = _validate_bindings(bindings)
     if scalar["resolved_input_device"] != checked_bindings["hardware"]["resolved_devices"]["input"]:
         raise ValueError("duplex resolved input device가 hardware binding과 다릅니다")
     if scalar["resolved_output_device"] != checked_bindings["hardware"]["resolved_devices"]["output"]:
@@ -1000,7 +1100,9 @@ def _validate_and_build_metadata(
         raise ValueError("planned PCM SHA가 signal plan binding과 다릅니다")
     if _array_sha256(preflight) != checked_bindings["preflight"]["raw_sha256"]:
         raise ValueError("preflight raw SHA가 binding과 다릅니다")
-    checked_session, chronology_invalid = _validate_session(session)
+    checked_session, chronology_invalid = _validate_session(
+        session, profile=profile
+    )
     checked_preflight_report = _validate_preflight_report(
         preflight_report,
         preflight_raw=preflight,
@@ -1009,7 +1111,10 @@ def _validate_and_build_metadata(
     )
     confirmations = _validate_confirmations(operator_confirmations)
     post_binding, post_invalid = _validate_post_binding(
-        post_capture_binding, bindings=checked_bindings, session=checked_session
+        post_capture_binding,
+        bindings=checked_bindings,
+        session=checked_session,
+        profile=profile,
     )
     if capture_exception is not None and (not isinstance(capture_exception, str) or not capture_exception):
         raise ValueError("capture_exception은 None 또는 nonempty string이어야 합니다")
@@ -1063,7 +1168,7 @@ def _validate_and_build_metadata(
 
     safe_scalar = json.loads(_canonical_json_bytes(scalar).decode("utf-8"))
     metadata = {
-        "schema": LIVE_RAW_SCHEMA,
+        "schema": profile["live_raw_schema"],
         "status": "CAPTURE_PASS" if success else "INVALID",
         "valid": success,
         "analysis_admission_eligible": False,
@@ -1255,7 +1360,12 @@ def publish_live_raw_v5(
     owned_preflight = _owned_array(preflight_raw_int32)
     session_input = _exact_mapping(session, SESSION_INPUT_KEYS, label="live raw session input")
     session_input["publisher_prepared_at_utc"] = _publisher_prepared_utc_now()
-    normalized, telemetry, capture_exception = _normalize_capture(capture)
+    checked_bindings = _validate_bindings(bindings)
+    profile = _generation_profile(checked_bindings)
+    normalized, telemetry, capture_exception = _normalize_capture(
+        capture,
+        expected_telemetry_schema=profile["audio"].DUPLEX_TELEMETRY_SCHEMA,
+    )
     arrays = {
         "planned_submitted_pcm": owned_planned,
         **normalized,
@@ -1407,7 +1517,8 @@ def load_live_raw_v5(
         raise ValueError("live raw canonical metadata JSON이 잘못됐습니다") from error
     if not isinstance(metadata, dict) or set(metadata) != METADATA_KEYS:
         raise ValueError("live raw metadata key 집합이 exact하지 않습니다")
-    if metadata.get("schema") != LIVE_RAW_SCHEMA:
+    profile = _generation_profile(checked_bindings)
+    if metadata.get("schema") != profile["live_raw_schema"]:
         raise ValueError("live raw metadata schema가 다릅니다")
     if metadata.get("bindings") != checked_bindings:
         raise ValueError("live raw authority binding이 expected binding과 다릅니다")
@@ -1461,9 +1572,12 @@ def admit_live_raw_v5_for_analysis(
 
 __all__ = [
     "LIVE_RAW_SCHEMA",
+    "LIVE_RAW_SCHEMA_V6",
+    "POST_CAPTURE_BINDING_SCHEMA_V6",
     "PREFLIGHT_REPORT_SCHEMA",
     "RAW_ARRAY_FIELDS",
     "TELEMETRY_ARRAY_FIELDS",
+    "SESSION_SCHEMA_V6",
     "admit_live_raw_v5_for_analysis",
     "load_live_raw_v5",
     "publish_live_raw_v5",

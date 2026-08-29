@@ -39,6 +39,7 @@ class Backend:
     def Stream(self, **kwargs):
         self.kwargs = kwargs
         outer = self
+        outer.calls.append("stream_created")
 
         class Stream:
             def start(self):
@@ -228,13 +229,55 @@ def test_external_plan_copy_and_watchdog_prefix():
     assert np.array_equal(telemetry["actual_submitted_pcm"], pcm())
 
     backend = Backend(blocks=2)
-    ticks = iter([0.0, 99.0, 99.0])
+    ticks = iter([0.0, 0.0, 0.0, 99.0, 99.0])
     with pytest.raises(DuplexCaptureFailure) as caught:
         run(backend, monotonic=lambda: next(ticks), sleep=lambda _: None)
     failure = caught.value
     assert failure.telemetry["captured_frames"] == 512
     assert np.all(failure.submitted_valid_mask[:512])
     assert not np.any(failure.submitted_valid_mask[512:])
+
+
+def test_slow_pre_open_is_excluded_from_capture_watchdog_and_elapsed():
+    backend = Backend()
+    ticks = iter([10.0, 71.0, 71.0, 71.025])
+
+    _, telemetry = run(
+        backend,
+        pre_open_check=lambda: None,
+        monotonic=lambda: next(ticks),
+        sleep=lambda _seconds: None,
+    )
+
+    assert telemetry["capture_monotonic_started"] == 71.0
+    assert telemetry["capture_monotonic_completed"] == 71.025
+    assert telemetry["capture_monotonic_elapsed_seconds"] == pytest.approx(0.025)
+    assert "pre_open_monotonic_started" not in telemetry
+    assert telemetry["normal_stop_completed"] is True
+
+
+def test_pre_open_failure_never_constructs_stream_or_submits_output():
+    backend = Backend()
+    ticks = iter([5.0, 66.0])
+
+    with pytest.raises(DuplexCaptureFailure, match="pre-open rejected") as caught:
+        run(
+            backend,
+            pre_open_check=lambda: (_ for _ in ()).throw(
+                RuntimeError("pre-open rejected")
+            ),
+            monotonic=lambda: next(ticks),
+            sleep=lambda _seconds: None,
+        )
+
+    failure = caught.value
+    assert backend.calls == []
+    assert backend.outputs == []
+    assert failure.telemetry["captured_frames"] == 0
+    assert failure.telemetry["submitted_frames"] == 0
+    assert failure.telemetry["capture_monotonic_started"] == 66.0
+    assert failure.telemetry["capture_monotonic_completed"] == 66.0
+    assert failure.telemetry["capture_monotonic_elapsed_seconds"] == 0.0
 
 
 def test_cleanup_errors_not_ignored():
@@ -267,7 +310,7 @@ def test_live_signal_aborts_and_closes_before_failure_returns(signum):
 def test_post_close_interrupt_still_reports_closed_before_failure():
     backend = Backend()
     events = []
-    ticks = iter([0.0])
+    ticks = iter([0.0, 0.0, 0.0])
 
     def monotonic():
         try:

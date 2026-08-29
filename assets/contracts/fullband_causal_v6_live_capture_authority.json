@@ -1,0 +1,24 @@
+{
+  "authority_sha256": "136728b0dab2c0068adbbb21da7e0a5fa315d1e036d3afa534b647f85d6e0f32",
+  "canonical_training_eligible": false,
+  "capture_only": true,
+  "hardware": {
+    "file_sha256": "45232a45e51fd76c7b88db338b9cf4f3840a88299b4d452e259064c0ee559351",
+    "path": "configs/hardware_jetson.yaml"
+  },
+  "hardware_sample_slip_authority": false,
+  "live_delay_authority": null,
+  "schema": "fullband_causal_v6_live_capture_authority_v1",
+  "scope": "capture_only_not_plant_delay_or_training_authority",
+  "sealed_raw": {
+    "must_not_exist_before_capture": true,
+    "path": "results/fullband_causal_v6/raw_capture.npz"
+  },
+  "signal_plan_envelope": {
+    "condition_receipt_payload_sha256": "211f581296d9d99927241a08c7a1096615246d68fe6702db8ff241cf1f582034",
+    "file_sha256": "500b93d1a5289ac0d467683088ea2d72181810f45872faf0bcb29265bb13cf3b",
+    "path": "assets/contracts/fullband_causal_v6_signal_plan.json",
+    "payload_sha256": "4ddd9df15469a288577bbbeac87091decd0ac2954d4e02f377968512dde52e40",
+    "pcm_sha256": "4e8a66b983af872192624bd6759282058cfe4a845460111a24bcd684b22551a3"
+  }
+}

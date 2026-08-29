@@ -138,7 +138,7 @@ def test_exact_saved_plan_and_capture_only_authority_pass(tmp_path: Path) -> Non
     }
 
 
-def test_actual_tracked_plan_and_hardware_match_pinned_bytes() -> None:
+def test_actual_tracked_plan_and_hardware_match_pinned_bytes(tmp_path: Path) -> None:
     plan_path = PROJECT_ROOT / SEALED_PLAN_ENVELOPE_RELATIVE_PATH
     authority_path = PROJECT_ROOT / SEALED_LIVE_CAPTURE_AUTHORITY_RELATIVE_PATH
     hardware_path = PROJECT_ROOT / SEALED_HARDWARE_RELATIVE_PATH
@@ -172,9 +172,21 @@ def test_actual_tracked_plan_and_hardware_match_pinned_bytes() -> None:
     ] == EXPECTED_CONDITION_RECEIPT_PAYLOAD_SHA256
     assert authority["hardware"]["file_sha256"] == EXPECTED_HARDWARE_FILE_SHA256
     assert _canonical(authority) == authority_path.read_bytes()
+    # 이 테스트의 목적은 tracked plan/authority/hardware bytes 검증이다. 실제 장비에
+    # immutable v5 raw가 이미 존재해도 asset 검증이 환경 의존적으로 실패하면 안 된다.
+    # canonical 세 파일만 fresh 임시 root에 복제해 pre-capture freshness까지 함께 본다.
+    isolated_plan = tmp_path / SEALED_PLAN_ENVELOPE_RELATIVE_PATH
+    isolated_authority = tmp_path / SEALED_LIVE_CAPTURE_AUTHORITY_RELATIVE_PATH
+    isolated_hardware = tmp_path / SEALED_HARDWARE_RELATIVE_PATH
+    isolated_plan.parent.mkdir(parents=True)
+    isolated_authority.parent.mkdir(parents=True, exist_ok=True)
+    isolated_hardware.parent.mkdir(parents=True, exist_ok=True)
+    isolated_plan.write_bytes(plan_path.read_bytes())
+    isolated_authority.write_bytes(authority_path.read_bytes())
+    isolated_hardware.write_bytes(hardware_path.read_bytes())
     loaded_authority = load_exact_saved_live_capture_authority_v5(
-        authority_path,
-        repository_root=PROJECT_ROOT,
+        isolated_authority,
+        repository_root=tmp_path,
         expected_file_sha256=EXPECTED_LIVE_CAPTURE_AUTHORITY_FILE_SHA256,
         expected_payload_sha256=EXPECTED_LIVE_CAPTURE_AUTHORITY_PAYLOAD_SHA256,
     )

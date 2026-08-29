@@ -13,22 +13,29 @@ import pytest
 
 from deep_anc import audio_io
 from deep_anc.dsp import fullband_v5_meter as v5_meter
+from deep_anc.dsp import fullband_v6_meter as v6_meter
 from deep_anc.dsp.measurement_level import ALSA_PHYSICAL_FINGERPRINT_SCHEMA
 from scripts.data import set_amp_level as meter
 
 
 @pytest.fixture(autouse=True)
 def _clean_v5_execution(monkeypatch):
+    identity = {
+        "repository_commit": "a" * 40,
+        "repository_branch": "work/test",
+        "repository_dirty": False,
+        "script_path": meter.SET_AMP_REPOSITORY_PATH,
+        "script_file_sha256": "b" * 64,
+    }
     monkeypatch.setattr(
         meter,
         "_v5_repository_execution_identity",
-        lambda: {
-            "repository_commit": "a" * 40,
-            "repository_branch": "work/test",
-            "repository_dirty": False,
-            "script_path": meter.SET_AMP_REPOSITORY_PATH,
-            "script_file_sha256": "b" * 64,
-        },
+        lambda: dict(identity),
+    )
+    monkeypatch.setattr(
+        meter,
+        "_v6_repository_execution_identity",
+        lambda: dict(identity),
     )
 
 
@@ -97,6 +104,26 @@ def _v5_contract() -> dict:
             "_evidence_sha256": "8" * 64,
         },
     }
+
+
+def _v6_contract() -> dict:
+    contract = _v5_contract()
+    contract["plan"] = {
+        **contract["plan"],
+        "path": "assets/contracts/fullband_causal_v6_signal_plan.json",
+    }
+    contract["live_capture_authority"] = {
+        **contract["live_capture_authority"],
+        "path": "assets/contracts/fullband_causal_v6_live_capture_authority.json",
+    }
+    contract["sealed_raw"] = {
+        "path": "results/fullband_causal_v6/raw_capture.npz",
+        "must_not_exist_before_capture": True,
+    }
+    # v6 static API는 이미 tracked attestation identity를 검증한 contract를 반환하며
+    # v5 내부 전용 evidence alias는 노출하지 않는다.
+    contract.pop("evidence")
+    return contract
 
 
 def _portaudio_available() -> bool:
@@ -572,6 +599,98 @@ def test_fullband_v5_meter_requires_all_five_confirmations(monkeypatch, capsys):
     assert "--confirm-same-amplifier-setting" in error
 
 
+def test_fullband_v6_meter_requires_all_five_confirmations(monkeypatch, capsys):
+    monkeypatch.setattr(
+        meter,
+        "measure",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("다섯 확인 전에 v6 measure를 호출하면 안 됩니다")
+        ),
+    )
+
+    assert meter.main(
+        [
+            "--mode",
+            "fullband-v6",
+            "--confirm-speaker",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+            "--confirm-routing-and-geometry",
+        ]
+    ) == 2
+    error = capsys.readouterr().err
+    assert "fullband-v6" in error
+    assert "다섯 확인" in error
+    assert "--confirm-same-amplifier-setting" in error
+
+
+def test_mode_specific_defaults_and_cross_generation_splice_fail_closed(
+    monkeypatch, capsys
+):
+    observed = []
+
+    def fake_measure(args):
+        observed.append(
+            {
+                "mode": args.mode,
+                "plan": args.plan_envelope,
+                "authority": args.live_authority,
+                "raw": args.raw_target,
+                "diagnostics": args.diagnostics_root,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr(meter, "measure", fake_measure)
+    confirmations = [
+        "--confirm-speaker",
+        "--confirm-user-present",
+        "--confirm-volume-minimum",
+        "--confirm-routing-and-geometry",
+        "--confirm-same-amplifier-setting",
+    ]
+    assert meter.main(["--mode", "fullband-v5", *confirmations]) == 0
+    assert meter.main(["--mode", "fullband-v6", *confirmations]) == 0
+    assert observed == [
+        {
+            "mode": "fullband-v5",
+            "plan": meter.V5_PLAN_ENVELOPE_PATH,
+            "authority": meter.V5_LIVE_AUTHORITY_PATH,
+            "raw": meter.V5_RAW_TARGET_PATH,
+            "diagnostics": meter.FULLBAND_V5_DEFAULT_DIAGNOSTICS_ROOT,
+        },
+        {
+            "mode": "fullband-v6",
+            "plan": meter.V6_PLAN_ENVELOPE_PATH,
+            "authority": meter.V6_LIVE_AUTHORITY_PATH,
+            "raw": meter.V6_RAW_TARGET_PATH,
+            "diagnostics": meter.FULLBAND_V6_DEFAULT_DIAGNOSTICS_ROOT,
+        },
+    ]
+
+    observed.clear()
+    assert meter.main(
+        [
+            "--mode",
+            "fullband-v6",
+            "--plan-envelope",
+            meter.V5_PLAN_ENVELOPE_PATH,
+            *confirmations,
+        ]
+    ) == 2
+    assert meter.main(
+        [
+            "--mode",
+            "fullband-v5",
+            "--raw-target",
+            meter.V6_RAW_TARGET_PATH,
+            *confirmations,
+        ]
+    ) == 2
+    assert observed == []
+    assert "exact generation path" in capsys.readouterr().err
+
+
 def test_fullband_v5_followup_command_is_explicit_and_has_five_confirmations():
     command = meter.fullband_v5_followup_command(
         "results/fullband_causal_v5/level_meter/session/meter_raw.npz"
@@ -599,6 +718,59 @@ def test_fullband_v5_followup_command_is_explicit_and_has_five_confirmations():
     assert "v4" not in command
 
 
+def test_fullband_v6_followup_command_is_explicit_and_has_five_confirmations():
+    command = meter.fullband_v6_followup_command(
+        "results/fullband_causal_v6/level_meter/session/meter_raw.npz"
+    )
+    assert command.lstrip().startswith(str(Path(sys.executable).absolute()))
+
+    required = (
+        "scripts/data/measure_paths_fullband_causal_v6.py",
+        "--execute-live",
+        "--plan-envelope assets/contracts/fullband_causal_v6_signal_plan.json",
+        "--live-authority assets/contracts/fullband_causal_v6_live_capture_authority.json",
+        "--meter-raw results/fullband_causal_v6/level_meter/session/meter_raw.npz",
+        "--level-evidence assets/measured/measurement_level_evidence.json",
+        "--hardware configs/hardware_jetson.yaml",
+        "--raw-target results/fullband_causal_v6/raw_capture.npz",
+        "--confirm-speaker",
+        "--confirm-user-present",
+        "--confirm-volume-minimum",
+        "--confirm-routing-and-geometry",
+        "--confirm-same-amplifier-setting",
+    )
+    for token in required:
+        assert token in command
+    assert "fullband_causal_v5" not in command
+    assert "interleaved" not in command
+
+
+def test_meter_identity_requires_generation_specific_identity_not_raw_sha_fallback():
+    assert meter._validated_meter_identity_sha256(
+        {"identity_sha256": "a" * 64, "raw_sha256": "b" * 64}
+    ) == "a" * 64
+    with pytest.raises(ValueError, match="identity_sha256"):
+        meter._validated_meter_identity_sha256({"raw_sha256": "b" * 64})
+    with pytest.raises(ValueError, match="identity_sha256"):
+        meter._validated_meter_identity_sha256({"identity_sha256": "A" * 64})
+
+
+def test_fullband_v6_adapter_marker_is_exact_and_missing_is_unavailable(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(meter, "REPO_ROOT", tmp_path)
+    path = tmp_path / meter.FULLBAND_V6_ADAPTER_SCRIPT
+    assert meter.fullband_v6_live_adapter_available() is False
+
+    path.parent.mkdir(parents=True)
+    path.write_text("FULLBAND_V6_LIVE_ADAPTER_IMPLEMENTED = False\n", encoding="utf-8")
+    assert meter.fullband_v6_live_adapter_available() is False
+    path.write_text("FULLBAND_V5_LIVE_ADAPTER_IMPLEMENTED = True\n", encoding="utf-8")
+    assert meter.fullband_v6_live_adapter_available() is False
+    path.write_text("FULLBAND_V6_LIVE_ADAPTER_IMPLEMENTED = True\n", encoding="utf-8")
+    assert meter.fullband_v6_live_adapter_available() is True
+
+
 def test_v5_followup_contract_rejects_any_binding_tamper():
     contract = _v5_contract()
     devices = {"input": 11, "output": 12}
@@ -623,6 +795,44 @@ def test_v5_followup_contract_rejects_any_binding_tamper():
         v5_meter.validate_fullband_v5_followup(
             tampered,
             expected_contract=contract,
+            expected_devices=devices,
+        )
+
+
+def test_v6_followup_contract_schema_confirmations_and_splice_are_exact():
+    contract = _v6_contract()
+    devices = {"input": 11, "output": 12}
+    confirmations = {name: True for name in meter._V6_CONFIRMATION_KEYS}
+    followup = v6_meter.build_fullband_v6_followup(
+        contract,
+        resolved_devices=devices,
+        confirmations=confirmations,
+    )
+
+    checked = v6_meter.validate_fullband_v6_followup(
+        followup,
+        expected_contract=contract,
+        expected_devices=devices,
+    )
+    assert checked == followup
+    assert checked["schema"] == meter.FULLBAND_V6_FOLLOWUP_SCHEMA
+    assert set(checked["operator_confirmations"]) == meter._V6_CONFIRMATION_KEYS
+
+    missing = dict(confirmations)
+    missing["same_amplifier_setting"] = False
+    with pytest.raises(ValueError, match="다섯 확인"):
+        v6_meter.build_fullband_v6_followup(
+            contract,
+            resolved_devices=devices,
+            confirmations=missing,
+        )
+
+    spliced_contract = json.loads(json.dumps(contract))
+    spliced_contract["plan"]["path"] = meter.V5_PLAN_ENVELOPE_PATH
+    with pytest.raises(ValueError, match="current authority/profile"):
+        v6_meter.validate_fullband_v6_followup(
+            followup,
+            expected_contract=spliced_contract,
             expected_devices=devices,
         )
 
@@ -659,6 +869,60 @@ def test_fullband_v5_files_fail_before_sounddevice_import(monkeypatch, capsys):
     assert meter.measure(args) == 2
     assert events == []
     assert "authority tampered" in capsys.readouterr().err
+
+
+def test_fullband_v6_files_fail_before_sounddevice_import(monkeypatch, capsys):
+    events = []
+    monkeypatch.setattr(
+        meter,
+        "_load_fullband_v6_static_contract",
+        lambda *_a, **_k: (_ for _ in ()).throw(ValueError("v6 authority tampered")),
+    )
+    monkeypatch.setattr(
+        meter,
+        "_resolve_fullband_v6_devices",
+        lambda *_a, **_k: events.append("portaudio_query"),
+    )
+    args = SimpleNamespace(
+        mode="fullband-v6",
+        seconds=20.0,
+        bootstrap_level_evidence=False,
+        plan_envelope=meter.V6_PLAN_ENVELOPE_PATH,
+        live_authority=meter.V6_LIVE_AUTHORITY_PATH,
+        level_evidence=meter.V6_LEVEL_EVIDENCE_PATH,
+        hardware=meter.V6_HARDWARE_PATH,
+        raw_target=meter.V6_RAW_TARGET_PATH,
+        diagnostics_root=meter.FULLBAND_V6_DEFAULT_DIAGNOSTICS_ROOT,
+        confirm_speaker=True,
+        confirm_user_present=True,
+        confirm_volume_minimum=True,
+        confirm_routing_and_geometry=True,
+        confirm_same_amplifier_setting=True,
+    )
+
+    assert meter.measure(args) == 2
+    assert events == []
+    assert "v6 authority tampered" in capsys.readouterr().err
+
+
+def test_fullband_v6_bootstrap_bypass_fails_before_static_or_backend(
+    monkeypatch, capsys
+):
+    events = []
+    monkeypatch.setattr(
+        meter,
+        "_load_fullband_v6_static_contract",
+        lambda *_a, **_k: events.append("static"),
+    )
+    args = SimpleNamespace(
+        mode="fullband-v6",
+        seconds=20.0,
+        bootstrap_level_evidence=True,
+    )
+
+    assert meter.measure(args) == 2
+    assert events == []
+    assert "bootstrap 우회" in capsys.readouterr().err
 
 
 def test_fullband_v5_dirty_checkout_fails_before_portaudio(monkeypatch, capsys):
@@ -834,6 +1098,163 @@ def test_fullband_v5_measure_revalidates_preopen_post_and_precommand(
     }
     output = capsys.readouterr()
     assert "--execute-live" in output.out
+    assert "[차단]" in output.err
+
+
+def test_fullband_v6_measure_uses_v6_metadata_writer_and_revalidation(
+    tmp_path, monkeypatch, capsys
+):
+    events = []
+    contract = _v6_contract()
+    devices = {"input": 21, "output": 22}
+    calls = {"static": 0}
+
+    def load_static(_args, *, require_sealed_raw_fresh):
+        assert require_sealed_raw_fresh is True
+        calls["static"] += 1
+        events.append(f"static_{calls['static']}")
+        return json.loads(json.dumps(contract))
+
+    monkeypatch.setattr(meter, "_load_fullband_v6_static_contract", load_static)
+    monkeypatch.setattr(
+        meter,
+        "_resolve_fullband_v6_devices",
+        lambda *_a, **_k: events.append("resolve") or dict(devices),
+    )
+    monkeypatch.setattr(
+        audio_io,
+        "assert_measurement_preconditions",
+        lambda *_a, **_k: events.append("input_preflight") or [0.0, 0.0],
+    )
+    monkeypatch.setattr(
+        meter,
+        "assert_live_pcm_clock_preconditions",
+        lambda *_a, **_k: events.append("immediate_pcm_clock"),
+    )
+    session = tmp_path / "meter-session-v6"
+    session.mkdir()
+    monkeypatch.setattr(meter, "_bootstrap_meter_session", lambda _args: (session, "cap6"))
+
+    @contextmanager
+    def fake_lock(*_args, **_kwargs):
+        yield {"path": "results/.lock", "pid": 1, "uid": 1000, "purpose": "test"}
+
+    monkeypatch.setattr(meter, "repository_audio_lock", fake_lock)
+    frames = 960_000
+    monkeypatch.setattr(meter, "probe_signal", lambda _seconds: np.zeros(frames, np.float32))
+    observed = {}
+
+    def fake_capture(*_args, **kwargs):
+        kwargs["pre_open_check"]()
+        events.append("output_stream_closed")
+        return (
+            [-50.1] * 8,
+            _telemetry(),
+            np.zeros((frames, 2), np.int16),
+            np.zeros((frames, 2), np.int32),
+        )
+
+    monkeypatch.setattr(meter, "capture_meter_stream", fake_capture)
+
+    def fake_v6_write(_path, **kwargs):
+        events.append("write_v6_raw")
+        observed["metadata"] = kwargs["metadata"]
+        return {
+            "raw": meter.REPO_ROOT
+            / "results/fullband_causal_v6/level_meter/fresh.npz",
+            "receipt": meter.REPO_ROOT
+            / "results/fullband_causal_v6/level_meter/fresh.receipt.json",
+            "sha256": "6" * 64,
+            "recovery_relative_path": (
+                "results/fullband_causal_v6/level_meter/.fresh.npz.token.v6_raw_recovery"
+            ),
+            "recovery_sha256": "6" * 64,
+        }
+
+    monkeypatch.setattr(meter, "write_fullband_v6_meter_raw_atomic", fake_v6_write)
+    monkeypatch.setattr(
+        meter,
+        "write_fullband_v5_meter_raw_atomic",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("v6 mode가 v5 writer를 호출하면 안 됩니다")
+        ),
+    )
+
+    def fake_precommand(raw_path, **kwargs):
+        events.append("precommand_validate")
+        assert kwargs == {
+            "repository_root": meter.REPO_ROOT,
+            "require_fresh": True,
+            "require_sealed_raw_fresh": True,
+        }
+        return {
+            "identity_sha256": "c" * 64,
+            "raw_sha256": "6" * 64,
+            "followup_contract_sha256": observed["metadata"]["fullband_v6_followup"][
+                "followup_contract_sha256"
+            ],
+        }
+
+    monkeypatch.setattr(meter, "validate_fullband_v6_meter_raw", fake_precommand)
+    monkeypatch.setattr(meter, "fullband_v6_live_adapter_available", lambda: False)
+    args = SimpleNamespace(
+        mode="fullband-v6",
+        seconds=20.0,
+        bootstrap_level_evidence=False,
+        plan_envelope=meter.V6_PLAN_ENVELOPE_PATH,
+        live_authority=meter.V6_LIVE_AUTHORITY_PATH,
+        level_evidence=meter.V6_LEVEL_EVIDENCE_PATH,
+        hardware=meter.V6_HARDWARE_PATH,
+        raw_target=meter.V6_RAW_TARGET_PATH,
+        diagnostics_root=meter.FULLBAND_V6_DEFAULT_DIAGNOSTICS_ROOT,
+        confirm_speaker=True,
+        confirm_user_present=True,
+        confirm_volume_minimum=True,
+        confirm_routing_and_geometry=True,
+        confirm_same_amplifier_setting=True,
+    )
+
+    assert meter.measure(args) == 0
+    assert events == [
+        "static_1",
+        "resolve",
+        "input_preflight",
+        "static_2",
+        "resolve",
+        "immediate_pcm_clock",
+        "output_stream_closed",
+        "static_3",
+        "resolve",
+        "write_v6_raw",
+        "precommand_validate",
+    ]
+    metadata = observed["metadata"]
+    assert metadata["repository_execution"] == meter._v6_repository_execution_identity()
+    assert metadata["calibration_evidence"]["mode"] == (
+        "fullband_v6_tracked_attestation"
+    )
+    assert metadata["calibration_evidence"]["level_evidence"] == {
+        "path": contract["level_evidence"]["path"],
+        "file_sha256": contract["level_evidence"]["file_sha256"],
+        "scope": contract["level_evidence"]["scope"],
+        "preserved_raw_revalidated": False,
+    }
+    followup = metadata["fullband_v6_followup"]
+    assert "fullband_v5_followup" not in metadata
+    assert followup["schema"] == meter.FULLBAND_V6_FOLLOWUP_SCHEMA
+    assert followup["signal_plan"] == contract["plan"]
+    assert followup["live_capture_authority"] == contract["live_capture_authority"]
+    assert followup["sealed_raw"] == contract["sealed_raw"]
+    assert followup["resolved_devices"] == devices
+    assert set(followup["operator_confirmations"]) == meter._V6_CONFIRMATION_KEYS
+    assert metadata["fullband_v6_post_capture_revalidation"] == {
+        "passed": True,
+        "error": None,
+    }
+    assert "fullband_v5_post_capture_revalidation" not in metadata
+    output = capsys.readouterr()
+    assert ".v6_raw_recovery" in output.out
+    assert "fullband_causal_v6" in output.out
     assert "[차단]" in output.err
 
 
