@@ -37,10 +37,23 @@ PYTHONPATH=src .venv/bin/python scripts/jetson/check_rt5640_fullband_static_v10.
 2채널 electrical tap health gate에 실패했다. 따라서 이를 loopback witness로 사용하지
 않는다.
 
+## v10.1 S32 signal-only plan
+
+`src/deep_anc/dsp/rt5640_fullband_s32_plan_v10.py`는 v5의 **signal-only Q15 waveform만**
+입력으로 받아 S32 plan을 만든다. v5/v6 live authority·raw publisher·meter·USB identity는
+상속하지 않는다. 이 module도 device/file write 없이 synthetic fixture만 통과한다.
+
+- Q15→S32은 `int64(q15) * 65536` 후 signed int32 range 검사를 하는 exact 16-bit
+  left shift다. float, simple cast, saturation은 금지한다.
+- current deterministic plan: 557,056 frames × 2ch, 2,176 callbacks, 11.605333초,
+  planned S32 SHA `dc897bde69b60e8df81d4d677cd68ae030b375e704d5082b214c1dbacd40c6ce`.
+- 이 SHA는 **planned application PCM**일 뿐 DAC 전기 출력/physical sample identity의
+  증거가 아니다. actual submitted PCM은 future duplex raw에서 별도 이름·SHA로 기록한다.
+
 ## 다음 순서
 
-1. 새 S32 actual-PCM signal plan과 fail-closed duplex primitive를 synthetic fixture로
-   검증한다. v6 raw/authority/path를 재사용하지 않는다.
+1. fail-closed S32 duplex primitive를 synthetic fixture로 검증한다. v6 raw/authority/path를
+   재사용하지 않는다.
 2. 안전한 external tap + 동기 ADC 또는 검증된 RT5640 TRRS capture를 준비해 electrical
    witness health를 통과시킨다. 이 장비가 없으면 v3 문서의 fixed-LTI conditional
    acoustic clock/stationarity evidence를 별도 raw로 충족해야 한다.

@@ -3,6 +3,7 @@
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
 > 최종 갱신: 2026-08-29. 완료된 현장 검증 브랜치: `work/v8-rt5640-zero-duplex`.
 > 현재 준비 브랜치: `work/v10-fullband-rt5640-contract`.
+> 현재 파일 기반 training readiness 감사: `docs/44_canonical_training_readiness_audit_20260829.md`.
 
 ## 0-V10. RT5640 full-octave static boundary (2026-08-29)
 
@@ -34,7 +35,10 @@ PCM, mixer, 결과 파일을 열지 않는다.
 focused test와 실제 무음 명령이 PASS했다. receipt는 config SHA
 `5fe219b4e2026d09fffc276aa5ad7e99a84e46e47bdcdefe08284e7af83ecfa4`를 결속했고,
 `audio_opened=false` 및 모든 P/S·electrical·training/deployment authority=false를
-명시했다.
+명시했다. 이어 v10.1 signal-only plan은 Q15 waveform만 exact 16-bit left shift해
+557,056×2 S32 frames(2,176 callbacks, 11.605333초)를 만들었고 planned PCM SHA는
+`dc897bde69b60e8df81d4d677cd68ae030b375e704d5082b214c1dbacd40c6ce`다. 이 SHA는
+application planned bytes이지 DAC/physical output SHA가 아니다.
 
 ### [판정]
 
@@ -44,8 +48,7 @@ J511 반대편 앰프, frame identity, electrical witness, P/S, ANC 감쇠 또�
 
 ### [다음 행동]
 
-1. v10.1에서 actual submitted S32 PCM plan·fail-closed duplex transport를 synthetic
-   fixture로 먼저 구현한다.
+1. v10.2에서 fail-closed S32 duplex transport를 synthetic fixture로 먼저 구현한다.
 2. external synchronous ADC/tap 또는 검증된 RT5640 TRRS capture의 electrical witness
    health를 준비한다. 현재 J511=`None` PCM0 input은 rail/stuck이라 사용할 수 없다.
 3. 그 뒤 meter/dry-run, 한 번의 physical P/S window, v3 raw/analysis/plant authority를
