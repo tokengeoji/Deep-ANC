@@ -18,10 +18,17 @@
    출력 경로의 재생 가능/불가능을 뜻하지는 않는다. 어느 출력 경로도 현장 검증되지 않았고,
    speaker가 분리된 동안에는 출력·P/S·ANC ON 실험을 하지 않는다. 다시 연결한 뒤에도
    장치 점유 확인→무음 preflight→사용자 입회/최소 볼륨의 짧은 검증 창 순서를 지킨다.
-2. 현재 strict P/S는 150--1600 Hz **Stage-1에만 authoritative**하다. 2/4/8 kHz 광대역
+2. 2026-08-29 read-only ALSA inventory에서 `card2` AB13X USB Audio의
+   `/proc/asound/card2/stream0`은 **48 kHz/S16, playback 2채널, capture 1채널**만
+   제공했다. APE의 ADMAIF 20개 열거는 8개 동기 물리 ADC 입력을 뜻하지 않는다. 모든 PCM은
+   `closed`였고 PulseAudio는 control node만 열고 있었다. 따라서 현 연결만으로는
+   `REF + NOISE_TAP + CANCEL_TAP + ERR_0..ERR_4` 8-input same-frame quiet-zone raw를
+   만들 수 없다. full-octave 다점 물리 판정에는 verified 8채널 동기 ADC/전기 tap acquisition
+   또는 동등한 hardware-frame bridge가 별도 blocker다.
+3. 현재 strict P/S는 150--1600 Hz **Stage-1에만 authoritative**하다. 2/4/8 kHz 광대역
    식별·학습·배포 authority가 아니며, 기존 checkpoint·ONNX·고역 결과도 canonical
    성능 근거로 승격하지 않는다.
-3. 광대역 canonical 학습을 여는 최소 순서는 **동기화된 다채널 electrical witness 확보 →
+4. 광대역 canonical 학습을 여는 최소 순서는 **동기화된 다채널 electrical witness 확보 →
    fail-closed P/S raw 분석 합격 → lineage-clean public/recorded manifest 합격 →
    surrogate pretrain → recorded fine-tune → one-shot physical G4**다. 어느 하나라도 없는
    상태에서 GPU 학습을 시작하거나 성능 수치를 주장하지 않는다.
