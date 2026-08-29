@@ -283,6 +283,8 @@ def repository_audio_lock(repository_root: str | Path, *, purpose: str):
             "pid": os.getpid(),
             "uid": os.getuid(),
             "purpose": str(purpose),
+            "device": int(file_status.st_dev),
+            "inode": int(file_status.st_ino),
         }
         os.ftruncate(descriptor, 0)
         payload = _canonical_json(identity).encode("utf-8")

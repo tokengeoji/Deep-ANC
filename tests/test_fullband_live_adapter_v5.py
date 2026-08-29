@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 from contextlib import contextmanager
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -100,8 +101,41 @@ def test_repository_audio_lock_file_matches_live_validator_identity(tmp_path: Pa
         saved = json.loads((tmp_path / audio_lock["path"]).read_text(encoding="utf-8"))
 
     assert saved == audio_lock
+    assert receipt["device"] == audio_lock["device"]
+    assert receipt["inode"] == audio_lock["inode"]
     assert receipt["exclusive_lock_observed"] is True
     assert receipt["identity_sha256"] == post.audio_lock_identity_sha256(audio_lock)
+
+
+def test_repository_audio_lock_rejects_named_inode_replacement(tmp_path: Path) -> None:
+    (tmp_path / "results").mkdir()
+
+    with measurement.repository_audio_lock(
+        tmp_path, purpose="fullband_causal_v5_live_capture"
+    ) as audio_lock:
+        lock_path = tmp_path / audio_lock["path"]
+        detached = lock_path.with_name("detached-held-lock")
+        lock_path.rename(detached)
+        replacement = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            payload = json.dumps(
+                audio_lock,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            assert os.write(replacement, payload) == len(payload)
+            fcntl.flock(replacement, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            with pytest.raises(RuntimeError, match="inode"):
+                post.validate_held_audio_lock(
+                    tmp_path,
+                    audio_lock,
+                    expected_purpose="fullband_causal_v5_live_capture",
+                )
+        finally:
+            fcntl.flock(replacement, fcntl.LOCK_UN)
+            os.close(replacement)
 
 
 def _fake_static(plan: dict) -> dict:
@@ -206,6 +240,8 @@ def _wire_fake_live(
                 "pid": os.getpid(),
                 "uid": os.getuid(),
                 "purpose": purpose,
+                "device": 1,
+                "inode": 2,
             }
         finally:
             events.append("lock_released")

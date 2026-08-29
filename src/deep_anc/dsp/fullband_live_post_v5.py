@@ -86,7 +86,17 @@ _AUDIO_LOCK_RECEIPT_KEYS = {
     "pid",
     "uid",
     "purpose",
+    "device",
+    "inode",
     "exclusive_lock_observed",
+}
+_AUDIO_LOCK_IDENTITY_KEYS = {
+    "path",
+    "pid",
+    "uid",
+    "purpose",
+    "device",
+    "inode",
 }
 
 
@@ -378,7 +388,7 @@ def external_post_receipt_relative_path(raw_relative_path: str) -> str:
 
 def audio_lock_identity_sha256(audio_lock: Mapping[str, Any]) -> str:
     lock = _exact_mapping(
-        audio_lock, {"path", "pid", "uid", "purpose"}, label="audio lock"
+        audio_lock, _AUDIO_LOCK_IDENTITY_KEYS, label="audio lock"
     )
     _canonical_relative_path(lock["path"], label="audio lock path")
     if type(lock["pid"]) is not int or lock["pid"] <= 0:
@@ -387,6 +397,10 @@ def audio_lock_identity_sha256(audio_lock: Mapping[str, Any]) -> str:
         raise ValueError("audio lock uid는 음이 아닌 exact int여야 합니다")
     if type(lock["purpose"]) is not str or not lock["purpose"]:
         raise ValueError("audio lock purpose가 필요합니다")
+    if type(lock["device"]) is not int or lock["device"] < 0:
+        raise ValueError("audio lock device는 음이 아닌 exact int여야 합니다")
+    if type(lock["inode"]) is not int or lock["inode"] <= 0:
+        raise ValueError("audio lock inode는 양의 exact int여야 합니다")
     return _payload_sha256(lock)
 
 
@@ -399,7 +413,7 @@ def validate_held_audio_lock(
     """현재 process의 exact lock bytes와 배타 잠금 보유를 독립 확인한다."""
 
     lock = _exact_mapping(
-        audio_lock, {"path", "pid", "uid", "purpose"}, label="audio lock"
+        audio_lock, _AUDIO_LOCK_IDENTITY_KEYS, label="audio lock"
     )
     if (
         lock["pid"] != os.getpid()
@@ -410,6 +424,9 @@ def validate_held_audio_lock(
     snapshot = read_repository_file_nofollow(repository_root, lock["path"])
     if snapshot["bytes"] != _canonical_json_bytes(lock):
         raise ValueError("audio lock file bytes가 context identity와 다릅니다")
+    expected_inode = (lock["device"], lock["inode"])
+    if (snapshot["device"], snapshot["inode"]) != expected_inode:
+        raise RuntimeError("audio lock snapshot inode가 held context와 다릅니다")
     root = _repository_root(repository_root)
     relative = _canonical_relative_path(lock["path"], label="audio lock path")
     filename, chain = _open_parent_chain(root, relative, create=False)
@@ -418,15 +435,35 @@ def validate_held_audio_lock(
     try:
         descriptor = os.open(
             filename,
-            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
             dir_fd=chain[-1][1],
         )
+        opened = os.fstat(descriptor)
+        named = os.stat(filename, dir_fd=chain[-1][1], follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != expected_inode
+            or (named.st_dev, named.st_ino) != expected_inode
+        ):
+            raise RuntimeError("audio lock probe inode가 held context와 다릅니다")
+        _verify_chain(chain)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             exclusive_observed = True
         else:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
+        opened_after = os.fstat(descriptor)
+        named_after = os.stat(filename, dir_fd=chain[-1][1], follow_symlinks=False)
+        if (
+            (opened_after.st_dev, opened_after.st_ino) != expected_inode
+            or (named_after.st_dev, named_after.st_ino) != expected_inode
+        ):
+            raise RuntimeError("audio lock inode가 flock 검증 중 변경됐습니다")
+        _verify_chain(chain)
         if not exclusive_observed:
             raise RuntimeError("repository audio lock이 배타 보유 상태가 아닙니다")
     finally:
@@ -439,6 +476,8 @@ def validate_held_audio_lock(
         "pid": lock["pid"],
         "uid": lock["uid"],
         "purpose": lock["purpose"],
+        "device": lock["device"],
+        "inode": lock["inode"],
         "exclusive_lock_observed": True,
     }
 
@@ -1007,7 +1046,7 @@ def issue_invalid_external_post_capture_receipt_v5(
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as lock_error:
         lock = _exact_mapping(
-            audio_lock, {"path", "pid", "uid", "purpose"}, label="audio lock"
+            audio_lock, _AUDIO_LOCK_IDENTITY_KEYS, label="audio lock"
         )
         lock_receipt = {
             "path": _canonical_relative_path(lock["path"], label="audio lock path"),
@@ -1015,6 +1054,8 @@ def issue_invalid_external_post_capture_receipt_v5(
             "pid": lock["pid"],
             "uid": lock["uid"],
             "purpose": lock["purpose"],
+            "device": lock["device"],
+            "inode": lock["inode"],
             "exclusive_lock_observed": False,
         }
         errors = [
