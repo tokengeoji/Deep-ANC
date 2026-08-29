@@ -9,6 +9,11 @@
 
     .venv/bin/python scripts/bench/measure_channel_paths.py \
       --confirm-user-present-volume-minimum
+
+``--dry-run``은 sounddevice/ALSA를 import·open하지 않고, 입력 인자·hardware YAML·
+출력 PCM 계획·no-replace 출력 경로만 검사한다. 따라서 물리 승인 flag는 dry-run에서
+요구하지 않는다. 반대로 기본 live 경로는 실제 스피커를 구동하므로 두 confirmation
+flag가 모두 필수다.
 """
 
 from __future__ import annotations
@@ -40,6 +45,8 @@ from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions  
 DEFAULT_AMPLITUDE = 0.005
 MAX_AMPLITUDE = 0.02
 MICROPHONE_NAMES = ("error_mic", "reference_mic")
+DEFAULT_FLUSH_SECONDS = 0.25
+DRY_RUN_SCHEMA_VERSION = 1
 
 
 def validate_probe_settings(
@@ -55,17 +62,22 @@ def validate_probe_settings(
     """오디오 장치를 열기 전에 자극과 길이의 안전 범위를 검사한다."""
     if sample_rate <= 0:
         raise ValueError("sample_rate는 양수여야 합니다")
-    if not 0.0 < frequency < sample_rate / 2.0:
+    if not math.isfinite(float(frequency)) or not 0.0 < frequency < sample_rate / 2.0:
         raise ValueError("frequency는 0보다 크고 Nyquist보다 작아야 합니다")
-    if not 0.0 < amplitude <= MAX_AMPLITUDE:
+    if not math.isfinite(float(amplitude)) or not 0.0 < amplitude <= MAX_AMPLITUDE:
         raise ValueError(
             f"amplitude는 0보다 크고 {MAX_AMPLITUDE:.3f} 이하여야 합니다"
         )
     if block_size <= 0:
         raise ValueError("block-size는 양수여야 합니다")
-    if pre_seconds < 0.5 or post_seconds < 0.5:
+    if (
+        not math.isfinite(float(pre_seconds))
+        or not math.isfinite(float(post_seconds))
+        or pre_seconds < 0.5
+        or post_seconds < 0.5
+    ):
         raise ValueError("안전을 위해 pre/post 무음은 각각 0.5초 이상이어야 합니다")
-    if tone_seconds < 1.0:
+    if not math.isfinite(float(tone_seconds)) or tone_seconds < 1.0:
         raise ValueError("안정적인 저레벨 분석을 위해 tone-seconds는 1초 이상이어야 합니다")
 
 
@@ -230,9 +242,9 @@ def analyze_path_capture(
                 "tone_bin_change_db": tone_delta,
                 "coupling_detected": coupling_detected,
                 "interpretation": (
-                    "300Hz 출력-마이크 결합 증거"
+                    f"{frequency:g}Hz 출력-마이크 결합 증거"
                     if coupling_detected
-                    else "현재 SNR에서 300Hz 결합을 확정하지 못함"
+                    else f"현재 SNR에서 {frequency:g}Hz 결합을 확정하지 못함"
                 ),
             }
         )
@@ -339,7 +351,7 @@ def flush_output_silence(
     sample_rate: int,
     block_size: int,
     latency: str,
-    seconds: float = 0.25,
+    seconds: float = DEFAULT_FLUSH_SECONDS,
 ) -> dict[str, Any]:
     """두 출력 채널에 0을 쓰고 스트림을 닫아 마지막 자극을 제거한다."""
     blocks = max(2, int(math.ceil(seconds * sample_rate / block_size)))
@@ -427,6 +439,217 @@ def _output_paths(value: str | None) -> tuple[Path, Path]:
     return prefix.with_suffix(".npz"), prefix.with_suffix(".json")
 
 
+def _validate_dry_run_hardware_config(
+    hardware_cfg: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """장치를 열지 않고 채널 진단에 필요한 YAML 부분만 엄격히 확인한다.
+
+    이 함수는 ``--dry-run`` 전용이다. ALSA card/proc 조회나 PortAudio 장치 열기는
+    수행하지 않으므로, 계획 검증이 실제 hardware liveness 증거로 오인될 수 없다.
+    """
+    if not isinstance(hardware_cfg, dict):
+        raise ValueError("hardware YAML 최상위는 mapping이어야 합니다")
+    audio = hardware_cfg.get("audio")
+    channels = hardware_cfg.get("channels")
+    if not isinstance(audio, dict) or not isinstance(channels, dict):
+        raise ValueError("hardware YAML에 audio와 channels mapping이 필요합니다")
+    input_cfg = audio.get("input")
+    output_cfg = audio.get("output")
+    if not isinstance(input_cfg, dict) or not isinstance(output_cfg, dict):
+        raise ValueError("hardware YAML에 audio.input/audio.output mapping이 필요합니다")
+
+    try:
+        sample_rate = int(audio["sample_rate"])
+        input_channels = int(input_cfg["channels"])
+        output_channels = int(output_cfg["channels"])
+        input_pcm = int(input_cfg["pcm"])
+        output_pcm = int(output_cfg["pcm"])
+        input_card = str(input_cfg["card"]).strip()
+        output_card = str(output_cfg["card"]).strip()
+        channel_map = {
+            name: int(channels[name])
+            for name in (
+                "error_mic",
+                "reference_mic",
+                "noise_out",
+                "cancel_out",
+            )
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"hardware YAML channel/sample-rate 값이 유효하지 않습니다: {exc}") from exc
+
+    if sample_rate <= 0:
+        raise ValueError("hardware YAML audio.sample_rate는 양수여야 합니다")
+    if not input_card or not output_card or input_pcm < 0 or output_pcm < 0:
+        raise ValueError("hardware YAML input/output card와 pcm은 유효해야 합니다")
+    if input_channels < 2 or output_channels < 2:
+        raise ValueError("채널 경로 진단에는 ERR/REF 입력 2채널과 출력 2채널이 필요합니다")
+    if channel_map["error_mic"] != 0 or channel_map["reference_mic"] != 1:
+        raise ValueError("ERR/REF channel map은 각각 0/1이어야 합니다")
+    if {channel_map["noise_out"], channel_map["cancel_out"]} != {0, 1}:
+        raise ValueError("noise_out/cancel_out은 서로 다른 stereo 채널 0/1이어야 합니다")
+    if str(input_cfg.get("dtype", "")).lower() != "int32":
+        raise ValueError("채널 경로 진단 input dtype은 int32여야 합니다")
+    if str(output_cfg.get("dtype", "")).lower() != "int16":
+        raise ValueError("채널 경로 진단 output dtype은 int16여야 합니다")
+    return audio, channels, sample_rate
+
+
+def build_channel_probe_plan(
+    *,
+    sample_rate: int,
+    frequency: float,
+    amplitude: float,
+    block_size: int,
+    pre_seconds: float,
+    tone_seconds: float,
+    post_seconds: float,
+    preflight_seconds: float,
+    output_channels: tuple[tuple[str, int], ...],
+) -> tuple[list[tuple[str, int, np.ndarray]], dict[str, tuple[int, int]], dict[str, Any]]:
+    """live와 dry-run이 공유하는 출력 PCM·정확한 시간 계획을 만든다.
+
+    반환 PCM은 memory-only 계획이며, raw microphone capture나 파일을 만들지 않는다.
+    """
+    validate_probe_settings(
+        sample_rate=sample_rate,
+        frequency=frequency,
+        amplitude=amplitude,
+        block_size=block_size,
+        pre_seconds=pre_seconds,
+        tone_seconds=tone_seconds,
+        post_seconds=post_seconds,
+    )
+    if not math.isfinite(float(preflight_seconds)) or preflight_seconds <= 0.0:
+        raise ValueError("preflight-seconds는 양수 finite여야 합니다")
+    if tuple(name for name, _channel in output_channels) != ("noise_out", "cancel_out"):
+        raise ValueError("출력 계획은 noise_out 뒤 cancel_out 순서여야 합니다")
+    if {int(channel) for _name, channel in output_channels} != {0, 1}:
+        raise ValueError("출력 계획은 서로 다른 stereo 채널 0/1이어야 합니다")
+
+    programs: list[tuple[str, int, np.ndarray]] = []
+    common_bounds: dict[str, tuple[int, int]] | None = None
+    stream_plans: list[dict[str, Any]] = []
+    for name, channel in output_channels:
+        program, bounds = build_output_program(
+            sample_rate=sample_rate,
+            frequency=frequency,
+            amplitude=amplitude,
+            output_channel=int(channel),
+            pre_seconds=pre_seconds,
+            tone_seconds=tone_seconds,
+            post_seconds=post_seconds,
+        )
+        if common_bounds is None:
+            common_bounds = bounds
+        elif bounds != common_bounds:
+            raise RuntimeError("두 출력 채널의 segment bounds가 다릅니다")
+        frames = int(program.shape[0])
+        stream_plans.append(
+            {
+                "name": name,
+                "output_channel": int(channel),
+                "frames": frames,
+                "seconds": frames / float(sample_rate),
+                "pre_silence_frames": int(bounds["pre"][1] - bounds["pre"][0]),
+                "tone_frames": int(bounds["tone"][1] - bounds["tone"][0]),
+                "post_silence_frames": int(bounds["post"][1] - bounds["post"][0]),
+                "pre_silence_seconds": (
+                    bounds["pre"][1] - bounds["pre"][0]
+                )
+                / float(sample_rate),
+                "audible_tone_seconds": (
+                    bounds["tone"][1] - bounds["tone"][0]
+                )
+                / float(sample_rate),
+                "post_silence_seconds": (
+                    bounds["post"][1] - bounds["post"][0]
+                )
+                / float(sample_rate),
+            }
+        )
+        programs.append((name, int(channel), program))
+
+    if common_bounds is None:  # pragma: no cover - fixed two-channel contract
+        raise RuntimeError("출력 계획이 비어 있습니다")
+    flush_blocks = max(
+        2,
+        int(math.ceil(DEFAULT_FLUSH_SECONDS * sample_rate / block_size)),
+    )
+    output_stream_seconds = float(sum(item["seconds"] for item in stream_plans))
+    audible_seconds = float(sum(item["audible_tone_seconds"] for item in stream_plans))
+    flush_stream_seconds = flush_blocks * block_size / float(sample_rate)
+    duration_plan: dict[str, Any] = {
+        "input_preflight_seconds": float(preflight_seconds),
+        "output_stream_seconds": output_stream_seconds,
+        "audible_seconds": audible_seconds,
+        "flush_requested_seconds": DEFAULT_FLUSH_SECONDS,
+        "flush_zero_blocks": flush_blocks,
+        "flush_stream_seconds": flush_stream_seconds,
+        "total_expected_device_occupancy_seconds": (
+            float(preflight_seconds) + output_stream_seconds + flush_stream_seconds
+        ),
+        "output_streams": stream_plans,
+    }
+    return programs, common_bounds, duration_plan
+
+
+def _dry_run_report(
+    *,
+    hardware_path: Path,
+    sample_rate: int,
+    frequency: float,
+    amplitude: float,
+    block_size: int,
+    latency: str,
+    channels: dict[str, Any],
+    duration_plan: dict[str, Any],
+    npz_path: Path,
+    json_path: Path,
+) -> dict[str, Any]:
+    """물리 승인 없이 보여 줄, side-effect 없는 계획 receipt를 만든다."""
+    return {
+        "schema_version": DRY_RUN_SCHEMA_VERSION,
+        "measurement_kind": "low_level_output_microphone_channel_path_probe_dry_run",
+        "mode": "dry_run",
+        "hardware_config": str(hardware_path.relative_to(REPO_ROOT.resolve())),
+        "sample_rate": int(sample_rate),
+        "frequency_hz": float(frequency),
+        "amplitude_peak": float(amplitude),
+        "block_size": int(block_size),
+        "latency": latency,
+        "channels": {
+            name: int(channels[name])
+            for name in ("error_mic", "reference_mic", "noise_out", "cancel_out")
+        },
+        "duration_plan": duration_plan,
+        "output_paths": {
+            "raw_capture_npz": str(npz_path.relative_to(REPO_ROOT.resolve())),
+            "summary_json": str(json_path.relative_to(REPO_ROOT.resolve())),
+            "no_replace_checked": True,
+        },
+        "dry_run_guarantees": {
+            "sounddevice_imported": False,
+            "alsa_or_portaudio_device_opened": False,
+            "raw_microphone_capture_created": False,
+            "artifact_written": False,
+            "speaker_output": False,
+        },
+        "confirmation_policy": {
+            "required_for_dry_run": False,
+            "required_for_live": [
+                "--confirm-user-present-volume-minimum",
+                "--confirm-speaker",
+            ],
+            "reason": "dry-run은 장치를 열거나 스피커를 출력하지 않으므로 물리 승인을 받지 않는다",
+        },
+        "limitations": [
+            "계획 검증은 실제 ALSA/PortAudio 장치 liveness나 microphone rail을 증명하지 않는다.",
+            "실제 live는 input preflight PASS와 두 confirmation flag 후에만 시작된다.",
+        ],
+    }
+
+
 def _save_results(
     npz_path: Path,
     json_path: Path,
@@ -467,7 +690,7 @@ def _save_results(
         json_temp.unlink(missing_ok=True)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hardware", default="configs/hardware_jetson.yaml")
     parser.add_argument("--frequency", type=float, default=300.0)
@@ -480,14 +703,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--preflight-seconds", type=float, default=2.0)
     parser.add_argument("--out-prefix", default=None)
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "sounddevice/ALSA를 import·open하지 않고 hardware YAML, PCM 계획, "
+            "출력 no-replace 경로와 예상 시간을 JSON으로 확인한다. "
+            "물리 confirmation flag는 필요 없다"
+        ),
+    )
+    parser.add_argument(
         "--confirm-user-present-volume-minimum",
         action="store_true",
         help="사용자 입회와 물리 앰프 볼륨 최저를 확인",
     )
     parser.add_argument("--confirm-speaker", action="store_true")
-    args = parser.parse_args(argv)
+    return parser
 
-    if not (args.confirm_user_present_volume_minimum and args.confirm_speaker):
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if not args.dry_run and not (
+        args.confirm_user_present_volume_minimum and args.confirm_speaker
+    ):
         print(
             "[중단] 사용자 입회와 앰프 볼륨 최저를 확인한 뒤 "
             "--confirm-user-present-volume-minimum 및 --confirm-speaker를 지정하세요.",
@@ -498,6 +736,46 @@ def main(argv: list[str] | None = None) -> int:
     try:
         hardware_path = _repo_path(args.hardware)
         hardware_cfg = load_yaml(hardware_path)
+        if args.dry_run:
+            _audio, channels, sample_rate = _validate_dry_run_hardware_config(
+                hardware_cfg
+            )
+            output_channels = (
+                ("noise_out", int(channels["noise_out"])),
+                ("cancel_out", int(channels["cancel_out"])),
+            )
+            _programs, _bounds, duration_plan = build_channel_probe_plan(
+                sample_rate=sample_rate,
+                frequency=args.frequency,
+                amplitude=args.amplitude,
+                block_size=args.block_size,
+                pre_seconds=args.pre_seconds,
+                tone_seconds=args.tone_seconds,
+                post_seconds=args.post_seconds,
+                preflight_seconds=args.preflight_seconds,
+                output_channels=output_channels,
+            )
+            npz_path, json_path = _output_paths(args.out_prefix)
+            if npz_path.exists() or json_path.exists():
+                raise FileExistsError(
+                    "기존 측정 결과는 덮어쓰지 않습니다. 다른 --out-prefix를 쓰세요"
+                )
+            report = _dry_run_report(
+                hardware_path=hardware_path,
+                sample_rate=sample_rate,
+                frequency=args.frequency,
+                amplitude=args.amplitude,
+                block_size=args.block_size,
+                latency=args.latency,
+                channels=channels,
+                duration_plan=duration_plan,
+                npz_path=npz_path,
+                json_path=json_path,
+            )
+            print("[DRY-RUN PASS] 재생·녹음·raw/artifact 파일 생성 없이 계획만 검증했습니다.")
+            print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+
         audio = hardware_cfg["audio"]
         import sounddevice as sd
         assert_live_pcm_clock_preconditions(audio)
@@ -513,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
             tone_seconds=args.tone_seconds,
             post_seconds=args.post_seconds,
         )
-        if args.preflight_seconds <= 0.0:
+        if not math.isfinite(float(args.preflight_seconds)) or args.preflight_seconds <= 0.0:
             raise ValueError("preflight-seconds는 양수여야 합니다")
         npz_path, json_path = _output_paths(args.out_prefix)
         output_channels = (int(channels["noise_out"]), int(channels["cancel_out"]))
@@ -558,23 +836,20 @@ def main(argv: list[str] | None = None) -> int:
     output_device = resolve_alsa_portaudio_device(
         audio["output"]["card"], audio["output"]["pcm"], "output", 2
     )
-    bounds: dict[str, tuple[int, int]] | None = None
-    programs: list[tuple[str, int, np.ndarray]] = []
-    for name, config_key in (("noise_out", "noise_out"), ("cancel_out", "cancel_out")):
-        channel = int(channels[config_key])
-        program, current_bounds = build_output_program(
-            sample_rate=sample_rate,
-            frequency=args.frequency,
-            amplitude=args.amplitude,
-            output_channel=channel,
-            pre_seconds=args.pre_seconds,
-            tone_seconds=args.tone_seconds,
-            post_seconds=args.post_seconds,
-        )
-        if bounds is None:
-            bounds = current_bounds
-        programs.append((name, channel, program))
-    assert bounds is not None
+    programs, bounds, _duration_plan = build_channel_probe_plan(
+        sample_rate=sample_rate,
+        frequency=args.frequency,
+        amplitude=args.amplitude,
+        block_size=args.block_size,
+        pre_seconds=args.pre_seconds,
+        tone_seconds=args.tone_seconds,
+        post_seconds=args.post_seconds,
+        preflight_seconds=args.preflight_seconds,
+        output_channels=(
+            ("noise_out", int(channels["noise_out"])),
+            ("cancel_out", int(channels["cancel_out"])),
+        ),
+    )
 
     print(
         f"[저레벨 경로 진단] {args.frequency:.1f}Hz, peak={args.amplitude:.4f}, "
@@ -649,7 +924,7 @@ def main(argv: list[str] | None = None) -> int:
         "performance_claim_allowed": False,
         "duct_identification_complete": False,
         "limitations": [
-            "300Hz 한 점의 출력-마이크 결합/채널 배선 진단이다.",
+            "단일 tone의 출력-마이크 결합/채널 배선 진단이다.",
             "P(z), S(z), 광대역 전달함수, 절대 지연을 식별하지 않는다.",
             "ANC 감쇠 또는 FxLMS 성공을 주장하는 데 사용할 수 없다.",
         ],
