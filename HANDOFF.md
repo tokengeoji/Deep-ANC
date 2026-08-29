@@ -46,7 +46,25 @@ I2S1/I2S2의 같은 APE rate 계열에서 다음 fullband clock/electrical witne
 - v8 집중/entry contract 테스트 158개 PASS.
 - 전체 pytest는 1,807개를 수집해 exit 0으로 끝났다. 알려진 skip과 로컬에 Elice public
   manifest 5종이 없다는 진단 warning만 있으며 새 FAIL은 없다.
-- 실제 장치 미개방 dry-run PASS, generation 미생성.
+- 실제 장치 미개방 dry-run PASS 후, 2026-08-29 exact commit
+  `0c1956dd5eb2e310e5a3174ea7ba8a542e8fa1fa`에서 live를 **한 번만** 실행했다.
+  `results/rt5640_zero_duplex/v1/receipt.json`은
+  `ZERO_DUPLEX_TRANSPORT_SMOKE_PASS`/`valid=true`이고, immutable raw
+  `raw_capture.npz` SHA-256은
+  `cd1444c69eee8b06f7728dece9ff5e03668dce1edb6a6bfd8e49920892893376`,
+  receipt SHA-256은
+  `ce4234d4196589ab71fcdccce4fc998abf7309b65e69ae9c1fbc64c68e5c4ba4`다.
+  독립 receipt validator와 raw SHA 재대조도 PASS했다.
+- live는 48 kHz/S32_LE/2ch/period 256으로 input `hw:APE,1`과 output
+  `hw:APE,0`을 동시에 열었다. 11,250 callback과 submitted/captured 각각
+  2,880,000 frame, 양 valid mask 전부 true, PortAudio xrun/status 0,
+  application output bitwise zero를 확인했다. ALSA/amixer 전후 raw snapshot도
+  byte-exact PASS했다.
+- 같은 simultaneous raw의 1초 settle 뒤 ERR/REF input health도 PASS했다.
+  ERR ch0은 RMS `-66.028 dBFS`, peak `0.001419`, unique code `18,939`, clip 0%;
+  REF ch1은 RMS `-63.297 dBFS`, peak `0.004896`, unique code `40,304`, clip 0%다.
+  별도 read-only RT5640 `CVB-RT Jack-state`는 세 번 연속 `None`이었다. 이는 Jetson
+  잭의 software-visible plug state일 뿐 앰프 쪽 케이블/전원이나 acoustic output의 증명은 아니다.
 - 실제 read-only gate: system PCM status 46개 전부 closed, PCM node 46개 owner 0,
   Pulse APE profile `off`, 다음 route 4개 exact PASS.
   - `I2S1 Mux=ADMAIF1`
@@ -55,11 +73,11 @@ I2S1/I2S2의 같은 APE rate 계열에서 다음 fullband clock/electrical witne
   - `I2S2 Mux=ADMAIF2`
 - 실제 장치 미개방 double snapshot은 raw `alsactl`의 12개 read-volatile 값만 달랐고,
   volatile-normalized ALSA/amixer와 모든 nonvolatile state는 exact PASS했다.
-- `results/rt5640_zero_duplex/v1`은 아직 생성되지 않았다. 실제 PCM/Stream은 열지 않았다.
+- live generation은 no-replace로 이미 소비됐으므로 성공·실패와 무관하게 재실행하지 않는다.
 
 ### [판정]
 
-**코드·read-only admission은 PASS, 실제 transport는 NOT RUN.** 현재 성공 상한도
+**코드·read-only admission과 실제 transport는 PASS.** 현재 성공 상한은 여전히
 `ZERO_DUPLEX_TRANSPORT_SMOKE_PASS`뿐이다. all-zero는 physical sample drop/add/reorder,
 shared clock, electrical route, P/S, lead, 감쇠 dB 또는 학습 적격성을 증명하지 않는다.
 
@@ -69,17 +87,13 @@ Stage-1 준비와 혼동하지 않으며, 사용자가 요구한 2/4/8 kHz 고�
 
 ### [다음 행동]
 
-1. 사용자에게서 다음 실제 상태를 확인한 뒤 exact commit에서 60초 live를 한 번만 실행한다.
-   - J511–앰프 분리
-   - 앰프 전원 OFF
-   - 앰프 입력 분리
-   - AB13X–앰프 분리
-   - 사용자 입회
-2. PASS해도 곧바로 학습하지 않는다. 짧은 electrical/frame witness를 먼저 설계·검증한다.
-3. 그 뒤에만 저레벨 channel/polarity와 실제 덕트 fullband P/S를 한 연결 창에서 측정한다.
-4. 새 plant가 150–1600 Hz뿐 아니라 2/4/8 kHz consistency와 out-of-band do-no-harm를
+1. PASS해도 곧바로 학습하지 않는다. J511 실제 출력과 I2S2 입력의 frame identity를 보일
+   별도 electrical/frame witness를 설계·구현·dry-run 검증한다. current all-zero raw는 이
+   권위를 만들지 않는다.
+2. 그 뒤에만 저레벨 channel/polarity와 실제 덕트 fullband P/S를 한 연결 창에서 측정한다.
+3. 새 plant가 150–1600 Hz뿐 아니라 2/4/8 kHz consistency와 out-of-band do-no-harm를
    통과하면 transfer manifest/Elice readiness를 새 exact commit에 다시 결속한다.
-5. 그 후 fullband loss pilot → canonical 100k pretrain → 50k measured fine-tune → unseen
+4. 그 후 fullband loss pilot → canonical 100k pretrain → 50k measured fine-tune → unseen
    speech/music/environment/machine 및 실제 natural sound G4를 실행한다.
 
 ## 0-V7. v6 실제 결과와 현재 차단 상태 (2026-08-29, 이전 실패 근거)

@@ -91,8 +91,22 @@ PYTHONPATH=src .venv/bin/python scripts/jetson/audit_rt5640_zero_duplex.py \
 - 실행 전후 ALSA snapshot 불일치와 no-replace generation 재사용
 - receipt에 shared-clock/P/S/감쇠 권위를 다시 서명해 주입하는 시도
 
-실제 live 결과와 artifact SHA는 실행 후 이 절과 `HANDOFF.md`에 추가한다. live 전에는 결과를
-미리 PASS로 기록하지 않는다.
+2026-08-29에 exact commit `0c1956dd5eb2e310e5a3174ea7ba8a542e8fa1fa`에서 live를 한 번
+실행했다. 결과는 `ZERO_DUPLEX_TRANSPORT_SMOKE_PASS`/`valid=true`다.
+
+- raw: `results/rt5640_zero_duplex/v1/raw_capture.npz`, SHA-256
+  `cd1444c69eee8b06f7728dece9ff5e03668dce1edb6a6bfd8e49920892893376`
+- receipt: `results/rt5640_zero_duplex/v1/receipt.json`, SHA-256
+  `ce4234d4196589ab71fcdccce4fc998abf7309b65e69ae9c1fbc64c68e5c4ba4`
+- 48 kHz/S32_LE/2ch/256-frame input/output simultaneous hw_params, 11,250 callback,
+  submitted/captured 각 2,880,000 frame, 양 valid mask 전부 true, xrun/status 0을 확인했다.
+- actual submitted PCM과 sealed PCM은 동일 SHA이고 모든 application output buffer는
+  bitwise zero다. ALSA/amixer 전후 raw snapshot은 byte-exact다.
+- 동일 raw에서 1초 settle을 버린 ERR/REF health는 PASS했다: ch0 `-66.028 dBFS`,
+  18,939 unique code, clip 0%; ch1 `-63.297 dBFS`, 40,304 unique code, clip 0%.
+
+receipt를 별도 contract validator로 다시 검증하고 raw SHA도 receipt와 재대조했다. 이
+generation은 no-replace로 소비됐으므로 재실행하지 않는다.
 
 ## [판정]
 
