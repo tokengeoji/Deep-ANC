@@ -1,7 +1,84 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-29. 현재 실측 작업 브랜치: `work/v6-clock-checkpoints`.
+> 최종 갱신: 2026-08-29. 현재 실패 분석·후속 설계 브랜치: `work/v7-nonaffine-clock`.
+
+## 0-V7. v6 실제 결과와 현재 차단 상태 (2026-08-29, 최우선)
+
+### [가설]
+
+v6의 시간 분리 clock checkpoint와 near-white P/S 슬롯이면 현 Jetson의 USB 출력과
+I2S 입력 사이를 하나의 stationary affine rate ratio `q`로 보정할 수 있다고 가정했다.
+
+### [근거]
+
+- 실행 commit/branch: `872e59322527880330acd989a435cd31a2d16387`,
+  `work/v6-clock-checkpoints`
+- 20초 level meter는 중앙값 `-48.2 dBFS`로 `-50.1±2 dBFS` 계약을 PASS했다.
+- v6 raw:
+  `results/fullband_causal_v6/raw_capture.npz`, SHA-256
+  `f153c8664106b0c341b67db940fb2fb1d76cb7e58c2fa9a6e49558e1dba50a63`
+- 외부 receipt SHA-256:
+  `6372cfdec4ce15013f7bdc958f47c25fa1055f1e368adaeaa1a8d5627608dbda`
+- 실패 artifact:
+  `results/fullband_causal_v6/failure_232a4e53a4eaa024d54b740a01c95fe1.json`,
+  SHA-256 `10856999254a8dc70c3696b02aed239db1b80f217a3dfd771442cedb2aacc75d`
+- capture id: `232a4e53a4eaa024d54b740a01c95fe1`
+
+### [확인 방법]
+
+immutable raw의 actual submitted/captured PCM, callback/status/xrun/clip, fixed-line SNR,
+global clock 목적함수의 모든 basin, path×mic 독립 최적값을 다시 계산했다. 추가로 8,192
+sample Hann window와 1,024 hop으로 8개 line×두 마이크의 short-time frequency scale을
+448개 시점에서 재계산했다. 이 진단은 P/S·지연·감쇠·학습 authority를 발행하지 않는다.
+
+### [결과]
+
+- 정확히 1,179,648 frame, 4,608×256 callback을 모두 제출·수신했고 planned/actual
+  int16 PCM은 byte-exact다. valid mask 전부 true, xrun/status/clip은 0이다.
+- preterminal/terminal clock line SNR 최저는 각각 24.174/26.963 dB로 20 dB gate를
+  통과했다. 따라서 단선·무출력·레벨 부족 실패가 아니다.
+- global objective에는 basin 20개가 있다. best는 `-354.907693 ppm`, runner는
+  `-470.919359 ppm`, runner/best objective ratio는 `1.029125`로 요구값 `4.0`에
+  크게 못 미친다.
+- 독립 최적값은 primary ERR/REF가 `+562.050/+564.697 ppm`, secondary ERR/REF가
+  `-477.045/-473.639 ppm`이다. 한 scalar `q`가 두 출력 구간에 동시에 맞지 않는다.
+- short-time 중앙값은 `-4,743.581`, `-851.638`, `+3,149.531 ppm`의 세 진단 mode로
+  나뉘고 여러 clock block 내부에서도 mode가 바뀐다. 448개 중 선언된 ±1,000 ppm 안은
+  132개(29.46%)뿐이다. mode 간 약 3,900–4,001 ppm 간격은 `1/256=3,906.25 ppm`과
+  정합하지만, 어느 소프트웨어/USB 계층이 변환하는지는 electrical loopback 없이는
+  확정하지 않는다.
+- 분석·operator·P/S NPZ는 하나도 발행되지 않았다.
+
+### [판정]
+
+**Invalid experiment (P/S·학습 관점).** 캡처 transport와 배선 반응은 PASS지만, 현
+APE/I2S ADC와 AB13X USB DAC의 서로 다른 clock domain을 하나의 affine `q`로 설명한다는
+가설은 **Contradicted**다. 최저 basin 하나를 골라 P/S로 승격하거나 q 범위·임계를 넓히는
+것은 금지한다. 이 raw로 2/4/8 kHz plant, ANC 감쇠 dB 또는 파인튜닝 준비 완료를 주장하지
+않는다.
+
+### [다음 행동]
+
+1. `work/v7-nonaffine-clock`에서 ambiguity basin receipt와 short-time diagnostic-only
+   재현 코드를 전체 테스트·clean commit으로 봉인한다.
+2. 같은 v6 acoustic capture는 반복하지 않는다. 스피커는 v7 신호·raw publisher·합성
+   insert/drop/time-warp fixture와 무음 dry-run이 모두 끝날 때까지 필요하지 않다.
+3. v7은 (A) 현 하드웨어의 조건부 비-affine time-map 연구 경로와 (B) ADC/DAC 공통 clock
+   또는 electrical witness를 가진 canonical 경로를 분리한다. A의 결과는 B 없이 canonical
+   광대역 P/S가 될 수 없다.
+4. 2026-08-29 실제 Jetson read-only 감사에서 온보드 RT5640(`/sys/bus/i2c/devices/8-001c`)
+   과 APE I2S1 출력 `hw:APE,0`을 확인했다. 현 I2S2 마이크 입력 `hw:APE,1`과 I2S1은
+   같은 `PLL_A_OUT0` 계열을 쓰므로 **Likely shared-rate 후보**다. 하지만 J511→앰프 배선,
+   mixer route, simultaneous duplex, slip 0은 아직 미검증이므로 PASS가 아니다. 다음
+   브랜치에서 reversible ALSA snapshot 후 amplifier/speaker 분리 상태의 all-zero duplex를
+   먼저 실행하고, 그 뒤에만 짧은 level/channel/polarity 및 새 P/S를 설계한다.
+5. Elice의 마지막 endpoint `central-01.tcp.tunnel.elice.io:56230`은 key exchange 전에
+   원격에서 닫혔다. 실행 중 GPU·학습은 확인되지 않았으며, valid 광대역 P/S와 새 endpoint가
+   생기기 전 canonical pretrain/fine-tune은 계속 차단한다.
+6. v5/v6 측정 파일은 Google Drive `DeepANC/jetson_measurements_20260829`에 file count,
+   bytes, `rclone check --download` 0 differences로 백업했다. 로컬 약 50 MiB는 후속
+   forensic에 필요하므로 삭제하지 않는다.
 
 ## 0-A. 2026-08-29 fullband causal v6 실측 준비
 
@@ -20,20 +97,22 @@
   PCM `4e8a66b983af872192624bd6759282058cfe4a845460111a24bcd684b22551a3`다.
 - 세부 계약과 실행 순서는 `docs/39_fullband_causal_v6_clock_checkpoints.md`에 있다.
 
-아직 v6 실제 소리는 출력하지 않았고 raw/P/S도 없다. 전체 pytest, 무음 dry-run,
-비밀정보·diff 검사, clean commit/push를 완료한 뒤 exact 20초 meter와 24.576초 P/S를
-각각 한 번만 실행한다. 따라서 현 시점에 2/4/8 kHz 실제 ANC 감쇠 dB 또는 canonical
-학습 준비 완료를 주장하지 않는다.
+v6는 위 exact commit에서 20초 meter와 24.576초 캡처를 각각 한 번 실행했다. raw transport는
+PASS했지만 global clock이 비-affine라 offline 분석이 fail-closed했고 P/S는 발행되지 않았다.
+동일 캡처를 반복하지 않으며, 현 시점에 2/4/8 kHz 실제 ANC 감쇠 dB 또는 canonical 학습
+준비 완료를 주장하지 않는다. 실제 결과와 SHA는 바로 앞 `0-V7` 절을 우선한다.
 
 ## 0. 현재 결론
 
-파인튜닝은 아직 시작하지 않는다. 이번 브랜치는 준비 계약과 계보를 복구하는 중이며,
-다음 증거가 모두 생긴 뒤에만 canonical 학습을 연다.
+파인튜닝은 아직 시작하지 않는다. 150–1600 Hz Stage-1에 쓰는 strict P/S와 level
+evidence는 완료됐지만, 사용자가 요구한 2 kHz 이상 fullband 목표의 canonical plant는
+아니다. 다음 증거가 모두 생긴 뒤에만 **fullband canonical 학습**을 연다.
 
-1. (완료) 새 strict P/S 캡처와 level evidence
-2. (로컬 완료) 해당 P/S·82세션·계보 자료를 결속한 Elice transfer manifest
-3. Elice에서 재생성한 public corpus manifest 6종과 전체 QA
-4. 선택된 계약으로 처음부터 완료한 tiny 100k canonical init checkpoint
+1. (Stage-1만 완료) 기존 strict 150–1600 Hz P/S와 level evidence
+2. (미완료) hardware frame identity 또는 독립 electrical witness가 있는 새 fullband P/S
+3. (재발행 필요) 새 hardware/P/S·82세션·계보 자료를 결속한 Elice transfer manifest
+4. Elice에서 재생성한 public corpus manifest 6종과 전체 QA
+5. fullband 선택 계약으로 처음부터 완료한 tiny canonical init checkpoint
 
 과거 `pretrain_*_corrected`, `finetune_tiny`, legacy P/S는 삭제하지 않지만 모두
 diagnostic-only다. init, resume, 모델 선택, 성능 주장의 근거로 사용하지 않는다.

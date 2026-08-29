@@ -17,6 +17,56 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def test_archival_loader_is_separate_and_can_never_return_analysis_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    def fake_common(**kwargs):  # noqa: ANN003, ANN202
+        calls.append(kwargs.pop("require_current_meter_execution"))
+        assert kwargs
+        return {
+            "receipt_file_sha256": "a" * 64,
+            "receipt": {
+                "schema": post.EXTERNAL_POST_RECEIPT_SCHEMA,
+                "status": "POST_CAPTURE_PASS",
+                "valid": True,
+                "receipt_payload_sha256": "b" * 64,
+            },
+            "raw": {"metadata": {}},
+        }
+
+    monkeypatch.setattr(post, "_load_external_post_capture_receipt_v6", fake_common)
+    values = {
+        "repository_root": "/tmp/repository",
+        "receipt_relative_path": "results/raw.npz.post_receipt.json",
+        "expected_receipt_file_sha256": "a" * 64,
+        "plan_envelope_path": "assets/plan.json",
+        "live_authority_path": "assets/authority.json",
+        "meter_raw_path": "results/meter.npz",
+        "level_evidence_path": "assets/evidence.json",
+        "hardware_path": "configs/hardware.yaml",
+    }
+    normal = post.load_external_post_capture_receipt_v6(**values)
+    assert normal["receipt"]["valid"] is True
+    archival = post._load_external_post_capture_receipt_v6_archival_forensics(**values)
+    assert calls == [True, False]
+    assert set(archival) == {
+        "schema",
+        "scope",
+        "analysis_admission_eligible",
+        "canonical_training_eligible",
+        "source_receipt_evidence",
+        "forensic_raw_snapshot",
+    }
+    assert "receipt" not in archival and "raw" not in archival
+    assert archival["analysis_admission_eligible"] is False
+    assert archival["canonical_training_eligible"] is False
+    assert archival["scope"] == (
+        "archival_forensics_only_no_analysis_no_plant_no_training_authority"
+    )
+
+
 def _bound_files(root: Path, *, schema: str = post.EXTERNAL_POST_RECEIPT_SCHEMA):
     raw = root / SEALED_RAW_RELATIVE_PATH
     raw.parent.mkdir(parents=True)

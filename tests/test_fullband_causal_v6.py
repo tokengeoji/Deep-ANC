@@ -191,6 +191,120 @@ def test_v6_global_grid_rejects_boundary_and_ambiguous_basins() -> None:
         global_grid_basin_search_v6(ambiguous)
 
 
+def test_v6_estimator_preserves_ambiguous_global_basin_receipt_and_stops_before_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, submitted = build_plan_v6()
+    captured = synthesize_affine_capture_v6(
+        submitted,
+        primary_fir_by_mic=np.asarray([[1.0], [0.8]], dtype=np.float64),
+        secondary_fir_by_mic=np.asarray([[0.7], [-0.9]], dtype=np.float64),
+        rate_ratio=1.0,
+    )
+    original_search = global_grid_basin_search_v6
+    calls: list[bool] = []
+
+    def ambiguous_first_search(
+        _objective, *, grid_step_ppm=v6.GLOBAL_GRID_STEP_PPM, require_unique=True
+    ):  # noqa: ANN001, ANN202
+        calls.append(require_unique)
+        if len(calls) != 1:
+            raise AssertionError("ambiguous global basin 뒤 view optimizer가 실행됐습니다")
+
+        def ambiguous(ratio: float) -> float:
+            ppm = (ratio - 1.0) * 1.0e6
+            return min(1.0 + (ppm + 500.0) ** 2, 2.0 + (ppm - 500.0) ** 2)
+
+        return original_search(
+            ambiguous,
+            grid_step_ppm=grid_step_ppm,
+            require_unique=require_unique,
+        )
+
+    monkeypatch.setattr(v6, "global_grid_basin_search_v6", ambiguous_first_search)
+    with pytest.raises(v6.V6ClockAdmissionError, match="multimodal ambiguous") as caught:
+        estimate_common_clock_v6(
+            plan=plan,
+            submitted_pcm=submitted,
+            captured_pcm=captured,
+        )
+
+    failure = caught.value
+    assert failure.stage == "global_grid_basin_search"
+    assert failure.optimizer_started is True
+    assert calls == [False]
+    assert set(failure.available_receipt) == {
+        "preterminal_preoptimizer_snr_admission",
+        "terminal_preoptimizer_snr_admission",
+        "global_search",
+    }
+    assert failure.available_receipt[
+        "preterminal_preoptimizer_snr_admission"
+    ]["passed"] is True
+    assert failure.available_receipt[
+        "terminal_preoptimizer_snr_admission"
+    ]["passed"] is True
+    global_search = failure.available_receipt["global_search"]
+    assert global_search["unique_basin_passed"] is False
+    assert len(global_search["basins"]) == 2
+    assert global_search["runner_up_to_best_objective_ratio"] == pytest.approx(2.0)
+    assert global_search["minimum_unique_basin_objective_ratio"] == pytest.approx(4.0)
+
+
+def test_v6_estimator_preserves_failed_view_basin_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, submitted = build_plan_v6()
+    captured = synthesize_affine_capture_v6(
+        submitted,
+        primary_fir_by_mic=np.asarray([[1.0], [0.8]], dtype=np.float64),
+        secondary_fir_by_mic=np.asarray([[0.7], [-0.9]], dtype=np.float64),
+        rate_ratio=1.0,
+    )
+    original_search = global_grid_basin_search_v6
+    calls: list[bool] = []
+
+    def fail_first_view(
+        objective, *, grid_step_ppm=v6.GLOBAL_GRID_STEP_PPM, require_unique=True
+    ):  # noqa: ANN001, ANN202
+        calls.append(require_unique)
+        if len(calls) == 1:
+            return original_search(
+                objective,
+                grid_step_ppm=grid_step_ppm,
+                require_unique=require_unique,
+            )
+
+        def ambiguous(ratio: float) -> float:
+            ppm = (ratio - 1.0) * 1.0e6
+            return min(1.0 + (ppm + 500.0) ** 2, 2.0 + (ppm - 500.0) ** 2)
+
+        return original_search(
+            ambiguous,
+            grid_step_ppm=grid_step_ppm,
+            require_unique=require_unique,
+        )
+
+    monkeypatch.setattr(v6, "global_grid_basin_search_v6", fail_first_view)
+    with pytest.raises(
+        v6.V6ClockAdmissionError, match="path/mic clock objective가 multimodal"
+    ) as caught:
+        estimate_common_clock_v6(
+            plan=plan,
+            submitted_pcm=submitted,
+            captured_pcm=captured,
+        )
+
+    failure = caught.value
+    assert failure.stage == "view_global_grid_basin_search/primary_ERR"
+    assert failure.optimizer_started is True
+    assert calls == [False, False]
+    assert failure.available_receipt["failed_view"] == "primary_ERR"
+    failed = failure.available_receipt["completed_view_searches"]["primary_ERR"]
+    assert failed["unique_basin_passed"] is False
+    assert len(failed["basins"]) == 2
+
+
 def test_v6_preoptimizer_snr_failure_stops_before_global_optimizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

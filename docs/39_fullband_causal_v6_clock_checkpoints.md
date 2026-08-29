@@ -122,3 +122,176 @@ v5 transport/raw writer의 검증 primitive는 재사용하지만 v5 telemetry s
 2026-08-27 `experimental_high_band` raw는 xrun/clip 0이어도 유효 clock 주기가 0개라
 `Invalid experiment`다. v6 결과와 합치거나 2–8 kHz 증폭/감쇠 수치의 근거로 재사용하지
 않는다. 기존 strict P/S와 legacy checkpoint도 자동 교체·resume하지 않는다.
+
+## 7. 2026-08-29 v6 실제 실행 결과
+
+이 섹션은 capture commit
+`872e59322527880330acd989a435cd31a2d16387`
+(`work/v6-clock-checkpoints`), capture-id
+`232a4e53a4eaa024d54b740a01c95fe1`에서 발행된 불변 raw와 receipt를
+기준으로 한다. `POST_CAPTURE_PASS`와 P/S PASS는 다른 권한이며, 아래 시계
+재검산은 임계를 우회하는 승격 경로가 아니다.
+
+### 7.1 raw transport와 level이 유효한가
+
+#### [가설]
+
+v6 raw가 planned 출력과 실제 입력 transport를 완전히 보존했고, offline
+clock 실패가 출력 누락, 마이크 단선, callback 누락, xrun 또는 clipping
+때문이 아닐 가능성을 검사한다.
+
+#### [근거]
+
+| Artifact | 경로 | SHA-256 |
+|---|---|---|
+| immutable raw | `results/fullband_causal_v6/raw_capture.npz` | `f153c8664106b0c341b67db940fb2fb1d76cb7e58c2fa9a6e49558e1dba50a63` |
+| external post-capture receipt | `results/fullband_causal_v6/raw_capture.npz.post_receipt.json` | `6372cfdec4ce15013f7bdc958f47c25fa1055f1e368adaeaa1a8d5627608dbda` |
+| offline failure | `results/fullband_causal_v6/failure_232a4e53a4eaa024d54b740a01c95fe1.json` | `10856999254a8dc70c3696b02aed239db1b80f217a3dfd771442cedb2aacc75d` |
+
+failure 내부 payload SHA는
+`8f30be9aff2c4f3d63ab0b08208eec5731962e16ce66f251c66fee12e2d3405d`이며 재계산과
+일치한다. fresh meter ch0는 −48.234 dBFS로 계약 −50.1±2 dBFS 안이었다.
+
+#### [확인 방법]
+
+raw ndarray의 dtype·shape·SHA, planned/actual PCM, valid mask, callback sequence/start/frame
+count/status, preflight, monotonic/watchdog, stop telemetry를 독립 재계산했다. 현재 clean
+checkout에서 external receipt loader로 raw와 현재 plan·authority·hardware·meter 바이트를
+다시 결속했다.
+
+#### [결과]
+
+- 1,179,648/1,179,648 frame, 4,608×256 callback, input/output valid mask 전부 true
+- actual submitted PCM이 planned PCM과 byte-exact, 반대 출력 channel은 exact zero
+- callback status bitmask 전부 0, xrun/status count 0, normal stop/output stop true
+- 실측 capture elapsed 24.596525초로 24.576+2.0초 watchdog 안에 있음
+- input preflight 양 channel non-stuck/PASS, 본 capture peak ch0 0.05609, ch1 0.07635,
+  clip 0
+- preterminal fixed-line SNR 192/192 PASS(최저 24.174 dB), terminal 64/64
+  PASS(최저 26.963 dB), 기준 20 dB
+
+#### [판정]
+
+**Confirmed.** raw의 소프트웨어 transport와 level은 PASS했고,
+transport·level·완전 단선이 offline clock 실패의 주원인이라는 해석은
+raw와 receipt에 반한다. 다만 telemetry는 명시적으로
+`hardware_sample_slip_authority=false`이므로 transport PASS를 hardware clock PASS로
+승격하지 않는다.
+
+#### [다음 행동]
+
+이 raw를 연결·transport 진단에는 보존하되, clock/P/S/학습 권한으로 쓰지
+않는다. 별도 hardware clock witness가 없는 상태에서 callback frame count로
+sample slip을 추정하지 않는다.
+
+### 7.2 하나의 stationary affine q로 설명할 수 있는가
+
+#### [가설]
+
+전체 preterminal clock checkpoint에 하나의 유일한 DAC/ADC rate ratio `q`가 존재하고,
+각 path·microphone view도 같은 q를 선택할 가능성을 검사한다.
+
+#### [근거]
+
+최초 failure는 `failure_stage=global_grid_basin_search`, `optimizer_started=true`,
+`global clock objective가 multimodal ambiguous`를 기록했다. 초기 구현이 전체 basin
+receipt를 예외 경로에서 버리던 결함을 복구한 뒤, 위 immutable raw를
+`require_unique=false`로 **진단 재계산**했다. 이 option은 receipt를 보존할
+뿐 후속 gate를 열지 않으며, `unique=false`면 즉시 fail-closed한다.
+
+#### [확인 방법]
+
+1 ppm grid의 ±1,000 ppm 전체 interior basin을 전부 refine하고, runner-up/best
+objective ratio를 기준 4.0과 비교했다. 같은 관측을 primary/secondary×ERR/REF
+네 view로 분리해 동일한 진단 search를 실행했다. 추가로 8,192-sample
+Hann, 1,024-sample hop, 8 line×2 microphone median의 short-time rate를 8 block에서
+56개씩 총 448 step 계산했다. short-time mode는 진단일 뿐 admission gate가
+아니다.
+
+#### [결과]
+
+전체 search는 interior basin 20개를 찾았고 best q는
+`0.9996450923072727`(−354.9077 ppm), runner-up/best ratio는
+`1.029125322639433`이었다. 4.0에 크게 못 미치므로 이 best q는
+선택된 clock이 아니라 단지 최저 objective basin이다.
+
+| View | 최저-basin q | ppm | basin 수 | runner/best | unique |
+|---|---:|---:|---:|---:|---|
+| primary/ERR | 1.0005620496902223 | +562.0497 | 16 | 1.008394 | false |
+| primary/REF | 1.0005646970175202 | +564.6970 | 16 | 1.002325 | false |
+| secondary/ERR | 0.9995229549130533 | −477.0451 | 15 | 1.089759 | false |
+| secondary/REF | 0.9995263607599849 | −473.6392 | 16 | 1.078258 | false |
+
+같은 path 내 ERR/REF는 약 2.65–3.41 ppm 차이지만, primary와 secondary 사이는
+약 1,038–1,042 ppm 반대 방향으로 분리됐다.
+
+short-time 448 step의 mode 요약은 다음과 같다.
+이 수치는 현재 dirty v7 진단 draft에서 재현된 **non-authoritative 경향**이다.
+script provenance, raw loader/cross-binding, dirfd no-replace, failure association의 독립
+검토와 clean commit 기반 final artifact 발행 전이므로 draft 경로·SHA를 최종
+증거로 고정하지 않는다.
+
+| Histogram center (ppm) | membership | membership median (ppm) |
+|---:|---:|---:|
+| −4,625 | 100 | −4,743.581 |
+| −875 | 129 | −851.638 |
+| +3,125 | 193 | +3,149.531 |
+
+전체 중 기존 affine search 경계 ±1,000 ppm 안의 step은 132/448
+(29.46%)이었다. 전체 median은 −674.456 ppm, 5–95 percentile은
+−4,818.908–+3,403.853 ppm이었다.
+
+#### [판정]
+
+**Contradicted.** 이 capture를 하나의 유일한 stationary affine q로 승인할 수
+없다. 20-basin/4-view 결과는 정식 uniqueness gate 실패이며, short-time 3-mode는
+경로·시간에 따른 non-affine 동작 가능성을 강하게 지지하는 diagnostic이다.
+다만 `hardware_sample_slip_authority=false`이므로 이 결과만으로 USB DAC, APE ADC,
+driver 중 어느 구성요소가 원인인지는 확정하지 않는다.
+
+#### [다음 행동]
+
+기존 4.0 uniqueness, ±1,000 ppm, SNR, endpoint, 8-subband 임계를 낮추지
+않는다. 먼저 current raw에서 block/path 별 non-affine clock hypothesis를 분리
+진단하고, 다음 실측은 하나의 q를 전제하지 않는 새 plan/authority/raw
+경로와 hardware clock witness를 먼저 설계한다. 전체 무음 dry-run과 새 fresh meter
+PASS 전에는 출력하지 않는다.
+
+### 7.3 P/S와 학습 권한을 발행할 수 있는가
+
+#### [가설]
+
+transport와 SNR이 PASS했으므로 이 raw에서 P/S를 발행하거나 파인튜닝을
+개시해도 된다는 가설을 검사한다.
+
+#### [근거]
+
+failure artifact는 `operator_published=false`, `analysis_published=false`,
+`canonical_training_eligible=false`를 명시한다. clock uniqueness가 P/S LS, compact FIR,
+96-row/8-subband consistency, delay 발행보다 먼저 실패했다.
+
+#### [확인 방법]
+
+`results/fullband_causal_v6/`와 `assets/measured/`에서 해당 capture-id에 결속된
+analysis/operator/P/S 산출물을 검색하고 failure flag와 대조했다. clock
+failure 이후 view optimizer, P/S operator, holdout score publisher가 열리지 않는지
+확인했다.
+
+#### [결과]
+
+analysis/operator/P/S는 하나도 발행되지 않았다. 따라서 current fullband P/S,
+lead, 2/4/8 kHz plant consistency, ANC 감쇠 dB는 모두 미확정이며, 이 capture로
+canonical pretrain/파인튜닝을 열 수 없다.
+
+#### [판정]
+
+**Invalid experiment.** raw transport 진단은 유효하지만 plant identification과 학습
+권한은 무효다.
+
+#### [다음 행동]
+
+이 capture-id와 동일 v6 signal-plan을 다시 출력하지 않는다. 실패 raw를
+불변 진단 자료로 보존하고, offline 원인 분석·새 clock/measurement 계약·전체
+무음 검증을 먼저 완료한다. 새 sealed plan이 기존 임계를 그대로 통과한
+다음에만 **새 capture-id와 새 raw 경로**로 한 번 실행한다. 유효 P/S가
+발행되기 전에는 학습을 계속 차단한다.

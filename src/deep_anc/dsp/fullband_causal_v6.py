@@ -871,7 +871,8 @@ def estimate_common_clock_v6(
     combined_observations = [value for path in PATH_CHANNEL for value in observations[path].values()]
     try:
         analytic_ratio, global_receipt = global_grid_basin_search_v6(
-            lambda q: _circular_phase_objective(combined_observations, q)
+            lambda q: _circular_phase_objective(combined_observations, q),
+            require_unique=False,
         )
     except ValueError as exc:
         raise V6ClockAdmissionError(
@@ -883,6 +884,17 @@ def estimate_common_clock_v6(
                 "terminal_preoptimizer_snr_admission": terminal_pre_snr,
             },
         ) from exc
+    if global_receipt["unique_basin_passed"] is not True:
+        raise V6ClockAdmissionError(
+            "global clock objective가 multimodal ambiguous입니다",
+            stage="global_grid_basin_search",
+            optimizer_started=True,
+            available_receipt={
+                "preterminal_preoptimizer_snr_admission": pre_snr,
+                "terminal_preoptimizer_snr_admission": terminal_pre_snr,
+                "global_search": global_receipt,
+            },
+        )
     view_ratios: dict[str, float] = {}
     view_receipts: dict[str, Any] = {}
     for path in PATH_CHANNEL:
@@ -890,7 +902,8 @@ def estimate_common_clock_v6(
             name = f"{path}_{label}"
             try:
                 view_ratios[name], view_receipts[name] = global_grid_basin_search_v6(
-                    lambda q, value=observations[path][mic]: _circular_phase_objective([value], q)
+                    lambda q, value=observations[path][mic]: _circular_phase_objective([value], q),
+                    require_unique=False,
                 )
             except ValueError as exc:
                 raise V6ClockAdmissionError(
@@ -902,6 +915,17 @@ def estimate_common_clock_v6(
                         "completed_view_searches": view_receipts,
                     },
                 ) from exc
+            if view_receipts[name]["unique_basin_passed"] is not True:
+                raise V6ClockAdmissionError(
+                    "v6 path/mic clock objective가 multimodal ambiguous입니다",
+                    stage=f"view_global_grid_basin_search/{name}",
+                    optimizer_started=True,
+                    available_receipt={
+                        "global_search": global_receipt,
+                        "failed_view": name,
+                        "completed_view_searches": view_receipts,
+                    },
+                )
     view_endpoint = (max(view_ratios.values()) - min(view_ratios.values())) * len(submitted)
     if view_endpoint > MAX_VIEW_ENDPOINT_DISAGREEMENT_SAMPLES:
         raise V6ClockAdmissionError(

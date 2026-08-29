@@ -770,8 +770,12 @@ def _collect_offline_external_bindings_without_backend(
     meter_raw_path: str,
     level_evidence_path: str,
     hardware_path: str,
+    require_current_meter_execution: bool = True,
 ) -> dict[str, Any]:
     """offline에서는 PortAudio query 없이 receipt가 봉인한 devices를 재검증한다."""
+
+    if type(require_current_meter_execution) is not bool:
+        raise TypeError("require_current_meter_execution은 exact bool이어야 합니다")
 
     from . import fullband_v6_meter
     from .measurement_level import (
@@ -850,9 +854,10 @@ def _collect_offline_external_bindings_without_backend(
         )
         if meter["sha256"] != guards["meter"].sha256:
             raise ValueError("offline generic meter validation SHA가 held raw와 다릅니다")
-        _validate_offline_meter_repository_execution_v6(
-            meter["metadata"], repository_root=repository_root
-        )
+        if require_current_meter_execution:
+            _validate_offline_meter_repository_execution_v6(
+                meter["metadata"], repository_root=repository_root
+            )
         followup = fullband_v6_meter.validate_fullband_v6_followup(
             meter["metadata"].get("fullband_v6_followup"),
             expected_contract=contract,
@@ -1174,7 +1179,7 @@ def issue_invalid_external_post_capture_receipt_v6(
     return {**published, "receipt": receipt}
 
 
-def load_external_post_capture_receipt_v6(
+def _load_external_post_capture_receipt_v6(
     *,
     repository_root: str | os.PathLike[str],
     receipt_relative_path: str,
@@ -1184,8 +1189,12 @@ def load_external_post_capture_receipt_v6(
     meter_raw_path: str,
     level_evidence_path: str,
     hardware_path: str,
+    require_current_meter_execution: bool,
 ) -> dict[str, Any]:
-    """offline에서 external receipt, actual bytes와 canonical raw를 함께 검증한다."""
+    """현재 실행 identity 선택을 제외한 공통 receipt/raw 검증 core."""
+
+    if type(require_current_meter_execution) is not bool:
+        raise TypeError("require_current_meter_execution은 exact bool이어야 합니다")
 
     root = _repository_root(repository_root)
     receipt_relative = _canonical_relative_path(
@@ -1222,6 +1231,7 @@ def load_external_post_capture_receipt_v6(
         meter_raw_path=meter_raw_path,
         level_evidence_path=level_evidence_path,
         hardware_path=hardware_path,
+        require_current_meter_execution=require_current_meter_execution,
     )
     if current != bindings:
         raise ValueError("offline current external files가 post receipt binding과 다릅니다")
@@ -1263,6 +1273,80 @@ def load_external_post_capture_receipt_v6(
         "receipt_file_sha256": snapshot["sha256"],
         "receipt": receipt,
         "raw": loaded,
+    }
+
+
+def load_external_post_capture_receipt_v6(
+    *,
+    repository_root: str | os.PathLike[str],
+    receipt_relative_path: str,
+    expected_receipt_file_sha256: str,
+    plan_envelope_path: str,
+    live_authority_path: str,
+    meter_raw_path: str,
+    level_evidence_path: str,
+    hardware_path: str,
+) -> dict[str, Any]:
+    """offline 분석용: capture 당시와 같은 clean meter 실행 identity까지 요구한다."""
+
+    return _load_external_post_capture_receipt_v6(
+        repository_root=repository_root,
+        receipt_relative_path=receipt_relative_path,
+        expected_receipt_file_sha256=expected_receipt_file_sha256,
+        plan_envelope_path=plan_envelope_path,
+        live_authority_path=live_authority_path,
+        meter_raw_path=meter_raw_path,
+        level_evidence_path=level_evidence_path,
+        hardware_path=hardware_path,
+        require_current_meter_execution=True,
+    )
+
+
+def _load_external_post_capture_receipt_v6_archival_forensics(
+    *,
+    repository_root: str | os.PathLike[str],
+    receipt_relative_path: str,
+    expected_receipt_file_sha256: str,
+    plan_envelope_path: str,
+    live_authority_path: str,
+    meter_raw_path: str,
+    level_evidence_path: str,
+    hardware_path: str,
+) -> dict[str, Any]:
+    """과거 raw forensic용 loader.
+
+    receipt가 봉인한 plan/authority/meter/evidence/hardware/raw의 canonical bytes와 모든
+    SHA/semantic binding은 동일하게 재검증한다. 다만 capture commit과 다른 clean 분석
+    commit에서 읽을 수 있도록 *현재* ``set_amp_level.py`` blob 동일성만 요구하지 않는다.
+    반환값은 분석/P/S/학습 admission capability가 아니다.
+    """
+
+    admitted = _load_external_post_capture_receipt_v6(
+        repository_root=repository_root,
+        receipt_relative_path=receipt_relative_path,
+        expected_receipt_file_sha256=expected_receipt_file_sha256,
+        plan_envelope_path=plan_envelope_path,
+        live_authority_path=live_authority_path,
+        meter_raw_path=meter_raw_path,
+        level_evidence_path=level_evidence_path,
+        hardware_path=hardware_path,
+        require_current_meter_execution=False,
+    )
+    receipt = admitted["receipt"]
+    return {
+        "schema": "fullband_causal_v6_archival_forensics_source_v1",
+        "scope": "archival_forensics_only_no_analysis_no_plant_no_training_authority",
+        "analysis_admission_eligible": False,
+        "canonical_training_eligible": False,
+        "source_receipt_evidence": {
+            "path": receipt_relative_path,
+            "file_sha256": admitted["receipt_file_sha256"],
+            "schema": receipt["schema"],
+            "status": receipt["status"],
+            "valid": receipt["valid"],
+            "receipt_payload_sha256": receipt["receipt_payload_sha256"],
+        },
+        "forensic_raw_snapshot": admitted["raw"],
     }
 
 
