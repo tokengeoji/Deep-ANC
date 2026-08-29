@@ -170,6 +170,14 @@ canonical_v4 bootstrap receipt와 full public manifest에서만 exact SHA로 발
 receipt → no-replace 17행 plan/dry-run → 짧은 Stage-1 additions 수집 → coverage 재감사다.
 그 뒤에만 G0/pilot/probe/smoke/100k pretrain/50k fine-tune을 연다.
 
+### 0.7 2026-08-29 개발선 통합
+
+clean linked worktree 7개와 stale registration을 Git으로 해제했고, `dev`에 완전히
+흡수된 작업 branch와 안전하지 않은 구형 high-frequency USB experiment를 제거하는
+정리 근거를 [`docs/60_20260829_branch_consolidation.md`](docs/60_20260829_branch_consolidation.md)에
+기록했다. 이 정리는 raw/model/data를 삭제하거나 `main`에 미검증 결과를 병합하지 않는다.
+최종 상태는 `main`(배포 기준선)과 `dev`(통합 개발선)만 유지한다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
