@@ -61,6 +61,13 @@ preflight, operator confirmation, 앰프 최소 볼륨 확인이 계속 필요�
 }
 ```
 
+J511이 `None`인 같은 상태에서 APE PCM0(=I2S1/RT5640 codec 방향)을 **입력 전용**으로
+1초 settle + 3초 probe했다. 이 작업은 output stream을 열지 않았고 종료 후 모든 PCM은
+다시 `closed`였다. 하지만 ch0은 RMS `-4.767 dBFS`, peak `1.0`, clip `1.191%`로 rail
+gate에 실패했고, ch1은 RMS `-189.645 dBFS`, raw `[-1, 0]`, unique code 2로 stuck이었다.
+이 probe는 raw artifact를 발행하지 않은 일회성 hardware capability 진단이며 P/S나
+clock evidence가 아니다.
+
 ## [판정]
 
 **Confirmed — J511의 software-visible plug state는 `None`이다.** 이는 Jetson 잭에서
@@ -74,8 +81,12 @@ plug가 감지되지 않았다는 증거다.
 - ERR/REF 물리 위치·극성·주파수응답
 
 따라서 J511 state PASS를 P/S, ANC 감쇠, 공통 clock 또는 학습 적격성으로 승격하지 않는다.
+특히 현재 `None` 상태의 PCM0 capture는 정상적인 2채널 electrical tap이 아니므로 이를
+J511 전기 witness 입력으로 쓰지 않는다.
 
 ## [다음 행동]
 
-실제 광대역 P/S 연결 창에서는 J511 cable의 감지 상태를 먼저 raw receipt에 결속한다. 그 뒤
-낮은 레벨의 channel/polarity 확인과 fullband clock/P/S gate를 순서대로 수행한다.
+실제 광대역 P/S 연결 창에서는 J511 cable의 감지 상태를 먼저 raw receipt에 결속한다. 독립
+electrical witness가 필요하면 J511 pre-amp tap을 안전한 감쇠/DC-block 회로를 거쳐 2채널
+동기 ADC 또는 검증된 RT5640 TRRS capture에 넣고, 그 입력 health부터 다시 PASS시켜야 한다.
+그 뒤 낮은 레벨의 channel/polarity 확인과 fullband clock/P/S gate를 순서대로 수행한다.

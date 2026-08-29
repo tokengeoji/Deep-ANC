@@ -95,11 +95,23 @@ Stage-1 준비와 혼동하지 않으며, 사용자가 요구한 2/4/8 kHz 고�
    범위와 한계는 `docs/42_rt5640_j511_connection_gate.md`에 있다.
 2. J511 실제 출력과 I2S2 입력의 frame identity를 보일 별도 electrical/frame witness를
    설계·구현·dry-run 검증한다. current all-zero raw는 이 권위를 만들지 않는다.
+   현재 J511=`None`에서 APE PCM0를 input-only probe한 결과는 ch0 rail/clip, ch1 stuck으로
+   invalid였으므로, 현 상태의 RT5640 capture를 electrical tap으로 오인하지 않는다.
+   안전한 external tap 또는 검증된 TRRS capture를 연결한 뒤 health gate부터 다시 통과해야 한다.
 3. 그 뒤에만 저레벨 channel/polarity와 실제 덕트 fullband P/S를 한 연결 창에서 측정한다.
 4. 새 plant가 150–1600 Hz뿐 아니라 2/4/8 kHz consistency와 out-of-band do-no-harm를
    통과하면 transfer manifest/Elice readiness를 새 exact commit에 다시 결속한다.
 5. 그 후 fullband loss pilot → canonical 100k pretrain → 50k measured fine-tune → unseen
    speech/music/environment/machine 및 실제 natural sound G4를 실행한다.
+
+### Elice 병렬 상태 (2026-08-29 재확인)
+
+기록된 endpoint `central-01.tcp.tunnel.elice.io:56230`은 DNS/TCP까지는 도달하지만,
+비대화형 공개키 SSH가 key exchange 전에 원격 종료(`Connection closed by remote host`,
+exit 255)로 실패한다. 따라서 현 GPU 종류·사용률·디스크·public manifest·학습 실행 여부는
+**Inconclusive**이며, 학습이 실제로 돌아간다고 주장하지 않는다. 새 endpoint가 주어지면
+유효한 fullband P/S와 재발행 transfer manifest 뒤 exact checkout의 `--no-update
+--preflight-only` bootstrap부터 다시 시작한다.
 
 ## 0-V7. v6 실제 결과와 현재 차단 상태 (2026-08-29, 이전 실패 근거)
 
