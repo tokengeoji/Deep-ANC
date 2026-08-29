@@ -5,6 +5,74 @@
 > 현재 준비 브랜치: `work/v10-fullband-rt5640-contract`.
 > 현재 파일 기반 training readiness 감사: `docs/44_canonical_training_readiness_audit_20260829.md`.
 
+## 0-HW. full-octave electrical witness·geometry 감사 (2026-08-29)
+
+### [가설]
+
+현재 APE/AB13X/RT5640 조합만으로 125 Hz--8 kHz canonical P/S를 발행할 수 있다.
+
+### [근거]
+
+실제 read-only ALSA inventory에서 AB13X capture는 mono이고 USB↔APE timebase는 독립이다.
+J511 state도 현재 `None`이며 PCM0 input probe는 rail/stuck이었다. 덕트 geometry도
+105×105 mm working estimate일 뿐 mic/CS actual acoustic coordinates가 receipt로 확정되지
+않았다. 상세: `docs/46_fullband_hardware_geometry_admission_20260829.md`.
+
+### [확인 방법]
+
+ERR/REF/noise-output tap/cancel-output tap의 동시 clock/PCM health, 그리고 실제 geometry
+사진·치수·polarity를 raw-first receipt로 검사한다.
+
+### [결과]
+
+기존 장비만으로는 3--4 signal electrical witness가 없다. 1.633 kHz는 high-order mode
+onset이지 고역 ANC 불가선은 아니지만, 현 single point는 2/4/8 kHz quiet-zone을 증명하지
+못한다.
+
+### [판정]
+
+**BLOCKED (physical topology).** existing 150--1600 Hz strict P/S와 외부 CRN raw는
+full-octave canonical training에 승격하지 않는다.
+
+### [다음 행동]
+
+P/S에는 동일 clock 4-input ADC(권장)와 safe output tap이, final five-position spatial
+evaluation에는 8 input 규모의 동시 capture가 필요하다. 그 사이 S32 disarmed meter/raw
+software와 data admission을 계속 준비한다.
+
+## 0-V10.3. RT5640 S32 level-control recipe (2026-08-29)
+
+### [가설]
+
+S16 legacy meter를 S32/J511 fullband path에 재표기해도 level은 보존된다.
+
+### [근거]
+
+새 config/recipe/static checker는 Q15 `0.003` probe를 exact 16-bit left shift로 S32로
+만든다. source: `configs/hardware_jetson_rt5640_fullband_s32_v10_3.yaml`,
+`src/deep_anc/dsp/rt5640_s32_meter_v10_3.py`, 상세 `docs/47_rt5640_s32_meter_recipe_v10_3.md`.
+
+### [확인 방법]
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/jetson/check_rt5640_s32_meter_static_v10_3.py
+```
+
+### [결과]
+
+20초=960,000 S32 frame/3,750 callback, ch0 only/ch1 exact-zero recipe와 125--8k contract
+binding이 무음으로 PASS했다. PCM/ALSA/result write는 0회다.
+
+### [판정]
+
+**Confirmed — static low-band level-control recipe only.** highband P/S/electrical/
+training authority는 계속 false다.
+
+### [다음 행동]
+
+disarmed live stream/hw_params gate와 raw-first meter publisher를 구현·dry-run한 뒤,
+external electrical witness 준비가 끝난 한 연결 창에서만 20초 meter를 실행한다.
+
 ## 0-V10. RT5640 full-octave static boundary (2026-08-29)
 
 ### [가설]
