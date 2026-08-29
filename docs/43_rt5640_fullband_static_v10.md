@@ -52,8 +52,13 @@ PYTHONPATH=src .venv/bin/python scripts/jetson/check_rt5640_fullband_static_v10.
 
 ## 다음 순서
 
-1. fail-closed S32 duplex primitive를 synthetic fixture로 검증한다. v6 raw/authority/path를
-   재사용하지 않는다.
+1. (구현·synthetic fixture PASS) fail-closed S32 duplex primitive
+   `src/deep_anc/audio_duplex_s32_v10.py`는 callback 첫 동작을 zero-fill로 고정하고,
+   sealed planned S32 block이 exact assignment됐을 때만 application-buffer evidence를
+   보존한다. xrun/unknown/priming status는 plan assignment 전에 zero 상태로 abort한다.
+   `on_stream_started` hook은 start 뒤에 오므로 nonzero admission 수단이 아니라
+   observational hook이다. 그 evidence는 physical output/frame identity/P/S authority가
+   아니다.
 2. 안전한 external tap + 동기 ADC 또는 검증된 RT5640 TRRS capture를 준비해 electrical
    witness health를 통과시킨다. 이 장비가 없으면 v3 문서의 fixed-LTI conditional
    acoustic clock/stationarity evidence를 별도 raw로 충족해야 한다.

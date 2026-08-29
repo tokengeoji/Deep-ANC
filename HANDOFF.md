@@ -39,6 +39,10 @@ focused test와 실제 무음 명령이 PASS했다. receipt는 config SHA
 557,056×2 S32 frames(2,176 callbacks, 11.605333초)를 만들었고 planned PCM SHA는
 `dc897bde69b60e8df81d4d677cd68ae030b375e704d5082b214c1dbacd40c6ce`다. 이 SHA는
 application planned bytes이지 DAC/physical output SHA가 아니다.
+v10.2 planned-S32 duplex synthetic fixture도 PASS했다. callback은 항상 zero-fill부터
+시작하고, malformed input/output, xrun/unknown/priming status에서는 current planned block을
+쓰기 전에 abort한다. assignment mismatch는 re-zero와 `state-uncertain` telemetry로
+보존한다. 이 evidence도 backend application buffer 범위이며 PCM open은 아직 0회다.
 
 ### [판정]
 
@@ -48,7 +52,8 @@ J511 반대편 앰프, frame identity, electrical witness, P/S, ANC 감쇠 또�
 
 ### [다음 행동]
 
-1. v10.2에서 fail-closed S32 duplex transport를 synthetic fixture로 먼저 구현한다.
+1. fresh S32 meter, raw-first publisher와 actual `hw_params`/APE/J511 preflight를
+   synthetic fixture·무음 dry-run으로 구현한다. 실제 nonzero PCM open은 아직 금지한다.
 2. external synchronous ADC/tap 또는 검증된 RT5640 TRRS capture의 electrical witness
    health를 준비한다. 현재 J511=`None` PCM0 input은 rail/stuck이라 사용할 수 없다.
 3. 그 뒤 meter/dry-run, 한 번의 physical P/S window, v3 raw/analysis/plant authority를
