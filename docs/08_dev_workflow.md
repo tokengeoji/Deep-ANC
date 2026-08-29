@@ -173,15 +173,18 @@ bash -n scripts/elice/bootstrap_all.sh scripts/elice/setup_env.sh
 git diff --check
 ```
 
-### 7.1 최종 두-브랜치 정리 정책 (2026-08-29 사용자 결정)
+### 7.1 최종 세-브랜치 정리 정책 (2026-08-29 사용자 결정)
 
 파인튜닝 준비가 실제 artifact 기준으로 끝난 **뒤에만** 작업 브랜치를 정리한다. 준비 중에는
-P/S·witness·data provenance의 독립 commit을 지우지 않는다. 최종 운영 branch는 다음 둘이다.
+P/S·witness·data provenance의 독립 commit을 지우지 않는다. 최종 운영 branch는 다음 셋이다.
+Git ref에는 `:`를 쓸 수 없으므로 사용자가 말한 `fix:dev` 역할의 실제 branch 이름은
+`fix/dev`로 쓴다.
 
 | 브랜치 | 역할 |
 |---|---|
 | `dev` | canonical fullband P/S 이후의 Elice pretrain, fine-tune, evaluation, 수정의 유일한 개발선 |
 | `main` | `dev`의 G4·실측·OOD 결과까지 검토된 안정 기준선 |
+| `fix/dev` | `dev`에서 분리한 좁은 복구·회귀 수정만 보존하는 repair line. 학습 결과나 raw를 기준선으로 승격하지 않는다. |
 
 정리 순서는 고정한다.
 
@@ -190,10 +193,11 @@ P/S·witness·data provenance의 독립 commit을 지우지 않는다. 최종 �
 2. `dev`에서 full pytest, no-audio dry-run, exact commit/manifest/receipt를 다시 확인한다.
 3. `dev`의 canonical fine-tune과 one-shot G4, 필요한 real duct/OOD 평가가 끝난 뒤에만
    `main`에 fast-forward 또는 검토된 merge로 반영한다.
-4. 각 retired branch의 최종 commit이 `dev` 또는 `main`에서 도달 가능한지 `git merge-base
-   --is-ancestor`로 확인하고, 필요하면 immutable tag를 만든다. 그 뒤에만 local/origin의
-   `work/*`, `fix/*`, `archive/*`를 정리한다.
+4. 각 retired branch의 최종 commit이 `dev`, `main`, 또는 `fix/dev`에서 도달 가능한지
+   `git merge-base --is-ancestor`로 확인하고, 필요하면 immutable tag를 만든다. 그 뒤에만
+   local/origin의 `work/*`, 불필요한 `fix/*`, `archive/*`와 연결 worktree를 정리한다.
 
 따라서 지금처럼 fullband witness/P/S가 없는 동안에는 branch 삭제·force-push·history
 rewrite를 하지 않는다. Elice detached checkout과 연결된 commit도 학습 receipt가 끝날 때까지
-이동하거나 삭제하지 않는다.
+이동하거나 삭제하지 않는다. 현재 `dev`에 아직 도달하지 않는 diagnostic commit은 먼저
+안전성을 재감사하거나 forensic tag로 보존한 뒤에만 정리 대상이 된다.
