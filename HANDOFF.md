@@ -152,6 +152,24 @@ high-band P/S·학습·ANC 권한이 아니며 8-input quiet-zone acquisition의
 [`docs/59_20260829_rt5640_common_clock_route_audit.md`](docs/59_20260829_rt5640_common_clock_route_audit.md)에
 기록했다. J511 cable이 실제로 연결될 때만 `HP`/`HS` 세 번 일치부터 다시 확인한다.
 
+### 0.6 2026-08-29 현재 Stage-1 학습 admission 재확인
+
+현재 `dev`에서 `check_finetune.py --config configs/train_finetune.yaml --set
+data.digital_primary_path_mode=measured`를 실제 실행하면 canonical bootstrap receipt와
+외부 `bootstrap_receipt_sha256`가 없다는 설정 admission에서 exit 2로 멈춘다. 결과
+directory도 만들지 않았으므로, 이 fail-closed 결과를 readiness PASS나 학습 실행으로
+오인하지 않는다.
+
+82세션의 64-segment coverage 진단에는 12 family×split×subband 부족 행이 있으며, 하한은
+독립 신규 session/group 17개다. local source/lineage로 확정된 environment/music 8개와
+ESC-50 machine 4개는 보존됐지만, train 2·val 1·test 2의 DNS speech 선택은 새 Elice
+canonical_v4 bootstrap receipt와 full public manifest에서만 exact SHA로 발행할 수 있다.
+따라서 현재 12행 임시 CSV나 임의 speech source로 녹음을 시작하지 않는다.
+
+다음 학습 전 무음 순서는 새 A100 80GB Elice exact checkout/bootstrap → DNS selection
+receipt → no-replace 17행 plan/dry-run → 짧은 Stage-1 additions 수집 → coverage 재감사다.
+그 뒤에만 G0/pilot/probe/smoke/100k pretrain/50k fine-tune을 연다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
