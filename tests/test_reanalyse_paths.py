@@ -74,6 +74,7 @@ def _slip(signal: np.ndarray, *, start: int, samples: int) -> np.ndarray:
 def _write_capture(
     session: Path,
     *,
+    band_hz: tuple[float, float] = BAND_HZ,
     slip_start_period: int | None = None,
     slip_samples: int = 32,
     metadata_override: dict | None = None,
@@ -82,7 +83,13 @@ def _write_capture(
 ) -> Path:
     """합성 캡처 디렉터리를 만든다. 실제 측정 스크립트와 같은 구조로 쓴다."""
 
-    probe = _probe()
+    probe = build_interleaved_probe(
+        sample_rate=FS,
+        period_seconds=PERIOD_SECONDS,
+        band_hz=band_hz,
+        amplitude=AMPLITUDE,
+        tone_spacing_hz=None,
+    )
     lead_in = FS // 2
     total = WARMUP + REPEATS
     period = probe.period_samples
@@ -133,7 +140,7 @@ def _write_capture(
             "routing_and_geometry": True,
         },
         "amplitude": AMPLITUDE,
-        "design_band_hz": [BAND_HZ[0], BAND_HZ[1]],
+        "design_band_hz": [band_hz[0], band_hz[1]],
         "required_band_hz": [150.0, 1600.0],
         "channel_band_hz": {
             drive: [
@@ -766,6 +773,314 @@ def _run_reanalysis_write(
         ]
     )
     return result, session, primary, secondary
+
+
+def _strict_reanalysis_args() -> list[str]:
+    """fixture raw의 capture-before analysis recipe와 exact하게 맞는 CLI args."""
+
+    return [
+        "--fit-band", "150", "1600",
+        "--fir-length", "2048",
+        "--pre-roll", "256",
+        "--max-delay-ms", "25",
+    ]
+
+
+def _minimal_valid_reanalysis() -> tuple[dict, dict]:
+    """CLI 분기 테스트용 최소 valid 분석 결과 — DSP 자체는 별도 회귀가 검증한다."""
+
+    def model(delay_samples: int) -> dict:
+        return {
+            "delay_samples": delay_samples,
+            "consistency": 1.0,
+            "fullband_consistency": 1.0,
+            "band_consistency_hz": [[150.0, 1600.0]],
+            "band_consistency": [1.0],
+        }
+
+    results = {
+        "noise": {
+            "model": model(600),
+            "reasons": [],
+            "snr_db": np.asarray([30.0]),
+        },
+        "cancel": {
+            "model": model(360),
+            "reasons": [],
+            "snr_db": np.asarray([30.0]),
+        },
+    }
+    report = {
+        "keep": np.ones(8, dtype=bool),
+        "anchor": 0,
+        "drift_samples_per_period": 0.0,
+        "drift_ppm": 0.0,
+        "relative_tau_max_abs": 0.0,
+        "relative_delay_spread_samples": 0,
+        "drift_rejected": np.asarray([], dtype=int),
+        "relative_tau_rejected": np.asarray([], dtype=int),
+        "relative_tau_centre": 0.0,
+    }
+    return results, report
+
+
+def test_high_band_diagnostic_raw_cannot_be_promoted_by_reanalysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """sidecar 상태값 없이도 [60,8000] raw recipe는 분석 전에 차단한다."""
+
+    session = _write_capture(
+        tmp_path / "results" / "high-band-diagnostic",
+        band_hz=(60.0, 8000.0),
+        omit_measurement=True,
+    )
+    # 실제 2026-08-27 diagnostic처럼 status는 raw가 아니라 사후 sidecar에만 있어도,
+    # sidecar는 승격 authority가 아니며 raw recipe mismatch가 먼저 막아야 한다.
+    (session / "analysis_metadata.json").write_text(
+        json.dumps({"artifact_status": "diagnostic_only_not_official"}),
+        encoding="utf-8",
+    )
+    primary = tmp_path / "assets" / "primary.npz"
+    secondary = tmp_path / "assets" / "secondary.npz"
+    monkeypatch.setattr(ra, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ra.cw,
+        "_repo_path",
+        lambda value, require_results=False: Path(value).resolve(),
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("strict recipe mismatch 뒤 analyse/write는 호출되면 안 됩니다")
+
+    monkeypatch.setattr(ra.mpi, "analyse_capture", forbidden)
+    monkeypatch.setattr(ra.mpi, "write_official_pair_atomic", forbidden)
+    result = ra.main(
+        [
+            str(session),
+            "--write",
+            "--primary-out", str(primary),
+            "--secondary-out", str(secondary),
+            *_strict_reanalysis_args(),
+        ]
+    )
+
+    assert result == 2
+    assert "raw design_band_hz" in capsys.readouterr().err
+    assert not primary.exists() and not secondary.exists()
+
+
+def test_high_band_diagnostic_dry_run_is_explicitly_blocked_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """진단 계산은 남기되 incompatible raw의 exit 0/ready 오인을 막는다."""
+
+    session = _write_capture(
+        tmp_path / "results" / "high-band-diagnostic-dry-run",
+        band_hz=(60.0, 8000.0),
+        omit_measurement=True,
+    )
+    monkeypatch.setattr(ra, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ra.cw,
+        "_repo_path",
+        lambda value, require_results=False: Path(value).resolve(),
+    )
+    analysis_called = False
+
+    def diagnostic_analysis(*_args, **_kwargs):
+        nonlocal analysis_called
+        analysis_called = True
+        return _minimal_valid_reanalysis()
+
+    monkeypatch.setattr(ra.mpi, "analyse_capture", diagnostic_analysis)
+
+    result = ra.main([str(session), "--dry-run", *_strict_reanalysis_args()])
+    captured = capsys.readouterr()
+
+    assert result == 1
+    assert analysis_called is True
+    assert "[dry-run]" in captured.out
+    assert "official_recipe_eligible=false" in captured.err
+    assert "diagnostic-only" in captured.err
+
+
+def test_high_band_diagnostic_dry_run_with_official_outputs_stops_before_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """출력 경로를 준 dry-run은 official intent이므로 recipe mismatch를 먼저 막는다."""
+
+    session = _write_capture(
+        tmp_path / "results" / "high-band-diagnostic-output-preflight",
+        band_hz=(60.0, 8000.0),
+        omit_measurement=True,
+    )
+    primary = tmp_path / "assets" / "primary.npz"
+    secondary = tmp_path / "assets" / "secondary.npz"
+    monkeypatch.setattr(ra, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ra.cw,
+        "_repo_path",
+        lambda value, require_results=False: Path(value).resolve(),
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("recipe mismatch 뒤 analyse_capture는 호출되면 안 됩니다")
+
+    monkeypatch.setattr(ra.mpi, "analyse_capture", forbidden)
+    result = ra.main(
+        [
+            str(session),
+            "--dry-run",
+            "--primary-out", str(primary),
+            "--secondary-out", str(secondary),
+            *_strict_reanalysis_args(),
+        ]
+    )
+
+    assert result == 2
+    assert "official_recipe_eligible=false" in capsys.readouterr().err
+    assert not primary.exists() and not secondary.exists()
+
+
+def test_strict_recipe_dry_run_with_output_paths_remains_no_write_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """호환 raw의 기존 output-path dry-run은 쓰지 않고 수치 preflight를 계속 허용한다."""
+
+    session = _write_capture(
+        tmp_path / "results" / "strict-output-preflight", omit_measurement=True
+    )
+    primary = tmp_path / "assets" / "primary.npz"
+    secondary = tmp_path / "assets" / "secondary.npz"
+    monkeypatch.setattr(ra, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ra.cw,
+        "_repo_path",
+        lambda value, require_results=False: Path(value).resolve(),
+    )
+    monkeypatch.setattr(
+        ra.mpi, "analyse_capture", lambda *_args, **_kwargs: _minimal_valid_reanalysis()
+    )
+
+    result = ra.main(
+        [
+            str(session),
+            "--dry-run",
+            "--primary-out", str(primary),
+            "--secondary-out", str(secondary),
+            *_strict_reanalysis_args(),
+        ]
+    )
+
+    assert result == 0
+    assert "official_recipe_eligible=true" in capsys.readouterr().out
+    assert not primary.exists() and not secondary.exists()
+
+
+def test_enormous_raw_recipe_number_is_normalized_to_controlled_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """arbitrary-precision JSON int가 float64 변환 traceback으로 탈출하면 안 된다."""
+
+    enormous = 10**1000
+    with pytest.raises(ValueError, match="float64로 표현 가능한"):
+        ra._require_exact_raw_recipe_band(
+            [enormous, 1650.0],
+            expected=(60.0, 1650.0),
+            label="design_band_hz",
+        )
+
+    # main의 official-intent precheck도 위 ValueError를 CLI exit 2로 전달해야 한다.
+    # raw I/O는 이 분기와 무관하므로 여기서는 최소 capture를 직접 주입한다.
+    real_load_capture = ra.load_capture
+    monkeypatch.setattr(
+        ra,
+        "load_capture",
+        lambda _session: {
+            "meta": {
+                "design_band_hz": [enormous, 1650.0],
+                "required_band_hz": [150.0, 1600.0],
+                "analysis_contract": {"consistency_band_hz": [150.0, 1600.0]},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        ra.cw,
+        "_repo_path",
+        lambda value, require_results=False: Path(value).resolve(),
+    )
+    cli_result = ra.main(
+        [
+            "unused-capture-dir",
+            "--write",
+            "--primary-out", str(tmp_path / "assets" / "precheck-primary.npz"),
+            "--secondary-out", str(tmp_path / "assets" / "precheck-secondary.npz"),
+        ]
+    )
+    cli_error = capsys.readouterr().err
+    assert cli_result == 2
+    assert "official_recipe_eligible=false" in cli_error
+    assert "float64로 표현 가능한" in cli_error
+    monkeypatch.setattr(ra, "load_capture", real_load_capture)
+
+    # raw metadata 자체가 거대 정수를 품어 probe 재구성 전에 OverflowError를 내더라도
+    # CLI는 같은 fail-closed exit 2로 정규화한다.
+    session = _write_capture(
+        tmp_path / "results" / "enormous-raw-recipe",
+        metadata_override={"design_band_hz": [enormous, 1650.0]},
+        omit_measurement=True,
+    )
+    primary = tmp_path / "assets" / "primary.npz"
+    secondary = tmp_path / "assets" / "secondary.npz"
+    monkeypatch.setattr(ra, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ra.cw,
+        "_repo_path",
+        lambda value, require_results=False: Path(value).resolve(),
+    )
+
+    result = ra.main(
+        [
+            str(session),
+            "--write",
+            "--primary-out", str(primary),
+            "--secondary-out", str(secondary),
+            *_strict_reanalysis_args(),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert "Traceback" not in captured.err
+    assert "[중단]" in captured.err
+    assert not primary.exists() and not secondary.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("design_band_hz", None, "정확히 두 유한 숫자"),
+        ("design_band_hz", [60.0], "정확히 두 유한 숫자"),
+        ("design_band_hz", [60.0, float("nan")], "NaN/Inf"),
+        ("design_band_hz", [1650.0, 60.0], "official recipe"),
+        ("required_band_hz", [150.0, 1500.0], "official recipe"),
+        ("analysis_contract.consistency_band_hz", [150.0, 1500.0], "official recipe"),
+    ],
+)
+def test_official_reanalysis_requires_exact_raw_strict_recipe(
+    tmp_path: Path, field: str, value: object, match: str
+):
+    capture = ra.load_capture(_write_capture(tmp_path / field.replace(".", "_")))
+    if field == "analysis_contract.consistency_band_hz":
+        capture["meta"]["analysis_contract"]["consistency_band_hz"] = value
+    else:
+        capture["meta"][field] = value
+    # 이 unit은 이미 load_capture를 마친 뒤 contract 함수만 직접 부른다. parser의
+    # 필수 positional은 실제 파일을 열지 않으므로 dummy 값으로만 채운다.
+    args = ra.build_parser().parse_args(["unused-capture-dir", *_strict_reanalysis_args()])
+
+    with pytest.raises(ValueError, match=match):
+        ra.require_official_analysis_contract(capture, args)
 
 
 def test_reanalysis_write_promotes_versioned_analysis_and_official_pair_atomically(
