@@ -43,6 +43,12 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from torch.utils.data import IterableDataset, get_worker_info
 
 from ..dsp.timing import TrainingTimingContract
+from .broadband_batch_sampler import (
+    MIN_TARGET_D_DENSITY_RATIO,
+    QUALIFIED_SAMPLING_MODE,
+    BroadbandQualifiedBatchPlanner,
+    target_d_density_ratios,
+)
 from .manifest import read_manifest, read_manifest_bytes
 from .resumable_stream import indexed_rng, worker_global_item_indices
 from .synth_dataset import _delay_np
@@ -52,10 +58,16 @@ from .transfer_contract import (
     validate_recorded_training_snapshot,
 )
 
-__all__ = ["RecordedANCDataset", "RecordedAugmentConfig", "RecordedLeadPlan"]
+__all__ = [
+    "RecordedANCDataset",
+    "RecordedAugmentConfig",
+    "RecordedLeadPlan",
+    "make_recorded_eval_batch",
+]
 
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
+_COMMON_EQ_HALF_HISTORY_SAMPLES = 64  # 129-tap common EQ의 왼쪽 경계 영향
 
 
 class RecordedLeadPlan(BaseModel):
@@ -276,6 +288,7 @@ class RecordedANCDataset(IterableDataset):
         training_batch_size: int = 1,
         resume_batch_index: int = 0,
         transfer_repo_root: str | Path | None = None,
+        broadband_valid_prefix_samples: int | None = None,
     ) -> None:
         super().__init__()
         transfer_keys = {
@@ -332,6 +345,13 @@ class RecordedANCDataset(IterableDataset):
             )
         fb = data_cfg.get("closed_loop", {}).get("feedback_delay_samples", [512, 1024])
         self.feedback_delay_range = (int(fb[0]), int(fb[1]))
+        self.broadband_valid_prefix_samples = (
+            0
+            if broadband_valid_prefix_samples is None
+            else int(broadband_valid_prefix_samples)
+        )
+        if self.broadband_valid_prefix_samples < 0:
+            raise ValueError("broadband valid prefix는 0 이상이어야 합니다")
         self.seed = int(seed)
         self.training_batch_size = int(training_batch_size)
         self.resume_batch_index = int(resume_batch_index)
@@ -343,6 +363,7 @@ class RecordedANCDataset(IterableDataset):
             "uniform_session",
             "family_group_session_balanced",
             "family_lineage_session_balanced",
+            QUALIFIED_SAMPLING_MODE,
         }:
             raise ValueError(
                 f"지원하지 않는 recorded_sampling: {self.sampling_mode!r}"
@@ -351,6 +372,7 @@ class RecordedANCDataset(IterableDataset):
         if self.sampling_mode in {
             "family_group_session_balanced",
             "family_lineage_session_balanced",
+            QUALIFIED_SAMPLING_MODE,
         }:
             hierarchy: dict[str, dict[str, list[int]]] = {}
             for index, entry in enumerate(self.entries):
@@ -362,7 +384,10 @@ class RecordedANCDataset(IterableDataset):
                         f"entry의 source_family/group_id가 필요합니다: index={index}, "
                         f"session_id={entry.get('session_id')!r}"
                     )
-                if self.sampling_mode == "family_lineage_session_balanced":
+                if self.sampling_mode in {
+                    "family_lineage_session_balanced",
+                    QUALIFIED_SAMPLING_MODE,
+                }:
                     source_pool_group = str(
                         entry.get("source_pool_group_id") or ""
                     ).strip()
@@ -417,6 +442,120 @@ class RecordedANCDataset(IterableDataset):
             else int(self.timing_contract.synthetic_total_advance_samples)
         )
         self.augment = RecordedAugmentConfig.from_data_config(data_cfg)
+        self._broadband_batch_planner: BroadbandQualifiedBatchPlanner | None = None
+        self._broadband_eq_suffix_samples = 0
+        self.broadband_reference_dropout_probability = 0.0
+        self.broadband_error_dropout_probability = 0.0
+        if self.sampling_mode == QUALIFIED_SAMPLING_MODE:
+            if (
+                self.broadband_valid_prefix_samples <= 0
+                or self.broadband_valid_prefix_samples % 256 != 0
+                or self.broadband_valid_prefix_samples
+                < max(self.feedback_delay_range)
+            ):
+                raise ValueError(
+                    "BLOCKED_MISSING_PREFIX_OR_STATE: recorded broadband session은 "
+                    "256-aligned prefix를 실제 연속 session에서 제공해야 하며 prefix가 "
+                    "최대 feedback delay 이상이어야 합니다"
+                )
+            if (
+                self.augment.enabled
+                and (self.augment.eq_tilt_db > 0.0 or self.augment.eq_band_db > 0.0)
+                and self.broadband_valid_prefix_samples
+                < max(self.feedback_delay_range) + _COMMON_EQ_HALF_HISTORY_SAMPLES
+            ):
+                raise ValueError(
+                    "recorded broadband prefix가 common EQ history와 feedback delay를 "
+                    "모두 덮지 못합니다"
+                )
+            dropout = data_cfg.get("broadband_channel_dropout")
+            if not isinstance(dropout, dict) or set(dropout) != {
+                "reference_probability", "error_probability"
+            }:
+                raise ValueError(
+                    "qualified recorded broadband은 reference/error dropout exact "
+                    "mapping이 필요합니다"
+                )
+            self.broadband_reference_dropout_probability = float(
+                dropout["reference_probability"]
+            )
+            self.broadband_error_dropout_probability = float(
+                dropout["error_probability"]
+            )
+            if (
+                self.broadband_reference_dropout_probability != 0.0
+                or not 0.0 <= self.broadband_error_dropout_probability <= 1.0
+            ):
+                raise ValueError(
+                    "qualified digital-reference recorded의 x_ref dropout은 exact 0, "
+                    "error dropout은 [0,1]이어야 합니다"
+                )
+            receipt_key = (
+                "recorded_broadband_batch_receipt"
+                if split == "train"
+                else "recorded_broadband_val_batch_receipt"
+            )
+            receipt_sha_key = f"{receipt_key}_sha256"
+            receipt_value = data_cfg.get(receipt_key)
+            if not receipt_value:
+                raise ValueError(
+                    f"subband-qualified {split} sampler에는 data.{receipt_key}가 "
+                    "필요합니다"
+                )
+            receipt_path = Path(str(receipt_value)).expanduser()
+            if not receipt_path.is_absolute() and transfer_repo_root is not None:
+                receipt_path = Path(transfer_repo_root) / receipt_path
+            receipt_bytes = receipt_path.read_bytes()
+            expected_sha = str(
+                data_cfg.get(receipt_sha_key) or ""
+            ).lower()
+            import hashlib
+
+            actual_sha = hashlib.sha256(receipt_bytes).hexdigest()
+            if expected_sha != actual_sha:
+                raise ValueError(
+                    "recorded broadband batch receipt 외부 SHA가 없거나 다릅니다: "
+                    f"configured={expected_sha!r}, actual={actual_sha}"
+                )
+            try:
+                receipt_payload = json.loads(receipt_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("recorded broadband batch receipt JSON이 잘못됐습니다") from exc
+            self._broadband_batch_planner = BroadbandQualifiedBatchPlanner(
+                receipt_payload,
+                verify_raw=True,
+                expected_split=split,
+                expected_valid_prefix_samples=self.broadband_valid_prefix_samples,
+            )
+            if self._broadband_batch_planner.batch_size != self.training_batch_size:
+                raise ValueError(
+                    "recorded broadband receipt batch_size와 training batch_size가 다릅니다"
+                )
+            if self._broadband_batch_planner.segment_samples != self.segment:
+                raise ValueError(
+                    "recorded broadband receipt segment_samples와 dataset segment가 다릅니다"
+                )
+            receipt_sessions = self._broadband_batch_planner.session_ids
+            manifest_sessions = {str(entry.get("session_id")) for entry in self.entries}
+            if not receipt_sessions.issubset(manifest_sessions):
+                raise ValueError("broadband batch receipt session이 현재 train manifest 밖입니다")
+            # raw d에서 통과한 segment를 common EQ/mix로 다시 바꾸면 loss 입력에서
+            # density>=0.25 보장이 사라진다. gain/polarity와 입력 전용 mic noise만 허용.
+            if self.augment.mix_probability > 0.0:
+                raise ValueError(
+                    "subband-qualified sampler는 target density를 임의로 합치는 mix "
+                    "증강을 허용하지 않습니다"
+                )
+            if self.augment.enabled and (
+                self.augment.eq_tilt_db > 0.0 or self.augment.eq_band_db > 0.0
+            ):
+                self._broadband_eq_suffix_samples = (
+                    _COMMON_EQ_HALF_HISTORY_SAMPLES
+                )
+            self._qualified_session_indices = {
+                str(entry.get("session_id")): index
+                for index, entry in enumerate(self.entries)
+            }
 
         # 워커마다 전 세션을 메모리에 올리면 64세션 × 70s × 48000 × 4ch × 4B ≈ 3.4 GB 다
         # (source_aligned 추가로 더 늘어난다). Jetson 에서 OOM 이 실재하므로 LRU 로 바꾼다.
@@ -608,7 +747,11 @@ class RecordedANCDataset(IterableDataset):
         return int(sessions[int(rng.integers(len(sessions)))])
 
     def _draw_pair(
-        self, index: int, rng: np.random.Generator
+        self,
+        index: int,
+        rng: np.random.Generator,
+        *,
+        exact_start: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray] | None:
         """세션 하나에서 (x_ref, d) 한 쌍을 뽑는다. 길이가 모자라면 None."""
 
@@ -624,18 +767,56 @@ class RecordedANCDataset(IterableDataset):
                 )
         else:
             lead = 0
-        if err.size <= self.segment + lead:
+        prefix = int(self.broadband_valid_prefix_samples)
+        suffix = int(self._broadband_eq_suffix_samples)
+        model_samples = prefix + int(self.segment)
+        read_samples = model_samples + suffix
+        if err.size < read_samples + lead:
             return None
-        start = int(rng.integers(0, err.size - self.segment - lead))
-        d = err[start : start + self.segment].copy()
-        if self.reference_mode == "digital":
-            x_ref = source[start + lead : start + lead + self.segment].copy()
+        if exact_start is None:
+            stop_exclusive = err.size - self.segment - suffix - lead + 1
+            if stop_exclusive <= prefix:
+                return None
+            start = int(rng.integers(prefix, stop_exclusive))
         else:
-            x_ref = ref[start : start + self.segment].copy()
+            start = int(exact_start)
+            if start < prefix or start + self.segment + suffix + lead > err.size:
+                raise ValueError(
+                    "qualified segment에 실제 session prefix가 없거나 lead 범위 "
+                    f"밖입니다: index={index}, start={start}, prefix={prefix}, lead={lead}"
+                )
+        begin = start - prefix
+        end = start + self.segment + suffix
+        d = err[begin:end].copy()
+        if self.reference_mode == "digital":
+            x_ref = source[begin + lead : end + lead].copy()
+        else:
+            x_ref = ref[begin:end].copy()
+        if d.size != read_samples or x_ref.size != read_samples:
+            raise RuntimeError("recorded continuous prefix exact crop 길이가 다릅니다")
         return x_ref, d
 
+    def _remove_broadband_eq_suffix(
+        self, values: tuple[np.ndarray, np.ndarray, np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """common-EQ right history를 사용한 뒤 model 입력 길이로 exact crop."""
+
+        suffix = int(self._broadband_eq_suffix_samples)
+        if suffix <= 0:
+            return values
+        cropped = tuple(np.asarray(value[:-suffix], dtype=np.float32) for value in values)
+        expected = self.broadband_valid_prefix_samples + self.segment
+        if any(value.size != expected for value in cropped):
+            raise RuntimeError("recorded common-EQ suffix crop 길이가 다릅니다")
+        return cropped
+
     def _augment(
-        self, x_ref: np.ndarray, d: np.ndarray, rng: np.random.Generator
+        self,
+        x_ref: np.ndarray,
+        d: np.ndarray,
+        rng: np.random.Generator,
+        *,
+        apply_eq: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """적용 순서: (D) 공통 EQ → (A) 레벨 → (B) 극성 → (C) 입력 잡음.
 
@@ -646,7 +827,7 @@ class RecordedANCDataset(IterableDataset):
         cfg = self.augment
         peak_before = float(max(np.max(np.abs(x_ref)), np.max(np.abs(d)), 1e-12))
 
-        kernel = common_eq_kernel(rng, cfg, self.fs)
+        kernel = common_eq_kernel(rng, cfg, self.fs) if apply_eq else None
         if kernel is not None:
             x_ref = apply_same_fir(x_ref, kernel)
             d = apply_same_fir(d, kernel)
@@ -693,16 +874,28 @@ class RecordedANCDataset(IterableDataset):
         )
 
         for global_index in indices:
-            pair = None
-            attempt = 0
-            while pair is None:
-                rng = indexed_rng(self.seed, 0x524543, global_index, attempt)
-                pair = self._draw_pair(self._sample_session_index(rng), rng)
-                attempt += 1
-                if attempt > max(32, len(self.entries) * 2):
-                    raise RuntimeError(
-                        f"recorded global item {global_index}에 유효한 segment가 없습니다"
-                    )
+            if self._broadband_batch_planner is not None:
+                planned = self._broadband_batch_planner.item(
+                    global_index, seed=self.seed
+                )
+                session_index = self._qualified_session_indices[planned.session_id]
+                rng = indexed_rng(self.seed, 0x524543, global_index)
+                pair = self._draw_pair(
+                    session_index, rng, exact_start=planned.start_frame
+                )
+                if pair is None:  # pragma: no cover - exact_start 검증이 먼저 예외로 닫는다
+                    raise RuntimeError("qualified segment를 읽을 수 없습니다")
+            else:
+                pair = None
+                attempt = 0
+                while pair is None:
+                    rng = indexed_rng(self.seed, 0x524543, global_index, attempt)
+                    pair = self._draw_pair(self._sample_session_index(rng), rng)
+                    attempt += 1
+                    if attempt > max(32, len(self.entries) * 2):
+                        raise RuntimeError(
+                            f"recorded global item {global_index}에 유효한 segment가 없습니다"
+                        )
             x_ref, d = pair
 
             if (
@@ -718,17 +911,89 @@ class RecordedANCDataset(IterableDataset):
                     x_ref = (a * x_ref + b * other[0]).astype(np.float32)
                     d = (a * d + b * other[1]).astype(np.float32)
 
-            if self.augment.enabled:
+            if self.augment.enabled and self._broadband_batch_planner is not None:
+                native_x = x_ref
+                native_d = d
+                accepted = False
+                # 예약 item은 자신에게 배정된 대역만 density>=0.25를 보존한다.
+                # native receipt가 먼저 PASS하므로 EQ가 부족 corpus를 승격할 수 없다.
+                required_bands = tuple(planned.required_post_augment_bands)
+                attempts = 32 if required_bands else 1
+                for augment_attempt in range(attempts):
+                    candidate_rng = indexed_rng(
+                        self.seed, 0x524541, global_index, augment_attempt
+                    )
+                    candidate = self._augment(
+                        native_x.copy(), native_d.copy(), candidate_rng
+                    )
+                    candidate = self._remove_broadband_eq_suffix(candidate)
+                    ratios = target_d_density_ratios(
+                        candidate[2][-self.segment :],
+                        sample_rate=self.fs,
+                        bands_hz=self._broadband_batch_planner.bands,
+                    )
+                    if not required_bands or all(
+                        ratios[index] >= MIN_TARGET_D_DENSITY_RATIO
+                        for index in required_bands
+                    ):
+                        x_ref, err_source, d = candidate
+                        rng = candidate_rng
+                        accepted = True
+                        break
+                if not accepted:
+                    # bounded rejection이 모두 실패해도 batch invariant를 깨지 않는다.
+                    # EQ만 identity로 두고 gain/polarity/input-only mic noise는 같은
+                    # global-index RNG에서 계속 적용한다.
+                    rng = indexed_rng(self.seed, 0x524546, global_index)
+                    x_ref, err_source, d = self._augment(
+                        native_x.copy(), native_d.copy(), rng, apply_eq=False
+                    )
+                    x_ref, err_source, d = self._remove_broadband_eq_suffix(
+                        (x_ref, err_source, d)
+                    )
+                    fallback_ratios = target_d_density_ratios(
+                        d[-self.segment :],
+                        sample_rate=self.fs,
+                        bands_hz=self._broadband_batch_planner.bands,
+                    )
+                    if any(
+                        fallback_ratios[index] < MIN_TARGET_D_DENSITY_RATIO
+                        for index in required_bands
+                    ):
+                        raise RuntimeError(
+                            "identity-EQ fallback가 assigned recorded subband 자격을 "
+                            "보존하지 못했습니다"
+                        )
+            elif self.augment.enabled:
                 x_ref, err_source, d = self._augment(x_ref, d, rng)
             else:
                 err_source = d
 
             fb_delay = int(rng.integers(*self.feedback_delay_range))
             err_in = _delay_np(err_source, fb_delay)
+            if self._broadband_batch_planner is not None:
+                dropout_rng = indexed_rng(
+                    self.seed, 0x524544, int(global_index)
+                )
+                if (
+                    dropout_rng.random()
+                    < self.broadband_error_dropout_probability
+                ):
+                    err_in = np.zeros_like(err_in)
             x = np.stack([x_ref, err_in]).astype(np.float32)
             yield {
                 "x": torch.from_numpy(x),
                 "d": torch.from_numpy(d.astype(np.float32)).unsqueeze(0),
+                **(
+                    {
+                        "valid_start_sample": torch.tensor(
+                            self.broadband_valid_prefix_samples,
+                            dtype=torch.int64,
+                        )
+                    }
+                    if self.broadband_valid_prefix_samples > 0
+                    else {}
+                ),
             }
 
     # ------------------------------------------------------------------ 진단
@@ -738,10 +1003,12 @@ class RecordedANCDataset(IterableDataset):
         return {
             "sessions": len(self.entries),
             "segment_samples": self.segment,
+            "broadband_valid_prefix_samples": self.broadband_valid_prefix_samples,
             "reference_mode": self.reference_mode,
             "require_aligned_source": self.require_aligned_source,
             "lead_mode": self.lead_mode,
             "sampling_mode": self.sampling_mode,
+            "broadband_batch_qualified": self._broadband_batch_planner is not None,
             "constant_lead_samples": self.digital_reference_lead,
             "total_advance_samples": self.total_advance_samples,
             "training_timing_contract": (
@@ -762,3 +1029,27 @@ class RecordedANCDataset(IterableDataset):
                 else self._recorded_transfer.recorded_aggregate_sha256
             ),
         }
+
+
+def make_recorded_eval_batch(
+    dataset: RecordedANCDataset, n_items: int
+) -> dict[str, torch.Tensor]:
+    """global index 0에서 시작하는 고정 recorded validation batch."""
+
+    count = int(n_items)
+    if count < 1 or count != dataset.training_batch_size:
+        raise ValueError(
+            "recorded eval batch 크기는 dataset training_batch_size와 같은 양수여야 합니다"
+        )
+    iterator = iter(dataset)
+    items = [next(iterator) for _ in range(count)]
+    batch = {
+        "x": torch.stack([item["x"] for item in items]),
+        "d": torch.stack([item["d"] for item in items]),
+    }
+    prefix_values = [item.get("valid_start_sample") for item in items]
+    if any(value is not None for value in prefix_values):
+        if not all(isinstance(value, torch.Tensor) for value in prefix_values):
+            raise ValueError("recorded eval batch valid prefix metadata가 일부만 있습니다")
+        batch["valid_start_sample"] = torch.stack(prefix_values)  # type: ignore[arg-type]
+    return batch

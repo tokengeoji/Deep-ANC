@@ -44,7 +44,7 @@ import sys
 import tempfile
 import re
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -73,11 +73,25 @@ from deep_anc.data.manifest_contract import (                  # noqa: E402
     validate_decoder_audit_binding,
     validate_decoder_audit_manifest_entry,
 )
+from deep_anc.data.recorded_generation import (                # noqa: E402
+    RecordedGenerationError,
+    validate_recorded_generation,
+)
+from deep_anc.data.recorded_generation_exclusion import (      # noqa: E402
+    RecordedGenerationExclusionError,
+    derive_recorded_generation_exclusion,
+    find_recorded_generation_overlaps,
+    generation_excluded_basenames,
+    generation_excluded_public_groups,
+    validate_recorded_generation_exclusion,
+)
 from deep_anc.data.public_lineage import (                      # noqa: E402
     DNS_MARKER_TAG_ROOTS,
+    PUBLIC_LINEAGE_SCHEMA,
     PublicLineageError,
     build_public_lineage,
     canonical_json_sha256,
+    validate_public_crosswalk_policy,
     validate_public_manifest_lineage,
 )
 
@@ -387,6 +401,16 @@ def _verify_committed_generation(
             raise RuntimeError("committed 학습 세대에 public_lineage가 없습니다")
         if committed_decoder_audit is None:
             raise RuntimeError("committed 학습 세대에 decoder audit가 없습니다")
+        if lineage.get("lineage_schema") != PUBLIC_LINEAGE_SCHEMA:
+            raise RuntimeError(
+                "committed public lineage schema가 canonical 값이 아닙니다"
+            )
+        try:
+            validate_public_crosswalk_policy(lineage.get("crosswalk_policy"))
+        except PublicLineageError as exc:
+            raise RuntimeError(
+                f"committed public lineage crosswalk_policy가 깨졌습니다: {exc}"
+            ) from exc
         try:
             validate_decoder_audit_dns_marker_partition(
                 lineage,
@@ -423,6 +447,26 @@ def _verify_committed_generation(
                 or metadata_snapshot.size != evidence.get("size")
             ):
                 raise RuntimeError(f"prepare 중 public lineage metadata가 바뀌었습니다: {name}")
+        generation_exclusion = contract.get("recorded_generation_exclusion")
+        if generation_exclusion is not None:
+            try:
+                validate_recorded_generation_exclusion(
+                    generation_exclusion, repo_root=REPO_ROOT
+                )
+                overlaps = find_recorded_generation_overlaps(
+                    generation_exclusion,
+                    committed_entries,
+                    repo_root=REPO_ROOT,
+                )
+            except RecordedGenerationExclusionError as exc:
+                raise RuntimeError(
+                    f"committed recorded generation exclusion 결속이 깨졌습니다: {exc}"
+                ) from exc
+            if overlaps:
+                raise RuntimeError(
+                    "committed public manifest에 recorded additions 원본 누수가 남았습니다: "
+                    f"{overlaps[:5]}"
+                )
     config_snapshot = read_regular_file_snapshot(
         data_config,
         root=REPO_ROOT,
@@ -543,6 +587,7 @@ def write_generation_transactionally(
     raw_roots: list[Path] | None = None,
     public_lineage: dict | None = None,
     decoder_audit: dict | None = None,
+    recorded_generation_exclusion: dict | None = None,
     hash_workers: int = 1,
 ) -> dict:
     out_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -557,6 +602,7 @@ def write_generation_transactionally(
             raw_roots=raw_roots,
             public_lineage=public_lineage,
             decoder_audit=decoder_audit,
+            recorded_generation_exclusion=recorded_generation_exclusion,
             hash_workers=hash_workers,
         )
 
@@ -572,6 +618,7 @@ def _write_generation_transactionally_locked(
     raw_roots: list[Path] | None,
     public_lineage: dict | None,
     decoder_audit: dict | None,
+    recorded_generation_exclusion: dict | None,
     hash_workers: int,
 ) -> dict:
     """검증된 manifest 세트와 provenance sidecar를 세대 단위로 교체한다.
@@ -631,6 +678,13 @@ def _write_generation_transactionally_locked(
         }
         if public_lineage is not None:
             contract["public_lineage"] = public_lineage
+        if recorded_generation_exclusion is not None:
+            if not training_eligible:
+                raise ValueError(
+                    "diagnostic-only manifest에는 canonical recorded generation exclusion을 "
+                    "결속하지 않습니다"
+                )
+            contract["recorded_generation_exclusion"] = recorded_generation_exclusion
         if decoder_audit is not None:
             audit_snapshot = decoder_audit.get("_snapshot")
             if audit_snapshot is None or not isinstance(getattr(audit_snapshot, "data", None), bytes):
@@ -864,6 +918,19 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--recorded-generation",
+        default=None,
+        help=(
+            "schema v2 recorded generation report. 추가 17세션의 source/raw SHA와 "
+            "lineage를 합성 manifest exclusion 및 sidecar에 결속한다"
+        ),
+    )
+    parser.add_argument(
+        "--expected-recorded-generation-sha256",
+        default=None,
+        help="신뢰한 recorded generation report의 64자리 SHA-256",
+    )
+    parser.add_argument(
         "--decoder-audit",
         default=None,
         help=(
@@ -1081,6 +1148,74 @@ def main() -> int:
             "합성 manifest에서 추가 제외합니다"
         )
 
+    recorded_generation_exclusion_evidence: dict[str, Any] | None = None
+    recorded_generation_public_groups: set[str] = set()
+    generation_args = (
+        args.recorded_generation,
+        args.expected_recorded_generation_sha256,
+    )
+    if any(value not in (None, "") for value in generation_args):
+        if args.allow_corpus_leak:
+            print(
+                "[실패] --allow-corpus-leak 진단 세대에는 recorded generation을 "
+                "결속할 수 없습니다",
+                file=sys.stderr,
+            )
+            return 2
+        if (
+            not isinstance(args.recorded_generation, str)
+            or not args.recorded_generation.strip()
+            or not isinstance(args.expected_recorded_generation_sha256, str)
+            or re.fullmatch(
+                r"[0-9a-fA-F]{64}", args.expected_recorded_generation_sha256
+            )
+            is None
+        ):
+            print(
+                "[실패] --recorded-generation과 "
+                "--expected-recorded-generation-sha256 64자리는 함께 필요합니다",
+                file=sys.stderr,
+            )
+            return 2
+        generation_path = Path(args.recorded_generation)
+        if not generation_path.is_absolute():
+            generation_path = REPO_ROOT / generation_path
+        try:
+            generation_summary = validate_recorded_generation(
+                generation_path,
+                repo_root=REPO_ROOT,
+                expected_sha256=args.expected_recorded_generation_sha256.lower(),
+                require_source_files=False,
+            )
+            recorded_generation_exclusion_evidence = (
+                derive_recorded_generation_exclusion(
+                    generation_summary, repo_root=REPO_ROOT
+                )
+            )
+        except (
+            OSError,
+            RecordedGenerationError,
+            RecordedGenerationExclusionError,
+        ) as exc:
+            print(
+                f"[실패] recorded generation exclusion 검증 실패: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        generation_basenames = generation_excluded_basenames(
+            recorded_generation_exclusion_evidence
+        )
+        recorded_generation_public_groups = generation_excluded_public_groups(
+            recorded_generation_exclusion_evidence
+        )
+        extra_excluded_basenames.update(generation_basenames)
+        print(
+            "recorded additions source/raw identity "
+            f"{recorded_generation_exclusion_evidence['identity_count']}행, "
+            f"basename {len(generation_basenames)}개와 public group "
+            f"{len(recorded_generation_public_groups)}개를 합성 manifest에서 추가 제외합니다"
+        )
+
     # 모든 필수 태그를 먼저 메모리에서 준비한 뒤 한꺼번에 쓴다. 태그 하나가 없는데
     # 앞쪽 manifest만 새 버전으로 덮이면 디렉터리가 서로 다른 holdout 세대를 섞게 된다.
     # 실패 실행은 기존 manifest를 한 바이트도 바꾸지 않아야 한다.
@@ -1197,6 +1332,88 @@ def main() -> int:
                 holdout_lineage=clip_lineage,
                 **lineage_kwargs,
             )
+            lineage_entries_by_tag = {
+                tag: list(entries)
+                for tag, entries in lineage_build.entries_by_tag.items()
+            }
+            generation_component_excluded_by_tag = {
+                tag: 0 for tag in lineage_entries_by_tag
+            }
+            if recorded_generation_exclusion_evidence is not None:
+                # basename exclusion은 build_public_lineage가 DSU component 단위로 이미
+                # 처리한다. renamed byte 또는 lineage alias 충돌도 놓치지 않도록 남은
+                # entries에서 content/lineage 교집합을 다시 구하고 해당 component 전체를
+                # 제거한다.
+                overlaps = find_recorded_generation_overlaps(
+                    recorded_generation_exclusion_evidence,
+                    lineage_entries_by_tag,
+                    repo_root=REPO_ROOT,
+                )
+                leaked_groups = {
+                    str(item["group_id"]) for item in overlaps if item.get("group_id")
+                }
+                # DNS selection receipt가 결속한 public group은 선택한 한 파일만이
+                # 아니라 그 component의 모든 member를 synthetic에서 제거한다.
+                leaked_groups.update(recorded_generation_public_groups)
+                if leaked_groups:
+                    for tag, entries in sorted(lineage_entries_by_tag.items()):
+                        kept = [
+                            entry
+                            for entry in entries
+                            if str(entry.get("group_id")) not in leaked_groups
+                        ]
+                        generation_component_excluded_by_tag[tag] = len(entries) - len(kept)
+                        if entries and not kept:
+                            raise PublicLineageError(
+                                f"{tag}의 모든 component가 recorded generation additions와 "
+                                "겹쳐 학습 항목이 없습니다"
+                            )
+                        lineage_entries_by_tag[tag] = kept
+                    components = lineage_build.evidence.get("components")
+                    if not isinstance(components, dict):
+                        raise PublicLineageError(
+                            "public lineage component evidence가 mapping이 아닙니다"
+                        )
+                    overlap_by_group: dict[str, list[dict[str, Any]]] = {}
+                    for item in overlaps:
+                        overlap_by_group.setdefault(str(item["group_id"]), []).append(item)
+                    for group, records in overlap_by_group.items():
+                        component = components.get(group)
+                        if isinstance(component, dict):
+                            component["excluded_by_recorded_generation"] = True
+                            component["recorded_generation_overlap"] = sorted(
+                                {
+                                    dimension
+                                    for record in records
+                                    for dimension in record["dimensions"]
+                                }
+                            )
+                    excluded_evidence = lineage_build.evidence.get(
+                        "excluded_by_tag"
+                    )
+                    if not isinstance(excluded_evidence, dict):
+                        raise PublicLineageError(
+                            "public lineage excluded_by_tag evidence가 mapping이 아닙니다"
+                        )
+                    for tag, count in generation_component_excluded_by_tag.items():
+                        excluded_evidence[tag] = int(
+                            excluded_evidence.get(tag, 0)
+                        ) + int(count)
+                    lineage_build.evidence["component_membership_sha256"] = (
+                        canonical_json_sha256(
+                            {key: components[key] for key in sorted(components)}
+                        )
+                    )
+                remaining = find_recorded_generation_overlaps(
+                    recorded_generation_exclusion_evidence,
+                    lineage_entries_by_tag,
+                    repo_root=REPO_ROOT,
+                )
+                if remaining:
+                    raise PublicLineageError(
+                        "recorded generation additions와 public manifest 교집합이 "
+                        f"component exclusion 뒤에도 남았습니다: {remaining[:5]}"
+                    )
             _progress(
                 "public lineage component 구성 완료 "
                 f"(components={lineage_build.evidence['component_count']})"
@@ -1208,7 +1425,7 @@ def main() -> int:
             # group_id가 strata를 넘지 않는지는 assign_splits가 보장하고, 최종
             # validate_public_manifest_lineage가 교차 태그 누수를 재검증한다.
             combined: list[dict] = []
-            for tag, entries in sorted(lineage_build.entries_by_tag.items()):
+            for tag, entries in sorted(lineage_entries_by_tag.items()):
                 for entry in entries:
                     item = dict(entry)
                     item["_public_lineage_tag"] = tag
@@ -1251,7 +1468,8 @@ def main() -> int:
             if entries:
                 prepared[tag] = (
                     entries,
-                    lineage_build.excluded_by_tag[tag],
+                    lineage_build.excluded_by_tag[tag]
+                    + generation_component_excluded_by_tag[tag],
                     sources_by_tag[tag],
                 )
         public_lineage_evidence = dict(lineage_build.evidence)
@@ -1322,6 +1540,7 @@ def main() -> int:
             raw_roots=roots,
             public_lineage=public_lineage_evidence,
             decoder_audit=decoder_audit_evidence,
+            recorded_generation_exclusion=recorded_generation_exclusion_evidence,
             hash_workers=hash_workers,
         )
     except (OSError, ValueError, RuntimeError) as exc:

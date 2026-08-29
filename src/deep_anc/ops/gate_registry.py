@@ -43,12 +43,14 @@ FAIL 하는 것을 확인한 게이트가 하나도 없었다.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
 __all__ = [
+    "CANONICAL_FINETUNE_READINESS_GATE_IDS",
     "GATES",
     "GateDeclaration",
     "declared_gate_ids",
@@ -164,6 +166,29 @@ _LOSS_TESTS = "tests/test_anc_loss.py"
 _START_TESTS = "tests/test_loss_start_sample.py"
 
 
+# canonical fine-tune을 시작하기 전에 집계하는 leaf gate의 단일 authority다.
+# ``readiness`` 집계 gate와 completion gate는 포함하지 않는다.
+CANONICAL_FINETUNE_READINESS_GATE_IDS: tuple[str, ...] = (
+    "config_fail_closed_flags",
+    "recorded_transfer_snapshot",
+    "absolute_objective_scope",
+    "measured_primary_mode",
+    "recorded_mix_ratio",
+    "official_secondary_path",
+    "official_primary_path",
+    "matched_path_measurement_conditions",
+    "path_delay_and_lead",
+    "completed_init_checkpoint",
+    "recorded_dataset_qa",
+    "recorded_alignment_integrity",
+    "recorded_statistical_power",
+    "recorded_subband_coverage",
+    "corpus_disjoint",
+    "measured_source_delay_agreement",
+    "plant_confidence_ceiling",
+)
+
+
 GATES: tuple[GateDeclaration, ...] = (
     # ---------------- 파인튜닝 진입 게이트 (audit_finetune_readiness) ----------------
     GateDeclaration(
@@ -174,7 +199,27 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_finetune_readiness.py::test_every_entry_gate_passes_at_its_declared_boundary"
         ),
-        positive_probe="진입 게이트 14종 전부를 한계에 붙인 설정에서 확인 (여유 0)",
+        positive_probe=(
+            "canonical 진입 leaf authority 분모 17개: non-trust 경계 fixture 16개와 "
+            "transfer 별도 정상 fixture 1개"
+        ),
+    ),
+    GateDeclaration(
+        gate_id="absolute_objective_scope",
+        owner=_READINESS,
+        what_it_asserts=(
+            "150–1600Hz와 speech/music/environment/machine 네 계열을 설정으로 "
+            "축소할 수 없다"
+        ),
+        negative_fixture=(
+            "tests/test_canonical_finetune_guardrails_doc.py::"
+            "test_absolute_objective_requires_all_four_families_and_environment_pool_mapping"
+        ),
+        positive_fixture=(
+            "tests/test_canonical_finetune_guardrails_doc.py::"
+            "test_absolute_objective_requires_all_four_families_and_environment_pool_mapping"
+        ),
+        positive_probe="절대목표 150–1600Hz와 source family 4개를 정확히 유지",
     ),
     GateDeclaration(
         gate_id="measured_primary_mode",
@@ -184,7 +229,10 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_finetune_readiness.py::test_every_entry_gate_passes_at_its_declared_boundary"
         ),
-        positive_probe="실측 P(z) 모드 그대로, 진입 게이트 14종이 경계에서 PASS",
+        positive_probe=(
+            "실측 P(z) 모드 그대로, canonical 진입 leaf authority 17개 중 "
+            "non-trust 경계 fixture 16개가 PASS"
+        ),
     ),
     GateDeclaration(
         gate_id="recorded_mix_ratio",
@@ -275,7 +323,10 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_finetune_readiness.py::test_every_entry_gate_passes_at_its_declared_boundary"
         ),
-        positive_probe="집계: 진입 게이트 14종이 전부 경계에서 PASS",
+        positive_probe=(
+            "집계 분모는 canonical 진입 leaf authority 17개이며 non-trust 경계 "
+            "fixture 16개와 transfer 별도 정상 fixture 1개로 검증"
+        ),
     ),
     # ---- 2026-08-05 신설: 확인된 결함 하나에 게이트 하나 ----
     GateDeclaration(
@@ -303,6 +354,23 @@ GATES: tuple[GateDeclaration, ...] = (
             "tests/test_finetune_readiness.py::test_every_entry_gate_passes_at_its_declared_boundary"
         ),
         positive_probe="계열당 그룹 = 하한 4 정확히",
+    ),
+    GateDeclaration(
+        gate_id="recorded_subband_coverage",
+        owner=_READINESS,
+        what_it_asserts=(
+            "현재 manifest/timing에 결속된 train/val/test family×strict 부대역 target "
+            "coverage가 독립 그룹 하한을 만족한다"
+        ),
+        negative_fixture=(
+            "tests/test_finetune_readiness.py::"
+            "test_readiness_rejects_forged_recorded_subband_coverage_aggregate"
+        ),
+        positive_fixture=(
+            "tests/test_finetune_readiness.py::"
+            "test_readiness_passes_only_with_official_paths_completed_init_and_full_recorded_qa"
+        ),
+        positive_probe="family×부대역 독립 그룹 = 하한 4 정확히",
     ),
     GateDeclaration(
         gate_id="corpus_disjoint",
@@ -622,6 +690,27 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_probe="그룹 4개(하한) 에서 CI 가 정의되고 세그먼트 재표집보다 넓다",
     ),
     GateDeclaration(
+        gate_id="g4_strict_trusted_subbands",
+        owner="src/deep_anc/eval/recorded.py",
+        what_it_asserts=(
+            "150–1600Hz 평균이 좋아도 family별 1000–1600Hz를 포함한 네 strict "
+            "부대역의 target(d=ERR) coverage·평균·최악10%·CI가 모두 통과해야 한다"
+        ),
+        negative_fixture=(
+            "tests/test_recorded_eval.py::"
+            "test_g4_rejects_aggregate_pass_when_upper_trusted_subband_amplifies"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_recorded_eval.py::"
+            "test_metrics_markdown_and_npz_include_source_octave_and_worst10"
+        ),
+        positive_probe=(
+            "150–300/300–600/600–1000/1000–1600Hz 각각에 FFT-bin 정렬 target과 "
+            "family별 독립 group 4개를 둔 정상 결과"
+        ),
+    ),
+    GateDeclaration(
         gate_id="metrics_plant_comparability",
         owner="src/deep_anc/eval/recorded.py",
         what_it_asserts="서로 다른 플랜트에서 나온 metrics 의 비교를 거부한다 (결함 5)",
@@ -632,7 +721,11 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_gate_positive_fixtures.py::test_metrics_comparison_accepts_two_runs_from_the_same_plant"
         ),
-        positive_probe="확정 플랜트 지문(P 1602 / S 1462 / lead 116) 동일 시 비교 허용",
+        positive_probe=(
+            "합성 fixture P 1602 / S 1462 / lead 116의 exact P/S SHA와 "
+            "TrainingTimingContract 지문이 같을 때만 비교 허용; 현행 strict "
+            "플랜트 수치 주장 아님"
+        ),
     ),
     # ---------------- recorded QA 게이트 ----------------
     GateDeclaration(
@@ -737,7 +830,10 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_gate_positive_fixtures.py::test_recorded_qa_gates_pass_at_the_minimum_length_and_full_coverage"
         ),
-        positive_probe="길이 = 최소 48117 샘플 정확히 (segment 48000 + lead 116 + 1)",
+        positive_probe=(
+            "합성 fixture TrainingTimingContract의 segment 48000 + lead 116 + 1 = "
+            "48117 최소 길이를 정확히 만족; 현행 strict 수치 주장 아님"
+        ),
     ),
     GateDeclaration(
         gate_id="recorded_qa_level_and_metadata",
@@ -859,7 +955,10 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_recorded_dataset_augment.py::test_timeline_lead_mode_derives_the_lead_from_the_session"
         ),
-        positive_probe="실측 지연 1602 에서 lead 116 을 유도 (확정값과 일치)",
+        positive_probe=(
+            "합성 fixture의 세션 지연 1602에서 lead 116을 timeline과 "
+            "TrainingTimingContract로 유도; 현행 strict 숫자는 NPZ가 단일 출처"
+        ),
     ),
     GateDeclaration(
         gate_id="recorded_augment_plant_commutes",
@@ -1071,7 +1170,10 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_invariants.py::test_plant_fingerprint_match_passes_for_the_same_plant"
         ),
-        positive_probe="확정 플랜트 P 1602 / S 1462 동일 지문",
+        positive_probe=(
+            "합성 fixture P 1602 / S 1462의 exact SHA와 timing digest가 같은 두 "
+            "지문; 현행 strict 플랜트 수치 주장 아님"
+        ),
     ),
     GateDeclaration(
         gate_id="invariant_lead_agreement",
@@ -1084,7 +1186,10 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_invariants.py::test_lead_agreement_passes_on_the_measured_plant"
         ),
-        positive_probe="실측 P−S 140 에서 유도된 lead 116",
+        positive_probe=(
+            "합성 fixture P−S 140과 handoff에서 PlantDelays.lead()=116을 유도; "
+            "현행 값은 strict NPZ와 handoff에서만 유도"
+        ),
     ),
     # ---------------- 손실 (절대목표 1·2 를 손실 안에서 강제) ----------------
     GateDeclaration(
@@ -1101,7 +1206,7 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_anc_loss.py::test_do_no_harm_bands_are_derived_by_subtracting_the_trusted_band"
         ),
-        positive_probe="신뢰대역 150–600Hz 를 뺀 여집합이 빈틈 없이 덮인다",
+        positive_probe="신뢰대역 150–1600Hz를 뺀 여집합이 빈틈 없이 덮인다",
     ),
     GateDeclaration(
         gate_id="loss_do_no_harm_margin_matches_the_gate",
@@ -1156,8 +1261,8 @@ GATES: tuple[GateDeclaration, ...] = (
             "tests/test_design_ceiling.py::test_shipped_declaration_matches_the_recomputation"
         ),
         positive_probe=(
-            "출하 선언 4.58 dB 가 재계산 4.83 dB 안에 들어온다 (허용 오차 0.5 dB) — "
-            "선언 5.5 는 거부된다"
+            "출하 선언 2.15 dB가 현행 strict P/S 최악 옥타브 재계산 17.28 dB보다 "
+            "보수적이다 (허용 오차 0.5 dB); current 재계산보다 낙관적인 선언은 거부된다"
         ),
     ),
     GateDeclaration(
@@ -1250,7 +1355,10 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_loss_start_sample.py::test_plant_settle_is_derived_from_the_measured_plant"
         ),
-        positive_probe="S 1462 + handoff 256 + FIR 2048 의 실측 조합에서 유도",
+        positive_probe=(
+            "합성 fixture S 1462 + handoff 256 + FIR 2048에서 "
+            "PlantSettle.derive()로만 유도; 현행 S 지연은 strict NPZ가 단일 출처"
+        ),
     ),
     GateDeclaration(
         gate_id="evaluation_warmup_floor",
@@ -1266,7 +1374,10 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_loss_start_sample.py::test_warmup_floor_does_not_shrink_a_longer_requested_warmup"
         ),
-        positive_probe="요청 warmup 12000 > 하한 3769 이면 그대로 둔다",
+        positive_probe=(
+            "합성 fixture 요청 warmup 12000 > PlantSettle 유도 하한 3769이면 "
+            "요청값 유지; 현행 strict 수치 주장 아님"
+        ),
     ),
     GateDeclaration(
         gate_id="timing_single_source_of_lead",
@@ -1300,17 +1411,112 @@ def gates_for_owner(owner: str) -> tuple[GateDeclaration, ...]:
     return tuple(item for item in GATES if item.owner == owner)
 
 
-_AUDIT_CALL = re.compile(
-    r"audit\.(?:pass_|fail)\(\s*(?:#[^\n]*\n\s*)?[\"']([a-z][a-z0-9_]*)[\"']"
-)
+class _AuditGateIdVisitor(ast.NodeVisitor):
+    """audit call의 literal과 단순 문자열 바인딩을 scope별로 찾는다."""
+
+    def __init__(self) -> None:
+        self.found: set[str] = set()
+        self._scopes: list[dict[str, str | None]] = []
+
+    @staticmethod
+    def _scope_bindings(body: list[ast.stmt]) -> dict[str, str | None]:
+        class _BindingCollector(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.bindings: dict[str, str | None] = {}
+
+            def _bind(self, name: str, value: ast.expr | None) -> None:
+                literal = (
+                    value.value
+                    if isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                    and _GATE_ID.fullmatch(value.value)
+                    else None
+                )
+                previous = self.bindings.get(name, literal)
+                self.bindings[name] = literal if previous == literal else None
+
+            def visit_Assign(self, node: ast.Assign) -> None:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self._bind(target.id, node.value)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                if isinstance(node.target, ast.Name):
+                    self._bind(node.target.id, node.value)
+
+            # 중첩 scope의 바인딩은 바깥 scope에 섞지 않는다.
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                return
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                return
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                return
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+        collector = _BindingCollector()
+        for statement in body:
+            collector.visit(statement)
+        return collector.bindings
+
+    def _visit_scope(self, body: list[ast.stmt]) -> None:
+        self._scopes.append(self._scope_bindings(body))
+        try:
+            for statement in body:
+                self.visit(statement)
+        finally:
+            self._scopes.pop()
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._visit_scope(node.body)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_scope(node.body)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_scope(node.body)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_scope(node.body)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        function = node.func
+        is_audit_call = (
+            isinstance(function, ast.Attribute)
+            and function.attr in {"pass_", "fail"}
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "audit"
+        )
+        if is_audit_call and node.args:
+            argument = node.args[0]
+            gate_id: str | None = None
+            if (
+                isinstance(argument, ast.Constant)
+                and isinstance(argument.value, str)
+                and _GATE_ID.fullmatch(argument.value)
+            ):
+                gate_id = argument.value
+            elif isinstance(argument, ast.Name):
+                for scope in reversed(self._scopes):
+                    if argument.id in scope:
+                        gate_id = scope[argument.id]
+                        break
+            if gate_id is not None:
+                self.found.add(gate_id)
+        self.generic_visit(node)
 
 
 def discover_audit_gate_ids(source_path: str | Path) -> frozenset[str]:
-    """소스에서 ``audit.pass_``/``audit.fail`` 의 게이트 id 문자열을 긁어낸다.
+    """AST에서 ``audit.pass_``/``audit.fail`` 의 정적 gate id를 찾는다.
 
-    선언을 빠뜨린 게이트를 메타 테스트가 잡아내기 위한 것이다. f-string 으로 만들어지는
-    id 는 여기서 발견되지 않으므로 선언에서 ``discoverable_id=False`` 로 표시한다.
+    문자열 literal뿐 아니라 같은 lexical scope의 단순 문자열 변수도 해석한다. f-string
+    또는 런타임 매개변수로 만들어지는 id는 선언에서 ``discoverable_id=False``로 표시한다.
     """
 
-    text = Path(source_path).read_text(encoding="utf-8")
-    return frozenset(_AUDIT_CALL.findall(text))
+    tree = ast.parse(Path(source_path).read_text(encoding="utf-8"))
+    visitor = _AuditGateIdVisitor()
+    visitor.visit(tree)
+    return frozenset(visitor.found)

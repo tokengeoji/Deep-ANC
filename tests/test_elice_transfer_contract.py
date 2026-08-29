@@ -287,9 +287,16 @@ def _write_bootstrap_receipt(
     freeze.parent.mkdir(parents=True, exist_ok=True)
     freeze.write_bytes(b"torch==2.5.1+cu121\n")
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    ignore = root / ".gitignore"
+    ignore.write_text(
+        "/data/\n/results/\n/assets/\n/.venv/\n",
+        encoding="utf-8",
+    )
     code_anchor = root / "receipt-code-anchor.txt"
     code_anchor.write_text("fixture code\n", encoding="utf-8")
-    subprocess.run(["git", "add", code_anchor.name], cwd=root, check=True)
+    subprocess.run(
+        ["git", "add", code_anchor.name, ignore.name], cwd=root, check=True
+    )
     subprocess.run(
         [
             "git",
@@ -525,6 +532,122 @@ def test_recorded_config_binder_rejects_receipt_chain_tampering(
 
     with pytest.raises(TransferContractError, match="environment freeze receipt"):
         bind_recorded_transfer_config(data_cfg, repo_root=tmp_path)
+
+
+def test_bootstrap_binder_rejects_dirty_source_after_clean_receipt(
+    tmp_path: Path,
+) -> None:
+    _manifest, transfer_sha, _files = _write_transfer_bundle(tmp_path)
+    receipt, receipt_sha, _summary = _write_bootstrap_receipt(
+        tmp_path,
+        transfer_sha256=transfer_sha,
+    )
+    (tmp_path / "receipt-code-anchor.txt").write_text(
+        "mutated after bootstrap\n", encoding="utf-8"
+    )
+    with pytest.raises(TransferContractError, match="clean exact source"):
+        bind_recorded_transfer_config(
+            {
+                "bootstrap_receipt": receipt.relative_to(tmp_path).as_posix(),
+                "bootstrap_receipt_sha256": receipt_sha,
+            },
+            repo_root=tmp_path,
+        )
+
+
+def test_bootstrap_binder_allows_ignored_runtime_cache_but_not_code_injection(
+    tmp_path: Path,
+) -> None:
+    _manifest, transfer_sha, _files = _write_transfer_bundle(tmp_path)
+    receipt, receipt_sha, _summary = _write_bootstrap_receipt(
+        tmp_path,
+        transfer_sha256=transfer_sha,
+    )
+    cache = tmp_path / "scripts/__pycache__/bootstrap.cpython-310.pyc"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"ordinary runtime cache")
+    with (tmp_path / ".git/info/exclude").open("a", encoding="utf-8") as handle:
+        handle.write("__pycache__/\n*.pyc\n/scripts/injected.py\n")
+    config = {
+        "bootstrap_receipt": receipt.relative_to(tmp_path).as_posix(),
+        "bootstrap_receipt_sha256": receipt_sha,
+    }
+    bind_recorded_transfer_config(config, repo_root=tmp_path)
+
+    (tmp_path / "scripts/injected.py").write_text("raise SystemExit('forged')\n")
+    with pytest.raises(TransferContractError, match="clean exact source"):
+        bind_recorded_transfer_config(
+            {
+                "bootstrap_receipt": receipt.relative_to(tmp_path).as_posix(),
+                "bootstrap_receipt_sha256": receipt_sha,
+            },
+            repo_root=tmp_path,
+        )
+
+
+def test_bootstrap_receipt_rejects_resealed_coverage_report_forgery(
+    tmp_path: Path,
+) -> None:
+    _manifest, transfer_sha, _files = _write_transfer_bundle(tmp_path)
+    receipt, _old_sha, _summary = _write_bootstrap_receipt(
+        tmp_path,
+        transfer_sha256=transfer_sha,
+    )
+    contract_sha = "4" * 64
+    coverage = (
+        tmp_path
+        / "results/data_audit/recorded_subband_coverage"
+        / f"{contract_sha}.json"
+    )
+    coverage.parent.mkdir(parents=True)
+    report_payload = {
+        "evidence_sha256": "5" * 64,
+        "manifest": {"sha256": "6" * 64},
+        "training_timing_contract_sha256": "7" * 64,
+        "coverage_contract_sha256": contract_sha,
+        "all_requested_splits_pass": False,
+    }
+    coverage.write_text(json.dumps(report_payload, sort_keys=True) + "\n")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    payload["recorded_subband_coverage"] = {
+        "path": coverage.relative_to(tmp_path).as_posix(),
+        "sha256": hashlib.sha256(coverage.read_bytes()).hexdigest(),
+        "evidence_sha256": report_payload["evidence_sha256"],
+        "manifest_sha256": report_payload["manifest"]["sha256"],
+        "training_timing_contract_sha256": report_payload[
+            "training_timing_contract_sha256"
+        ],
+        "coverage_contract_sha256": contract_sha,
+        "all_requested_splits_pass": False,
+    }
+    receipt.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    receipt_sha = hashlib.sha256(receipt.read_bytes()).hexdigest()
+    valid = bind_recorded_transfer_config(
+        {
+            "bootstrap_receipt": receipt.relative_to(tmp_path).as_posix(),
+            "bootstrap_receipt_sha256": receipt_sha,
+        },
+        repo_root=tmp_path,
+    )
+    assert valid.recorded_subband_coverage_receipt is not None
+
+    # 공격자가 report payload와 자체 evidence SHA를 함께 다시 봉인해도, 별도 채널로
+    # 전달된 bootstrap receipt SHA 아래 file SHA는 바꿀 수 없다.
+    report_payload["all_requested_splits_pass"] = True
+    report_payload["evidence_sha256"] = "8" * 64
+    coverage.write_text(json.dumps(report_payload, sort_keys=True) + "\n")
+    with pytest.raises(TransferContractError, match="coverage report가 변경"):
+        bind_recorded_transfer_config(
+            {
+                "bootstrap_receipt": receipt.relative_to(tmp_path).as_posix(),
+                "bootstrap_receipt_sha256": receipt_sha,
+            },
+            repo_root=tmp_path,
+        )
 
 
 def test_recorded_config_binder_rejects_transfer_changed_after_receipt(

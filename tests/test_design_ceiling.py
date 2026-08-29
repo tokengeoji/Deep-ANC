@@ -170,8 +170,11 @@ def test_shipped_declaration_matches_the_recomputation(tmp_path) -> None:
     from deep_anc.dsp.design_ceiling import cached_design_ceiling_db
     from deep_anc.train.finetune_readiness import DESIGN_CEILING_TOLERANCE_DB
 
-    primary = REPO_ROOT / "assets" / "measured" / "primary_path_il.npz"
-    secondary = REPO_ROOT / "assets" / "measured" / "secondary_path_il.npz"
+    duct_cfg = yaml.safe_load(
+        (REPO_ROOT / "configs" / "duct.yaml").read_text(encoding="utf-8")
+    )
+    primary = REPO_ROOT / duct_cfg["digital_reference"]["primary_path_npz"]
+    secondary = REPO_ROOT / duct_cfg["secondary_path"]["npz"]
     if not primary.is_file() or not secondary.is_file():
         pytest.skip("실측 P/S 아티팩트가 없는 환경")
 
@@ -191,15 +194,12 @@ def test_shipped_declaration_matches_the_recomputation(tmp_path) -> None:
     secondary_data = load_secondary_path(secondary)
     primary_data, primary_delay = resolve_digital_primary_path(
         {**data_sim, "digital_primary_path_mode": "measured"},
-        {"digital_reference": {"primary_path_npz": str(primary)},
-         "secondary_path": {"npz": str(secondary), "handoff_extra_samples": 256},
-         "positions_m": {"noise_speaker": 0.0, "error_mic": 1.0,
-                          "cancel_speaker": 1.0}},
+        duct_cfg,
         int(FS), secondary_data,
     )
     assert primary_data is not None
     lead = int(PlantDelays.from_config(
-        duct_cfg={"secondary_path": {"handoff_extra_samples": 256}},
+        duct_cfg=duct_cfg,
         secondary_delay_samples=int(secondary_data.delay_samples),
         primary_delay_samples=int(primary_delay),
         sample_rate=int(FS),
@@ -224,18 +224,19 @@ def test_shipped_declaration_matches_the_recomputation(tmp_path) -> None:
         sample_rate=float(FS),
         cache_path=cache_path,
     )
-    # **구속하는 것은 옥타브별 최악값이다.** 대역평균은 저역의 큰 여유가 중역의
-    # 병목을 가린다 — 실측: 전대역 4.83 dB 인데 옥타브 500 은 2.16 dB 뿐이다.
+    # **구속하는 것은 옥타브별 최악값이다.** 수치는 현재 configs/duct.yaml이
+    # 가리키는 strict P/S에서 재계산하며 legacy P/S 파일에 고정하지 않는다.
     assert declared <= worst_db + DESIGN_CEILING_TOLERANCE_DB, (
         f"출하 선언 {declared:.2f} dB 가 최악 옥타브 재계산 {worst_db:.2f} dB "
         f"({worst_hz:.0f} Hz) 보다 낙관적입니다"
     )
     # 재계산이 "그럴듯한 숫자" 인지 — 0 이나 30 이 나오면 계산이 깨진 것이다.
-    assert 3.0 < band_solved.ceiling_db < 8.0, band_solved
-    assert 1.0 < worst_db < 4.0, (worst_db, worst_hz)
-    # 경계를 숫자로 고정한다 (2026-08-06 실측, official P1602/S1462/lead 116):
-    #   전대역 [150,1600] 4.83 dB · 최악 옥타브 500 Hz 2.16 dB · 출하 선언 2.15 dB
-    assert band_solved.ceiling_db == pytest.approx(4.83, abs=0.30), band_solved
-    assert worst_db == pytest.approx(2.16, abs=0.20), (worst_db, worst_hz)
-    assert worst_hz == pytest.approx(500.0, abs=1.0)
+    assert 20.0 < band_solved.ceiling_db < 30.0, band_solved
+    assert 15.0 < worst_db < 20.0, (worst_db, worst_hz)
+    # 경계를 숫자로 고정한다 (2026-08-27 strict P1386/S1245/lead 115):
+    #   전대역 [150,1600] 26.10 dB · 최악 옥타브 125 Hz 17.28 dB.
+    # 출하 선언 2.15 dB는 단일 strict 캡처의 상한을 과장하지 않는 보수적 prior다.
+    assert band_solved.ceiling_db == pytest.approx(26.10, abs=0.50), band_solved
+    assert worst_db == pytest.approx(17.28, abs=0.50), (worst_db, worst_hz)
+    assert worst_hz == pytest.approx(125.0, abs=1.0)
     assert declared == pytest.approx(2.15, abs=0.01)

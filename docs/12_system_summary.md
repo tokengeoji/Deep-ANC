@@ -4,7 +4,11 @@
 > 실행 명령을 현행 학습 계약으로 재사용하지 않는다. 2026-08-26 이후의 authoritative 상태와
 > 다음 명령은 [HANDOFF.md](../HANDOFF.md), timing은 `TrainingTimingContract`, 학습 판정은
 > current readiness report가 단일 출처다. 특히 기존 82세션은 전량 폐기가 아니라 historical
-> 계보 복구와 component regrouping 뒤 사용하며, 새 strict P/S 전에는 official delay가 없다.
+> 계보 복구와 component regrouping 뒤 사용한다. 현행 strict capture의
+> P `delay_samples=1386`, S `delay_samples=1245`, handoff=256에서
+> `PlantDelays.lead()`가 115를 유도한다. 아래의
+> P1602/S1462/lead116 및 4.58/2.159 dB는 모두 historical diagnostic-only이며
+> current official 실행·readiness·성능 근거가 아니다.
 
 > 최종 갱신 **2026-08-06**. 이 문서는 **측정된 것만** 담는다. 각 수치의 출처 명령을 함께 적었고,
 > 재현이 불가능한 값은 넣지 않는다. 진행 중인 작업 상태는 [HANDOFF.md](../HANDOFF.md)가 단일 출처다.
@@ -101,6 +105,9 @@ USB DAC와 Tegra APE I²S ADC는 별도 클록 도메인이다. 보존된 raw A�
 > ```
 
 ### 1.3 지연 예산 — **99.6%가 버퍼다**
+
+> 이 표는 2026-08-06 legacy capture의 지연 예산이다. 현행 runtime timing을
+> 계산하거나 Base/Tiny 성능을 판정하는 데 재사용하지 않는다.
 
 | 항목 | 샘플 | ms | 비중 |
 |---|---:|---:|---|
@@ -270,7 +277,15 @@ RIR 뱅크를 함께 갱신해야 한다.
 
 ### 2.3 실측 경로 자산
 
-**현행 채택본 (2026-08-05 재발행, 캡처 `225546_f7b0fecd`)**
+> **현행 authority:** `configs/duct.yaml`의
+> `primary_path_il_strict_5dc06fdd.npz`/
+> `secondary_path_il_strict_5dc06fdd.npz`는 같은 strict capture이며,
+> P `delay_samples=1386`, S `delay_samples=1245`, handoff=256에서 lead=115가
+> 유도된다. 아래 표는 이를
+> 대체하지 않는다.
+
+**당시 채택본—현재 invalid/diagnostic-only
+(2026-08-05 재발행, 캡처 `225546_f7b0fecd`)**
 
 | 파일 | 벌크지연 | 검증 대역 | 그 대역 일관성 | 전대역 | 유지/전체 반복 | P−S spread |
 |---|---:|---|---:|---:|---:|---:|
@@ -278,8 +293,10 @@ RIR 뱅크를 함께 갱신해야 한다.
 | `secondary_path_il.npz` | **1462** | 150–1600 Hz | **0.9990** | **0.9984** | 18/48 | 1 |
 | `secondary_path_4s.npz` | 1342 | 150–600 Hz | 0.40 | — | — | 순차 ESS (폐기) |
 
-`P − S = 140`, `lead = S 1462 + handoff 256 − P 1602 = 116`, 앵커 반복 13.
-두 채택본은 **한 번의 재생으로 동시 측정**했고 `capture_id` 가 일치한다.
+`P − S = 140`, `lead = S 1462 + handoff 256 − P 1602 = 116`, 앵커 반복 13은
+모두 이 historical capture 안에서만 유효한 진단값이다. 두 당시 채택본은
+**한 번의 재생으로 동시 측정**했고 `capture_id`가 일치했지만, strict
+provenance를 만족하지 않아 current artifact로 승격할 수 없다.
 
 채택본 부대역 일관성 (`band_consistency` / `band_consistency_hz`):
 
@@ -333,7 +350,8 @@ for f in ['assets/measured/primary_path_il.npz','assets/measured/secondary_path_
 > (S FIR 시간영역 54.2%). **출하 npz 로 설계한 최적 필터를 클린 플랜트에 적용하면
 > −0.54 dB** 밖에 못 낸다(올바른 설계 −6.53 dB) — 결함 3·4 의 플랜트 측 원인이다.
 
-**절대 지연은 재현되지 않는다 — `P − S = 140` 만이 물리 불변량이다.** 저장된 캡처 11건을
+당시 legacy 분석에서는 **절대 지연은 재현되지 않았고 `P − S = 140`만
+불변량으로 보였다.** 저장된 캡처 11건을
 전수 재분석한 결과 유효 9건 전부에서 P−S = 139~141, lead = 115~117(중앙 **116**)이지만,
 절대 지연은 low-latency 1565~1659 / high-latency 2858~2888 로 흩어진다(캡처별 타임베이스
 드리프트 364~729 ppm + 앵커 반복 선택 의존). 그래서 P 와 S 는 반드시 **같은 캡처·같은
@@ -536,7 +554,9 @@ completed_init_checkpoint · recorded_dataset_qa
 >
 > 평가 플랜트 자체가 바뀌었으므로 두 수를 뺄 수 없다. 유효한 전후 비교를 하려면 **같은
 > 플랜트에서 사전학습 checkpoint 를 다시 평가**해야 한다(미실시). 게다가 사후 플랜트
-> (S 1465 / lead 113)조차 지금은 **폐기된 오염 아티팩트**다 — 현행은 S 1462 / lead 116.
+> (S 1465 / lead 113)조차 지금은 **폐기된 오염 아티팩트**다. 현행
+> strict capture는 S `delay_samples=1245`, P `delay_samples=1386`, handoff 256에서
+> `PlantDelays.lead()=115`를 유도한다. 이 숫자도 NPZ가 바뀌면 다시 유도해야 한다.
 >
 > **또한 val 전체 −0.07 dB 는 0 과 통계적으로 구별되지 않는다** — cluster bootstrap 95% CI
 > **[−0.456, +0.481]**. "상쇄로 돌아섰다"고 말할 근거가 없다.
@@ -826,7 +846,7 @@ TrtEngine 최적화 내역(30W 기준 P50 1.32 → 0.56 ms):
 | 신뢰대역 유도식이 5곳에 복붙 | `dsp/timing.py` 의 **`BandPlan.resolve(...)`** 단일 출처로 통합. 소비처 5곳이 전부 이것을 호출한다 (`trainer.py:236`, `eval/recorded.py:226`, `evaluate_offline.py:98`, `evaluate_session.py:176`, `render_anc_demo.py:158`) |
 | `intersect_frequency_bands` 두 번 정의 | **`dsp/timing.py:147` 한 곳**만 남았다 |
 | `configs/eval*.yaml` 의 죽은 `trusted_band_hz` | **삭제됨** (세 파일 모두 삭제 사유 주석만 남음) |
-| `measured_design_ceiling_db: 6.53` | **`4.58` + `measured_design_ceiling_band_hz: [150, 1600]`** 으로 정정. 대역이 `required_path_band_hz` 를 덮는지 게이트가 검사한다. 이전 값은 요구 대역보다 **2 dB 낙관적인 fail-open** 이었고 오판정 방향이 정확히 고역 방치였다 |
+| `measured_design_ceiling_db: 6.53` | **당시 legacy capture에서** `4.58` + `measured_design_ceiling_band_hz: [150, 1600]`으로 정정했다. 현행 strict 상한은 이 수치를 쓰지 않고 `configs/duct.yaml`의 P/S bytes에서 다시 푼다. 이 행은 historical fail-open 사고 기록이다 |
 | lead 가 trainer 와 게이트에서 갈라짐 (109 vs 113) | **`PlantDelays.lead()`** 로만 만들 수 있다. 손으로 쓰면 `TypeError` |
 | 서로 다른 플랜트끼리 비교 | **`PlantFingerprint`** 가 막는다 |
 
@@ -863,7 +883,15 @@ TrtEngine 최적화 내역(30W 기준 P50 1.32 → 0.56 ms):
 nvpmodel -q ; lscpu ; free -h ; cat /proc/asound/cards
 cat /proc/sys/kernel/sched_rt_runtime_us /proc/sys/kernel/sched_rt_period_us   # 950000 / 1000000
 
-# --- 플랜트 아티팩트 §2.3 (소리 없음) ---
+# --- current strict P/S timing (소리 없음; 숫자를 실행에 복사하지 않음) ---
+.venv/bin/python -c "
+import numpy as np
+p=np.load('assets/measured/primary_path_il_strict_5dc06fdd.npz')
+s=np.load('assets/measured/secondary_path_il_strict_5dc06fdd.npz')
+print('P', int(p['delay_samples']), 'S', int(s['delay_samples']),
+      'lead', int(s['delay_samples']) + 256 - int(p['delay_samples']))"
+
+# --- 2026-08-05 legacy diagnostic-only §2.3 재현 (소리 없음) ---
 .venv/bin/python -c "
 import numpy as np
 for f in ['assets/measured/primary_path_il.npz','assets/measured/secondary_path_il.npz']:
@@ -871,7 +899,7 @@ for f in ['assets/measured/primary_path_il.npz','assets/measured/secondary_path_
     print(f, d['delay_samples'], d['consistency_band_hz'], d['excitation_band_hz'],
           np.round(d['band_consistency'],4), 'rejected', int(d['rejected_repeats']),
           'spread', int(d['delay_spread_samples']), 'anchor', int(d['anchor_repeat']))"
-# lead = S + 256 - P = 116
+# legacy capture 안의 lead = S + 256 - P = 116; current runtime에 사용 금지
 
 # 오염 반복의 P-S 상대 τ 점프 (.orig 백업본)
 .venv/bin/python -c "
@@ -930,6 +958,6 @@ taskset -c 4-7 chrt -f 80 .venv/bin/python scripts/bench/measure_inference_laten
 | 상대 클록 드리프트 | raw A 약 +620 ppm (주기당 +3.72/6000 sample) | 보존 raw의 adjacent-cycle 재분석. 다음 물리 측정에서도 ERR/REF 공통 q gate로 재확인 필요 |
 | GPU 듀티 6% 열화 | P50 0.30 → 1.10 ms @306 MHz | 주기 호출 벤치가 저장소에 없다 (`--period-ms` 미구현) |
 | cluster bootstrap CI | [−0.456, +0.481] | 평가 전문가 계산. 산출물로 저장되지 않았다 |
-| 150–600 Hz 이론 상한 6.53 dB | — | 게이트 값은 4.58(150–1600Hz)로 정정됐으나, 150–600Hz 값 자체는 독립 재계산이 5.21~5.41 로 불일치 |
+| legacy 150–600 Hz 이론 상한 6.53 dB | — | 당시 게이트 값은 4.58(150–1600Hz)로 정정됐으나, 150–600Hz 값 자체는 독립 재계산이 5.21~5.41로 불일치했다. 모두 historical diagnostic-only이다 |
 | 저역 회복 하한 120~130 Hz | — | 저역 전용 2차 프로브 미구현·미측정 |
 | ERR 마이크 단면 위치 | — | `duct.yaml positions_m.error_mic_cross_section_m` 미확정. 벽면 장착으로 판명되면 신뢰 상한을 1200 Hz 로 낮춰야 한다 |

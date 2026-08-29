@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-"""raw campaign evidence만으로 canonical-pretrain v5 ledger를 no-replace 발행한다.
+"""raw campaign evidence만으로 canonical-pretrain v7 ledger를 no-replace 발행한다.
 
 이 명령은 사람이 NMSE, gradient share, pilot score, winner, probe PASS를 입력받지
-않는다. G0 receipt, checkpoint/metrics, measured probe, A100 smoke artifact의 pathname만
-받고, ledger 발행 뒤 같은 raw bytes를 다시 계산하는 validator를 즉시 실행한다.
+않는다. alpha별 G0/pre-pilot calibration/pilot/probe와 selected-20k gradient,
+A100 smoke artifact pathname만 받고, ledger 발행 뒤 같은 raw bytes를 다시
+계산하는 validator를 즉시 실행한다.
 
 예시 (모든 artifact는 Elice repository 내부의 immutable 파일이어야 한다):
   .venv/bin/python scripts/train/issue_canonical_pretrain_prerequisite.py \
     --bootstrap-receipt-sha256 "$BOOTSTRAP_SHA" \
-    --loss-alpha <WINNER_ALPHA> \
-    --g0-receipt results/training_prerequisites/evidence/g0_x/receipt.json \
-    --gradient-receipt results/training_prerequisites/evidence/gradient_x/receipt.json \
+    --loss-alpha <WINNER_ALPHA> --loss-lambda-dnh <WINNER_LAMBDA> \
+    --g0-receipt results/training_prerequisites/evidence/g0_07/receipt.json \
+    --prepilot-gradient-receipt results/training_prerequisites/evidence/gradient_07/receipt.json \
+    --g0-receipt results/training_prerequisites/evidence/g0_10/receipt.json \
+    --prepilot-gradient-receipt results/training_prerequisites/evidence/gradient_10/receipt.json \
+    --gradient-receipt results/training_prerequisites/evidence/gradient_selected20k/receipt.json \
     --pilot-best runs/<pilot07>/ckpt/best.pt --pilot-last runs/<pilot07>/ckpt/last.pt \
     --pilot-metrics runs/<pilot07>/eval_recorded_val/metrics.npz \
     --pilot-best runs/<pilot10>/ckpt/best.pt --pilot-last runs/<pilot10>/ckpt/last.pt \
     --pilot-metrics runs/<pilot10>/eval_recorded_val/metrics.npz \
-    --probe-best runs/<probe>/ckpt/best.pt --probe-last runs/<probe>/ckpt/last.pt \
-    --probe-metrics runs/<probe>/eval_recorded_val/metrics.npz \
-    --probe-init-checkpoint runs/<selected-pilot>/ckpt/best.pt \
+    --probe-best runs/<probe07>/ckpt/best.pt --probe-last runs/<probe07>/ckpt/last.pt \
+    --probe-metrics runs/<probe07>/eval_recorded_val/metrics.npz \
+    --probe-init-checkpoint runs/<pilot07>/ckpt/best.pt \
+    --probe-best runs/<probe10>/ckpt/best.pt --probe-last runs/<probe10>/ckpt/last.pt \
+    --probe-metrics runs/<probe10>/eval_recorded_val/metrics.npz \
+    --probe-init-checkpoint runs/<pilot10>/ckpt/best.pt \
     --smoke-receipt results/training_prerequisites/a100_pretrain_smoke/<target>/receipt.json \
     --smoke-environment-receipt results/training_prerequisites/a100_pretrain_smoke/<target>/environment_receipt.json \
     --smoke-telemetry results/training_prerequisites/a100_pretrain_smoke/<target>/telemetry.json
@@ -28,6 +35,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -35,9 +43,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from deep_anc.config import load_train_config  # noqa: E402
+from deep_anc.config import (  # noqa: E402
+    canonical_recorded_manifest_for_data,
+    load_train_config,
+)
 from deep_anc.train.campaign_evidence import (  # noqa: E402
-    CANONICAL_RECORDED_VAL_MANIFEST,
     PILOT_SELECTION_RULE,
     make_campaign_evidence_reference,
 )
@@ -71,7 +81,16 @@ def _canonical_cfg(
     prerequisite_sha: str,
     *,
     loss_alpha: float,
+    loss_lambda_dnh: float,
 ) -> dict:
+    alpha = float(loss_alpha)
+    lambda_dnh = float(loss_lambda_dnh)
+    if not math.isfinite(alpha):
+        raise ValueError("selected alpha가 finite가 아닙니다")
+    if not math.isfinite(lambda_dnh) or lambda_dnh <= 0.0:
+        raise ValueError("selected lambda_dnh가 finite 양수가 아닙니다")
+    alpha_literal = f"{alpha:.1f}" if alpha.is_integer() else f"{alpha:.12g}"
+    lambda_literal = repr(lambda_dnh)
     return load_train_config(
         config,
         [
@@ -79,8 +98,8 @@ def _canonical_cfg(
             f"campaign_prerequisite_sha256={prerequisite_sha}",
             # ``1``이 아닌 ``1.0``으로 직렬화해 loss selection digest가 pilot과
             # 달라지는 것을 막는다. winner와 다른 값을 주면 raw validator가 거부한다.
-            f"loss.nmse_cvar_alpha={float(loss_alpha):.1f}" if float(loss_alpha).is_integer()
-            else f"loss.nmse_cvar_alpha={float(loss_alpha):.12g}",
+            f"loss.nmse_cvar_alpha={alpha_literal}",
+            f"loss.lambda_dnh={lambda_literal}",
         ],
     )
 
@@ -104,12 +123,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         required=True,
         help=(
-            "raw pilot selection으로 유도된 canonical alpha. issuer와 이후 100k "
+            "raw measured-probe selection으로 유도된 canonical alpha. issuer와 "
+            "이후 100k "
             "명령은 반드시 같은 float literal을 사용한다."
         ),
     )
-    parser.add_argument("--g0-receipt", required=True)
-    parser.add_argument("--gradient-receipt", required=True)
+    parser.add_argument(
+        "--loss-lambda-dnh",
+        type=float,
+        required=True,
+        help="raw winner identity에서 유도된 canonical lambda_dnh",
+    )
+    parser.add_argument("--g0-receipt", action="append", required=True)
+    parser.add_argument(
+        "--prepilot-gradient-receipt", action="append", required=True
+    )
+    parser.add_argument(
+        "--gradient-receipt",
+        required=True,
+        help="selected 20k winner의 post-pilot output-gradient receipt",
+    )
     parser.add_argument("--pilot-best", action="append", required=True)
     parser.add_argument("--pilot-last", action="append", required=True)
     parser.add_argument("--pilot-metrics", action="append", required=True)
@@ -118,17 +151,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         help=(
-            "각 pilot recorded-val manifest. 생략 시 canonical "
-            f"{CANONICAL_RECORDED_VAL_MANIFEST}를 모든 candidate에 사용합니다."
+            "각 pilot recorded-val manifest. 생략 시 resolved canonical data의 "
+            "recorded generation에서 권위 manifest를 유도해 모든 candidate에 "
+            "사용합니다."
         ),
     )
-    parser.add_argument("--probe-best", required=True)
-    parser.add_argument("--probe-last", required=True)
-    parser.add_argument("--probe-metrics", required=True)
+    parser.add_argument("--probe-best", action="append", required=True)
+    parser.add_argument("--probe-last", action="append", required=True)
+    parser.add_argument("--probe-metrics", action="append", required=True)
     parser.add_argument(
-        "--probe-manifest", default=CANONICAL_RECORDED_VAL_MANIFEST
+        "--probe-manifest",
+        action="append",
+        default=None,
+        help=(
+            "각 measured probe recorded-val manifest. 생략 시 resolved canonical "
+            "data의 recorded generation에서 권위 manifest를 유도해 모든 "
+            "candidate에 사용합니다."
+        ),
     )
-    parser.add_argument("--probe-init-checkpoint", required=True)
+    parser.add_argument("--probe-init-checkpoint", action="append", required=True)
     parser.add_argument("--smoke-receipt", required=True)
     parser.add_argument("--smoke-environment-receipt", required=True)
     parser.add_argument("--smoke-telemetry", required=True)
@@ -140,20 +181,61 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ordered_candidate_inputs(
+    args: argparse.Namespace, *, default_manifest: str
+) -> list[tuple[str, ...]]:
+    """CLI의 pilot/probe 반복 인자를 동일 index chain으로 고정한다."""
+
+    lengths = {
+        len(args.g0_receipt),
+        len(args.prepilot_gradient_receipt),
+        len(args.pilot_best),
+        len(args.pilot_last),
+        len(args.pilot_metrics),
+        len(args.probe_best),
+        len(args.probe_last),
+        len(args.probe_metrics),
+        len(args.probe_init_checkpoint),
+    }
+    if len(lengths) != 1 or next(iter(lengths)) < 2:
+        raise ValueError(
+            "G0/pre-pilot-gradient/pilot/probe best/last/metrics/init은 같은 개수와 순서의 "
+            "최소 두 candidate여야 합니다"
+        )
+    count = len(args.pilot_best)
+    if not str(default_manifest).strip():
+        raise ValueError("resolved canonical recorded manifest가 비었습니다")
+    pilot_manifests = args.pilot_manifest or [default_manifest] * count
+    probe_manifests = args.probe_manifest or [default_manifest] * count
+    if len(pilot_manifests) != count:
+        raise ValueError("--pilot-manifest는 생략하거나 모든 candidate마다 한 번 지정해야 합니다")
+    if len(probe_manifests) != count:
+        raise ValueError("--probe-manifest는 생략하거나 모든 candidate마다 한 번 지정해야 합니다")
+    return list(
+        zip(
+            args.g0_receipt,
+            args.prepilot_gradient_receipt,
+            args.pilot_best,
+            args.pilot_last,
+            args.pilot_metrics,
+            pilot_manifests,
+            args.probe_best,
+            args.probe_last,
+            args.probe_metrics,
+            probe_manifests,
+            args.probe_init_checkpoint,
+            strict=True,
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.out != CANONICAL_PATH:
         raise ValueError(f"campaign ledger output은 {CANONICAL_PATH}로 고정됩니다")
     bootstrap_sha = _sha(args.bootstrap_receipt_sha256, label="bootstrap receipt SHA")
     loss_alpha = float(args.loss_alpha)
-    lengths = {len(args.pilot_best), len(args.pilot_last), len(args.pilot_metrics)}
-    if len(lengths) != 1 or next(iter(lengths)) < 2:
-        raise ValueError("pilot best/last/metrics는 같은 개수의 최소 두 candidate여야 합니다")
-    manifests = args.pilot_manifest or [CANONICAL_RECORDED_VAL_MANIFEST] * len(
-        args.pilot_best
-    )
-    if len(manifests) != len(args.pilot_best):
-        raise ValueError("--pilot-manifest는 생략하거나 모든 candidate마다 한 번 지정해야 합니다")
+    loss_lambda_dnh = float(args.loss_lambda_dnh)
     destination = REPO_ROOT / CANONICAL_PATH
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"canonical prerequisite ledger를 덮어쓸 수 없습니다: {destination}")
@@ -162,10 +244,20 @@ def main(argv: list[str] | None = None) -> int:
     # resolve한다. campaign SHA는 source/P/S/loss 선택 자체에는 포함하지 않으며, 실제
     # write 뒤에는 새 SHA로 resolve한 cfg를 validator가 다시 검사한다.
     provisional = _canonical_cfg(
-        args.config, bootstrap_sha, "0" * 64, loss_alpha=loss_alpha
+        args.config,
+        bootstrap_sha,
+        "0" * 64,
+        loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
     )
     require_exact_source_trust(
         provisional, repo_root=REPO_ROOT, roles={"canonical_pretrain"}
+    )
+    canonical_recorded_manifest = canonical_recorded_manifest_for_data(
+        provisional.get("data") or {}
+    )
+    candidate_inputs = _ordered_candidate_inputs(
+        args, default_manifest=canonical_recorded_manifest
     )
     contract = provisional["experiment_contract"]
     source = contract["source"]
@@ -179,7 +271,6 @@ def main(argv: list[str] | None = None) -> int:
             "primary_path_sha256": artifacts["primary_path"]["sha256"],
             "secondary_path_sha256": artifacts["secondary_path"]["sha256"],
         },
-        "g0": {"receipt": _reference(args.g0_receipt, label="campaign G0 receipt")},
         "gradient_budget": {
             "receipt": _reference(args.gradient_receipt, label="gradient budget receipt")
         },
@@ -187,22 +278,63 @@ def main(argv: list[str] | None = None) -> int:
             "selection_rule": PILOT_SELECTION_RULE,
             "candidates": [
                 {
-                    "best_checkpoint": _reference(best, label=f"pilot[{index}] best checkpoint"),
-                    "last_checkpoint": _reference(last, label=f"pilot[{index}] last checkpoint"),
-                    "metrics": _reference(metrics, label=f"pilot[{index}] recorded-val metrics"),
-                    "manifest": _reference(manifest, label=f"pilot[{index}] recorded manifest"),
+                    "g0": {
+                        "receipt": _reference(
+                            g0_receipt, label=f"candidate[{index}] G0 receipt"
+                        )
+                    },
+                    "gradient_calibration": {
+                        "receipt": _reference(
+                            prepilot_gradient_receipt,
+                            label=f"candidate[{index}] pre-pilot gradient receipt",
+                        )
+                    },
+                    "pilot": {
+                        "best_checkpoint": _reference(
+                            pilot_best, label=f"pilot[{index}] best checkpoint"
+                        ),
+                        "last_checkpoint": _reference(
+                            pilot_last, label=f"pilot[{index}] last checkpoint"
+                        ),
+                        "metrics": _reference(
+                            pilot_metrics, label=f"pilot[{index}] recorded-val metrics"
+                        ),
+                        "manifest": _reference(
+                            pilot_manifest, label=f"pilot[{index}] recorded manifest"
+                        ),
+                    },
+                    "measured_probe": {
+                        "best_checkpoint": _reference(
+                            probe_best, label=f"probe[{index}] best checkpoint"
+                        ),
+                        "last_checkpoint": _reference(
+                            probe_last, label=f"probe[{index}] last checkpoint"
+                        ),
+                        "metrics": _reference(
+                            probe_metrics, label=f"probe[{index}] recorded-val metrics"
+                        ),
+                        "manifest": _reference(
+                            probe_manifest, label=f"probe[{index}] recorded manifest"
+                        ),
+                        "init_checkpoint": _reference(
+                            probe_init, label=f"probe[{index}] pilot init checkpoint"
+                        ),
+                    },
                 }
-                for index, (best, last, metrics, manifest) in enumerate(
-                    zip(args.pilot_best, args.pilot_last, args.pilot_metrics, manifests)
-                )
+                for index, (
+                    g0_receipt,
+                    prepilot_gradient_receipt,
+                    pilot_best,
+                    pilot_last,
+                    pilot_metrics,
+                    pilot_manifest,
+                    probe_best,
+                    probe_last,
+                    probe_metrics,
+                    probe_manifest,
+                    probe_init,
+                ) in enumerate(candidate_inputs)
             ],
-        },
-        "measured_probe": {
-            "best_checkpoint": _reference(args.probe_best, label="measured probe best checkpoint"),
-            "last_checkpoint": _reference(args.probe_last, label="measured probe last checkpoint"),
-            "metrics": _reference(args.probe_metrics, label="measured probe recorded-val metrics"),
-            "manifest": _reference(args.probe_manifest, label="measured probe recorded manifest"),
-            "init_checkpoint": _reference(args.probe_init_checkpoint, label="measured probe init checkpoint"),
         },
         "a100_smoke_resume": {
             "evidence": _reference(args.smoke_receipt, label="A100 smoke receipt"),
@@ -216,7 +348,11 @@ def main(argv: list[str] | None = None) -> int:
     # 먼저 돌려 실패한 evidence가 canonical fixed pathname을 점유하지 않게 한다.
     prospective_sha = _ledger_sha256(ledger)
     prospective_cfg = _canonical_cfg(
-        args.config, bootstrap_sha, prospective_sha, loss_alpha=loss_alpha
+        args.config,
+        bootstrap_sha,
+        prospective_sha,
+        loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
     )
     validate_canonical_pretrain_ledger_payload(
         prospective_cfg,
@@ -230,7 +366,11 @@ def main(argv: list[str] | None = None) -> int:
     # 원자 공개 뒤, canonical entrypoint와 동일한 path+external SHA에서 raw proof를
     # 재계산한다. 어떤 hand-written score/boolean도 이 단계에서는 읽지 않는다.
     canonical = _canonical_cfg(
-        args.config, bootstrap_sha, ledger_sha, loss_alpha=loss_alpha
+        args.config,
+        bootstrap_sha,
+        ledger_sha,
+        loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
     )
     validate_canonical_pretrain_prerequisites(canonical, repo_root=REPO_ROOT)
     print(

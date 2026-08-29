@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,17 @@ CANONICAL_PRETRAIN_POLICY_VERSION = "canonical_pretrain_v1"
 A100_PRETRAIN_SMOKE_POLICY_VERSION = "a100_pretrain_smoke_v1"
 PRETRAIN_DERIVATIVE_STRICT_ROLES = frozenset({"loss_pilot", "measured_probe"})
 """canonical 선택 증거를 만드는 단일-GPU·결정론 derivative 역할."""
+# 이 두 값은 campaign ledger가 다시 검증하는 선택 증거의 길이이면서, GPU를
+# 잘못된 role/config에 쓰기 전에 차단하는 config admission 계약이다. campaign_evidence가
+# config를 import하므로 여기서 한 번만 정의하고 그 모듈은 이를 재수출한다.
+CANONICAL_LOSS_PILOT_STEPS = 20_000
+CANONICAL_MEASURED_PROBE_STEPS = 5_000
+CANONICAL_PRETRAIN_DERIVATIVE_STEPS = {
+    "loss_pilot": CANONICAL_LOSS_PILOT_STEPS,
+    "measured_probe": CANONICAL_MEASURED_PROBE_STEPS,
+}
+CANONICAL_RECORDED_MANIFEST = "data/manifests/recorded_regrouped.jsonl"
+CANONICAL_RECORDED_RATIO = 0.7
 CANONICAL_DETERMINISM_POLICY = {
     "schema_version": 1,
     "torch_use_deterministic_algorithms": True,
@@ -42,12 +55,6 @@ CANONICAL_LOSS_BASELINE = {
     "nmse_objective": "trusted_band",
     "nmse_cvar_q": 0.25,
     "nmse_cvar_min_k": 4,
-    # 과거 0.264는 strict S라도 loss_start_sample=0으로 계산한 값이라 실제 Trainer
-    # 목적함수의 증거가 아니다. 현행 strict S + 3549-sample 정착 절단 고정 fixture는
-    # 0.130이지만, 이 값도 실제 A100 모델/배치를 대표하지 않는다. canonical 전에는
-    # 같은 loss_start_sample을 결속한 campaign prerequisite ledger의 0.2–0.4 증거가
-    # 있어야 하며, 그 전에는 이 baseline을 승인값으로 해석하지 않는다.
-    "lambda_dnh": 0.00075,
     "dnh_weight_below": 1.0,
     "dnh_weight_above": 2.0,
     "nmse_frame_samples": 8192,
@@ -59,6 +66,11 @@ CANONICAL_LOSS_BASELINE = {
     "lambda_sat": 1.0,
     "sat_margin": 2.0,
 }
+# YAML의 시작값일 뿐 canonical 승인값이 아니다. alpha별 approved G0 model-output
+# gradient calibration이 현재 λ의 share 0.2–0.4를 통과해야 그 alpha 후보의
+# 20k/5k를 열 수 있다. 범위 밖이면 receipt의 추천값으로 config를 바꾸고 해당
+# alpha의 G0부터 다시 실행한다.
+CANONICAL_DNH_BOOTSTRAP_LAMBDA = 0.00075
 CANONICAL_LOSS_GRID = frozenset(
     {
         # signed frame-CVaR는 λ=0.5와 0.2 모두 fixed-batch control에서 y→0으로
@@ -112,6 +124,66 @@ CANONICAL_RECORDED_AUGMENT = {
     "mix_weight_range": [0.0, 0.7],
     "lead_jitter_samples": 0.0,
 }
+CANONICAL_STAGE1_NONLINEAR = {
+    "sef_eta_choices": [10.0],
+    "drive_range": [1.0, 1.0],
+    "hardclip_prob": 0.0,
+}
+CANONICAL_STAGE1_PLANT_PERTURBATION = {
+    "delay_jitter_range": [0, 0],
+    "gain_tilt_db_per_octave": [0, 0],
+    "gain_db": [0, 0],
+    "allpass_perturb": False,
+}
+CANONICAL_CLOSED_LOOP_DATA = {
+    "feedback_delay_samples": [512, 1024],
+    "warmup_seconds": 0.25,
+    "unroll_group_frames": 4,
+}
+# 공개 corpus와 strict P/S를 통과한 Stage-1 분포를 한 곳에서 고정한다. experiment
+# contract SHA만 다르면 된다는 해석은 충분하지 않다. canonical이라는 이름으로
+# manifest/RIR/plant 증강을 바꾸면 pilot·ledger·100k가 서로 다른 문제를 풀게 된다.
+CANONICAL_DATA_DISTRIBUTION = {
+    "sample_rate": 48000,
+    "segment_seconds": 1.5,
+    "reference_mode": "digital",
+    "recorded_lead_mode": "timeline",
+    "recorded_sampling": "family_lineage_session_balanced",
+    "source_mix_ratio": CANONICAL_SOURCE_MIX_RATIO,
+    "recorded_augment": CANONICAL_RECORDED_AUGMENT,
+    "noise_manifest_dir": "data/manifests/canonical_v4",
+    "rir_bank": "data/rir_bank/duct_rirs_v1.npz",
+    "level_dbfs": [-45, -20],
+    "snr_mic_noise_db": [5, 30],
+    "dc_hum_prob": 0.2,
+    "nonlinear": CANONICAL_STAGE1_NONLINEAR,
+    "plant_perturbation": CANONICAL_STAGE1_PLANT_PERTURBATION,
+    # stage=open_loop이어도 dataset은 이 feedback-delay 범위로 err input의
+    # timeline을 만든다. 이름만 보고 override를 허용하면 다른 학습분포가 된다.
+    "closed_loop": CANONICAL_CLOSED_LOOP_DATA,
+}
+# ``measured_probe``는 surrogate pilot의 학습 곡선을 measured P에서 한 번 더
+# 보는 synthetic-only 진단이 아니다. 선택된 20k pilot의 weight를 시작점으로
+# canonical recorded train 70% + synthetic 30%를 정확히 5k step 학습하는 짧은
+# measured fine-tune이다. 역할 이름만 바꿔 recorded stream/init을 빠뜨리는 실수를
+# 막기 위해 role 해석 시 아래 필드를 resolved config에 물질화한다.
+CANONICAL_MEASURED_PROBE_POLICY = {
+    "require_measured_primary_path": True,
+    "require_init_checkpoint": True,
+    # 20k pilot은 init_eligible canonical run이 아니므로 completion receipt 발급
+    # 대상이 아니다. 대신 campaign ledger가 selected pilot best.pt SHA와 probe의
+    # init bytes를 직접 결속한다.
+    "require_init_completion_receipt": False,
+    "require_recorded_manifest": True,
+    "required_init_experiment_role": "loss_pilot",
+    "require_init_eligible": False,
+    "recorded_manifest": CANONICAL_RECORDED_MANIFEST,
+    "recorded_ratio": CANONICAL_RECORDED_RATIO,
+    "readiness": {
+        "required_path_band_hz": [150, 1600],
+        "max_init_lead_mismatch_samples": 16,
+    },
+}
 CANONICAL_FINETUNE_POLICY = {
     "experiment_role": "canonical_finetune",
     "init_eligible": False,
@@ -136,9 +208,61 @@ CANONICAL_FINETUNE_POLICY = {
     "eval_every": 1000,
     "log_every": 100,
     "early_stop_patience": 0,
-    "recorded_manifest": "data/manifests/recorded_regrouped.jsonl",
-    "recorded_ratio": 0.7,
+    "recorded_manifest": CANONICAL_RECORDED_MANIFEST,
+    "recorded_ratio": CANONICAL_RECORDED_RATIO,
 }
+
+
+def canonical_recorded_manifest_for_data(data: dict) -> str:
+    """data generation 선언에서 권위 recorded manifest를 fail-closed 유도한다.
+
+    generation 선언이 전혀 없을 때만 immutable legacy parent82 manifest를 반환한다.
+    generation path/SHA 중 하나라도 선언되면 둘 다 exact여야 하며, 같은 generation
+    directory의 combined ``recorded.jsonl``만 선택한다.
+    """
+
+    if not isinstance(data, dict):
+        raise ValueError("canonical recorded data config는 mapping이어야 합니다")
+    generation = data.get("recorded_generation")
+    generation_sha = data.get("recorded_generation_sha256")
+    if generation in (None, "") and generation_sha in (None, ""):
+        return CANONICAL_RECORDED_MANIFEST
+    if not isinstance(generation, str) or not isinstance(generation_sha, str):
+        raise ValueError(
+            "recorded_generation path와 recorded_generation_sha256은 함께 선언해야 합니다"
+        )
+    generation_path = Path(generation)
+    root = Path("data/manifests/recorded_generations")
+    try:
+        generation_relative = generation_path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("recorded_generation canonical root가 아닙니다") from exc
+    if (
+        generation_path.is_absolute()
+        or len(generation_relative.parts) != 2
+        or generation_relative.name != "generation.json"
+    ):
+        raise ValueError("recorded_generation path가 exact generation.json 경로가 아닙니다")
+    generation_id = generation_relative.parts[0]
+    if (
+        re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", generation_id) is None
+        or len(generation_sha) != 64
+        or any(character not in "0123456789abcdef" for character in generation_sha)
+    ):
+        raise ValueError("recorded_generation id/SHA-256 선언이 유효하지 않습니다")
+    return (root / generation_id / "recorded.jsonl").as_posix()
+
+
+def _canonical_recorded_manifest_binding(cfg: dict) -> bool:
+    """Legacy 82 또는 transfer-결속된 generation 99 manifest 선언만 허용한다."""
+
+    try:
+        expected = canonical_recorded_manifest_for_data(cfg.get("data") or {})
+    except ValueError:
+        return False
+    return cfg.get("recorded_manifest") == expected
+
+
 CANONICAL_PRETRAIN_POLICY = {
     "experiment_role": "canonical_pretrain",
     "init_eligible": True,
@@ -269,6 +393,8 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
         elif role == A100_PRETRAIN_SMOKE_ROLE:
             _enforce_a100_pretrain_smoke_policy(cfg)
         else:
+            if role == "measured_probe":
+                _materialize_measured_probe_policy(cfg)
             _enforce_pretrain_derivative_policy(cfg)
     # canonical YAML 밖에서 이 역할 이름만 주입해 장기/완화 학습을 우회하는
     # 경로도 닫는다. smoke는 canonical pretrain의 semantic projection만 증명하는
@@ -284,7 +410,7 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
         "canonical_pretrain",
         "canonical_finetune",
         A100_PRETRAIN_SMOKE_ROLE,
-    }:
+    } | PRETRAIN_DERIVATIVE_STRICT_ROLES:
         # 공식 계약은 검증된 Elice bootstrap generation을 config에 먼저
         # 결속한 뒤에만 timing/experiment SHA를 만들 수 있다. anchor 없는
         # config를 일단 stamp하고 Trainer에서 뒤늦게 거부하면 동일 YAML이
@@ -295,12 +421,13 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
             or not cfg["data"].get("bootstrap_receipt_sha256")
         ):
             raise ValueError(
-                "canonical 학습 config를 stamp하려면 "
+                "canonical 학습/선택 evidence config를 stamp하려면 "
                 "data.bootstrap_receipt와 외부 bootstrap_receipt_sha256이 필요합니다"
             )
         from .data.transfer_contract import bind_recorded_transfer_config
 
         bind_recorded_transfer_config(cfg["data"], repo_root=REPO_ROOT)
+        _materialize_bound_recorded_manifest(cfg)
         if resolved_role == "canonical_pretrain":
             prerequisite_sha = str(cfg.get("campaign_prerequisite_sha256") or "")
             if (
@@ -317,11 +444,18 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
         from .data.transfer_contract import bind_recorded_transfer_config
 
         bind_recorded_transfer_config(cfg["data"], repo_root=REPO_ROOT)
+        _materialize_bound_recorded_manifest(cfg)
+    if resolved_role in {
+        "canonical_pretrain",
+        "canonical_finetune",
+        A100_PRETRAIN_SMOKE_ROLE,
+    } | PRETRAIN_DERIVATIVE_STRICT_ROLES:
+        _require_canonical_rir_bank(cfg)
     if str(cfg.get("experiment_role", "")) in {
         "canonical_pretrain",
         "canonical_finetune",
         A100_PRETRAIN_SMOKE_ROLE,
-    }:
+    } | PRETRAIN_DERIVATIVE_STRICT_ROLES:
         declared_primary_delay = cfg["data"].get("require_primary_delay_artifact")
         if declared_primary_delay is False:
             raise ValueError(
@@ -374,11 +508,85 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
     return cfg
 
 
+def _materialize_bound_recorded_manifest(cfg: dict) -> None:
+    """검증된 schema v1/v2 transfer에서 recorded 역할의 manifest를 투영한다."""
+
+    role = str(cfg.get("experiment_role", ""))
+    if role not in {"measured_probe", "canonical_finetune"}:
+        return
+    expected = canonical_recorded_manifest_for_data(cfg.get("data") or {})
+    declared = cfg.get("recorded_manifest")
+    if declared not in (None, "", CANONICAL_RECORDED_MANIFEST, expected):
+        raise ValueError(
+            "recorded_manifest override가 검증된 transfer generation과 다릅니다: "
+            f"declared={declared!r}, expected={expected!r}"
+        )
+    cfg["recorded_manifest"] = expected
+    # 초기 YAML policy 검사는 아직 schema를 모르는 legacy placeholder에서 실행된다.
+    # transfer 결속 뒤 dynamic manifest를 물질화한 상태를 다시 검사해 checkpoint에
+    # 저장되는 최종 semantics도 동일한 policy 경로를 통과시킨다.
+    if role == "canonical_finetune":
+        _enforce_canonical_finetune_policy(cfg)
+    else:
+        _enforce_pretrain_derivative_policy(cfg)
+
+
+def _require_canonical_rir_bank(cfg: dict) -> None:
+    """공식 역할에서 SynthANCDataset의 즉석 32-RIR fallback을 차단한다."""
+
+    value = (cfg.get("data") or {}).get("rir_bank")
+    if value != CANONICAL_DATA_DISTRIBUTION["rir_bank"]:
+        raise ValueError(
+            "canonical 학습은 data/rir_bank/duct_rirs_v1.npz만 사용할 수 있습니다"
+        )
+    target = _resolve_path(str(value)).absolute()
+    try:
+        relative = target.relative_to(REPO_ROOT.absolute())
+    except ValueError as exc:
+        raise ValueError("canonical RIR bank는 저장소 내부 regular file이어야 합니다") from exc
+    cursor = REPO_ROOT.absolute()
+    for component in relative.parts:
+        cursor /= component
+        if cursor.is_symlink():
+            raise ValueError(f"canonical RIR bank 경로에는 symlink를 허용하지 않습니다: {cursor}")
+    from .train.evaluation_contract import snapshot_regular_file
+
+    try:
+        snapshot = snapshot_regular_file(target)
+    except ValueError as exc:
+        raise ValueError(f"canonical RIR bank regular file이 필요합니다: {target}") from exc
+    if not snapshot.content:
+        raise ValueError(f"canonical RIR bank가 비었습니다: {target}")
+    # regular file이라는 이유만으로 손상된 NPZ를 허용하면 SynthANCDataset이 OSError를
+    # 잡아 즉석 RIR로 되돌아간다. pathname을 다시 열지 않고 위 snapshot bytes 자체를
+    # 검사해 세 경로 bank가 동일한 유한 2-D shape인지까지 닫는다.
+    import io
+
+    import numpy as np
+
+    try:
+        with np.load(io.BytesIO(snapshot.content), allow_pickle=False) as bank:
+            arrays = [np.asarray(bank[key]) for key in ("p_ref", "p_err", "f_fb")]
+    except (KeyError, OSError, ValueError) as exc:
+        raise ValueError(f"canonical RIR bank NPZ가 손상됐습니다: {target}") from exc
+    shapes = {array.shape for array in arrays}
+    if (
+        len(shapes) != 1
+        or any(array.ndim != 2 or array.size < 1 for array in arrays)
+        or any(not bool(np.isfinite(array).all()) for array in arrays)
+    ):
+        raise ValueError(
+            "canonical RIR bank p_ref/p_err/f_fb는 같은 shape의 유한 2-D 배열이어야 합니다"
+        )
+
+
 def _enforce_canonical_finetune_policy(cfg: dict) -> None:
     """canonical config의 CLI 약화/역할 세탁을 override 적용 뒤 차단한다."""
 
     mismatches: list[str] = []
     for key, required in CANONICAL_FINETUNE_POLICY.items():
+        if key == "recorded_manifest" and _canonical_recorded_manifest_binding(cfg):
+            continue
         if cfg.get(key) != required:
             required_text = str(required).lower() if isinstance(required, bool) else repr(required)
             mismatches.append(
@@ -440,21 +648,28 @@ def _collect_canonical_pretrain_semantic_mismatches(
         mismatches.append(
             f"seed={seed!r} (required one of [20260803, 20260903])"
         )
-    data = cfg.get("data") or {}
-    for key, required in {
-        "sample_rate": 48000,
-        "segment_seconds": 1.5,
-        "reference_mode": "digital",
-        "digital_primary_path_mode": "secondary_surrogate",
-        "recorded_lead_mode": "timeline",
-        "recorded_sampling": "family_lineage_session_balanced",
-        "source_mix_ratio": CANONICAL_SOURCE_MIX_RATIO,
-        "recorded_augment": CANONICAL_RECORDED_AUGMENT,
-    }.items():
-        if data.get(key) != required:
-            mismatches.append(
-                f"data.{key}={data.get(key)!r} (required {required!r})"
-            )
+
+    _collect_surrogate_only_stream_mismatches(
+        cfg, mismatches, role="canonical_pretrain"
+    )
+
+
+def _collect_surrogate_only_stream_mismatches(
+    cfg: dict, mismatches: list[str], *, role: str
+) -> None:
+    """surrogate pretrain/pilot에 recorded branch가 조용히 섞이지 않게 한다."""
+
+    if cfg.get("recorded_manifest") not in (None, ""):
+        mismatches.append(f"{role} recorded_manifest must be null (synthetic-only)")
+    if cfg.get("recorded_ratio") not in (None, 0, 0.0):
+        mismatches.append(f"{role} recorded_ratio must be 0 (synthetic-only)")
+    for key in (
+        "require_measured_primary_path",
+        "require_init_checkpoint",
+        "require_recorded_manifest",
+    ):
+        if bool(cfg.get(key, False)):
+            mismatches.append(f"{role} {key} must be false")
 
 
 def _enforce_a100_pretrain_smoke_policy(cfg: dict) -> None:
@@ -524,7 +739,88 @@ def _enforce_pretrain_derivative_policy(cfg: dict) -> None:
         raise ValueError(
             f"{role}는 canonical 선택 증거이므로 required_world_size=1이어야 합니다"
         )
+    if role in PRETRAIN_DERIVATIVE_STRICT_ROLES:
+        mismatches: list[str] = []
+        # derivative는 길이/role/primary/recorded stream만 다르고 optimizer,
+        # schedule, batch, AMP, logging cadence 등 학습 의미는 canonical pretrain과
+        # 정확히 같아야 한다. campaign validator가 checkpoint에서 이 정책을 다시
+        # 실행하므로 이름만 derivative인 임의 실험은 ledger 후보가 될 수 없다.
+        for key, required in CANONICAL_PRETRAIN_POLICY.items():
+            if key in {"experiment_role", "init_eligible"}:
+                continue
+            if cfg.get(key) != required:
+                mismatches.append(
+                    f"{key}={cfg.get(key)!r} (required {required!r})"
+                )
+        expected_steps = CANONICAL_PRETRAIN_DERIVATIVE_STEPS[role]
+        try:
+            run_until_step = int(cfg.get("run_until_step", -1))
+        except (TypeError, ValueError):
+            run_until_step = -1
+        if run_until_step != expected_steps:
+            mismatches.append(
+                f"run_until_step={cfg.get('run_until_step')!r} "
+                f"(required {expected_steps} for {role})"
+            )
+        init_ckpt = cfg.get("init_ckpt")
+        if role == "loss_pilot" and init_ckpt not in (None, ""):
+            mismatches.append("loss_pilot init_ckpt must be null (from-scratch only)")
+        if role == "measured_probe" and not isinstance(init_ckpt, str):
+            mismatches.append(
+                "measured_probe init_ckpt must name the selected 20k pilot best.pt"
+            )
+        elif role == "measured_probe" and not init_ckpt.strip():
+            mismatches.append(
+                "measured_probe init_ckpt must name the selected 20k pilot best.pt"
+            )
+        if role == "loss_pilot":
+            _collect_surrogate_only_stream_mismatches(
+                cfg, mismatches, role="loss_pilot"
+            )
+        else:
+            for key, required in CANONICAL_MEASURED_PROBE_POLICY.items():
+                if key == "recorded_manifest" and _canonical_recorded_manifest_binding(cfg):
+                    continue
+                if cfg.get(key) != required:
+                    mismatches.append(
+                        f"{key}={cfg.get(key)!r} "
+                        f"(required {required!r} for measured_probe)"
+                    )
+        _collect_common_training_policy_mismatches(cfg, mismatches, role=role)
+        if mismatches:
+            raise ValueError(
+                f"{role} trust policy는 override로 학습 분포를 약화할 수 없습니다: "
+                + "; ".join(mismatches)
+            )
     cfg["canonical_trust_policy"] = f"{role}_derivative_v1"
+
+
+def _materialize_measured_probe_policy(cfg: dict) -> None:
+    """role declaration을 정확한 measured 70:30 probe stream으로 해석한다.
+
+    이 함수는 YAML/CLI를 처음 해석하는 경계에서만 호출한다. 저장된 checkpoint를
+    다시 검증하는 :func:`validate_canonical_training_policy`는 값을 채우지 않고
+    완성된 필드 전체를 요구하므로, 누락 필드가 있는 위조 cfg는 통과할 수 없다.
+    """
+
+    mismatches: list[str] = []
+    for key, required in CANONICAL_MEASURED_PROBE_POLICY.items():
+        if key == "recorded_manifest" and _canonical_recorded_manifest_binding(cfg):
+            continue
+        if key in cfg and cfg.get(key) != required:
+            mismatches.append(
+                f"{key}={cfg.get(key)!r} "
+                f"(required {required!r} for measured_probe)"
+            )
+    if mismatches:
+        raise ValueError(
+            "measured_probe trust policy는 override로 학습 분포를 약화할 수 없습니다: "
+            + "; ".join(mismatches)
+        )
+    for key, required in CANONICAL_MEASURED_PROBE_POLICY.items():
+        if key == "recorded_manifest" and _canonical_recorded_manifest_binding(cfg):
+            continue
+        cfg[key] = copy.deepcopy(required)
 
 
 def _collect_common_training_policy_mismatches(
@@ -540,6 +836,7 @@ def _collect_common_training_policy_mismatches(
         expected_keys = set(CANONICAL_LOSS_BASELINE) | {
             "nmse_cvar_alpha",
             "lambda_frame",
+            "lambda_dnh",
         }
         if set(loss) != expected_keys:
             mismatches.append(
@@ -552,27 +849,54 @@ def _collect_common_training_policy_mismatches(
                 mismatches.append(
                     f"loss.{key}={loss.get(key)!r} (required {required!r})"
                 )
+        lambda_dnh = loss.get("lambda_dnh")
+        if (
+            isinstance(lambda_dnh, bool)
+            or not isinstance(lambda_dnh, (int, float))
+            or not math.isfinite(float(lambda_dnh))
+            or float(lambda_dnh) <= 0.0
+        ):
+            mismatches.append(
+                "loss.lambda_dnh는 alpha별 output-gradient calibration을 위한 "
+                f"finite 양수여야 합니다: {lambda_dnh!r}"
+            )
         pair = (loss.get("nmse_cvar_alpha"), loss.get("lambda_frame"))
         if pair not in CANONICAL_LOSS_GRID:
             mismatches.append(
                 "loss alpha×frame이 승인 grid가 아닙니다: "
                 f"{pair!r}, allowed={sorted(CANONICAL_LOSS_GRID)}"
             )
-    data = cfg.get("data") or {}
-    if role == "canonical_finetune":
-        for key, required in {
-            "sample_rate": 48000,
-            "segment_seconds": 1.5,
-            "reference_mode": "digital",
-            "recorded_lead_mode": "timeline",
-            "recorded_sampling": "family_lineage_session_balanced",
-            "source_mix_ratio": CANONICAL_SOURCE_MIX_RATIO,
-            "recorded_augment": CANONICAL_RECORDED_AUGMENT,
-        }.items():
-            if data.get(key) != required:
-                mismatches.append(
-                    f"data.{key}={data.get(key)!r} (required {required!r})"
-                )
+    data = cfg.get("data")
+    if not isinstance(data, dict):
+        mismatches.append("data=<missing mapping>")
+        return
+    for key, required in CANONICAL_DATA_DISTRIBUTION.items():
+        if data.get(key) != required:
+            mismatches.append(
+                f"data.{key}={data.get(key)!r} (required {required!r})"
+            )
+    # 이 값은 SynthANCDataset에서 누락 tag를 조용히 synthetic으로 대체한다. canonical
+    # pretrain/finetune, 선택 pilot/probe, A100 smoke 어디에서도 허용하면 안 된다.
+    if bool(data.get("allow_missing_source_manifests", False)):
+        mismatches.append(
+            "data.allow_missing_source_manifests=true "
+            "(canonical source family 누락 대체는 금지)"
+        )
+    expected_primary_mode = {
+        "canonical_pretrain": "secondary_surrogate",
+        A100_PRETRAIN_SMOKE_ROLE: "secondary_surrogate",
+        "loss_pilot": "secondary_surrogate",
+        "measured_probe": "measured",
+        "canonical_finetune": "measured",
+    }.get(role)
+    if expected_primary_mode is not None and data.get(
+        "digital_primary_path_mode"
+    ) != expected_primary_mode:
+        mismatches.append(
+            "data.digital_primary_path_mode="
+            f"{data.get('digital_primary_path_mode')!r} "
+            f"(required {expected_primary_mode!r})"
+        )
 
 
 def loss_selection_sha256(loss_cfg: dict) -> str:
@@ -630,42 +954,60 @@ def validate_canonical_training_policy(cfg: dict) -> None:
             )
 
 
-def _finalize_training_metadata(cfg: dict) -> None:
+def _finalize_training_metadata(
+    cfg: dict, *, repo_root: str | Path = REPO_ROOT
+) -> None:
     """계약 SHA 전에 결정 가능한 학습 파생값을 단 한 번 materialize한다."""
 
-    from .dsp.secondary_path import load_secondary_path
     from .dsp.timing import BandPlan, PlantSettle, handoff_samples_from_config
+    from .train.criterion_factory import (
+        BROADBAND_CRITERION_ROLE,
+        bind_criterion_contract,
+    )
 
     data = cfg.get("data") or {}
     duct = cfg.get("duct") or {}
     secondary_value = (duct.get("secondary_path") or {}).get("npz")
-    if not secondary_value:
+    if not secondary_value and cfg.get("broadband_causal_training_authority") is None:
         raise ValueError("duct.secondary_path.npz가 없어 학습 metadata를 확정할 수 없습니다")
-    secondary = load_secondary_path(_resolve_path(secondary_value))
+    criterion_admission = bind_criterion_contract(cfg, repo_root=repo_root)
+    secondary = criterion_admission.secondary
     sample_rate = int(data["sample_rate"])
-    band = BandPlan.resolve(
-        plant_trusted_band_hz=secondary.trusted_band_hz(),
-        duct_cfg=duct,
-        sample_rate=sample_rate,
-    ).optimize.as_tuple()
+    if criterion_admission.role == BROADBAND_CRITERION_ROLE:
+        band = criterion_admission.trusted_band_hz
+        best_metric_key = "nmse_subband_guard_cvar_db"
+    else:
+        assert secondary is not None
+        band = BandPlan.resolve(
+            plant_trusted_band_hz=secondary.trusted_band_hz(),
+            duct_cfg=duct,
+            sample_rate=sample_rate,
+        ).optimize.as_tuple()
+        best_metric_key = "nmse_trusted_cvar_db"
     derived = {
         "digital_reference_lead_samples": int(
             data.get("digital_reference_lead_samples", 0)
         ),
         "physics_status": (
-            "acoustic_rir_training"
-            if str(data.get("reference_mode", "digital")) != "digital"
+            "fullband_causal_joint_fir_training"
+            if criterion_admission.causal_authority is not None
             else (
-                "measured_primary_path"
-                if str(data.get("digital_primary_path_mode", "rir_surrogate"))
-                == "measured"
-                else f"{data.get('digital_primary_path_mode', 'rir_surrogate')}_representation_pretrain"
+                "acoustic_rir_training"
+                if str(data.get("reference_mode", "digital")) != "digital"
+                else (
+                    "measured_primary_path"
+                    if str(data.get("digital_primary_path_mode", "rir_surrogate"))
+                    == "measured"
+                    else f"{data.get('digital_primary_path_mode', 'rir_surrogate')}_representation_pretrain"
+                )
             )
         ),
         "trusted_band_hz": [float(value) for value in band],
-        "best_metric_key": "nmse_trusted_cvar_db",
+        "best_metric_key": best_metric_key,
         "loss_start_sample": int(
-            PlantSettle.derive(
+            criterion_admission.broadband_valid_prefix_samples
+            if criterion_admission.causal_authority is not None
+            else PlantSettle.derive(
                 secondary_delay_samples=int(secondary.delay_samples),
                 handoff_samples=handoff_samples_from_config(duct),
                 fir_taps=int(secondary.fir.size),
@@ -729,6 +1071,11 @@ def _propagate_training_timing_contract(cfg: dict) -> None:
         # RIR variant마다 peak 위치가 달라 하나의 계약으로 표현할 수 없다. recorded
         # timeline과 함께 쓰면 RecordedANCDataset이 fail-closed 한다.
         data.pop("training_timing_contract", None)
+        return
+    if mode == "causal_joint_v4":
+        # joint authority parser가 P/S/fractional delay/handoff/lead를 한 번에
+        # 검증한다. 여기서 legacy compact P/S로 다시 유도하면 동일
+        # 역할에 두 source가 생긴다.
         return
 
     from .data.primary_path import resolve_digital_primary_path
@@ -796,10 +1143,15 @@ def _validate_resolved_training_contract(cfg: dict) -> None:
     duct = cfg.get("duct") or {}
     reference_mode = str(data.get("reference_mode", "digital"))
     primary_mode = str(data.get("digital_primary_path_mode", "rir_surrogate"))
+    causal_mode = (
+        primary_mode == "causal_joint_v4"
+        and isinstance(cfg.get("broadband_causal_training_authority"), dict)
+    )
     if (
         bool(cfg.get("require_measured_primary_path", False))
         and reference_mode == "digital"
         and primary_mode != "measured"
+        and not causal_mode
     ):
         raise ValueError(
             "require_measured_primary_path=true인 학습은 override 적용 후 "
@@ -812,13 +1164,39 @@ def _validate_resolved_training_contract(cfg: dict) -> None:
             "공식 fine-tune은 contract_run_dir=true여야 합니다 — 구형 고정 run "
             "경로의 last.pt와 섞을 수 없습니다"
         )
-    if bool(cfg.get("require_recorded_manifest", False)) and str(
-        data.get("recorded_sampling", "")
-    ) != "family_lineage_session_balanced":
-        raise ValueError(
-            "공식 recorded fine-tune은 "
-            "data.recorded_sampling=family_lineage_session_balanced여야 합니다"
+    if bool(cfg.get("require_recorded_manifest", False)):
+        broadband_role = str((cfg.get("loss") or {}).get("schema_version", "")).startswith(
+            "broadband_equal_subband_loss_"
         )
+        expected_sampling = (
+            "family_lineage_session_subband_qualified"
+            if broadband_role
+            else "family_lineage_session_balanced"
+        )
+        if str(data.get("recorded_sampling", "")) != expected_sampling:
+            raise ValueError(
+                "공식 recorded fine-tune sampler가 criterion 역할과 다릅니다: "
+                f"expected={expected_sampling}"
+            )
+        if broadband_role and not (
+            data.get("recorded_broadband_batch_receipt")
+            and data.get("recorded_broadband_batch_receipt_sha256")
+            and data.get("recorded_broadband_val_batch_receipt")
+            and data.get("recorded_broadband_val_batch_receipt_sha256")
+        ):
+            raise ValueError(
+                "광대역 recorded fine-tune에는 train/val ERR subband batch receipt "
+                "path/SHA가 모두 필수입니다"
+            )
+    if causal_mode:
+        from .train.criterion_factory import admit_criterion_config
+
+        admission = admit_criterion_config(
+            cfg, repo_root=REPO_ROOT, require_bound=True
+        )
+        if admission.causal_authority is None:
+            raise ValueError("causal_joint_v4 mode에 v4 authority admission이 없습니다")
+        return
     if reference_mode != "digital" or primary_mode == "rir_surrogate":
         return
 

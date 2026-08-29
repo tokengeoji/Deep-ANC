@@ -57,6 +57,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import signal
 import sys
@@ -244,6 +245,9 @@ COMPACT_TRANSFER_SUB_BANDS_HZ = (
     (600.0, 1000.0),
     (1000.0, 1600.0),
 )
+
+SEPARATION_CROSSCHECK_OVERALL_BAND_HZ = (150.0, 1600.0)
+"""strict v1 joint-LS/cubic 독립 교차검증의 전대역 기본값."""
 
 CONSISTENCY_SUB_BANDS_HZ = (
     (80.0, 150.0),
@@ -436,6 +440,9 @@ def compact_transfer_round_trip(
     effective_delay_samples: int,
     sample_rate: int,
     band_hz: tuple[float, float],
+    required_subbands_hz: tuple[
+        tuple[float, float], ...
+    ] = COMPACT_TRANSFER_SUB_BANDS_HZ,
 ) -> dict[str, Any]:
     """출하될 ``zeros(delay)+FIR`` 이 측정 복소 전달함수를 재현하는지 검사한다."""
 
@@ -490,16 +497,22 @@ def compact_transfer_round_trip(
             ),
         }
 
+    required_subbands = tuple(
+        (float(bounds[0]), float(bounds[1])) for bounds in required_subbands_hz
+    )
+    if not required_subbands or any(lo >= hi for lo, hi in required_subbands):
+        raise ValueError("compact transfer 필수 부대역이 비었거나 잘못되었습니다")
+
     overall = _metrics((float(band_hz[0]), float(band_hz[1])))
     subbands = [
         _metrics(bounds)
-        for bounds in COMPACT_TRANSFER_SUB_BANDS_HZ
+        for bounds in required_subbands
         if bounds[0] >= float(band_hz[0]) and bounds[1] <= float(band_hz[1])
     ]
-    if len(subbands) != len(COMPACT_TRANSFER_SUB_BANDS_HZ):
+    if len(subbands) != len(required_subbands):
         raise ValueError(
             f"compact gate 대역 {band_hz}가 필수 부대역 "
-            f"{COMPACT_TRANSFER_SUB_BANDS_HZ} 전체를 덮지 못합니다"
+            f"{required_subbands} 전체를 덮지 못합니다"
         )
     passed = bool(overall["passed"] and all(item["passed"] for item in subbands))
     return {
@@ -922,6 +935,7 @@ def capture_measurement_preserving_partial(
     output_float: np.ndarray,
     meter_completed_at_utc: dt.datetime | None = None,
     pre_open_check: Callable[[], None] | None = None,
+    record_callback_time_info: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """interleaved 전용 full-duplex; 실패도 partial arrays/telemetry를 surface한다."""
 
@@ -931,6 +945,14 @@ def capture_measurement_preserving_partial(
     output_pcm = cw.float32_to_pcm_int16(output_float)
     recorded_raw = np.zeros((total, 2), dtype=np.int32)
     cursor = {"frames": 0}
+    timing_capacity = int(math.ceil(total / max(1, int(block_size)))) + 4
+    timing_arrays = {
+        "callback_start_frames": np.full(timing_capacity, -1, dtype=np.int64),
+        "callback_frame_counts": np.zeros(timing_capacity, dtype=np.int64),
+        "input_buffer_adc_time": np.full(timing_capacity, np.nan, dtype=np.float64),
+        "output_buffer_dac_time": np.full(timing_capacity, np.nan, dtype=np.float64),
+        "callback_current_time": np.full(timing_capacity, np.nan, dtype=np.float64),
+    }
     telemetry: dict[str, Any] = {
         "callback_count": 0,
         "callback_status_count": 0,
@@ -952,6 +974,31 @@ def capture_measurement_preserving_partial(
         outdata.fill(0)
         try:
             telemetry["callback_count"] += 1
+            timing_index = int(telemetry["callback_count"]) - 1
+            if record_callback_time_info:
+                if timing_index >= timing_capacity:
+                    raise RuntimeError("callback timing witness capacity를 넘었습니다")
+
+                def time_value(name: str) -> float:
+                    if isinstance(_time_info, dict):
+                        value = _time_info.get(name, float("nan"))
+                    else:
+                        value = getattr(_time_info, name, float("nan"))
+                    return float(value)
+
+                timing_arrays["callback_start_frames"][timing_index] = int(
+                    cursor["frames"]
+                )
+                timing_arrays["callback_frame_counts"][timing_index] = int(frames)
+                timing_arrays["input_buffer_adc_time"][timing_index] = time_value(
+                    "inputBufferAdcTime"
+                )
+                timing_arrays["output_buffer_dac_time"][timing_index] = time_value(
+                    "outputBufferDacTime"
+                )
+                timing_arrays["callback_current_time"][timing_index] = time_value(
+                    "currentTime"
+                )
             if status:
                 item = cw._status_snapshot(status)
                 telemetry["callback_status_count"] += 1
@@ -1049,6 +1096,12 @@ def capture_measurement_preserving_partial(
         stream is None or close_error is None
     )
     telemetry["captured_frames"] = int(cursor["frames"])
+    if record_callback_time_info:
+        count = int(telemetry["callback_count"])
+        telemetry["callback_time_info"] = {
+            name: np.asarray(values[:count]).copy()
+            for name, values in timing_arrays.items()
+        }
     telemetry["elapsed_seconds"] = float(time.monotonic() - call_started)
     telemetry["output_elapsed_seconds"] = (
         None
@@ -1377,6 +1430,7 @@ def observe_period_clock_ratios(
     period_starts: list[int],
     max_drift_deviation_samples: float,
     min_valid_periods: int,
+    clock_band_hz: tuple[float, float] = CLOCK_BAND_HZ,
 ) -> dict[str, Any]:
     """ERR/REF 인접 주기의 공통 observed-cycle 길이와 ``q=N/(N+d)``를 잰다."""
 
@@ -1385,11 +1439,17 @@ def observe_period_clock_ratios(
         raise ValueError("clock ratio 관측에는 주기 3개 이상이 필요합니다")
     n_period = int(starts.size)
     n = int(probe.period_samples)
+    clock_band = (float(clock_band_hz[0]), float(clock_band_hz[1]))
+    nyquist = 0.5 * float(probe.sample_rate)
+    if not (0.0 <= clock_band[0] < clock_band[1] <= nyquist):
+        raise ValueError(
+            f"clock 관측 대역이 잘못되었습니다: {clock_band}, Nyquist={nyquist}"
+        )
     clock_segments: dict[str, np.ndarray] = {}
     clock_frequencies = np.fft.rfftfreq(n, d=1.0 / float(probe.sample_rate))
     clock_mask = (
-        (clock_frequencies >= CLOCK_BAND_HZ[0])
-        & (clock_frequencies <= CLOCK_BAND_HZ[1])
+        (clock_frequencies >= clock_band[0])
+        & (clock_frequencies <= clock_band[1])
     )
     for name, values in (("err", err), ("ref", ref)):
         signal = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -1484,7 +1544,7 @@ def observe_period_clock_ratios(
         "drift_deviation_samples": drift_deviation,
         "drift_samples_per_period": drift_median,
         "drift_ppm": 1e6 * drift_median / float(n),
-        "clock_band_hz": np.asarray(CLOCK_BAND_HZ, dtype=np.float64),
+        "clock_band_hz": np.asarray(clock_band, dtype=np.float64),
     }
 
 
@@ -1530,6 +1590,7 @@ def fractional_joint_channel_stacks(
     fit_band_hz: tuple[float, float],
     max_drift_deviation_samples: float,
     min_valid_periods: int,
+    clock_band_hz: tuple[float, float] = CLOCK_BAND_HZ,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, Any]]:
     """clock-corrected real joint LS로 P/S를 동시에 풀고 독립 cubic FFT를 만든다."""
 
@@ -1540,6 +1601,7 @@ def fractional_joint_channel_stacks(
         period_starts=period_starts,
         max_drift_deviation_samples=max_drift_deviation_samples,
         min_valid_periods=min_valid_periods,
+        clock_band_hz=clock_band_hz,
     )
     starts = np.asarray(period_starts, dtype=np.int64)
     n_period = int(starts.size)
@@ -1816,6 +1878,12 @@ def analyse_channel(
     common_alignment_taus: np.ndarray | None = None,
     provisional_taus: np.ndarray | None = None,
     alignment_scores: np.ndarray | None = None,
+    consistency_subbands_hz: tuple[
+        tuple[float, float], ...
+    ] = CONSISTENCY_SUB_BANDS_HZ,
+    compact_transfer_subbands_hz: tuple[
+        tuple[float, float], ...
+    ] = COMPACT_TRANSFER_SUB_BANDS_HZ,
 ) -> dict[str, Any]:
     """주기별 전달함수를 주파수영역에서 정렬·평균한 뒤 순수지연 + compact FIR 로 나눈다.
 
@@ -1923,6 +1991,7 @@ def analyse_channel(
         effective_delay_samples=effective_delay,
         sample_rate=probe.sample_rate,
         band_hz=consistency_band_hz,
+        required_subbands_hz=compact_transfer_subbands_hz,
     )
     if not round_trip["passed"]:
         raise ValueError(
@@ -1933,12 +2002,20 @@ def analyse_channel(
             f"(최대 {MAX_COMPACT_TRANSFER_RELATIVE_ERROR:.6f})"
         )
 
+    consistency_subbands = tuple(
+        (float(bounds[0]), float(bounds[1]))
+        for bounds in consistency_subbands_hz
+    )
+    if not consistency_subbands or any(
+        lo >= hi for lo, hi in consistency_subbands
+    ):
+        raise ValueError("일관성 부대역이 비었거나 잘못되었습니다")
     band_consistency = np.asarray(
         [
             complex_consistency(aligned[:, (frequencies >= lo) & (frequencies <= hi)])
             if int(((frequencies >= lo) & (frequencies <= hi)).sum()) >= 4
             else np.nan
-            for lo, hi in CONSISTENCY_SUB_BANDS_HZ
+            for lo, hi in consistency_subbands
         ],
         dtype=np.float64,
     )
@@ -1959,7 +2036,7 @@ def analyse_channel(
         "anchor_repeat": int(anchor),
         "kept_repeat_indices": np.flatnonzero(keep).astype(np.int64),
         "band_consistency": band_consistency,
-        "band_consistency_hz": np.asarray(CONSISTENCY_SUB_BANDS_HZ, dtype=np.float64),
+        "band_consistency_hz": np.asarray(consistency_subbands, dtype=np.float64),
         "rejected_repeats": int(taus.size - taus_kept.size),
         "consistency": consistency,
         "fullband_consistency": fullband_consistency,
@@ -2048,17 +2125,31 @@ def separation_crosscheck_metrics(
     joint_stacks: dict[str, np.ndarray],
     resampled_stacks: dict[str, np.ndarray],
     keep: np.ndarray,
+    subbands_hz: tuple[
+        tuple[float, float], ...
+    ] = COMPACT_TRANSFER_SUB_BANDS_HZ,
+    overall_band_hz: tuple[
+        float, float
+    ] = SEPARATION_CROSSCHECK_OVERALL_BAND_HZ,
 ) -> dict[str, Any]:
     """joint LS와 독립 cubic playback-grid FFT의 복소 일치를 hard gate한다."""
 
     selected_rows = np.asarray(keep, dtype=bool).reshape(-1)
+    required_subbands = tuple(
+        (float(bounds[0]), float(bounds[1])) for bounds in subbands_hz
+    )
+    overall_band = (float(overall_band_hz[0]), float(overall_band_hz[1]))
+    if not required_subbands or any(lo >= hi for lo, hi in required_subbands):
+        raise ValueError("separation crosscheck 부대역이 비었거나 잘못되었습니다")
+    if overall_band[0] >= overall_band[1]:
+        raise ValueError("separation crosscheck 전대역이 잘못되었습니다")
     report: dict[str, Any] = {}
     for drive in ("noise", "cancel"):
         freq = np.asarray(frequencies[drive], dtype=np.float64).reshape(-1)
         joint = np.asarray(joint_stacks[drive], dtype=np.complex128)[selected_rows]
         check = np.asarray(resampled_stacks[drive], dtype=np.complex128)[selected_rows]
         rows = []
-        for bounds in (*COMPACT_TRANSFER_SUB_BANDS_HZ, (150.0, 1600.0)):
+        for bounds in (*required_subbands, overall_band):
             mask = (freq >= bounds[0]) & (freq <= bounds[1])
             if int(mask.sum()) < 4:
                 raise ValueError(
@@ -2127,6 +2218,19 @@ def analyse_capture(
     max_relative_tau_samples: float,
     max_drift_deviation_samples: float,
     max_delay_jitter_samples: int,
+    clock_band_hz: tuple[float, float] = CLOCK_BAND_HZ,
+    consistency_subbands_hz: tuple[
+        tuple[float, float], ...
+    ] = CONSISTENCY_SUB_BANDS_HZ,
+    compact_transfer_subbands_hz: tuple[
+        tuple[float, float], ...
+    ] = COMPACT_TRANSFER_SUB_BANDS_HZ,
+    crosscheck_subbands_hz: tuple[
+        tuple[float, float], ...
+    ] = COMPACT_TRANSFER_SUB_BANDS_HZ,
+    crosscheck_overall_band_hz: tuple[
+        float, float
+    ] = SEPARATION_CROSSCHECK_OVERALL_BAND_HZ,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """캡처 한 건을 2-pass 공동 분석한다 — **온라인·오프라인이 공유하는 유일한 경로**.
 
@@ -2156,9 +2260,10 @@ def analyse_capture(
         output_pcm_int16=output_pcm_int16,
         probe=probe,
         period_starts=period_starts,
-        fit_band_hz=CLOCK_BAND_HZ,
+        fit_band_hz=clock_band_hz,
         max_drift_deviation_samples=max_drift_deviation_samples,
         min_valid_periods=min_kept_repeats,
+        clock_band_hz=clock_band_hz,
     )
 
     keep, anchor, report = select_repeats(
@@ -2208,6 +2313,8 @@ def analyse_capture(
         joint_stacks=stacks,
         resampled_stacks=separation["crosscheck_transfers"],
         keep=final_keep,
+        subbands_hz=crosscheck_subbands_hz,
+        overall_band_hz=crosscheck_overall_band_hz,
     )
 
     results: dict[str, dict[str, Any]] = {}
@@ -2223,6 +2330,8 @@ def analyse_capture(
             common_alignment_taus=common_taus,
             provisional_taus=provisional_taus[drive],
             alignment_scores=alignment_scores[drive],
+            consistency_subbands_hz=consistency_subbands_hz,
+            compact_transfer_subbands_hz=compact_transfer_subbands_hz,
         )
         if not np.array_equal(model["kept_mask"], final_keep):
             raise ValueError(f"{drive} 공통 반복 집합 재계산이 일치하지 않습니다")

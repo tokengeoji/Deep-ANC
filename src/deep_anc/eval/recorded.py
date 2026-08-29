@@ -31,7 +31,10 @@ from ..dsp.secondary_path import (
     load_secondary_path,
 )
 # 대역 밖 예산의 단일 출처 — 손실 힌지가 이 임계에서 유도된다 (발생기 A).
-from ..dsp.do_no_harm import MAX_OUT_OF_BAND_AMPLIFICATION_DB
+from ..dsp.do_no_harm import (
+    MAX_OUT_OF_BAND_AMPLIFICATION_DB,
+    OCTAVE_BAND_CENTERS_HZ,
+)
 
 # 지연·lead·대역 부기의 단일 출처 (발생기 A).
 from ..dsp.timing import (
@@ -47,10 +50,32 @@ from ..train.trainer import validate_training_physics
 from ..train.evaluation_contract import snapshot_regular_file
 from ..train.experiment_contract import validate_embedded_experiment_contract
 from .metrics import (
+    band_power,
     band_nmse_db,
     intersect_frequency_bands,
     nmse_db,
     octave_band_attenuation,
+)
+from .recorded_sampling import (
+    CANONICAL_EDGE_TRIM_SECONDS,
+    CANONICAL_MAX_SEGMENTS_PER_SESSION,
+    CANONICAL_SEGMENT_SECONDS,
+    RECORDED_SAMPLING_CONTRACT_SCHEMA,
+    canonical_feedback_delay_samples,
+    canonical_warmup_samples,
+    deterministic_segment_starts,
+    effective_segment_samples,
+)
+from .trusted_subbands import (
+    MIN_GROUPS_PER_FAMILY,
+    MIN_SUBBAND_SOURCE_ENERGY_DENSITY_RATIO,
+    STRICT_TRUSTED_BAND_HZ,
+    STRICT_TRUSTED_SUBBAND_SCHEMA,
+    STRICT_TRUSTED_SUBBANDS_HZ,
+    cluster_bootstrap_ci as _strict_cluster_bootstrap_ci,
+    source_energy_covered,
+    strict_subband_includes_upper_edge,
+    strict_trusted_subbands_for,
 )
 
 
@@ -396,37 +421,6 @@ def load_and_audit_recorded_manifest(
     )
 
 
-def deterministic_segment_starts(
-    usable_samples: int,
-    segment_samples: int,
-    max_segments: int,
-    edge_trim_samples: int = 0,
-) -> list[int]:
-    """양끝 trim 뒤 구간에 고르게 분포한 비중첩 segment 시작점을 반환."""
-
-    usable_samples = int(usable_samples)
-    segment_samples = int(segment_samples)
-    max_segments = int(max_segments)
-    edge_trim_samples = int(edge_trim_samples)
-    if segment_samples <= 0:
-        raise ValueError("segment_samples는 양수여야 합니다")
-    if max_segments <= 0:
-        raise ValueError("max_segments는 양수여야 합니다")
-    if edge_trim_samples < 0:
-        raise ValueError("edge_trim_samples는 0 이상이어야 합니다")
-    trimmed_samples = usable_samples - 2 * edge_trim_samples
-    count = trimmed_samples // segment_samples
-    if count <= 0:
-        return []
-    candidates = (
-        np.arange(count, dtype=np.int64) * segment_samples + edge_trim_samples
-    )
-    if count <= max_segments:
-        return [int(value) for value in candidates]
-    indices = np.linspace(0, count - 1, num=max_segments, dtype=np.int64)
-    return [int(candidates[index]) for index in indices]
-
-
 def resolve_feedback_delay(data_cfg: dict, requested: int | None = None) -> int:
     """학습 범위 안의 결정론적 feedback 지연을 선택한다(기본=중앙값)."""
 
@@ -521,12 +515,31 @@ def _load_session_audio(
         raise FileNotFoundError(f"recorded session 디렉터리가 없습니다: {session_dir}")
 
     metadata = _read_session_metadata(session_dir)
-    for key in ("group_id", "source_family"):
-        if key in metadata and str(metadata[key]) != str(entry[key]):
+    # canonical regrouped manifest의 group_id는 leakage-safe lineage component이고,
+    # immutable session.json의 group_id는 녹음 당시 source-pool group이다. 이 둘을
+    # 그대로 같다고 요구하면 정상 canonical 82세션을 모두 거부한다. 반대로 session
+    # metadata를 무시하면 manifest가 다른 원본 녹음으로 바뀐 것을 놓친다. 따라서
+    # session.json은 source_pool_group_id(있을 때), bootstrap/CI의 독립 group은 manifest
+    # group_id(component)라는 서로 다른 의미를 각각 검증한다.
+    if "group_id" in metadata:
+        source_pool_group = entry.get("source_pool_group_id")
+        expected_group = (
+            str(source_pool_group).strip()
+            if source_pool_group is not None
+            else str(entry["group_id"])
+        )
+        if not expected_group or str(metadata["group_id"]) != expected_group:
             raise ValueError(
-                f"{session_dir}: manifest {key}={entry[key]!r}와 "
-                f"session.json={metadata[key]!r}가 다릅니다"
+                f"{session_dir}: manifest source-pool group={expected_group!r}와 "
+                f"session.json group_id={metadata['group_id']!r}가 다릅니다"
             )
+    if "source_family" in metadata and str(metadata["source_family"]) != str(
+        entry["source_family"]
+    ):
+        raise ValueError(
+            f"{session_dir}: manifest source_family={entry['source_family']!r}와 "
+            f"session.json={metadata['source_family']!r}가 다릅니다"
+        )
     if "sample_rate" in metadata and int(metadata["sample_rate"]) != sample_rate:
         raise ValueError(
             f"{session_dir}: session.json sample_rate={metadata['sample_rate']} "
@@ -738,13 +751,34 @@ def evaluate_recorded_segments(
     model.eval()
     plant.eval()
 
+    # ``octave_rows``의 집계값만 남기면 나중에 scalar/summary를 바꿔도 실제
+    # segment가 무엇을 보였는지 재감사할 방법이 없다. 입력 순서와 무관하게 항상
+    # 오름차순 중심주파수 열을 쓰는 raw matrix를 함께 보존한다. 비정규 octave
+    # 집합도 이 함수에서는 진단용으로 계산할 수 있지만, persisted canonical G4
+    # validator는 125/250/500/1000/1600/2000/4000/8000Hz의 정확한 8-band schema만
+    # 허용한다.
+    requested_octaves = tuple(sorted(float(center) for center in octave_bands_hz))
+    if not requested_octaves or any(
+        not math.isfinite(center) or center <= 0.0 for center in requested_octaves
+    ):
+        raise ValueError("octave_bands_hz는 비어 있지 않은 유한 양수여야 합니다")
+    if len(set(requested_octaves)) != len(requested_octaves):
+        raise ValueError("octave_bands_hz 중심주파수는 중복될 수 없습니다")
+
     metadata: list[RecordedSegment] = []
     fullband_values: list[float] = []
     trusted_values: list[float] = []
     octave_values: dict[float, list[float]] = {
-        float(center): [] for center in octave_bands_hz
+        center: [] for center in requested_octaves
     }
     octave_trusted: dict[float, bool] = {}
+    per_segment_octave_values: list[list[float]] = []
+    # 공식 150–1600 Hz가 아니면 이 평가는 진단용이다. 빈 목록을 "부대역 전부
+    # 통과"로 읽지 않도록 schema/flag는 write_recorded_metrics에서 fail-closed한다.
+    strict_subbands = strict_trusted_subbands_for(trusted_band_hz)
+    per_segment_subband_values: list[list[float]] = []
+    per_segment_subband_coverage: list[list[bool]] = []
+    per_segment_subband_density: list[list[float]] = []
 
     def evaluate_batch(batch: list[RecordedSegment]) -> None:
         x_np = np.stack([segment.x for segment in batch])
@@ -778,15 +812,54 @@ def evaluate_recorded_segments(
                 d_item,
                 e_item,
                 sample_rate,
-                [float(value) for value in octave_bands_hz],
+                list(requested_octaves),
                 trusted_band_hz,
             )
+            by_center = {float(row["center_hz"]): row for row in band_rows}
+            if set(by_center) != set(requested_octaves):
+                raise RuntimeError("octave attenuation 결과 중심주파수가 요청과 다릅니다")
             for row in band_rows:
                 center = float(row["center_hz"])
                 octave_values.setdefault(center, []).append(
                     float(row["attenuation_db"])
                 )
                 octave_trusted[center] = bool(row["trusted"])
+            per_segment_octave_values.append(
+                [float(by_center[center]["attenuation_db"]) for center in requested_octaves]
+            )
+            if strict_subbands is not None:
+                trusted_power = band_power(d_item, sample_rate, trusted_band_hz)
+                subband_values: list[float] = []
+                subband_coverage: list[bool] = []
+                subband_density: list[float] = []
+                for subband in strict_subbands:
+                    include_upper = strict_subband_includes_upper_edge(subband)
+                    subband_power = band_power(
+                        d_item,
+                        sample_rate,
+                        subband,
+                        include_upper=include_upper,
+                    )
+                    covered, density = source_energy_covered(
+                        subband_power,
+                        trusted_power,
+                        subband,
+                        min_density_ratio=MIN_SUBBAND_SOURCE_ENERGY_DENSITY_RATIO,
+                    )
+                    subband_values.append(
+                        band_nmse_db(
+                            d_item,
+                            e_item,
+                            sample_rate,
+                            subband,
+                            include_upper=include_upper,
+                        )
+                    )
+                    subband_coverage.append(bool(covered))
+                    subband_density.append(float(density))
+                per_segment_subband_values.append(subband_values)
+                per_segment_subband_coverage.append(subband_coverage)
+                per_segment_subband_density.append(subband_density)
             metadata.append(segment)
 
     pending: list[RecordedSegment] = []
@@ -847,7 +920,7 @@ def evaluate_recorded_segments(
         )
 
     octave_rows: list[dict] = []
-    for center in sorted(octave_values):
+    for center in requested_octaves:
         values = np.asarray(octave_values[center], dtype=np.float64)
         if values.size == 0:
             continue
@@ -862,6 +935,72 @@ def evaluate_recorded_segments(
                 "trusted": bool(octave_trusted.get(center, False)),
             }
         )
+
+    if strict_subbands is None:
+        strict_subband_hz = np.empty((0, 2), dtype=np.float64)
+        strict_subband_values = np.empty((len(metadata), 0), dtype=np.float64)
+        strict_subband_coverage = np.empty((len(metadata), 0), dtype=np.bool_)
+        strict_subband_density = np.empty((len(metadata), 0), dtype=np.float64)
+        strict_subband_rows: list[dict] = []
+        source_strict_subband_rows: list[dict] = []
+    else:
+        strict_subband_hz = np.asarray(strict_subbands, dtype=np.float64)
+        strict_subband_values = np.asarray(per_segment_subband_values, dtype=np.float64)
+        strict_subband_coverage = np.asarray(
+            per_segment_subband_coverage, dtype=np.bool_
+        )
+        strict_subband_density = np.asarray(
+            per_segment_subband_density, dtype=np.float64
+        )
+        if strict_subband_values.shape != (len(metadata), len(strict_subbands)):
+            raise RuntimeError("strict trusted subband 결과 shape이 segment 수와 다릅니다")
+
+        strict_subband_rows = []
+        for band_index, subband in enumerate(strict_subbands):
+            valid = strict_subband_coverage[:, band_index]
+            values = strict_subband_values[valid, band_index]
+            strict_subband_rows.append(
+                {
+                    "band_hz": tuple(float(value) for value in subband),
+                    "n_segments": int(values.size),
+                    "coverage_fraction": float(np.mean(valid)),
+                    "source_energy_density_ratio_mean": float(
+                        np.mean(strict_subband_density[:, band_index])
+                    ),
+                    "nmse": _distribution(values) if values.size else None,
+                }
+            )
+
+        source_strict_subband_rows = []
+        for family in families:
+            family_indices = np.asarray(
+                [
+                    index
+                    for index, segment in enumerate(metadata)
+                    if segment.source_family == family
+                ],
+                dtype=np.int64,
+            )
+            for band_index, subband in enumerate(strict_subbands):
+                valid = strict_subband_coverage[family_indices, band_index]
+                values = strict_subband_values[family_indices, band_index][valid]
+                groups = np.asarray(
+                    [metadata[index].group_id for index in family_indices], dtype=np.str_
+                )[valid]
+                source_strict_subband_rows.append(
+                    {
+                        "source_family": family,
+                        "band_hz": tuple(float(value) for value in subband),
+                        "n_total_segments": int(family_indices.size),
+                        "n_segments": int(values.size),
+                        "n_groups": int(np.unique(groups).size),
+                        "coverage_fraction": float(np.mean(valid)),
+                        "source_energy_density_ratio_mean": float(
+                            np.mean(strict_subband_density[family_indices, band_index])
+                        ),
+                        "nmse": _distribution(values) if values.size else None,
+                    }
+                )
 
     return {
         "n_segments": len(metadata),
@@ -902,6 +1041,24 @@ def evaluate_recorded_segments(
         ),
         "source_rows": source_rows,
         "octave_rows": octave_rows,
+        "octave_center_hz": np.asarray(requested_octaves, dtype=np.float64),
+        "per_segment_octave_attenuation_db": np.asarray(
+            per_segment_octave_values, dtype=np.float64
+        ),
+        "strict_trusted_subband_schema": (
+            STRICT_TRUSTED_SUBBAND_SCHEMA if strict_subbands is not None else ""
+        ),
+        "strict_trusted_subband_min_source_energy_density_ratio": (
+            float(MIN_SUBBAND_SOURCE_ENERGY_DENSITY_RATIO)
+            if strict_subbands is not None
+            else float("nan")
+        ),
+        "strict_trusted_subband_hz": strict_subband_hz,
+        "per_segment_trusted_subband_nmse_db": strict_subband_values,
+        "per_segment_trusted_subband_coverage": strict_subband_coverage,
+        "per_segment_trusted_subband_source_energy_density_ratio": strict_subband_density,
+        "strict_trusted_subband_rows": strict_subband_rows,
+        "source_strict_trusted_subband_rows": source_strict_subband_rows,
     }
 
 
@@ -910,15 +1067,9 @@ def evaluate_recorded_segments(
 # 8.5 dB 차이로 FAIL** 했다. 이제 정의는 ``dsp/do_no_harm.py`` 한 곳이고 손실 마진은
 # 거기에서 유도된다. 이 이름은 기존 참조(테스트·스크립트)를 위해 위에서 import 된다.
 
-MIN_GROUPS_PER_FAMILY = 4
-"""cluster bootstrap 이 CI 를 정의할 수 있는 계열당 최소 **독립 그룹** 수.
-
-같은 그룹 안의 세그먼트는 독립이 아니다(같은 음원·같은 세션). 따라서 계열 평균의
-불확도는 세그먼트 수가 아니라 그룹 수가 정한다. 실측(2026-08-05): 계열 내 그룹 간
-잔차 SD 1.46 dB, 그룹 2개면 SE 1.03 dB 인데 계열 간 전체 폭이 0.92 dB 였다 — **폭이
-1 SE 보다 작아** "최악 계열" 선택이 동전 던지기였다. 그룹이 1개면(val machine,
-test environment, test machine) SE 추정 자체가 불가능하다.
-"""
+# ``MIN_GROUPS_PER_FAMILY``는 trusted_subbands의 단일 출처다. 같은 그룹 안의
+# 세그먼트는 독립이 아니므로 CI/부대역 coverage는 세그먼트 수가 아니라 독립 group
+# 수로 판정한다.
 
 G4_PASS = "PASS"
 G4_FAIL = "FAIL"
@@ -954,24 +1105,211 @@ def cluster_bootstrap_ci(
     가장 위험한 실패다.
     """
 
-    values = np.asarray(values, dtype=np.float64).reshape(-1)
-    groups = np.asarray(groups).reshape(-1)
-    if values.size != groups.size:
-        raise ValueError(f"값과 그룹 길이가 다릅니다: {values.size} != {groups.size}")
-    unique = np.unique(groups)
-    if unique.size < MIN_GROUPS_PER_FAMILY:
-        return float("nan"), float("nan"), int(unique.size)
-    by_group = [values[groups == key] for key in unique]
-    rng = np.random.default_rng(int(seed))
-    picks = rng.integers(0, unique.size, size=(int(n_resamples), unique.size))
-    draws = np.empty(int(n_resamples), dtype=np.float64)
-    for index in range(int(n_resamples)):
-        draws[index] = float(
-            np.concatenate([by_group[choice] for choice in picks[index]]).mean()
+    return _strict_cluster_bootstrap_ci(
+        values,
+        groups,
+        min_groups=MIN_GROUPS_PER_FAMILY,
+        n_resamples=n_resamples,
+        seed=seed,
+        alpha=alpha,
+    )
+
+
+def _strict_trusted_subband_g4(result: dict) -> dict:
+    """공식 네 trusted 부대역의 family별 G4 증거를 raw segment에서 재계산한다.
+
+    전체 150–1600 Hz 평균은 한 부대역의 증폭을 다른 부대역의 큰 감쇠로 숨길 수 있다.
+    이 함수는 사람이 읽는 ``source_*_rows``를 믿지 않고, result가 보존한 per-segment
+    NMSE/coverage/group 배열에서 family×subband mean, worst10, CI를 다시 만든다.
+    """
+
+    source_rows = result.get("source_rows") or []
+    families = [str(row["source_family"]) for row in source_rows]
+    bands = np.asarray(STRICT_TRUSTED_SUBBANDS_HZ, dtype=np.float64)
+    shape = (len(families), len(STRICT_TRUSTED_SUBBANDS_HZ))
+
+    def empty(reason: str) -> dict:
+        return {
+            "schema_pass": False,
+            "reason": reason,
+            "families": families,
+            "bands_hz": bands,
+            "n_segments": np.zeros(shape, dtype=np.int64),
+            "n_groups": np.zeros(shape, dtype=np.int64),
+            "coverage_fraction": np.zeros(shape, dtype=np.float64),
+            "density_ratio_mean": np.full(shape, np.nan, dtype=np.float64),
+            "mean_db": np.full(shape, np.nan, dtype=np.float64),
+            "worst10_db": np.full(shape, np.nan, dtype=np.float64),
+            "ci_lo_db": np.full(shape, np.nan, dtype=np.float64),
+            "ci_hi_db": np.full(shape, np.nan, dtype=np.float64),
+            "coverage_pass": np.zeros(shape, dtype=np.bool_),
+            "power_pass": np.zeros(shape, dtype=np.bool_),
+            "mean_pass": np.zeros(shape, dtype=np.bool_),
+            "worst10_pass": np.zeros(shape, dtype=np.bool_),
+            "ci_pass": np.zeros(shape, dtype=np.bool_),
+            "source_pass": np.zeros(shape, dtype=np.bool_),
+            "g4_coverage_pass": False,
+            "g4_power_pass": False,
+            "g4_mean_pass": False,
+            "g4_worst10_pass": False,
+            "g4_ci_pass": False,
+            "g4_pass": False,
+            "upper_pass": False,
+            "failed_mean_rows": [],
+            "failed_worst10_rows": [],
+        }
+
+    if str(result.get("strict_trusted_subband_schema", "")) != (
+        STRICT_TRUSTED_SUBBAND_SCHEMA
+    ):
+        return empty(
+            "공식 G4는 strict trusted-band schema "
+            f"{STRICT_TRUSTED_SUBBAND_SCHEMA!r}가 필요합니다"
         )
-    lo = float(np.percentile(draws, 100.0 * alpha / 2.0))
-    hi = float(np.percentile(draws, 100.0 * (1.0 - alpha / 2.0)))
-    return lo, hi, int(unique.size)
+    stored_bands = np.asarray(result.get("strict_trusted_subband_hz"), dtype=np.float64)
+    if stored_bands.shape != bands.shape or not np.array_equal(stored_bands, bands):
+        return empty("strict trusted subband 경계가 canonical 150–1600Hz 분할과 다릅니다")
+
+    try:
+        values = np.asarray(
+            result["per_segment_trusted_subband_nmse_db"], dtype=np.float64
+        )
+        coverage = np.asarray(
+            result["per_segment_trusted_subband_coverage"], dtype=np.bool_
+        )
+        density = np.asarray(
+            result["per_segment_trusted_subband_source_energy_density_ratio"],
+            dtype=np.float64,
+        )
+        segment_family = np.asarray(result["segment_source_family"]).astype(str).reshape(-1)
+        segment_group = np.asarray(result["segment_group_id"]).astype(str).reshape(-1)
+    except (KeyError, TypeError, ValueError) as exc:
+        return empty(f"strict trusted subband raw 배열이 없습니다: {exc}")
+    expected_shape = (segment_family.size, len(STRICT_TRUSTED_SUBBANDS_HZ))
+    if (
+        values.shape != expected_shape
+        or coverage.shape != expected_shape
+        or density.shape != expected_shape
+        or segment_group.size != segment_family.size
+    ):
+        return empty("strict trusted subband raw 배열 shape이 segment metadata와 다릅니다")
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(density)):
+        return empty("strict trusted subband raw NMSE/target-energy에 NaN/Inf가 있습니다")
+
+    n_segments = np.zeros(shape, dtype=np.int64)
+    n_groups = np.zeros(shape, dtype=np.int64)
+    coverage_fraction = np.zeros(shape, dtype=np.float64)
+    density_ratio_mean = np.full(shape, np.nan, dtype=np.float64)
+    mean_db = np.full(shape, np.nan, dtype=np.float64)
+    worst10_db = np.full(shape, np.nan, dtype=np.float64)
+    ci_lo_db = np.full(shape, np.nan, dtype=np.float64)
+    ci_hi_db = np.full(shape, np.nan, dtype=np.float64)
+    coverage_pass = np.zeros(shape, dtype=np.bool_)
+    power_pass = np.zeros(shape, dtype=np.bool_)
+    mean_pass = np.zeros(shape, dtype=np.bool_)
+    worst10_pass = np.zeros(shape, dtype=np.bool_)
+    ci_pass = np.zeros(shape, dtype=np.bool_)
+    source_pass = np.zeros(shape, dtype=np.bool_)
+    failed_mean_rows: list[tuple[str, tuple[float, float], float]] = []
+    failed_worst10_rows: list[tuple[str, tuple[float, float], float]] = []
+
+    for family_index, family in enumerate(families):
+        family_mask = segment_family == family
+        if not np.any(family_mask):
+            return empty(f"source family {family!r}의 segment metadata가 없습니다")
+        for band_index, band in enumerate(STRICT_TRUSTED_SUBBANDS_HZ):
+            valid = coverage[family_mask, band_index]
+            selected_values = values[family_mask, band_index][valid]
+            selected_groups = segment_group[family_mask][valid]
+            n_segments[family_index, band_index] = int(selected_values.size)
+            n_groups[family_index, band_index] = int(np.unique(selected_groups).size)
+            coverage_fraction[family_index, band_index] = float(np.mean(valid))
+            density_ratio_mean[family_index, band_index] = float(
+                np.mean(density[family_mask, band_index])
+            )
+            has_coverage = bool(selected_values.size > 0)
+            coverage_pass[family_index, band_index] = has_coverage
+            has_power = bool(
+                has_coverage
+                and n_groups[family_index, band_index] >= MIN_GROUPS_PER_FAMILY
+            )
+            power_pass[family_index, band_index] = has_power
+            if has_coverage:
+                stats = _distribution(selected_values)
+                mean_db[family_index, band_index] = float(stats["mean_db"])
+                worst10_db[family_index, band_index] = float(
+                    stats["worst10_mean_db"]
+                )
+                mean_pass[family_index, band_index] = bool(
+                    mean_db[family_index, band_index] < 0.0
+                )
+                worst10_pass[family_index, band_index] = bool(
+                    worst10_db[family_index, band_index] < 0.0
+                )
+                if not mean_pass[family_index, band_index]:
+                    failed_mean_rows.append(
+                        (family, tuple(band), float(mean_db[family_index, band_index]))
+                    )
+                if not worst10_pass[family_index, band_index]:
+                    failed_worst10_rows.append(
+                        (
+                            family,
+                            tuple(band),
+                            float(worst10_db[family_index, band_index]),
+                        )
+                    )
+                lo, hi, _ = cluster_bootstrap_ci(selected_values, selected_groups)
+                ci_lo_db[family_index, band_index] = lo
+                ci_hi_db[family_index, band_index] = hi
+                ci_pass[family_index, band_index] = bool(
+                    has_power and math.isfinite(hi) and hi < 0.0
+                )
+            source_pass[family_index, band_index] = bool(
+                coverage_pass[family_index, band_index]
+                and power_pass[family_index, band_index]
+                and mean_pass[family_index, band_index]
+                and worst10_pass[family_index, band_index]
+                and ci_pass[family_index, band_index]
+            )
+
+    g4_coverage_pass = bool(coverage_pass.size and np.all(coverage_pass))
+    g4_power_pass = bool(power_pass.size and np.all(power_pass))
+    g4_mean_pass = bool(mean_pass.size and np.all(mean_pass))
+    g4_worst10_pass = bool(worst10_pass.size and np.all(worst10_pass))
+    g4_ci_pass = bool(ci_pass.size and np.all(ci_pass))
+    g4_pass = bool(source_pass.size and np.all(source_pass))
+    # 마지막 열은 single source인 1000–1600 Hz다. 별도 flag를 남겨 평균이 이 대역의
+    # 실패를 감추는지 completion audit과 사람이 즉시 확인할 수 있게 한다.
+    upper_pass = bool(source_pass.shape[1] and np.all(source_pass[:, -1]))
+    return {
+        "schema_pass": True,
+        "reason": "",
+        "families": families,
+        "bands_hz": bands,
+        "n_segments": n_segments,
+        "n_groups": n_groups,
+        "coverage_fraction": coverage_fraction,
+        "density_ratio_mean": density_ratio_mean,
+        "mean_db": mean_db,
+        "worst10_db": worst10_db,
+        "ci_lo_db": ci_lo_db,
+        "ci_hi_db": ci_hi_db,
+        "coverage_pass": coverage_pass,
+        "power_pass": power_pass,
+        "mean_pass": mean_pass,
+        "worst10_pass": worst10_pass,
+        "ci_pass": ci_pass,
+        "source_pass": source_pass,
+        "g4_coverage_pass": g4_coverage_pass,
+        "g4_power_pass": g4_power_pass,
+        "g4_mean_pass": g4_mean_pass,
+        "g4_worst10_pass": g4_worst10_pass,
+        "g4_ci_pass": g4_ci_pass,
+        "g4_pass": g4_pass,
+        "upper_pass": upper_pass,
+        "failed_mean_rows": failed_mean_rows,
+        "failed_worst10_rows": failed_worst10_rows,
+    }
 
 
 def _plant_fingerprint_for(context: "RecordedEvalContext") -> PlantFingerprint:
@@ -1056,6 +1394,10 @@ def write_recorded_metrics(
     context: RecordedEvalContext,
     feedback_delay_samples: int,
     allow_surrogate: bool,
+    model_hop: int,
+    max_segments_per_session: int,
+    segment_seconds: float,
+    canonical_sampling: bool,
     edge_trim_samples: int,
     warmup_samples: int,
     checkpoint_sha256: str | None = None,
@@ -1074,8 +1416,66 @@ def write_recorded_metrics(
     npz_path = out_dir / "metrics.npz"
     trusted = result["trusted"]
     fullband = result["fullband"]
+    resolved_model_hop = int(model_hop)
+    resolved_max_segments = int(max_segments_per_session)
+    resolved_segment_seconds = float(segment_seconds)
+    resolved_edge_trim = int(edge_trim_samples)
+    expected_segment_samples = effective_segment_samples(
+        sample_rate=int(context.sample_rate),
+        model_hop=resolved_model_hop,
+        segment_seconds=resolved_segment_seconds,
+    )
+    if int(result["segment_samples"]) != expected_segment_samples:
+        raise ValueError(
+            "평가 결과 segment_samples가 sampling 요청/hop 유도값과 다릅니다"
+        )
+    canonical_sampling = bool(canonical_sampling)
+    plant_settle_samples = _plant_settle_samples(context)
+    if canonical_sampling:
+        canonical_edge_trim = int(
+            round(CANONICAL_EDGE_TRIM_SECONDS * int(context.sample_rate))
+        )
+        if (
+            resolved_max_segments != CANONICAL_MAX_SEGMENTS_PER_SESSION
+            or resolved_segment_seconds != CANONICAL_SEGMENT_SECONDS
+            or resolved_edge_trim != canonical_edge_trim
+        ):
+            raise ValueError(
+                "canonical recorded sampling은 max=64, segment=1.5초, "
+                "edge trim=0.25초와 정확히 같아야 합니다"
+            )
+        saved_loss_start = context.cfg.get("loss_start_sample")
+        if (
+            isinstance(saved_loss_start, bool)
+            or not isinstance(saved_loss_start, int)
+            or int(saved_loss_start) != plant_settle_samples
+        ):
+            raise ValueError(
+                "canonical recorded sampling의 checkpoint loss_start_sample이 "
+                "실제 S(z) PlantSettle과 정확히 같아야 합니다"
+            )
+        expected_feedback = canonical_feedback_delay_samples(context.cfg["data"])
+        if int(feedback_delay_samples) != expected_feedback:
+            raise ValueError(
+                "canonical recorded sampling feedback delay가 checkpoint 기본 중앙값과 "
+                "다릅니다"
+            )
+        expected_warmup = canonical_warmup_samples(
+            context.cfg["data"],
+            sample_rate=int(context.sample_rate),
+            plant_settle_samples=plant_settle_samples,
+        )
+        if int(warmup_samples) != expected_warmup:
+            raise ValueError(
+                "canonical recorded sampling warmup이 checkpoint 기본값/PlantSettle과 "
+                "다릅니다"
+            )
     if int(result.get("warmup_samples", warmup_samples)) != int(warmup_samples):
         raise ValueError("평가 결과와 보고서 warmup_samples가 다릅니다")
+    if int(result.get("metric_samples_per_segment", -1)) != (
+        int(result["segment_samples"]) - int(warmup_samples)
+    ):
+        raise ValueError("평가 결과 metric_samples_per_segment가 segment-warmup과 다릅니다")
     trusted_pass = bool(trusted["mean_db"] < 0.0)
     fullband_pass = bool(fullband["mean_db"] <= 0.0)
 
@@ -1110,19 +1510,29 @@ def write_recorded_metrics(
 
     # ---- (a) 대역 밖 do-no-harm (절대목표 1) ------------------------------------
     octave_rows = result.get("octave_rows") or []
+    # do-no-harm은 이름 그대로 **trusted 최적화 대역 밖**의 증폭을 막는 게이트다.
+    # trusted 150–1600 Hz 안의 작은 감쇠량을 이 게이트에 섞으면, 해당 대역의
+    # NMSE/strict-subband 게이트와 같은 사실을 중복 판정하고 정작 2/4/8 kHz
+    # 증폭의 의미가 흐려진다. ``trusted`` 표시는 plant-derived band에서 왔다.
+    out_of_band_octave_rows = [
+        row for row in octave_rows if not bool(row.get("trusted", False))
+    ]
     worst_octave = (
-        min(octave_rows, key=lambda row: float(row["attenuation_worst10_mean_db"]))
-        if octave_rows
+        min(
+            out_of_band_octave_rows,
+            key=lambda row: float(row["attenuation_worst10_mean_db"]),
+        )
+        if out_of_band_octave_rows
         else None
     )
     amplified = [
         row
-        for row in octave_rows
+        for row in out_of_band_octave_rows
         if float(row["attenuation_worst10_mean_db"]) <= -MAX_OUT_OF_BAND_AMPLIFICATION_DB
     ]
-    # 옥타브 행이 아예 없으면 "해치지 않았다"를 **측정하지 못한** 것이다. 측정하지
-    # 못한 것을 통과로 세지 않는다 — 그것이 이 저장소에서 반복된 실패 방식이다.
-    do_no_harm_pass = bool(octave_rows) and not amplified
+    # 대역 밖 옥타브 행이 아예 없으면 "해치지 않았다"를 **측정하지 못한** 것이다.
+    # 측정하지 못한 것을 통과로 세지 않는다.
+    do_no_harm_pass = bool(out_of_band_octave_rows) and not amplified
 
     # ---- (b) 통계적 검정력 (D3) ---------------------------------------------------
     underpowered = [
@@ -1151,6 +1561,12 @@ def write_recorded_metrics(
     )
     ci_pass = ci_defined and all(hi < 0.0 for _, _, hi, _ in source_ci)
 
+    # ---- (d) strict trusted 부대역 (기능 1의 150–1600 Hz 내부) -------------------
+    # 전체 trusted 평균만으로는 150–1000 Hz의 이득이 1000–1600 Hz의 증폭을 덮는다.
+    # official G4는 네 부대역 모두에서 family별 target(d=ERR) coverage, 평균, 최악 10%,
+    # 독립 group bootstrap CI를 요구한다. strict schema가 아니면 진단 결과일 뿐이다.
+    strict_subband = _strict_trusted_subband_g4(result)
+
     # ---- 3값 판정 ------------------------------------------------------------------
     # 순서가 중요하다: **증명된 악화(FAIL)** 가 **판정 불가(INCONCLUSIVE)** 보다 먼저다.
     # 표본이 부족하더라도 이미 해를 끼친 것이 보인다면 그것은 결론이 난 사실이다.
@@ -1174,6 +1590,17 @@ def write_recorded_metrics(
                     for row in amplified
                 )
             )
+    if strict_subband["schema_pass"]:
+        for family, band, value in strict_subband["failed_mean_rows"]:
+            hard_failures.append(
+                f"trusted {band[0]:.0f}–{band[1]:.0f}Hz {family} 평균 "
+                f"{value:+.2f} dB ≥ 0"
+            )
+        for family, band, value in strict_subband["failed_worst10_rows"]:
+            hard_failures.append(
+                f"trusted {band[0]:.0f}–{band[1]:.0f}Hz {family} 최악 10% "
+                f"{value:+.2f} dB ≥ 0"
+            )
 
     inconclusive_reasons: list[str] = []
     if not power_pass:
@@ -1190,6 +1617,46 @@ def write_recorded_metrics(
                 f"{family} [{lo:+.2f}, {hi:+.2f}]" for family, lo, hi, _ in source_ci
             )
             + " — 점추정이 음수라도 0 과 구별되지 않으면 개선을 주장할 수 없습니다"
+        )
+    if not strict_subband["schema_pass"]:
+        inconclusive_reasons.append(
+            f"strict trusted 150–1600Hz 부대역 증거가 없습니다: {strict_subband['reason']}"
+        )
+    elif not strict_subband["g4_coverage_pass"]:
+        incomplete = [
+            f"{family} {band[0]:.0f}–{band[1]:.0f}Hz"
+            for family_index, family in enumerate(strict_subband["families"])
+            for band_index, band in enumerate(STRICT_TRUSTED_SUBBANDS_HZ)
+            if not strict_subband["coverage_pass"][family_index, band_index]
+        ]
+        inconclusive_reasons.append(
+            "trusted 부대역에 실제 target 에너지가 없어 평가할 수 없습니다: "
+            + ", ".join(incomplete)
+        )
+    elif not strict_subband["g4_power_pass"]:
+        weak = [
+            f"{family} {band[0]:.0f}–{band[1]:.0f}Hz="
+            f"{int(strict_subband['n_groups'][family_index, band_index])} groups"
+            for family_index, family in enumerate(strict_subband["families"])
+            for band_index, band in enumerate(STRICT_TRUSTED_SUBBANDS_HZ)
+            if not strict_subband["power_pass"][family_index, band_index]
+        ]
+        inconclusive_reasons.append(
+            "trusted 부대역 independent group coverage 부족 (최소 "
+            f"{MIN_GROUPS_PER_FAMILY}): " + ", ".join(weak)
+        )
+    elif not strict_subband["g4_ci_pass"]:
+        weak_ci = [
+            f"{family} {band[0]:.0f}–{band[1]:.0f}Hz "
+            f"[{strict_subband['ci_lo_db'][family_index, band_index]:+.2f}, "
+            f"{strict_subband['ci_hi_db'][family_index, band_index]:+.2f}]"
+            for family_index, family in enumerate(strict_subband["families"])
+            for band_index, band in enumerate(STRICT_TRUSTED_SUBBANDS_HZ)
+            if not strict_subband["ci_pass"][family_index, band_index]
+        ]
+        inconclusive_reasons.append(
+            "trusted 부대역 family cluster bootstrap CI 상단이 0 아래가 아닙니다: "
+            + ", ".join(weak_ci)
         )
 
     if hard_failures:
@@ -1296,6 +1763,23 @@ def write_recorded_metrics(
             else "정의 불가"
         )
         + f" | {'PASS' if ci_pass else '판정 불가'} |",
+        f"| **strict trusted 부대역 schema** | `{STRICT_TRUSTED_SUBBAND_SCHEMA}` | "
+        + (
+            "150–300 / 300–600 / 600–1000 / 1000–1600 Hz"
+            if strict_subband["schema_pass"]
+            else strict_subband["reason"]
+        )
+        + f" | {'PASS' if strict_subband['schema_pass'] else '판정 불가'} |",
+        f"| **모든 family×trusted 부대역 coverage** | target(d=ERR) energy + ≥ {MIN_GROUPS_PER_FAMILY} groups | "
+        f"coverage={strict_subband['g4_coverage_pass']}, groups={strict_subband['g4_power_pass']} | "
+        f"{'PASS' if strict_subband['g4_coverage_pass'] and strict_subband['g4_power_pass'] else '판정 불가'} |",
+        f"| **모든 family×trusted 부대역 평균/최악 10%** | < 0 dB | "
+        f"mean={strict_subband['g4_mean_pass']}, worst10={strict_subband['g4_worst10_pass']} | "
+        f"{'PASS' if strict_subband['g4_mean_pass'] and strict_subband['g4_worst10_pass'] else 'FAIL'} |",
+        f"| **1000–1600 Hz upper trusted 부대역** | 모든 family PASS | "
+        f"{strict_subband['upper_pass']} | {'PASS' if strict_subband['upper_pass'] else 'FAIL/판정 불가'} |",
+        f"| **trusted 부대역 CI 상단** | < 0 dB | {strict_subband['g4_ci_pass']} | "
+        f"{'PASS' if strict_subband['g4_ci_pass'] else '판정 불가'} |",
         "",
         f"**G4 종합: {verdict}** — {verdict_reason}",
         "",
@@ -1343,6 +1827,44 @@ def write_recorded_metrics(
         )
     lines += [
         "",
+        "## Strict trusted 150–1600 Hz 부대역 결과",
+        "",
+        "공식 G4는 각 family가 네 부대역 모두에 실제 target(d=ERR) 에너지를 가져야 한다. "
+        "평균/최악 10%는 NMSE이므로 음수일수록 좋고, CI 상단도 0 dB 아래여야 한다.",
+        "",
+    ]
+    if not strict_subband["schema_pass"]:
+        lines += [
+            f"> [!WARNING] {strict_subband['reason']}",
+            "> 이 결과는 진단용이며 canonical G4 PASS로 사용할 수 없습니다.",
+        ]
+    else:
+        lines += [
+            "| Source family | 부대역 | coverage segments/groups | density | 평균 NMSE | 최악 10% | 95% CI | 판정 |",
+            "|---|---:|---:|---:|---:|---:|---|---|",
+        ]
+        for family_index, family in enumerate(strict_subband["families"]):
+            for band_index, band in enumerate(STRICT_TRUSTED_SUBBANDS_HZ):
+                lo = strict_subband["ci_lo_db"][family_index, band_index]
+                hi = strict_subband["ci_hi_db"][family_index, band_index]
+                interval = (
+                    f"[{lo:+.2f}, {hi:+.2f}]"
+                    if math.isfinite(hi)
+                    else "정의 불가"
+                )
+                lines.append(
+                    f"| {family} | {band[0]:.0f}–{band[1]:.0f} Hz | "
+                    f"{int(strict_subband['n_segments'][family_index, band_index])}/"
+                    f"{int(strict_subband['n_groups'][family_index, band_index])} "
+                    f"({100.0 * strict_subband['coverage_fraction'][family_index, band_index]:.0f}%) | "
+                    f"{strict_subband['density_ratio_mean'][family_index, band_index]:.2f} | "
+                    f"{strict_subband['mean_db'][family_index, band_index]:+.2f} | "
+                    f"{strict_subband['worst10_db'][family_index, band_index]:+.2f} | "
+                    f"{interval} | "
+                    f"{'PASS' if strict_subband['source_pass'][family_index, band_index] else 'FAIL/INCONCLUSIVE'} |"
+                )
+    lines += [
+        "",
         "## 옥타브 밴드 감쇠",
         "",
         "감쇠는 높을수록 좋으며, 최악 10%는 감쇠가 작은 하위 10% 평균입니다.",
@@ -1372,6 +1894,25 @@ def write_recorded_metrics(
 
     source_rows = result["source_rows"]
     octave_rows = result["octave_rows"]
+    # 비정규 center/대역은 모델 진단에는 유용할 수 있다. 다만 이 파일이 official
+    # G4의 clear-pass 근거인지 여부를 사람이 읽어도 명확하게 남긴다. canonical
+    # validator는 label만 믿지 않고 아래 raw center matrix를 다시 검사한다.
+    g4_metric_scope = (
+        "canonical_recorded_g4"
+        if np.array_equal(
+            np.asarray(result["octave_center_hz"], dtype=np.float64),
+            np.asarray(OCTAVE_BAND_CENTERS_HZ, dtype=np.float64),
+        )
+        and np.array_equal(
+            np.asarray(context.trusted_band_hz, dtype=np.float64),
+            np.asarray(STRICT_TRUSTED_BAND_HZ, dtype=np.float64),
+        )
+        and context.physics_status == "measured_primary_path"
+        and not bool(allow_surrogate)
+        and canonical_sampling
+        and split in {"val", "test"}
+        else "diagnostic_noncanonical"
+    )
     npz_tmp = npz_path.with_suffix(".npz.tmp")
     with open(npz_tmp, "wb") as file_obj:
         np.savez_compressed(
@@ -1391,9 +1932,28 @@ def write_recorded_metrics(
             manifest=np.asarray(str(Path(manifest)), dtype=np.str_),
             manifest_sha256=np.asarray(manifest_sha256, dtype=np.str_),
             split=np.asarray(split, dtype=np.str_),
+            g4_metric_scope=np.asarray(g4_metric_scope, dtype=np.str_),
             physics_status=np.asarray(context.physics_status, dtype=np.str_),
             allow_surrogate=np.asarray(bool(allow_surrogate)),
             sample_rate=np.asarray(context.sample_rate, dtype=np.int64),
+            recorded_sampling_contract_schema=np.asarray(
+                RECORDED_SAMPLING_CONTRACT_SCHEMA, dtype=np.str_
+            ),
+            recorded_sampling_canonical=np.asarray(
+                canonical_sampling, dtype=np.bool_
+            ),
+            recorded_sampling_model_hop=np.asarray(
+                resolved_model_hop, dtype=np.int64
+            ),
+            recorded_sampling_max_segments_per_session=np.asarray(
+                resolved_max_segments, dtype=np.int64
+            ),
+            recorded_sampling_segment_seconds=np.asarray(
+                resolved_segment_seconds, dtype=np.float64
+            ),
+            recorded_sampling_plant_settle_samples=np.asarray(
+                plant_settle_samples, dtype=np.int64
+            ),
             n_sessions=np.asarray(result["n_sessions"], dtype=np.int64),
             n_groups=np.asarray(result["n_groups"], dtype=np.int64),
             n_segments=np.asarray(result["n_segments"], dtype=np.int64),
@@ -1425,6 +1985,43 @@ def write_recorded_metrics(
             g4_trusted_pass=np.asarray(trusted_pass, dtype=np.bool_),
             g4_fullband_pass=np.asarray(fullband_pass, dtype=np.bool_),
             g4_pass=np.asarray(g4_pass, dtype=np.bool_),
+            # ---- strict trusted 150–1600Hz 내부 게이트 ----------------------------
+            # 이 schema/배열이 없는 구형 metrics는 canonical completion에 쓸 수 없다.
+            strict_trusted_subband_schema=np.asarray(
+                STRICT_TRUSTED_SUBBAND_SCHEMA
+                if strict_subband["schema_pass"]
+                else "",
+                dtype=np.str_,
+            ),
+            strict_trusted_subband_min_source_energy_density_ratio=np.asarray(
+                result["strict_trusted_subband_min_source_energy_density_ratio"],
+                dtype=np.float64,
+            ),
+            trusted_subband_hz=np.asarray(strict_subband["bands_hz"], dtype=np.float64),
+            g4_trusted_subband_schema_pass=np.asarray(
+                strict_subband["schema_pass"], dtype=np.bool_
+            ),
+            g4_trusted_subband_coverage_pass=np.asarray(
+                strict_subband["g4_coverage_pass"], dtype=np.bool_
+            ),
+            g4_trusted_subband_power_pass=np.asarray(
+                strict_subband["g4_power_pass"], dtype=np.bool_
+            ),
+            g4_trusted_subband_mean_pass=np.asarray(
+                strict_subband["g4_mean_pass"], dtype=np.bool_
+            ),
+            g4_trusted_subband_worst10_pass=np.asarray(
+                strict_subband["g4_worst10_pass"], dtype=np.bool_
+            ),
+            g4_trusted_subband_ci_pass=np.asarray(
+                strict_subband["g4_ci_pass"], dtype=np.bool_
+            ),
+            g4_trusted_subband_pass=np.asarray(
+                strict_subband["g4_pass"], dtype=np.bool_
+            ),
+            g4_upper_trusted_subband_pass=np.asarray(
+                strict_subband["upper_pass"], dtype=np.bool_
+            ),
             # 기능 2 판정을 npz 에도 남긴다 — finetune_readiness 가 이 값을 검증해야
             # "평균만 좋은" 모델이 게이트를 통과하지 못한다.
             g4_source_pass=np.asarray(source_pass, dtype=np.bool_),
@@ -1498,6 +2095,22 @@ def write_recorded_metrics(
             per_segment_trusted_db=result["per_segment_trusted_db"],
             per_segment_fullband_db=result["per_segment_fullband_db"],
             per_segment_gap_db=result["per_segment_gap_db"],
+            # 집계 octave 행만으로는 do-no-harm scalar를 재검산할 수 없다. 각 열은
+            # ``octave_center_hz``의 같은 인덱스이고, 각 행은 segment metadata의
+            # 같은 인덱스다. persisted G4 contract가 이 raw matrix에서 mean/median/
+            # worst10과 최악 octave/threshold 판정을 다시 만든다.
+            per_segment_octave_attenuation_db=result[
+                "per_segment_octave_attenuation_db"
+            ],
+            per_segment_trusted_subband_nmse_db=result[
+                "per_segment_trusted_subband_nmse_db"
+            ],
+            per_segment_trusted_subband_coverage=result[
+                "per_segment_trusted_subband_coverage"
+            ],
+            per_segment_trusted_subband_source_energy_density_ratio=result[
+                "per_segment_trusted_subband_source_energy_density_ratio"
+            ],
             segment_session_id=result["segment_session_id"],
             segment_group_id=result["segment_group_id"],
             segment_source_family=result["segment_source_family"],
@@ -1543,9 +2156,49 @@ def write_recorded_metrics(
             source_gap_trusted_minus_fullband_mean_db=np.asarray(
                 [row["gap_mean_db"] for row in source_rows], dtype=np.float64
             ),
-            octave_center_hz=np.asarray(
-                [row["center_hz"] for row in octave_rows], dtype=np.float64
+            source_trusted_subband_n_segments=np.asarray(
+                strict_subband["n_segments"], dtype=np.int64
             ),
+            source_trusted_subband_n_groups=np.asarray(
+                strict_subband["n_groups"], dtype=np.int64
+            ),
+            source_trusted_subband_coverage_fraction=np.asarray(
+                strict_subband["coverage_fraction"], dtype=np.float64
+            ),
+            source_trusted_subband_source_energy_density_ratio_mean=np.asarray(
+                strict_subband["density_ratio_mean"], dtype=np.float64
+            ),
+            source_trusted_subband_nmse_mean_db=np.asarray(
+                strict_subband["mean_db"], dtype=np.float64
+            ),
+            source_trusted_subband_nmse_worst10_mean_db=np.asarray(
+                strict_subband["worst10_db"], dtype=np.float64
+            ),
+            source_trusted_subband_ci_lo_db=np.asarray(
+                strict_subband["ci_lo_db"], dtype=np.float64
+            ),
+            source_trusted_subband_ci_hi_db=np.asarray(
+                strict_subband["ci_hi_db"], dtype=np.float64
+            ),
+            source_trusted_subband_coverage_pass=np.asarray(
+                strict_subband["coverage_pass"], dtype=np.bool_
+            ),
+            source_trusted_subband_power_pass=np.asarray(
+                strict_subband["power_pass"], dtype=np.bool_
+            ),
+            source_trusted_subband_mean_pass=np.asarray(
+                strict_subband["mean_pass"], dtype=np.bool_
+            ),
+            source_trusted_subband_worst10_pass=np.asarray(
+                strict_subband["worst10_pass"], dtype=np.bool_
+            ),
+            source_trusted_subband_ci_pass=np.asarray(
+                strict_subband["ci_pass"], dtype=np.bool_
+            ),
+            source_trusted_subband_pass=np.asarray(
+                strict_subband["source_pass"], dtype=np.bool_
+            ),
+            octave_center_hz=result["octave_center_hz"],
             octave_attenuation_mean_db=np.asarray(
                 [row["attenuation_mean_db"] for row in octave_rows],
                 dtype=np.float64,

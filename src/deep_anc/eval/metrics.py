@@ -32,11 +32,55 @@ def nmse_db(d: np.ndarray, e: np.ndarray) -> float:
     return float(10.0 * np.log10((np.mean(e**2) + _EPS) / (np.mean(d**2) + _EPS)))
 
 
+def band_power(
+    x: np.ndarray,
+    sample_rate: int,
+    band_hz: tuple[float, float] | list[float],
+    *,
+    include_upper: bool = True,
+) -> float:
+    """주어진 대역의 one-sided Parseval 평균 전력.
+
+    ``band_nmse_db``와 동일한 FFT/가중치 규약을 쓴다. recorded G4의 source-coverage가
+    별도의 Welch/필터 구현으로 갈라지면, 어느 신호를 "고역이 있다"고 보는지가
+    평가마다 달라진다. 기본값은 기존 평가 호환성을 위한 닫힌 구간 [lo, hi]이다.
+    strict trusted partition만 [lo, hi)(마지막 구간만 닫힘)을 명시해 인접 경계
+    FFT bin이 두 부대역의 coverage/NMSE에 중복 집계되지 않게 한다.
+    """
+
+    fs = float(sample_rate)
+    if not math.isfinite(fs) or fs <= 0.0:
+        raise ValueError(f"sample_rate는 유한한 양수여야 합니다: {sample_rate}")
+    band = intersect_frequency_bands(band_hz, band_hz, fs / 2.0)
+    values = np.asarray(x, dtype=np.float64).reshape(-1)
+    if values.size < 2:
+        raise ValueError("대역 전력 계산에는 2샘플 이상이 필요합니다")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("대역 전력 신호에 NaN/Inf가 있습니다")
+    spectrum = np.fft.rfft(values, norm="ortho")
+    frequencies = np.fft.rfftfreq(values.size, d=1.0 / fs)
+    mask = (frequencies >= band[0]) & (
+        frequencies <= band[1] if bool(include_upper) else frequencies < band[1]
+    )
+    if not np.any(mask):
+        raise ValueError(
+            f"신호 {values.size}샘플 FFT에 {band[0]:g}–{band[1]:g}Hz 빈이 없습니다"
+        )
+    weights = np.full(spectrum.shape, 2.0, dtype=np.float64)
+    weights[0] = 1.0
+    if values.size % 2 == 0:
+        weights[-1] = 1.0
+    energy = np.sum(np.abs(spectrum[mask]) ** 2 * weights[mask])
+    return float(energy / values.size)
+
+
 def band_nmse_db(
     d: np.ndarray,
     e: np.ndarray,
     sample_rate: int,
     band_hz: tuple[float, float] | list[float],
+    *,
+    include_upper: bool = True,
 ) -> float:
     """주어진 대역의 one-sided Parseval 전력 NMSE(dB).
 
@@ -51,24 +95,8 @@ def band_nmse_db(
     e = np.asarray(e, dtype=np.float64).reshape(-1)
     if d.size < 2 or e.size < 2:
         raise ValueError("대역 NMSE 계산에는 d/e 각각 2샘플 이상이 필요합니다")
-
-    def _band_power(x: np.ndarray, name: str) -> float:
-        spectrum = np.fft.rfft(x, norm="ortho")
-        frequencies = np.fft.rfftfreq(x.size, d=1.0 / fs)
-        mask = (frequencies >= band[0]) & (frequencies <= band[1])
-        if not np.any(mask):
-            raise ValueError(
-                f"{name} {x.size}샘플 FFT에 {band[0]:g}–{band[1]:g}Hz 빈이 없습니다"
-            )
-        weights = np.full(spectrum.shape, 2.0, dtype=np.float64)
-        weights[0] = 1.0
-        if x.size % 2 == 0:
-            weights[-1] = 1.0
-        energy = np.sum(np.abs(spectrum[mask]) ** 2 * weights[mask])
-        return float(energy / x.size)
-
-    d_power = _band_power(d, "d")
-    e_power = _band_power(e, "e")
+    d_power = band_power(d, int(fs), band, include_upper=include_upper)
+    e_power = band_power(e, int(fs), band, include_upper=include_upper)
     return float(10.0 * np.log10((e_power + _EPS) / (d_power + _EPS)))
 
 

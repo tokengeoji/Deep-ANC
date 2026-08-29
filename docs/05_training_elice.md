@@ -140,26 +140,93 @@ recorded/holdout와 synthetic train·val·test의 원본 계보 교집합은 모
 bootstrap은 `results/provenance/decoder_audit.json`을 먼저 만들고
 `data/manifests/canonical_v4/`에 새 세대를 발행한 뒤, 이 경로만 대상으로 noise QA를 실행한다.
 기존 `data/manifests/` v3 세대는 forensic/diagnostic 자료로 보존하며 canonical 설정이 읽지
-않는다. bootstrap 종료 후 noise QA, recorded QA, 전체 pytest와 readiness를 다시 실행한다.
-strict P/S·transfer/public corpus가 모두 정상이고 canonical init만 없는 상태가
-**15/16 PASS**다. 그보다 적으면 학습을 시작하지 않는다.
+않는다. bootstrap 종료 후 noise QA, recorded QA, strict 부대역 coverage, 전체 pytest와
+readiness를 다시 실행한다. 현재 82세션은 cross-public speech lineage, recorded strict
+부대역 coverage, canonical init 세 blocker가 남아 **가능한 최대치가 14/17 PASS**이지만, 새 exact
+bootstrap receipt가 나오기 전에는 현재 점수를 확정하지 않는다. 먼저 numeric alias가 겹치는
+speech lineage를 독립 원본으로 복구해 **15/17 PASS**를 확인한다. 다음으로 부족 family×대역을
+추가 녹음해 coverage PASS인 **16/17 PASS**를 확인한다. 이 순서를 모두
+마친 뒤에만 G0를 시작하며, 그보다 적거나 coverage가 FAIL이면 학습을 시작하지 않는다.
 
 ## 5. 사전학습 계약 선택
 
 공식 sampler는 family→lineage component→session을 각 단계에서 균등 추첨한다. 공통
 gain/polarity/EQ와 input-only mic noise만 켜고, 1차 실행의 session mixing과 lead jitter는 0이다.
 
-1. strict S로 `lambda_dnh`의 gradient 비중이 주 NMSE의 0.2–0.4인지 측정한다.
-2. 고정 batch G0에서 trusted NMSE < −6 dB와 timing metadata를 확인한다.
-3. seed `20260803`으로 frame-metric-only 상태에서 다음 2개를 20k surrogate-pretrain
+1. alpha별 현재 `lambda_dnh`로 고정 batch G0를 **처음부터** 실행해 trusted NMSE
+   `< -6 dB`와 timing metadata를 확인한다.
+2. 합격 G0의 같은 checkpoint/fixed batch와 strict S, Trainer의 settle 절단,
+   150–1600 Hz를 사용해
+   `‖lambda_dnh·∂L_dnh/∂y‖ / ‖∂L_nmse/∂y‖`를 다시 계산한다. 이는 model
+   parameter-gradient가 아니라 **model output waveform y-gradient**이며, 현재 cfg의
+   실제 share가 0.2–0.4일 때만 PASS다. 범위 안이면 현재 λ를 유지한다.
+3. G0가 실패했거나 share가 범위 밖이면 sealed receipt의 추천 λ는 다음 실행을 위한
+   정보일 뿐이다. 추천값으로 새 contract를 만들고 weight 전이 없이 G0부터 다시 실행한다.
+   실패 checkpoint/추천 receipt는 pilot·init 자격을 열 수 없다.
+4. seed `20260803`으로 frame-metric-only 상태에서 다음 2개를 20k surrogate-pretrain
    + 5k measured probe한다. signed frame-CVaR는 λ=0.5와 0.2가 모두 fixed-batch
    control에서 영출력 붕괴를 재현해 후보에서 제외한다.
 
 ```text
-alpha ∈ {0.7, 1.0}, lambda_frame = 0.0
+candidate identity = (alpha, lambda_frame, lambda_dnh)
+alpha ∈ {0.7, 1.0}, lambda_frame = 0.0,
+lambda_dnh = 해당 alpha가 G0+pre-pilot share gate를 통과한 값
 ```
 
-test는 열지 않고 recorded val만 사용한다. 차이가 0.2 dB 이내이면
+한 `lambda_dnh`를 모든 alpha에 강제하지 않는다. 각 후보의 exact identity는
+G0→pre-pilot gradient→20k→5k 전 구간에 결속된다. 선택된 후보는 20k best에서 모든
+후보 G0가 공유한 fixed-batch SHA 중 **winner G0의 authoritative artifact path/SHA
+자체**로 share를 한 번 더 계산해 출력 분포 drift도 통과해야 하며, post-pilot batch를
+복제하거나 새로 골라서는 안 된다. 그 winner identity 전체가
+smoke→100k→50k에 그대로 이어진다.
+
+alpha별 G0와 pre-pilot receipt의 기본 흐름은 다음과 같다. 경로에는 alpha와 현재 λ를
+반드시 포함해 no-replace evidence가 서로 충돌하지 않게 한다.
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+BOOT=$(sha256sum data/manifests/elice_bootstrap_receipt.json | awk '{print $1}')
+ALPHA=0.7
+LAMBDA_DNH=0.00075  # 시작값일 뿐 승인값이 아님
+G0_DIR="results/training_prerequisites/evidence/g0_a${ALPHA}_dnh${LAMBDA_DNH}"
+
+.venv/bin/python scripts/bench/diagnose_training_overfit.py \
+  --config configs/train_pretrain_tiny.yaml \
+  --loss-alpha "$ALPHA" \
+  --loss-lambda-dnh "$LAMBDA_DNH" \
+  --bootstrap-receipt-sha256 "$BOOT" \
+  --evidence-dir "$G0_DIR"
+
+# 위 명령이 PASS(exit 0)한 G0에만 공식 pre-pilot gate를 발행한다.
+.venv/bin/python scripts/train/measure_gradient_budget.py \
+  --g0-receipt "$G0_DIR/receipt.json" \
+  --out-dir "results/training_prerequisites/evidence/prepilot_a${ALPHA}_dnh${LAMBDA_DNH}"
+```
+
+G0가 exit 2이면 같은 디렉터리에는 campaign-eligible G0가 아니라 failed-diagnostic kind가
+봉인된다. 추천이 필요할 때만 아래 명령을 사용한다. 이 명령도 의도적으로 exit 2이며,
+출력된 추천값으로 **새 경로의 fresh G0**를 실행해야 한다.
+
+```bash
+.venv/bin/python scripts/train/measure_gradient_budget.py \
+  --failed-g0-receipt "$G0_DIR/receipt.json" \
+  --out-dir "results/training_prerequisites/evidence/failed_gradient_a${ALPHA}_dnh${LAMBDA_DNH}"
+```
+
+5k measured-probe로 winner를 고른 뒤 selected-20k drift 검사는 새 validation batch를 만들지
+않는다. 반드시 winner의 위 G0 receipt를 다시 넘겨 그 receipt가 가리키는 exact batch
+path/SHA를 사용한다.
+
+```bash
+.venv/bin/python scripts/train/measure_gradient_budget.py \
+  --checkpoint runs/<winner-20k>/ckpt/best.pt \
+  --authoritative-g0-receipt results/training_prerequisites/evidence/<winner-g0>/receipt.json \
+  --out-dir results/training_prerequisites/evidence/gradient_selected20k
+```
+
+test는 열지 않고 각 20k pilot best.pt를 init으로 한 5k measured 70:30
+probe의 recorded val만 최종 선택에 사용한다. 두 measured-probe 점수 차이가
+0.2 dB 이내이면
 alpha 0.85(`lambda_frame=0`)를 추가한다. alpha 1.0의 non-finite/실행 실패는 현재
 "불안정"이라는 수기 표기로 0.85를 자동 승인하지 않는다. pre-forward model·batch·RNG를
 재실행해 검증하는 immutable failure receipt가 준비되기 전까지는 canonical을 차단하고 raw를
@@ -174,20 +241,23 @@ pilot/probe checkpoint는
 `configs/train_pretrain_tiny.yaml`은 canonical A100 한 장 전용이다. 실행 디렉터리는 계약 SHA와
 seed에서 파생하며 기존 경로를 덮어쓰지 않는다.
 
-아래 값은 모두 같은 Elice exact checkout에서 읽고, `ALPHA`는 raw pilot selection으로
-유도한 값만 쓴다. bare `train.py --config ...`는 의도적으로 fail-closed한다.
+아래 값은 모두 같은 Elice exact checkout에서 읽고, `ALPHA`와 `LAMBDA_DNH`는 raw
+measured-probe winner identity로 유도한 값만 쓴다. bare `train.py --config ...`는
+의도적으로 fail-closed한다.
 
 ```bash
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 BOOT=$(sha256sum data/manifests/elice_bootstrap_receipt.json | awk '{print $1}')
 LEDGER=$(sha256sum results/training_prerequisites/canonical_pretrain.json | awk '{print $1}')
-ALPHA=0.7  # raw pilot winner(0.7/0.85/1.0) 값으로 교체
+ALPHA=0.7  # raw measured-probe winner(0.7/0.85/1.0) 값으로 교체
+LAMBDA_DNH=<winner의 alpha별 approved 값>
 
 .venv/bin/python scripts/train/train.py \
   --config configs/train_pretrain_tiny.yaml \
   --set data.bootstrap_receipt_sha256="$BOOT" \
   --set campaign_prerequisite_sha256="$LEDGER" \
-  --set loss.nmse_cvar_alpha="$ALPHA"
+  --set loss.nmse_cvar_alpha="$ALPHA" \
+  --set loss.lambda_dnh="$LAMBDA_DNH"
 ```
 
 `scripts/elice/run_pretrain.sh`, `run_parallel_models.sh`, `queue_gpu0.yaml`,
@@ -204,6 +274,7 @@ ALPHA=0.7  # raw pilot winner(0.7/0.85/1.0) 값으로 교체
   --set data.bootstrap_receipt_sha256="$BOOT" \
   --set campaign_prerequisite_sha256="$LEDGER" \
   --set loss.nmse_cvar_alpha="$ALPHA" \
+  --set loss.lambda_dnh="$LAMBDA_DNH" \
   --resume runs/<canonical-contract-seed>/ckpt/last.pt
 ```
 
@@ -212,20 +283,35 @@ recorded-val `best.pt`, best metric/step 관계를 결속해야 init 자격이 �
 
 ## 6. 공식 파인튜닝과 test
 
-canonical 100k `best.pt`를 `init_ckpt`로 명시하고 readiness **16/16 PASS**를 먼저 확인한다.
+canonical 100k `best.pt`를 `init_ckpt`로 명시하고 readiness **17/17 PASS**를 먼저 확인한다.
 
 ```bash
 INIT_CKPT=runs/<canonical-pretrain>/ckpt/best.pt
+# canonical pretrain을 만든 같은 Elice generation과 loss winner를 그대로 쓴다.
+# 이 두 값이 없으면 canonical fine-tune config stamp가 fail-closed한다.
+BOOT=$(sha256sum data/manifests/elice_bootstrap_receipt.json | awk '{print $1}')
+ALPHA=0.7  # canonical ledger의 raw measured-probe winner(0.7/0.85/1.0)로 교체
+LAMBDA_DNH=<같은 winner의 approved 값>
 .venv/bin/python scripts/train/check_finetune.py \
   --config configs/train_finetune.yaml \
   --set data.digital_primary_path_mode=measured \
-  --set init_ckpt="$INIT_CKPT"
+  --set init_ckpt="$INIT_CKPT" \
+  --set data.bootstrap_receipt_sha256="$BOOT" \
+  --set loss.nmse_cvar_alpha="$ALPHA" \
+  --set loss.lambda_dnh="$LAMBDA_DNH"
 
 .venv/bin/python scripts/train/run_finetune_pipeline.py \
   --config configs/train_finetune.yaml \
   --set data.digital_primary_path_mode=measured \
-  --set init_ckpt="$INIT_CKPT"
+  --set init_ckpt="$INIT_CKPT" \
+  --set data.bootstrap_receipt_sha256="$BOOT" \
+  --set loss.nmse_cvar_alpha="$ALPHA" \
+  --set loss.lambda_dnh="$LAMBDA_DNH"
 ```
+
+`ALPHA`와 `LAMBDA_DNH`는 `canonical_pretrain.json`이 검증해 선택한 identity와 같아야
+한다. YAML의 기본값을 자동으로 믿으면 winner가 다른 alpha/λ일 때 init checkpoint의
+`loss_selection_sha256`와 달라져 fine-tune은 의도적으로 시작 전에 중단된다.
 
 공식 설정은 tiny/open-loop, recorded 70% + synthetic 30%, bf16 forward + FP32 loss, 50k다.
 checkpoint 선택은 recorded val만 사용한다. 선택을 원자 고정한 뒤 capability ledger가 허용한

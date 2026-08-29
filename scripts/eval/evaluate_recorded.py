@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """독립 recorded val/test를 체크포인트의 resolved 물리 설정으로 평가한다.
 
-예시:
+진단용 val 예시(test를 열지 않음):
   .venv/bin/python scripts/eval/evaluate_recorded.py \
     --ckpt runs/finetune_base/ckpt/best.pt \
-    --manifest data/manifests/recorded_train.jsonl --split test
+    --manifest data/manifests/recorded_regrouped.jsonl --split val
+
+공식 test는 고정된 selection과 single-use capability/consumed marker가 모두
+필요하다. 제어된 test 명령은 ``run_finetune_pipeline.py evaluate-test``가
+출력한 값을 그대로 사용한다.
 
 저장된 오디오 파일만 읽으며 오디오 장치를 열거나 실제 소리를 출력하지 않는다.
 """
@@ -21,6 +25,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.dsp.timing import PlantSettle  # noqa: E402
+from deep_anc.eval.recorded_sampling import (  # noqa: E402
+    CANONICAL_EDGE_TRIM_SECONDS,
+    CANONICAL_MAX_SEGMENTS_PER_SESSION,
+    CANONICAL_SEGMENT_SECONDS,
+)
 from deep_anc.eval.recorded import (  # noqa: E402
     evaluate_recorded_segments,
     iter_recorded_segments,
@@ -40,7 +49,12 @@ from deep_anc.train.evaluation_contract import (  # noqa: E402
 )
 
 
-DEFAULT_OCTAVE_BANDS = (125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0)
+# Recorded G4의 중심주파수는 손실/게이트의 단일 출처를 그대로 쓴다. 이곳에
+# 별도 tuple을 두면 CLI 기본값만 구형 7-center로 남아 canonical artifact를
+# 조용히 만들 수 있다.
+from deep_anc.dsp.do_no_harm import OCTAVE_BAND_CENTERS_HZ  # noqa: E402
+
+DEFAULT_OCTAVE_BANDS = OCTAVE_BAND_CENTERS_HZ
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,12 +76,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="surrogate checkpoint를 진단용으로만 허용(물리 성능 판정 금지)",
     )
-    parser.add_argument("--max-segments-per-session", type=int, default=8)
+    parser.add_argument(
+        "--max-segments-per-session",
+        type=int,
+        default=CANONICAL_MAX_SEGMENTS_PER_SESSION,
+    )
     parser.add_argument(
         "--segment-seconds",
         type=float,
         default=None,
         help="생략 시 checkpoint data.segment_seconds 사용",
+    )
+    parser.add_argument(
+        "--diagnostic-sampling-override",
+        action="store_true",
+        help=(
+            "진단 전용: canonical 64 segment/1.5초/edge 0.25초 모집단 외 설정 허용. "
+            "이 결과는 val 선택이나 test capability에 사용할 수 없음"
+        ),
     )
     parser.add_argument(
         "--feedback-delay-samples",
@@ -112,7 +138,43 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     consumed = None
     staging_dir: Path | None = None
+    terminal_rejection: Path | None = None
     try:
+        requested_segment_seconds = (
+            CANONICAL_SEGMENT_SECONDS
+            if args.segment_seconds is None
+            else float(args.segment_seconds)
+        )
+        canonical_edge_trim = float(CANONICAL_EDGE_TRIM_SECONDS)
+        sampling_matches_canonical = (
+            int(args.max_segments_per_session)
+            == CANONICAL_MAX_SEGMENTS_PER_SESSION
+            and requested_segment_seconds == CANONICAL_SEGMENT_SECONDS
+            and float(args.edge_trim_seconds) == canonical_edge_trim
+        )
+        if not sampling_matches_canonical and not args.diagnostic_sampling_override:
+            raise ValueError(
+                "canonical recorded 평가는 max-segments=64, segment=1.5초, "
+                "edge-trim=0.25초가 필요합니다. 축소 모집단은 "
+                "--diagnostic-sampling-override를 명시해야 하며 성능 판정에 쓸 수 없습니다"
+            )
+        if (
+            not args.diagnostic_sampling_override
+            and (
+                args.feedback_delay_samples is not None
+                or args.warmup_seconds is not None
+            )
+        ):
+            raise ValueError(
+                "canonical recorded 평가는 checkpoint 기본 feedback 중앙값과 "
+                "warmup/PlantSettle만 사용합니다. --feedback-delay-samples 또는 "
+                "--warmup-seconds override는 --diagnostic-sampling-override에서만 "
+                "허용되며 canonical val/test 근거가 될 수 없습니다"
+            )
+        if args.split == "test" and args.diagnostic_sampling_override:
+            raise ValueError(
+                "recorded test capability에서는 diagnostic sampling override를 허용하지 않습니다"
+            )
         checkpoint = Path(args.ckpt)
         out_dir = (
             Path(args.out)
@@ -165,6 +227,18 @@ def main(argv: list[str] | None = None) -> int:
             args.manifest, args.split, manifest_bytes=manifest_snapshot.content
         )
         model_hop = int(context.cfg["model"]["hop"])
+        resolved_segment_seconds = (
+            float(context.cfg["data"]["segment_seconds"])
+            if args.segment_seconds is None
+            else float(args.segment_seconds)
+        )
+        if (
+            not args.diagnostic_sampling_override
+            and resolved_segment_seconds != CANONICAL_SEGMENT_SECONDS
+        ):
+            raise ValueError(
+                "canonical checkpoint data.segment_seconds가 1.5초와 다릅니다"
+            )
         feedback_delay = resolve_feedback_delay(
             context.cfg["data"], args.feedback_delay_samples
         )
@@ -221,6 +295,13 @@ def main(argv: list[str] | None = None) -> int:
             context=context,
             feedback_delay_samples=feedback_delay,
             allow_surrogate=args.allow_surrogate,
+            model_hop=model_hop,
+            max_segments_per_session=args.max_segments_per_session,
+            segment_seconds=resolved_segment_seconds,
+            canonical_sampling=(
+                not args.diagnostic_sampling_override
+                and not args.allow_legacy_recorded_timeline
+            ),
             edge_trim_samples=edge_trim_samples,
             warmup_samples=warmup_samples,
             checkpoint_sha256=checkpoint_snapshot.sha256,
@@ -242,12 +323,14 @@ def main(argv: list[str] | None = None) -> int:
         markdown_path = out_dir / staged_markdown.name
         npz_path = out_dir / staged_npz.name
         if consumed is not None:
-            complete_test_evaluation(
+            terminal_marker = complete_test_evaluation(
                 selection_path=args.selection,
                 capability_path=args.test_capability,
                 consumed_marker_path=args.test_consumed_marker,
                 output_dir=out_dir,
             )
+            if terminal_marker.name != "completed.json":
+                terminal_rejection = terminal_marker
     except (FileExistsError, FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
         if consumed is not None:
             try:
@@ -278,6 +361,13 @@ def main(argv: list[str] | None = None) -> int:
         f"gap {result['gap_mean_db']:+.2f} dB"
     )
     print(f"산출물: {markdown_path}, {npz_path}")
+    if terminal_rejection is not None:
+        print(
+            "[거부] valid recorded test raw는 보존했지만 G4가 PASS가 아니므로 "
+            f"completion/deployment를 열지 않았습니다: {terminal_rejection}",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

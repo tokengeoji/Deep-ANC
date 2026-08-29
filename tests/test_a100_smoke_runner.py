@@ -19,7 +19,7 @@ def _load_runner():
     return module
 
 
-def test_loss_alpha_override_is_explicit_and_preserves_all_required_smoke_overrides():
+def test_loss_identity_override_is_explicit_and_preserves_all_required_smoke_overrides():
     runner = _load_runner()
     base = runner._overrides(
         bootstrap_sha256="a" * 64,
@@ -31,12 +31,36 @@ def test_loss_alpha_override_is_explicit_and_preserves_all_required_smoke_overri
         label="uninterrupted",
         run_until_step=500,
         loss_alpha=1.0,
+        loss_lambda_dnh=0.000375,
     )
 
     assert "loss.nmse_cvar_alpha=1.0" not in base
     assert "loss.nmse_cvar_alpha=1.0" in selected
+    assert "loss.lambda_dnh=0.000375" in selected
     assert set(base).issubset(set(selected))
     assert selected.count("loss.nmse_cvar_alpha=1.0") == 1
+    assert selected.count("loss.lambda_dnh=0.000375") == 1
+
+
+def test_runner_requires_selected_alpha_and_lambda_and_rejects_nonpositive_lambda():
+    runner = _load_runner()
+    parser = runner.build_parser()
+    alpha = next(item for item in parser._actions if item.dest == "loss_alpha")
+    lambda_dnh = next(
+        item for item in parser._actions if item.dest == "loss_lambda_dnh"
+    )
+    assert alpha.required is True
+    assert lambda_dnh.required is True
+    import pytest
+
+    with pytest.raises(ValueError, match="finite 양수"):
+        runner._overrides(
+            bootstrap_sha256="a" * 64,
+            label="uninterrupted",
+            run_until_step=500,
+            loss_alpha=0.7,
+            loss_lambda_dnh=0.0,
+        )
 
 
 def test_runner_only_admits_the_approved_loss_alpha_grid():

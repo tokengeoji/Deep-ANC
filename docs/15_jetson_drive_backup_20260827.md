@@ -1,7 +1,7 @@
 # Jetson 데이터 Google Drive 백업 기록
 
 최초 시작: 2026-08-27 (KST)  
-상태: **순차 업로드 진행 중 — 검증 완료한 개별 public 원본만 부분 정리**
+상태: **누락 343개만 순차 업로드 재개 — 검증 완료한 개별 public 원본만 부분 정리**
 
 ## 백업 대상과 무결성 기준
 
@@ -67,6 +67,34 @@ data/rir_bank
 그 외 `recorded`, `recorded_broken`, `source_pool`, `source_pool_v2`도 각 경로의
 전송·검증이 끝나기 전까지 보존한다. 검증된 Drive 사본에서 복구할 수 있지만, Jetson의
 로컬 삭제 자체는 되돌릴 수 없으므로 다음 후보도 같은 순서로만 처리한다.
+
+### 2026-08-28 16:19 KST 전체 목록 재감사·누락 전송 재개
+
+업로드가 끝났다는 화면 상태를 그대로 믿지 않고 Drive를 다시 열어 고정 목록과 대조했다.
+Drive에 보존된 `data_backup_manifest.sha256`은 13,428행이고 파일 SHA-256은
+`1dd9fef8d796cc1f27fbf5d434d640c8b80554e16f04b6bfac0d3403c748bea2`로 최초 목록과
+일치했다. 그러나 실제 `data/` 원격 inventory는 **13,085개 / 12,789,037,252바이트**뿐이었다.
+고정 목록과 원격 상대경로의 집합 차이는 다음과 같다.
+
+| 구분 | 파일 수 | 로컬 바이트 | 상태 |
+|---|---:|---:|---|
+| `recorded/` | 263 | 아래 합계에 포함 | Drive에 누락 |
+| `recorded_broken/` | 39 | 아래 합계에 포함 | Drive에 누락 |
+| `source_pool/` | 16 | 아래 합계에 포함 | Drive에 누락 |
+| `source_pool_v2/` | 25 | 아래 합계에 포함 | Drive에 누락 |
+| **합계** | **343** | **4,650,407,939** | 원격 extra 0 |
+
+343개 로컬 파일은 업로드 전에 모두 고정 목록의 SHA-256과 다시 일치함을 확인했다. 그 뒤
+삭제 옵션이 없는 `rclone copy data .../data --files-from <missing-list>`로 이 343개만
+저요청률(`checkers=2`, `transfers=2`, `tpslimit=4`) 재개했다. 전송 중에는 source를 삭제하지
+않는다. 프로세스 종료 뒤 다음 세 조건이 모두 PASS하기 전에는 백업 완료로 바꾸지 않는다.
+
+1. 원격 inventory가 정확히 13,428개 / 17,441,317,063바이트일 것
+2. 원격 extra와 missing이 각각 0일 것
+3. remote download hash 또는 동일 강도의 `rclone check`가 13,428개 전부 일치할 것
+
+현재 rclone shared Google Drive client ID의 2026년 폐기 예고와 요청률 변동도 관찰됐다.
+전송 속도 때문에 검증 단계를 줄이거나 전송 프로세스를 중복 실행하지 않는다.
 
 ## 삭제·보존 정책
 

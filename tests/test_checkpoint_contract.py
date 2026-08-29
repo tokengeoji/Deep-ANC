@@ -24,6 +24,7 @@ from deep_anc.config import (
     load_train_config,
     load_yaml,
 )
+import deep_anc.config as config_module
 from deep_anc.data.resumable_stream import indexed_rng, worker_global_item_indices
 from deep_anc.train.checkpoint import (
     load_checkpoint,
@@ -35,6 +36,7 @@ from deep_anc.train.campaign_prerequisite import (
     validate_canonical_pretrain_prerequisites,
 )
 import deep_anc.train.campaign_prerequisite as campaign_prerequisite_module
+import deep_anc.train.campaign_evidence as campaign_evidence_module
 from deep_anc.train.campaign_evidence import PILOT_SELECTION_RULE
 from deep_anc.train.a100_pretrain_smoke import (
     A100_MIN_USABLE_MEMORY_BYTES,
@@ -64,6 +66,7 @@ from deep_anc.train.trainer import (
     configure_canonical_determinism,
     validate_canonical_run_entry,
     validate_init_checkpoint_role,
+    validate_measured_probe_init_chain,
     validate_resume_physics,
     validate_training_world_size,
 )
@@ -128,7 +131,11 @@ def test_a100_environment_accepts_actual_nominal_80gb_usable_memory(tmp_path):
 
 
 def _load_bound_canonical(
-    path, overrides: list[str] | None = None, *, campaign_anchor: bool = True
+    path,
+    overrides: list[str] | None = None,
+    *,
+    campaign_anchor: bool = True,
+    recorded_generation: bool = False,
 ) -> dict:
     """정책 단위 테스트용 검증 완료 transfer generation stub.
 
@@ -143,6 +150,14 @@ def _load_bound_canonical(
             transfer_manifest_sha256="b" * 64,
             recorded_transfer_aggregate_sha256="c" * 64,
         )
+        if recorded_generation:
+            data.update(
+                recorded_generation=(
+                    "data/manifests/recorded_generations/"
+                    "highband-coverage-v1/generation.json"
+                ),
+                recorded_generation_sha256="d" * 64,
+            )
 
     values = list(overrides or [])
     values.append(f"data.bootstrap_receipt_sha256={_BOOTSTRAP_SHA}")
@@ -332,6 +347,50 @@ def test_rng_restore_error_is_not_silently_ignored(tmp_path):
         load_checkpoint(checkpoint, model, optimizer, restore_rng=True)
 
 
+@pytest.mark.parametrize("role", ["loss_pilot", "measured_probe"])
+def test_selection_derivative_resume_requires_exactly_one_cuda_rng(
+    tmp_path, role
+):
+    """pilot/probe도 preview와 실제 resume 모두 world1 CUDA RNG 누락을 거부한다."""
+
+    cfg = cfg_snapshot(_config(tmp_path), trusted_band_hz=(150.0, 1_600.0))
+    cfg["experiment_role"] = role
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    checkpoint = tmp_path / role / "last.pt"
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        1,
+        -1.0,
+        cfg,
+        training_state=_training_state(),
+    )
+    missing = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    missing["rng"]["cuda"] = None
+    torch.save(missing, checkpoint)
+    assert missing["rng"]["cuda"] is None
+    before = deepcopy(model.state_dict())
+    with pytest.raises(ValueError, match="CUDA RNG state가 정확히 하나"):
+        validate_resume_checkpoint_preview(
+            checkpoint, missing, model, optimizer, scheduler
+        )
+    with pytest.raises(ValueError, match="CUDA RNG state가 정확히 하나"):
+        load_checkpoint(
+            checkpoint, model, optimizer, scheduler, restore_rng=True
+        )
+    _assert_nested_equal(before, model.state_dict())
+
+    missing["rng"]["cuda"] = [torch.zeros(32, dtype=torch.uint8)]
+    torch.save(missing, checkpoint)
+    validate_resume_checkpoint_preview(
+        checkpoint, missing, model, optimizer, scheduler
+    )
+
+
 class _IndexedToyDataset(IterableDataset):
     def __init__(self, *, start_batch: int, batch_size: int) -> None:
         self.start_batch = int(start_batch)
@@ -516,11 +575,25 @@ def test_canonical_config_requires_bootstrap_and_prerequisite_anchors_before_sta
             )
 
 
+def test_canonical_roles_reject_missing_regular_rir_before_contract_stamp():
+    original = config_module._resolve_path
+    missing = REPO_ROOT / "data/rir_bank/__missing_canonical_fixture__.npz"
+
+    def redirect(value):
+        if str(value) == "data/rir_bank/duct_rirs_v1.npz":
+            return missing
+        return original(value)
+
+    with patch.object(config_module, "_resolve_path", side_effect=redirect):
+        with pytest.raises(ValueError, match="RIR bank regular file"):
+            _load_bound_canonical(REPO_ROOT / "configs/train_pretrain_tiny.yaml")
+
+
 def test_approved_frame_metric_only_alpha_pilots_have_distinct_20k_contracts():
     base = _load_bound_canonical(REPO_ROOT / "configs/train_pretrain_tiny.yaml")
     run_dirs = set()
     for alpha in (0.7, 1.0):
-        pilot = load_train_config(
+        pilot = _load_bound_canonical(
             REPO_ROOT / "configs/train_pretrain_tiny.yaml",
             [
                 "experiment_role=loss_pilot",
@@ -542,7 +615,7 @@ def test_approved_frame_metric_only_alpha_pilots_have_distinct_20k_contracts():
 
 def test_measured_primary_five_k_probe_is_an_explicit_distinct_contract():
     base = _load_bound_canonical(REPO_ROOT / "configs/train_pretrain_tiny.yaml")
-    probe = load_train_config(
+    probe = _load_bound_canonical(
         REPO_ROOT / "configs/train_pretrain_tiny.yaml",
         [
             "experiment_role=measured_probe",
@@ -557,7 +630,281 @@ def test_measured_primary_five_k_probe_is_an_explicit_distinct_contract():
     assert probe["init_eligible"] is False
     assert probe["run_until_step"] == 5_000
     assert probe["init_ckpt"].endswith("selected-20k/ckpt/best.pt")
+    assert probe["require_measured_primary_path"] is True
+    assert probe["require_init_checkpoint"] is True
+    assert probe["require_init_completion_receipt"] is False
+    assert probe["require_recorded_manifest"] is True
+    assert probe["required_init_experiment_role"] == "loss_pilot"
+    assert probe["require_init_eligible"] is False
+    assert probe["recorded_manifest"] == "data/manifests/recorded_regrouped.jsonl"
+    assert probe["recorded_ratio"] == 0.7
+    assert probe["readiness"] == {
+        "required_path_band_hz": [150, 1600],
+        "max_init_lead_mismatch_samples": 16,
+    }
+    assert probe["experiment_contract"]["artifacts"]["recorded_manifest"][
+        "exists"
+    ]
+    assert probe["experiment_contract"]["artifacts"]["init_checkpoint"][
+        "path"
+    ].endswith("selected-20k/ckpt/best.pt")
     assert probe["ckpt_dir"] != base["ckpt_dir"]
+
+
+@pytest.mark.parametrize(
+    ("config", "overrides", "expected_recorded_manifest"),
+    [
+        ("configs/train_pretrain_tiny.yaml", [], None),
+        (
+            "configs/train_pretrain_tiny.yaml",
+            [
+                "experiment_role=loss_pilot",
+                "init_eligible=false",
+                "run_until_step=20000",
+            ],
+            None,
+        ),
+        (
+            "configs/train_pretrain_tiny.yaml",
+            [
+                "experiment_role=measured_probe",
+                "init_eligible=false",
+                "data.digital_primary_path_mode=measured",
+                "run_until_step=5000",
+                "init_ckpt=runs/selected-20k/ckpt/best.pt",
+            ],
+            (
+                "data/manifests/recorded_generations/"
+                "highband-coverage-v1/recorded.jsonl"
+            ),
+        ),
+        (
+            "configs/train_finetune.yaml",
+            ["data.digital_primary_path_mode=measured"],
+            (
+                "data/manifests/recorded_generations/"
+                "highband-coverage-v1/recorded.jsonl"
+            ),
+        ),
+    ],
+)
+def test_schema2_bootstrap_atomically_resolves_all_official_role_manifests(
+    config, overrides, expected_recorded_manifest
+):
+    """bootstrap SHA 하나로 pilot/probe/canonical/fine-tune이 같은 99세대를 본다."""
+
+    cfg = _load_bound_canonical(
+        REPO_ROOT / config,
+        overrides,
+        recorded_generation=True,
+    )
+    assert cfg["data"]["recorded_generation"] == (
+        "data/manifests/recorded_generations/"
+        "highband-coverage-v1/generation.json"
+    )
+    assert cfg["data"]["recorded_generation_sha256"] == "d" * 64
+    assert cfg.get("recorded_manifest") == expected_recorded_manifest
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "recorded_ratio=0.3",
+        "recorded_manifest=data/manifests/recorded_train.jsonl",
+        "require_recorded_manifest=false",
+        "require_measured_primary_path=false",
+        "require_init_checkpoint=false",
+        "require_init_completion_receipt=true",
+        "required_init_experiment_role=canonical_pretrain",
+        "require_init_eligible=true",
+        "readiness.max_init_lead_mismatch_samples=0",
+    ],
+)
+def test_measured_probe_cannot_weaken_recorded_70_30_or_selected_init_policy(
+    override,
+):
+    with pytest.raises(ValueError, match="measured_probe trust policy"):
+        _load_bound_canonical(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            [
+                "experiment_role=measured_probe",
+                "init_eligible=false",
+                "data.digital_primary_path_mode=measured",
+                "run_until_step=5000",
+                "init_ckpt=runs/selected-20k/ckpt/best.pt",
+                override,
+            ],
+        )
+
+
+def _measured_probe_init_fixture(tmp_path: Path, *, last_step: int = 20_000):
+    pilot = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        [
+            "experiment_role=loss_pilot",
+            "init_eligible=false",
+            "run_until_step=20000",
+        ],
+    )
+    checkpoint_dir = tmp_path / "pilot" / "ckpt"
+    checkpoint_dir.mkdir(parents=True)
+    best = checkpoint_dir / "best.pt"
+    last = checkpoint_dir / "last.pt"
+    best_state = {"cfg": pilot, "model": {"weight": torch.ones(1)}, "step": 15_000}
+    torch.save(best_state, best)
+    torch.save(
+        {"cfg": pilot, "model": {"weight": torch.ones(1)}, "step": last_step},
+        last,
+    )
+    probe = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        [
+            "experiment_role=measured_probe",
+            "init_eligible=false",
+            "data.digital_primary_path_mode=measured",
+            "run_until_step=5000",
+            f"init_ckpt={best}",
+        ],
+    )
+    return best_state, probe, best
+
+
+def test_measured_probe_requires_same_loss_completed_20k_pilot_before_gpu(tmp_path):
+    best_state, probe, best = _measured_probe_init_fixture(tmp_path)
+    validate_measured_probe_init_chain(best_state, probe, best)
+
+    incomplete = torch.load(best.with_name("last.pt"), weights_only=False)
+    incomplete["step"] = 19_999
+    torch.save(incomplete, best.with_name("last.pt"))
+    with pytest.raises(ValueError, match="정확히 20k 완료"):
+        validate_measured_probe_init_chain(best_state, probe, best)
+
+
+def test_measured_probe_rejects_different_alpha_before_gpu(tmp_path):
+    best_state, _probe, best = _measured_probe_init_fixture(tmp_path)
+    different = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        [
+            "experiment_role=measured_probe",
+            "init_eligible=false",
+            "data.digital_primary_path_mode=measured",
+            "run_until_step=5000",
+            f"init_ckpt={best}",
+            "loss.nmse_cvar_alpha=1.0",
+        ],
+    )
+    with pytest.raises(ValueError, match="loss selection"):
+        validate_measured_probe_init_chain(best_state, different, best)
+
+
+@pytest.mark.parametrize(
+    ("role", "primary_mode", "overrides"),
+    [
+        (
+            "loss_pilot",
+            "secondary_surrogate",
+            [
+                "experiment_role=loss_pilot",
+                "init_eligible=false",
+                "run_until_step=20000",
+            ],
+        ),
+        (
+            "measured_probe",
+            "measured",
+            [
+                "experiment_role=measured_probe",
+                "init_eligible=false",
+                "data.digital_primary_path_mode=measured",
+                "run_until_step=5000",
+                "init_ckpt=runs/selected-20k/ckpt/best.pt",
+            ],
+        ),
+    ],
+)
+def test_campaign_replays_full_derivative_policy_from_checkpoint(
+    role, primary_mode, overrides
+):
+    canonical = _load_bound_canonical(REPO_ROOT / "configs/train_pretrain_tiny.yaml")
+    derivative = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        overrides,
+    )
+    forged = deepcopy(derivative)
+    forged["optimizer"]["lr"] = 0.01
+    forged = stamp_experiment_contract(forged, repo_root=REPO_ROOT)
+    with pytest.raises(ValueError, match=rf"{role} trust policy"):
+        campaign_evidence_module._validate_derivative_cfg(
+            forged,
+            canonical_cfg=canonical,
+            canonical_contract=canonical["experiment_contract"],
+            root=REPO_ROOT,
+            label=f"forged {role}",
+            role=role,
+            primary_mode=primary_mode,
+            embedded=True,
+            expected_identity=(0.7, 0.0, 0.00075),
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            [
+                "experiment_role=loss_pilot",
+                "init_eligible=false",
+                "run_until_step=19999",
+            ],
+            "run_until_step",
+        ),
+        (
+            [
+                "experiment_role=loss_pilot",
+                "init_eligible=false",
+                "run_until_step=20000",
+                "init_ckpt=runs/other/ckpt/best.pt",
+            ],
+            "from-scratch",
+        ),
+        (
+            [
+                "experiment_role=measured_probe",
+                "init_eligible=false",
+                "data.digital_primary_path_mode=measured",
+                "run_until_step=4999",
+                "init_ckpt=runs/selected-20k/ckpt/best.pt",
+            ],
+            "run_until_step",
+        ),
+        (
+            [
+                "experiment_role=measured_probe",
+                "init_eligible=false",
+                "data.digital_primary_path_mode=measured",
+                "run_until_step=5000",
+            ],
+            "selected 20k",
+        ),
+    ],
+)
+def test_strict_selection_derivative_admission_rejects_wrong_budget_or_init(
+    overrides, message
+):
+    with pytest.raises(ValueError, match=message):
+        _load_bound_canonical(REPO_ROOT / "configs/train_pretrain_tiny.yaml", overrides)
+
+
+def test_strict_selection_derivative_requires_bootstrap_anchor_before_stamp():
+    with pytest.raises(ValueError, match="bootstrap_receipt_sha256"):
+        load_train_config(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            [
+                "experiment_role=loss_pilot",
+                "init_eligible=false",
+                "run_until_step=20000",
+            ],
+        )
 
 
 def test_canonical_smoke_stop_budget_keeps_the_long_run_contract():
@@ -771,7 +1118,19 @@ def test_canonical_finetune_trust_policy_cannot_be_weakened(override):
         "model.encoder.channels=64",
         "seed=1",
         "loss.lambda_dnh=0.0",
+        "loss.lambda_dnh=.nan",
+        "loss.lambda_dnh=.inf",
+        "loss.lambda_dnh=true",
         "data.recorded_augment.mix_probability=0.1",
+        "data.allow_missing_source_manifests=true",
+        "data.noise_manifest_dir=data/manifests",
+        "data.rir_bank=data/rir_bank/other.npz",
+        "data.level_dbfs=[-20,-20]",
+        "data.snr_mic_noise_db=[0,0]",
+        "data.dc_hum_prob=0.0",
+        "data.nonlinear.hardclip_prob=0.1",
+        "data.plant_perturbation.delay_jitter_range=[0,1]",
+        "data.closed_loop.feedback_delay_samples=[1,2]",
         "recorded_ratio=0.1",
     ],
 )
@@ -793,12 +1152,55 @@ def test_canonical_finetune_full_training_policy_cannot_be_weakened(override):
         "optimizer.lr=0.01",
         "seed=1",
         "init_eligible=false",
+        "data.allow_missing_source_manifests=true",
+        "data.noise_manifest_dir=data/manifests",
+        "data.rir_bank=data/rir_bank/other.npz",
+        "data.level_dbfs=[-20,-20]",
+        "data.snr_mic_noise_db=[0,0]",
+        "data.dc_hum_prob=0.0",
+        "data.nonlinear.hardclip_prob=0.1",
+        "data.plant_perturbation.delay_jitter_range=[0,1]",
+        "data.closed_loop.feedback_delay_samples=[1,2]",
+        "recorded_manifest=data/manifests/recorded_regrouped.jsonl",
+        "recorded_ratio=0.7",
+        "require_recorded_manifest=true",
     ],
 )
 def test_canonical_pretrain_cannot_be_promoted_from_a_changed_contract(override):
     with pytest.raises(ValueError, match="canonical_pretrain trust policy"):
         load_train_config(
             REPO_ROOT / "configs/train_pretrain_tiny.yaml", [override]
+        )
+
+
+@pytest.mark.parametrize(
+    ("role", "primary_mode", "extra", "init"),
+    [
+        ("loss_pilot", "secondary_surrogate", "run_until_step=20000", None),
+        (
+            "measured_probe",
+            "measured",
+            "run_until_step=5000",
+            "init_ckpt=runs/selected-20k/ckpt/best.pt",
+        ),
+    ],
+)
+def test_canonical_selection_derivatives_cannot_replace_missing_source_families(
+    role, primary_mode, extra, init
+):
+    """pilot/probe도 누락 public source를 synthetic으로 대체할 수 없다."""
+
+    with pytest.raises(ValueError, match="allow_missing_source_manifests"):
+        _load_bound_canonical(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            [
+                f"experiment_role={role}",
+                "init_eligible=false",
+                f"data.digital_primary_path_mode={primary_mode}",
+                extra,
+                *([init] if init else []),
+                "data.allow_missing_source_manifests=true",
+            ],
         )
 
 
@@ -815,6 +1217,12 @@ def test_canonical_loss_identity_must_match_between_pretrain_and_finetune():
     )
     with pytest.raises(ValueError, match="loss selection"):
         validate_init_checkpoint_role({"cfg": mismatched}, finetune)
+    mismatched_lambda = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        ["loss.lambda_dnh=0.000375"],
+    )
+    with pytest.raises(ValueError, match="loss selection"):
+        validate_init_checkpoint_role({"cfg": mismatched_lambda}, finetune)
 
 
 def _sha_ref(source_root: Path, path: Path) -> dict[str, str]:
@@ -1117,15 +1525,25 @@ def _prerequisite_components(tmp_path):
     provisional = stamp_experiment_contract(cfg, repo_root=source_root)
     source = provisional["experiment_contract"]["source"]
     artifacts = provisional["experiment_contract"]["artifacts"]
-    # v5 ledger는 사람이 score/winner/gradient/NMSE를 적지 않고 raw artifact
-    # reference만 보관한다. 이 fixture의 P/S는 unit-test용 bytes라 raw DSP
-    # 재계산은 아래 helper에서 stub하고, A100 smoke chain만 독립 검증한다.
+    # v7 ledger는 각 alpha의 G0/calibration/20k pilot/5k measured probe를
+    # identity=(alpha,frame,lambda_dnh) chain으로 보관한다. 이 fixture의 P/S는 unit-test용 bytes라 raw DSP 재계산은
+    # 아래 helper에서 stub하고, A100 smoke chain만 독립 검증한다.
     candidates = [
-        {"fixture_pair": [0.7, 0.0]},
-        {"fixture_pair": [1.0, 0.0]},
+        {
+            "g0": {"receipt": evidence_ref},
+            "gradient_calibration": {"receipt": evidence_ref},
+            "pilot": {"fixture_identity": [0.7, 0.0, 0.00075]},
+            "measured_probe": {"fixture_identity": [0.7, 0.0, 0.00075]},
+        },
+        {
+            "g0": {"receipt": evidence_ref},
+            "gradient_calibration": {"receipt": evidence_ref},
+            "pilot": {"fixture_identity": [1.0, 0.0, 0.000375]},
+            "measured_probe": {"fixture_identity": [1.0, 0.0, 0.000375]},
+        },
     ]
     ledger = {
-        "schema_version": 5,
+        "schema_version": 7,
         "source": {
             "git_commit": source["git_commit"],
             "source_tree_sha256": source["source_tree_sha256"],
@@ -1133,18 +1551,10 @@ def _prerequisite_components(tmp_path):
             "primary_path_sha256": artifacts["primary_path"]["sha256"],
             "secondary_path_sha256": artifacts["secondary_path"]["sha256"],
         },
-        "g0": {"receipt": evidence_ref},
         "gradient_budget": {"receipt": evidence_ref},
         "loss_pilot_selection": {
             "selection_rule": PILOT_SELECTION_RULE,
             "candidates": candidates,
-        },
-        "measured_probe": {
-            "best_checkpoint": evidence_ref,
-            "last_checkpoint": evidence_ref,
-            "metrics": evidence_ref,
-            "manifest": evidence_ref,
-            "init_checkpoint": evidence_ref,
         },
         "a100_smoke_resume": _a100_smoke_ledger_refs(source_root, cfg),
     }
@@ -1161,23 +1571,73 @@ def _prerequisite_components(tmp_path):
     return cfg, source_root, ledger_path
 
 
-def _validate_fixture_campaign(cfg: dict, source_root: Path):
+def _validate_fixture_campaign(
+    cfg: dict,
+    source_root: Path,
+    *,
+    pilot_scores: tuple[float, float] = (-4.0, -2.0),
+    probe_scores: tuple[float, float] = (-4.0, -2.0),
+    g0_batch_shas: tuple[str, str] = ("c" * 64, "c" * 64),
+    g0_batch_paths: tuple[str, str] = ("shared-batch.pt", "shared-batch.pt"),
+):
     """A100 smoke fixture에서는 새 raw-DSP validators만 분리한다.
 
     이 파일의 fake ``*.npz``는 transfer/source/a100 receipt test를 빠르게 하기 위한
-    text fixture다. schema-v5 raw G0/pilot/probe 계산은
+    text fixture다. schema-v7 raw G0/calibration/pilot/probe 계산은
     ``tests/test_campaign_evidence.py``의 real raw artifact fixture에서 다룬다.
     """
 
-    pairs = iter(((0.7, 0.0, -4.0), (1.0, 0.0, -2.0)))
+    pilots = iter(
+        (
+            ((0.7, 0.0, 0.00075), float(pilot_scores[0]), "a" * 64),
+            ((1.0, 0.0, 0.000375), float(pilot_scores[1]), "b" * 64),
+        )
+    )
+    probes = iter(
+        (
+            ((0.7, 0.0, 0.00075), float(probe_scores[0]), "a" * 64),
+            ((1.0, 0.0, 0.000375), float(probe_scores[1]), "b" * 64),
+        )
+    )
 
     def pilot(*_args, **_kwargs):
-        alpha, frame, score = next(pairs)
+        identity, score, sha = next(pilots)
+        assert tuple(_kwargs["expected_identity"]) == identity
         return {
-            "pair": (alpha, frame),
+            "identity": identity,
             "score_db": score,
-            "best_snapshot": SimpleNamespace(sha256=("a" if alpha == 0.7 else "b") * 64),
+            "best_snapshot": SimpleNamespace(sha256=sha),
         }
+
+    def probe(*_args, **kwargs):
+        identity, score, init_sha = next(probes)
+        assert tuple(kwargs["expected_identity"]) == identity
+        assert kwargs["expected_init_checkpoint_sha256"] == init_sha
+        return {"identity": identity, "score_db": score}
+
+    g0_rows = iter(
+        (
+            ((0.7, 0.0, 0.00075), g0_batch_paths[0], g0_batch_shas[0]),
+            ((1.0, 0.0, 0.000375), g0_batch_paths[1], g0_batch_shas[1]),
+        )
+    )
+
+    def g0(*_args, **_kwargs):
+        identity, batch_path, batch_sha = next(g0_rows)
+        return {
+            "identity": identity,
+            "batch": SimpleNamespace(
+                path=source_root / "results/evidence" / batch_path,
+                sha256=batch_sha,
+            ),
+        }
+
+    def gradient(*_args, **kwargs):
+        assert kwargs["expected_batch_path"] == (
+            source_root / "results/evidence" / g0_batch_paths[0]
+        )
+        assert kwargs["expected_batch_sha256"] == g0_batch_shas[0]
+        return {}
 
     with patch.object(
         campaign_prerequisite_module,
@@ -1186,7 +1646,11 @@ def _validate_fixture_campaign(cfg: dict, source_root: Path):
     ), patch.object(
         campaign_prerequisite_module,
         "validate_g0_receipt",
-        return_value={},
+        side_effect=g0,
+    ), patch.object(
+        campaign_prerequisite_module,
+        "validate_prepilot_gradient_receipt",
+        return_value={"gradient_share": 0.3},
     ), patch.object(
         campaign_prerequisite_module,
         "validate_loss_pilot_candidate",
@@ -1194,11 +1658,11 @@ def _validate_fixture_campaign(cfg: dict, source_root: Path):
     ), patch.object(
         campaign_prerequisite_module,
         "validate_gradient_budget_receipt",
-        return_value={},
+        side_effect=gradient,
     ), patch.object(
         campaign_prerequisite_module,
         "validate_measured_probe",
-        return_value={},
+        side_effect=probe,
     ):
         return validate_canonical_pretrain_prerequisites(cfg, repo_root=source_root)
 
@@ -1206,7 +1670,12 @@ def _validate_fixture_campaign(cfg: dict, source_root: Path):
 def test_canonical_pretrain_prerequisites_bind_every_campaign_gate(tmp_path):
     cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
     ledger = _validate_fixture_campaign(cfg, source_root)
-    assert set(ledger["g0"]) == {"receipt"}
+    assert "g0" not in ledger
+    assert "measured_probe" not in ledger
+    assert all(
+        set(candidate) == {"g0", "gradient_calibration", "pilot", "measured_probe"}
+        for candidate in ledger["loss_pilot_selection"]["candidates"]
+    )
     assert set(ledger["a100_smoke_resume"]) == {
         "evidence",
         "environment_receipt",
@@ -1215,10 +1684,62 @@ def test_canonical_pretrain_prerequisites_bind_every_campaign_gate(tmp_path):
 
     # old scalar schema must not remain an accidental manual-evidence escape hatch.
     legacy = json.loads(ledger_path.read_text())
-    legacy["schema_version"] = 4
+    legacy["schema_version"] = 6
     ledger_path.write_text(json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8")
     refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
     with pytest.raises(ValueError, match="schema_version"):
+        _validate_fixture_campaign(refreshed, source_root)
+
+
+def test_campaign_requires_the_same_fixed_g0_batch_for_every_alpha(tmp_path):
+    cfg, source_root, _ = _prerequisite_components(tmp_path)
+    with pytest.raises(ValueError, match="authoritative fixed batch SHA"):
+        _validate_fixture_campaign(
+            cfg,
+            source_root,
+            g0_batch_shas=("c" * 64, "d" * 64),
+        )
+
+
+def test_campaign_allows_same_g0_batch_bytes_in_candidate_receipts_but_locks_authority(tmp_path):
+    cfg, source_root, _ = _prerequisite_components(tmp_path)
+    _validate_fixture_campaign(
+        cfg,
+        source_root,
+        g0_batch_paths=("alpha07-batch.pt", "alpha10-batch.pt"),
+    )
+
+
+def test_campaign_winner_is_derived_from_measured_probe_not_surrogate_pilot(
+    tmp_path,
+):
+    cfg, source_root, _ = _prerequisite_components(tmp_path)
+    # surrogate pilot은 alpha=0.7을 선호하지만 measured probe는 alpha=1.0을
+    # 0.2 dB 밖으로 명확히 선호한다. canonical cfg가 0.7이므로 반드시 거부된다.
+    with pytest.raises(ValueError, match="winner.*canonical pretrain loss"):
+        _validate_fixture_campaign(
+            cfg,
+            source_root,
+            pilot_scores=(-5.0, -2.0),
+            probe_scores=(-1.0, -2.0),
+        )
+
+
+def test_campaign_rejects_legacy_v5_single_winner_probe_layout(tmp_path):
+    cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
+    legacy = json.loads(ledger_path.read_text(encoding="utf-8"))
+    chains = legacy["loss_pilot_selection"]["candidates"]
+    legacy["schema_version"] = 6
+    legacy["loss_pilot_selection"]["candidates"] = [
+        chain["pilot"] for chain in chains
+    ]
+    legacy["measured_probe"] = chains[0]["measured_probe"]
+    ledger_path.write_text(
+        json.dumps(legacy, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    refreshed = _restamp_campaign_anchor(cfg, source_root, ledger_path)
+    with pytest.raises(ValueError, match="campaign prerequisite key 집합"):
         _validate_fixture_campaign(refreshed, source_root)
 
 
@@ -1226,7 +1747,7 @@ def test_canonical_pretrain_prerequisite_rejects_manual_v4_gradient_fields(tmp_p
     cfg, source_root, ledger_path = _prerequisite_components(tmp_path)
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     ledger["gradient_budget"] = {
-        "evidence": ledger["g0"]["receipt"],
+        "evidence": ledger["loss_pilot_selection"]["candidates"][0]["g0"]["receipt"],
         "strict_ps": True,
         "lambda_dnh": cfg["loss"]["lambda_dnh"],
         "gradient_share": 0.3,

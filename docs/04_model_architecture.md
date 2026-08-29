@@ -20,7 +20,7 @@ GCRN / Transformer / WaveNet / Conv-TasNet 네 구조에서 실시간 ANC 에 �
 ```
 입력 [B,2,T] (ch0=ref, ch1=err피드백, T=hop 배수)
  ├ ÷ io_scale (0.02)
- ├ 좌측 256샘플 패딩 → Encoder Conv1d(2→512, k=384, s=128) → GLU → 256ch   ← 룩백 8ms, 룩어헤드 0
+ ├ 좌측 256샘플 패딩 → Encoder Conv1d(2→512, k=384, s=128) → GLU → 256ch   ← block-acquired, hop 내 +127 sample
  ├ ChannelLN + 1×1
  ├ TCN 반복 ×3 { dilation 1,2,4,8,16 }        각 블록: 1×1(256→512)+PReLU+LN
  │    ↑ 반복2 뒤: GLSTM(그룹2, 그룹당 hid256)     → dwConv k3 ×2(주경로·게이트 σ)
@@ -60,12 +60,20 @@ tiny batch 128을 각각 100k step 학습한다. GPU0/base와 GPU1/tiny는 서�
 
 ## 3. 인과성과 지연
 
-- 인코더는 과거 384샘플만 참조(좌측 패딩), 디코더 OLA 는 과거 프레임의 꼬리만 합산
-  → **알고리즘 지연 0**. 테스트: 미래 입력을 바꿔도 현재 출력 불변(비트 단위 동일).
-- 모델 자체는 입력에서 미래 샘플을 참조하지 않는다. 현재 digital-ref는 모델 예측에
-  116샘플 차이를 맡기지 않고, 자기생성 ref를 먼저 주고 실제 noise playback을
-  116샘플 FIFO로 지연한다. `reference[t]=playback[t+116]`이므로
-  `116 + D_noise(1602) = S_total(1462+256=1718)`로 도착 시각이 정렬된다.
+- 인코더 frame은 좌측 history와 현재 hop 128 samples를 한번에 사용한다.
+  따라서 첫 output phase는 같은 hop의 끝인 `x[+127]`까지 참조하며
+  **sample-zero-lookahead가 아니다**. legacy Tiny Jacobian에서도 nonzero 입력 범위가
+  정확히 `0..127`로 확인됐다.
+- 실시간 엔진은 256-sample block 전체를 받은 뒤 출력한다. 따라서 위
+  127-sample 의존은 물리적으로 구현 가능하지만, 이 256-sample handoff를 P/S·학습·
+  checkpoint·runtime timing contract에 **정확히 한 번** 포함해야 한다. 프레임
+  경계 인과성을 sample-level 지연 0으로 표기하지 않는다.
+- digital-ref는
+  자기생성 ref를 먼저 주고 noise playback을 현재 strict P/S에서 유도한
+  FIFO lead만큼 지연한다. 현재 capture에서는 `1245 + 256 − 1386 = 115`
+  샘플이지만, 이 숫자를 config/checkpoint/runtime에 손으로 복사하지 않는다.
+  NPZ→`PlantDelays.lead()`→`TrainingTimingContract`와 그 SHA가 전 경로의
+  단일 출처다.
 - acoustic-ref에서는 이 확정적 선행 공급을 쓸 수 없다. 약 30ms 예측 부담은 손실 정렬과
   LSTM/MHSA의 주기 기억으로 학습하되, 광대역 랜덤음은 물리적으로 예측할 수 없다.
 
@@ -80,7 +88,8 @@ tiny batch 128을 각각 100k step 학습한다. GPU0/base와 GPU1/tiny는 서�
 | `st_i_attn_m` | [1,1,1,64] | KV 슬롯 유효성 마스크 (빈 슬롯 −1e4) — 워밍업 구간도 오프라인과 등가 |
 | `st_dec` | [1,1,256] | 디코더 OLA 꼬리 |
 
-스트리밍=오프라인 등가성: 실측 max err ~3e-8 (테스트 게이트 1e-5). GLSTM 은 학습 시 cuDNN nn.LSTM,
+스트리밍=오프라인 등가성: 실측 max err ~3e-8 (테스트 게이트 1e-5). 이는 256-sample
+block이 이미 수신된 후의 수치 등가성이지 sample-zero-lookahead 주장이 아니다. GLSTM 은 학습 시 cuDNN nn.LSTM,
 스트리밍/export 시 동일 가중치의 수동 셀 — 등가성 테스트 포함 (설계 H1).
 
 ## 5. Stage-1 학습 플랜트와 손실 (`losses/anc_loss.py`)

@@ -1,7 +1,7 @@
 """HybridANCNet — 시간영역 인과 하이브리드 ANC 모델.
 
 구성 (docs/04_model_architecture.md):
-  Conv-TasNet 학습형 인코더/디코더(k=384, hop=128, 룩어헤드 0)
+  Conv-TasNet 학습형 인코더/디코더(k=384, hop=128, block-acquired 인과 경로)
   + WaveNet dilated causal depthwise TCN (GLU 게이팅)
   + GCRN GLSTM 병목 (그룹 LSTM)
   + windowed causal MHSA 1층 (주기 잡음 재조회)
@@ -11,8 +11,10 @@
                  ref-only / err-only 운용도 같은 인터페이스로 커버.
 출력  [B, 1, T]: 상쇄 스피커 구동 신호 y.
 
-인과성: 인코더는 좌측 win-hop 패딩만 사용, 디코더 overlap-add 는 과거 프레임의
-꼬리만 더한다 → 알고리즘 지연 0 (예측 지평은 손실 정렬로 학습됨).
+인과성: 인코더는 좌측 win-hop 패딩을 쓰지만 한 frame의 첫 출력 sample은 같은 hop의
+마지막 입력까지 최대 +127 samples를 본다. 따라서 sample-zero-lookahead 모델은 아니다.
+실시간 경로는 256-sample 입력 block 전체를 받은 뒤 출력하며, 이 block handoff를 P/S
+timing contract가 정확히 한 번 포함한다. 디코더 overlap-add는 과거 frame tail만 더한다.
 """
 
 from __future__ import annotations

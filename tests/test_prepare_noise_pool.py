@@ -44,6 +44,7 @@ from deep_anc.data.public_lineage import (
     ESC50_METADATA,
     FMA_TRACKS,
     LIBRISPEECH_CHAPTERS,
+    PUBLIC_CROSSWALK_POLICY,
     PUBLIC_LINEAGE_SCHEMA,
     PublicLineageBuild,
     canonical_json_sha256,
@@ -318,6 +319,7 @@ def _run(
             "components": {key: components[key] for key in sorted(components)},
             "holdout_clips_sha256": holdout_lineage["clips_sha256"],
             "excluded_by_tag": {tag: 0 for tag in sorted(entries_by_tag)},
+            "crosswalk_policy": json.loads(json.dumps(PUBLIC_CROSSWALK_POLICY)),
         }
         # 실제 public lineage parser를 쓰지 않는 이 fixture도 canonical v4의 DNS
         # marker partition/postcommit 경계를 통과해야 한다. marker member는 raw
@@ -1227,6 +1229,161 @@ def test_manifest_validator_rederives_dns_reject_partition_after_sidecar_tamper(
         validate_manifest_generation(
             manifest_dir,
             required_tags={"speech"},
+            repo_root=root,
+        )
+
+
+def test_manifest_validator_rejects_resealed_noncanonical_crosswalk_policy(
+    tmp_path, monkeypatch
+):
+    """build_id까지 다시 봉인해도 구 namespace-disjoint 정책은 거부한다."""
+
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0},
+    )
+    assert _run(module, root, monkeypatch) == 0
+    manifest_dir = root / "data/manifests"
+    validate_manifest_generation(
+        manifest_dir,
+        required_tags={"esc50"},
+        repo_root=root,
+    )
+
+    sidecar_path = manifest_dir / "manifest_generation.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["public_lineage"]["crosswalk_policy"] = {
+        "dns_read_speech_to_librispeech": (
+            "namespace_disjoint_no_official_crosswalk"
+        ),
+        "cross_namespace_overlap_checks": ["content_sha256", "basename"],
+    }
+    basis = {
+        key: value
+        for key, value in sidecar.items()
+        if key not in {"build_id", "created_at"}
+    }
+    sidecar["build_id"] = hashlib.sha256(
+        manifest_contract._canonical_json_bytes(basis)
+    ).hexdigest()
+    sidecar_path.write_bytes(manifest_contract._canonical_json_bytes(sidecar))
+
+    with pytest.raises(ValueError, match="crosswalk_policy"):
+        validate_manifest_generation(
+            manifest_dir,
+            required_tags={"esc50"},
+            repo_root=root,
+        )
+
+
+def test_manifest_validator_derives_libri_holdout_alias_and_rejects_dns_leak(
+    tmp_path, monkeypatch
+):
+    """immutable holdout raw key와 public alias의 충돌을 sidecar와 독립 재계산한다."""
+
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0},
+    )
+    assert _run(module, root, monkeypatch) == 0
+    manifest_dir = root / "data/manifests"
+    validate_manifest_generation(
+        manifest_dir,
+        required_tags={"esc50"},
+        repo_root=root,
+    )
+
+    manifest_path = manifest_dir / "esc50.jsonl"
+    entries = [
+        json.loads(line)
+        for line in manifest_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    target = entries[0]
+    old_group = target["group_id"]
+    target["lineage_keys"] = [
+        "conservative_speech_book_numeric:340",
+        "dns_book:340",
+    ]
+    target["group_id"] = "public-lineage-" + canonical_json_sha256(
+        {
+            "lineage_keys": target["lineage_keys"],
+            "content_sha256": [target["content_sha256"]],
+        }
+    )
+    module.write_manifest(entries, manifest_path)
+
+    holdout_path = manifest_dir / "recorded_holdout.json"
+    holdout = json.loads(holdout_path.read_text(encoding="utf-8"))
+    held_row = next(
+        row
+        for row in holdout["clip_lineage"]["clips"]
+        if row["family"] == "environment"
+    )
+    # 기존 holdout schema의 authoritative Libri key만 둔다. alias를 artifact에
+    # 써 넣지 않아도 validator 소비 시점에 동일한 numeric alias를 유도해야 한다.
+    held_row["lineage_keys"] = ["gutenberg_book:340"]
+    holdout["clip_lineage"]["clips_sha256"] = canonical_json_sha256(
+        holdout["clip_lineage"]["clips"]
+    )
+    holdout_path.write_text(
+        json.dumps(holdout, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    sidecar_path = manifest_dir / "manifest_generation.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["manifests"]["esc50"]["sha256"] = hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    sidecar["holdout_sha256"] = hashlib.sha256(
+        holdout_path.read_bytes()
+    ).hexdigest()
+    lineage = sidecar["public_lineage"]
+    lineage["holdout_clips_sha256"] = holdout["clip_lineage"]["clips_sha256"]
+    component = lineage["components"].pop(old_group)
+    component["lineage_keys"] = list(target["lineage_keys"])
+    component["excluded_by_holdout"] = False
+    component["overlap"] = {
+        "basename": [],
+        "content_sha256": [],
+        "lineage_keys": [],
+    }
+    lineage["components"][target["group_id"]] = component
+    lineage["components"] = {
+        key: lineage["components"][key] for key in sorted(lineage["components"])
+    }
+    lineage["component_count"] = len(lineage["components"])
+    lineage["component_membership_sha256"] = canonical_json_sha256(
+        lineage["components"]
+    )
+    manifest_summary = module.validate_public_manifest_lineage({"esc50": entries})
+    lineage["manifest_component_count"] = manifest_summary["component_count"]
+    lineage["manifest_component_membership_sha256"] = manifest_summary[
+        "component_membership_sha256"
+    ]
+    basis = {
+        key: value
+        for key, value in sidecar.items()
+        if key not in {"build_id", "created_at"}
+    }
+    sidecar["build_id"] = hashlib.sha256(
+        manifest_contract._canonical_json_bytes(basis)
+    ).hexdigest()
+    sidecar_path.write_bytes(manifest_contract._canonical_json_bytes(sidecar))
+
+    with pytest.raises(ValueError, match="holdout.*lineage 누수"):
+        validate_manifest_generation(
+            manifest_dir,
+            required_tags={"esc50"},
             repo_root=root,
         )
 

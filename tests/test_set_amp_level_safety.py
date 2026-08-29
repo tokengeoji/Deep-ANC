@@ -241,6 +241,332 @@ def test_meter_followup_command_always_requires_fresh_user_presence(bootstrap):
     assert ("--bootstrap-level-evidence" in command) is bootstrap
 
 
+def test_default_strict_followup_command_remains_byte_exact():
+    assert meter.strict_followup_command(
+        "results/meter/raw.npz",
+        capture_id="abcdef012345",
+        bootstrap=False,
+    ) == (
+        "  .venv/bin/python scripts/data/measure_paths_interleaved.py "
+        "--meter-raw results/meter/raw.npz "
+        "--confirm-same-amplifier-setting --confirm-user-present "
+        "--confirm-volume-minimum --confirm-routing-and-geometry "
+        "--primary-out assets/measured/primary_path_il_strict_abcdef01.npz "
+        "--secondary-out assets/measured/secondary_path_il_strict_abcdef01.npz"
+    )
+
+
+def test_broadband_followup_command_carries_exact_inputs_and_all_confirmations():
+    command = meter.broadband_followup_command(
+        "results/meter raw/meter_raw.npz",
+        plan="results/plans/live authority.json",
+        raw_session_dir="results/calibration_interleaved/broadband/session-01",
+        level_evidence="assets/measured/measurement_level_evidence.json",
+        hardware="configs/custom hardware.yaml",
+    )
+
+    assert "scripts/data/measure_paths_broadband_interleaved.py" in command
+    assert "--execute-live" in command
+    assert "'results/meter raw/meter_raw.npz'" in command
+    assert "'results/plans/live authority.json'" in command
+    assert "--hardware 'configs/custom hardware.yaml'" in command
+    assert (
+        "--raw-session-dir results/calibration_interleaved/broadband/session-01"
+        in command
+    )
+    assert (
+        "--level-evidence assets/measured/measurement_level_evidence.json" in command
+    )
+    for confirmation in (
+        "--confirm-speaker",
+        "--confirm-user-present",
+        "--confirm-volume-minimum",
+        "--confirm-routing-and-geometry",
+        "--confirm-same-amplifier-setting",
+    ):
+        assert confirmation in command
+
+
+def test_fullband_v5_contract_and_command_are_exact_capture_only() -> None:
+    args = SimpleNamespace(
+        followup_mode="fullband-v5",
+        broadband_plan=None,
+        broadband_raw_session_dir=None,
+        bootstrap_level_evidence=False,
+        hardware="configs/hardware_jetson.yaml",
+        level_evidence="assets/measured/measurement_level_evidence.json",
+    )
+    contract = meter.validate_followup_contract(args)
+    assert contract["schema"] == "fullband_v5_meter_followup_v1"
+    assert contract["status"] == "blocked_until_v5_live_adapter_implementation"
+    assert contract["capture_only"] is True
+    assert contract["plan_live_capture_enabled"] is False
+    assert contract["sealed_raw"] == {
+        "path": "results/fullband_causal_v5/raw_capture.npz",
+        "fresh": True,
+    }
+    command = meter.fullband_v5_followup_command(
+        "results/meter/raw.npz", contract=contract
+    )
+    assert "measure_paths_fullband_causal_v5.py --execute-live" in command
+    for fragment in (
+        "--plan-envelope assets/contracts/fullband_causal_v5_signal_plan.json",
+        "--live-authority assets/contracts/fullband_causal_v5_live_capture_authority.json",
+        "--meter-raw results/meter/raw.npz",
+        "--level-evidence assets/measured/measurement_level_evidence.json",
+        "--hardware configs/hardware_jetson.yaml",
+        "--raw-target results/fullband_causal_v5/raw_capture.npz",
+        "--confirm-speaker",
+        "--confirm-user-present",
+        "--confirm-volume-minimum",
+        "--confirm-routing-and-geometry",
+        "--confirm-same-amplifier-setting",
+    ):
+        assert fragment in command
+    assert "measure_paths_interleaved.py" not in command
+    assert "measure_paths_broadband_interleaved.py" not in command
+    assert "--primary-out" not in command
+
+
+def test_fullband_v5_rejects_old_broadband_arguments() -> None:
+    args = SimpleNamespace(
+        followup_mode="fullband-v5",
+        broadband_plan="old-v4.json",
+        broadband_raw_session_dir=None,
+        bootstrap_level_evidence=False,
+        hardware="configs/hardware_jetson.yaml",
+        level_evidence="assets/measured/measurement_level_evidence.json",
+    )
+    with pytest.raises(ValueError, match="old --broadband"):
+        meter.validate_followup_contract(args)
+
+
+def test_fullband_v5_authority_tamper_stops_before_sounddevice(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(
+        meter,
+        "_validate_fullband_v5_followup_contract",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("authority file SHA tamper")),
+    )
+    monkeypatch.setattr(
+        meter,
+        "measure",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("tamper 뒤 sounddevice/meter에 도달하면 안 됩니다")
+        ),
+    )
+    result = meter.main(
+        [
+            "--followup-mode",
+            "fullband-v5",
+            "--confirm-speaker",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+            "--confirm-routing-and-geometry",
+            "--confirm-same-amplifier-setting",
+        ]
+    )
+    assert result == 2
+    assert "authority file SHA tamper" in capsys.readouterr().err
+
+
+def test_fullband_v5_requires_all_five_confirmations_before_meter(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(
+        meter,
+        "measure",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("5 confirmations 전에 meter를 열면 안 됩니다")
+        ),
+    )
+    result = meter.main(
+        [
+            "--followup-mode",
+            "fullband-v5",
+            "--confirm-speaker",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+        ]
+    )
+    assert result == 2
+    assert "5개 confirmation" in capsys.readouterr().err
+
+
+def test_fullband_v5_meter_signal_duration_peak_and_channel_role() -> None:
+    signal = meter.probe_signal(20.0)
+    assert signal.shape == (960_000,)
+    assert np.max(np.abs(signal)) <= 0.003 + 1.0e-8
+    output = np.zeros((len(signal), 2), dtype=np.float32)
+    output[:, 0] = signal
+    assert np.any(output[:, 0] != 0.0)
+    assert np.all(output[:, 1] == 0.0)
+
+
+def test_broadband_followup_missing_plan_stops_before_meter(monkeypatch, capsys):
+    monkeypatch.setattr(
+        meter,
+        "measure",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("followup preflight 실패 뒤 meter를 열면 안 됩니다")
+        ),
+    )
+
+    assert meter.main(
+        [
+            "--followup-mode",
+            "broadband",
+            "--broadband-raw-session-dir",
+            "results/calibration_interleaved/broadband/fresh-session",
+            "--confirm-speaker",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+        ]
+    ) == 2
+    assert "--broadband-plan" in capsys.readouterr().err
+
+
+def test_broadband_followup_rejects_target_outside_results_before_meter(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        meter,
+        "measure",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("부적절한 target으로 meter를 열면 안 됩니다")
+        ),
+    )
+
+    assert meter.main(
+        [
+            "--followup-mode",
+            "broadband",
+            "--broadband-plan",
+            "results/missing-plan.json",
+            "--broadband-raw-session-dir",
+            "assets/measured/not-a-raw-session",
+            "--confirm-speaker",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+        ]
+    ) == 2
+    assert "results/ 아래" in capsys.readouterr().err
+
+
+def test_broadband_followup_rejects_existing_target_before_plan_or_meter(
+    tmp_path, monkeypatch, capsys
+):
+    from scripts.data import measure_paths_broadband_interleaved as broadband
+
+    existing = tmp_path / "results" / "existing-session"
+    existing.mkdir(parents=True)
+    monkeypatch.setattr(meter, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(broadband, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        meter,
+        "measure",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("기존 target으로 meter를 열면 안 됩니다")
+        ),
+    )
+
+    assert meter.main(
+        [
+            "--followup-mode",
+            "broadband",
+            "--broadband-plan",
+            "results/missing-plan.json",
+            "--broadband-raw-session-dir",
+            "results/existing-session",
+            "--confirm-speaker",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+        ]
+    ) == 2
+    assert "덮어쓰지 않습니다" in capsys.readouterr().err
+
+
+def test_broadband_followup_rejects_bootstrap_pairing_before_meter(monkeypatch, capsys):
+    monkeypatch.setattr(
+        meter,
+        "measure",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("bootstrap+broadband에서 meter를 열면 안 됩니다")
+        ),
+    )
+
+    assert meter.main(
+        [
+            "--bootstrap-level-evidence",
+            "--followup-mode",
+            "broadband",
+            "--broadband-plan",
+            "results/missing-plan.json",
+            "--broadband-raw-session-dir",
+            "results/calibration_interleaved/broadband/fresh-session",
+            "--confirm-speaker",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+        ]
+    ) == 2
+    assert "--bootstrap-level-evidence" in capsys.readouterr().err
+
+
+def test_broadband_followup_revalidation_detects_plan_binding_change(monkeypatch):
+    contract = {
+        "schema": "broadband_meter_followup_v1",
+        "mode": "broadband",
+        "plan": {
+            "path": "results/authority.json",
+            "file_sha256": "1" * 64,
+            "payload_sha256": "2" * 64,
+            "pcm_sha256": "3" * 64,
+        },
+        "raw_session_dir": "results/fresh-session",
+        "hardware": {"path": "configs/hardware.yaml", "sha256": "4" * 64},
+        "level_evidence": {"path": "assets/level.json", "sha256": "5" * 64},
+    }
+    changed = {
+        **contract,
+        "plan": {**contract["plan"], "file_sha256": "f" * 64},
+    }
+    monkeypatch.setattr(
+        meter,
+        "_validate_broadband_followup_contract",
+        lambda **kwargs: changed,
+    )
+
+    with pytest.raises(ValueError, match="최초 preflight 이후 변경"):
+        meter.revalidate_followup_contract(contract)
+
+
+def test_broadband_followup_revalidation_detects_target_claim(monkeypatch):
+    contract = {
+        "schema": "broadband_meter_followup_v1",
+        "mode": "broadband",
+        "plan": {
+            "path": "results/authority.json",
+            "file_sha256": "1" * 64,
+            "payload_sha256": "2" * 64,
+            "pcm_sha256": "3" * 64,
+        },
+        "raw_session_dir": "results/fresh-session",
+        "hardware": {"path": "configs/hardware.yaml", "sha256": "4" * 64},
+        "level_evidence": {"path": "assets/level.json", "sha256": "5" * 64},
+    }
+    monkeypatch.setattr(
+        meter,
+        "_validate_broadband_followup_contract",
+        lambda **kwargs: (_ for _ in ()).throw(
+            FileExistsError("raw target claimed during meter")
+        ),
+    )
+
+    with pytest.raises(FileExistsError, match="target claimed"):
+        meter.revalidate_followup_contract(contract)
+
+
 def test_meter_close_failure_prints_physical_disconnect_warning(capsys):
     class FakeSD:
         class CallbackStop(Exception):
@@ -1283,8 +1609,9 @@ def test_explicit_bootstrap_mode_reaches_measure_without_existing_evidence(
 
 
 @requires_portaudio
+@pytest.mark.parametrize("followup_mode", ("strict", "broadband", "fullband-v5"))
 def test_normal_meter_uses_permanent_evidence_but_always_emits_fresh_raw(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, followup_mode
 ):
     events = []
     hardware_config = {
@@ -1310,6 +1637,7 @@ def test_normal_meter_uses_permanent_evidence_but_always_emits_fresh_raw(
         meter,
         "load_measurement_level_evidence",
         lambda *_a, **_k: {
+            "schema": "measurement_level_evidence_v2_bootstrap_pair",
             "hardware_identity": identity,
             "_evidence_path": "assets/measured/measurement_level_evidence.json",
             "_evidence_sha256": "e" * 64,
@@ -1364,6 +1692,65 @@ def test_normal_meter_uses_permanent_evidence_but_always_emits_fresh_raw(
         )
 
     monkeypatch.setattr(meter, "capture_meter_stream", fake_capture)
+    followup = {"mode": "strict"}
+    if followup_mode == "broadband":
+        followup = {
+            "schema": "broadband_meter_followup_v1",
+            "mode": "broadband",
+            "plan": {
+                "path": "results/data_audit/test-authority.json",
+                "file_sha256": "1" * 64,
+                "payload_sha256": "2" * 64,
+                "pcm_sha256": "3" * 64,
+            },
+            "raw_session_dir": "results/calibration_interleaved/broadband/test-session",
+            "hardware": {
+                "path": "configs/hardware_jetson.yaml",
+                "sha256": meter._sha256_file(
+                    meter.REPO_ROOT / "configs/hardware_jetson.yaml"
+                ),
+            },
+            "level_evidence": {
+                "path": "assets/measured/measurement_level_evidence.json",
+                "sha256": "e" * 64,
+            },
+        }
+    elif followup_mode == "fullband-v5":
+        followup = {
+            "schema": "fullband_v5_meter_followup_v1",
+            "mode": "fullband-v5",
+            "status": "blocked_until_v5_live_adapter_implementation",
+            "capture_only": True,
+            "plan_live_capture_enabled": False,
+            "plan_envelope": {
+                "path": "assets/contracts/fullband_causal_v5_signal_plan.json",
+            },
+            "live_capture_authority": {
+                "path": "assets/contracts/fullband_causal_v5_live_capture_authority.json",
+            },
+            "sealed_raw": {
+                "path": "results/fullband_causal_v5/raw_capture.npz",
+                "fresh": True,
+            },
+            "hardware": {
+                "path": "configs/hardware_jetson.yaml",
+                "sha256": meter._sha256_file(
+                    meter.REPO_ROOT / "configs/hardware_jetson.yaml"
+                ),
+            },
+            "level_evidence": {
+                "path": "assets/measured/measurement_level_evidence.json",
+                "sha256": "e" * 64,
+                "schema": "measurement_level_evidence_v2_bootstrap_pair",
+            },
+            "canonical_payload_sha256": "f" * 64,
+        }
+    revalidations = []
+    monkeypatch.setattr(
+        meter,
+        "revalidate_followup_contract",
+        lambda contract: revalidations.append(dict(contract)) or contract,
+    )
 
     def fake_write(_path, **kwargs):
         observed["metadata"] = kwargs["metadata"]
@@ -1383,6 +1770,9 @@ def test_normal_meter_uses_permanent_evidence_but_always_emits_fresh_raw(
         confirm_speaker=True,
         confirm_user_present=True,
         confirm_volume_minimum=True,
+        confirm_routing_and_geometry=True,
+        confirm_same_amplifier_setting=True,
+        _validated_followup_contract=followup,
     )
 
     assert meter.measure(args) == 0
@@ -1401,5 +1791,29 @@ def test_normal_meter_uses_permanent_evidence_but_always_emits_fresh_raw(
     assert "--meter-raw results/fresh_normal_meter.npz" in output
     assert "--confirm-same-amplifier-setting" in output
     assert "--confirm-user-present" in output
-    assert "--primary-out assets/measured/primary_path_il_strict_cap.npz" in output
-    assert "--secondary-out assets/measured/secondary_path_il_strict_cap.npz" in output
+    if followup_mode == "strict":
+        assert "--primary-out assets/measured/primary_path_il_strict_cap.npz" in output
+        assert "--secondary-out assets/measured/secondary_path_il_strict_cap.npz" in output
+        assert len(revalidations) == 2
+        assert "followup_contract" not in observed["metadata"]
+    elif followup_mode == "broadband":
+        assert "measure_paths_broadband_interleaved.py --execute-live" in output
+        assert "--hardware configs/hardware_jetson.yaml" in output
+        assert "--plan results/data_audit/test-authority.json" in output
+        assert "--primary-out" not in output
+        assert len(revalidations) == 4
+        assert observed["metadata"]["followup_contract"] == followup
+        assert observed["metadata"]["hardware"] == followup["hardware"]
+        assert observed["metadata"]["calibration_evidence"] == {
+            "mode": "verified_existing",
+            **followup["level_evidence"],
+        }
+    else:
+        assert "measure_paths_fullband_causal_v5.py --execute-live" in output
+        assert "blocked_until_v5_live_adapter_implementation" in output
+        assert "--plan-envelope assets/contracts/fullband_causal_v5_signal_plan.json" in output
+        assert "--live-authority assets/contracts/fullband_causal_v5_live_capture_authority.json" in output
+        assert "--raw-target results/fullband_causal_v5/raw_capture.npz" in output
+        assert len(revalidations) == 4
+        assert observed["metadata"]["followup_contract"] == followup
+        assert all(observed["metadata"]["fullband_v5_operator_confirmations"].values())

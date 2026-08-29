@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,27 +47,12 @@ SCAN_ROOTS = (REPO_ROOT / "src", REPO_ROOT / "scripts")
 AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     # 규약 자체를 정의하는 곳
     "src/deep_anc/audio_io.py": (False, True, "규약의 단일 출처. 장치 해석과 게이트를 제공한다"),
-    "src/deep_anc/dsp/fullband_v5_meter.py": (
-        False,
-        True,
-        "v5 meter consumer가 static 계약 뒤 현재 PortAudio device identity만 조회한다",
-    ),
     # 실기 런타임
     "src/deep_anc/realtime/run_realtime.py": (True, True, "ANC 런타임. 명시적 사용자·볼륨·장치 게이트"),
     "src/deep_anc/baselines/fxlms_core.py": (False, True, "FxLMS 오프라인 기준선 유틸리티"),
     # 측정·수집
     "scripts/data/record_duct.py": (True, True, "실측 세션 수집. 레일 게이트 + 저장 시점 정렬 게이트"),
     "scripts/data/measure_paths_interleaved.py": (True, True, "P/S 동시 측정"),
-    "scripts/data/measure_paths_fullband_causal_v5.py": (
-        True,
-        True,
-        "v5 광대역 P/S 실측. 지연 import한 sounddevice도 동일 진입 규약 적용",
-    ),
-    "scripts/data/measure_paths_fullband_causal_v6.py": (
-        True,
-        True,
-        "v6 클록 checkpoint P/S 실측. 지연 import한 sounddevice도 동일 진입 규약 적용",
-    ),
     "scripts/data/calibrate_wideband.py": (True, True, "채널별 ESS 측정"),
     "scripts/data/set_amp_level.py": (True, True, "앰프 레벨 교정 미터"),
     # 벤치·진단 (실기 필요, 학습 산출물에 직접 들어가지 않음)
@@ -77,11 +63,6 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     "scripts/bench/measure_duct_transfer_map.py": (True, True, "덕트 전달맵 측정"),
     "scripts/bench/playback_duct_probe.py": (True, True, "재생 프로브"),
     "scripts/bench/sweep_probe_level.py": (True, True, "프로브 레벨 스윕"),
-    "scripts/jetson/audit_rt5640_zero_duplex.py": (
-        True,
-        True,
-        "RT5640 공유-rate 후보의 exact-zero 전이중 smoke. 물리 분리와 APE 전역 점유 게이트",
-    ),
     "scripts/demo/evaluate_fxlms_direct.py": (True, True, "FxLMS 실기 평가"),
 }
 
@@ -89,7 +70,6 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
 PRECONDITION_CALLS = frozenset(
     {
         "assert_measurement_preconditions",
-        "capture_measurement_preflight_raw",
         "assert_live_pcm_clock_preconditions",
         "input_rail_gate",  # 레일 게이트를 직접 부르는 진입점
     }
@@ -110,11 +90,7 @@ def _python_files() -> list[Path]:
 
 def _uses_sounddevice(path: Path) -> bool:
     text = path.read_text(encoding="utf-8", errors="ignore")
-    return (
-        "import sounddevice" in text
-        or 'import_module("sounddevice")' in text
-        or "import_module('sounddevice')" in text
-    )
+    return "import sounddevice" in text
 
 
 def _called_names(path: Path) -> set[str]:
@@ -370,88 +346,48 @@ def test_precondition_checks_both_pcm_endpoints_before_recording(monkeypatch):
         audio_io.assert_measurement_preconditions(_MustNotRecord(), hardware)
 
 
-def test_public_preflight_returns_owned_post_settle_int32_raw(monkeypatch):
-    """총 1.5초를 입력만 캡처하고 앞 0.5초를 버린 exact raw를 반환한다."""
-
-    import numpy as np
+def test_public_measurement_preflight_is_input_only_owned_and_analyzer_bound(
+    monkeypatch,
+):
     import deep_anc.audio_io as audio_io
 
-    events = []
     fs = 48_000
+    source = np.empty((int(1.5 * fs), 2), dtype="<i4")
+    rng = np.random.default_rng(7)
+    source[:] = np.rint(rng.normal(0.0, 2_000_000.0, source.shape)).astype("<i4")
+    calls = []
+
+    class InputOnly:
+        def check_input_settings(self, **kwargs):
+            calls.append(("check_input", kwargs))
+
+        def rec(self, frames, **kwargs):
+            calls.append(("rec", frames, kwargs))
+            return source
+
+        def wait(self):
+            calls.append(("wait",))
+
     hardware = {
         "sample_rate": fs,
         "input": {"card": "APE", "pcm": 1},
         "output": {"card": "Audio", "pcm": 0},
     }
-
-    class _InputOnlyDevice:
-        def rec(self, frames, **kwargs):
-            events.append(("rec", int(frames), dict(kwargs)))
-            rng = np.random.default_rng(7)
-            signal = rng.integers(-2_000_000, 2_000_000, size=(int(frames), 2), dtype=np.int32)
-            return signal
-
-        def wait(self):
-            events.append(("wait",))
-
-        def play(self, *_args, **_kwargs):  # pragma: no cover - 호출되면 즉시 실패
-            raise AssertionError("input-only preflight가 출력 API를 호출했습니다")
-
-        def Stream(self, *_args, **_kwargs):  # noqa: N802  # pragma: no cover
-            raise AssertionError("input-only preflight가 duplex/output stream을 열었습니다")
-
-    monkeypatch.setattr(audio_io, "assert_measurement_pcm_unoccupied", lambda _h: events.append(("pcm",)))
-    monkeypatch.setattr(audio_io, "assert_capture_clock_undisturbed", lambda _c: events.append(("clock",)))
-    monkeypatch.setattr(audio_io, "resolve_alsa_portaudio_device", lambda *_a, **_k: 17)
-
+    monkeypatch.setattr(audio_io, "assert_measurement_pcm_unoccupied", lambda _h: calls.append(("pcm",)))
+    monkeypatch.setattr(audio_io, "assert_capture_clock_undisturbed", lambda _c: calls.append(("clock",)))
+    monkeypatch.setattr(audio_io, "resolve_alsa_portaudio_device", lambda *_a, **_k: 4)
     raw, report = audio_io.capture_measurement_preflight_raw(
-        _InputOnlyDevice(), hardware
+        InputOnly(), hardware, seconds=1.5
     )
-
-    assert events[:2] == [("pcm",), ("clock",)]
-    assert events[2][0:2] == ("rec", 72_000)
-    assert events[2][2] == {
-        "samplerate": 48_000,
-        "channels": 2,
-        "dtype": "int32",
-        "device": 17,
-    }
-    assert events[3] == ("wait",)
+    expected = audio_io.analyze_int32_input_probe(raw)
     assert raw.dtype == np.dtype("<i4")
     assert raw.shape == (48_000, 2)
-    assert raw.flags.owndata and raw.flags.c_contiguous
-    assert report["frames"] == 48_000
-    assert report["resolved_input_device"] == 17
-    assert report["capture_seconds"] == 1.5
-    assert report["settle_seconds"] == 0.5
-    assert report["analyzed_seconds"] == 1.0
-    assert report["passed"] is True
-
-
-def test_assert_preconditions_delegates_to_public_raw_capture(monkeypatch):
-    import numpy as np
-    import deep_anc.audio_io as audio_io
-
-    calls = []
-    report = {
-        "passed": True,
-        "channels": [
-            {"channel": 0, "clip_ratio": 0.001},
-            {"channel": 1, "clip_ratio": 0.002},
-        ],
-    }
-    monkeypatch.setattr(
-        audio_io,
-        "capture_measurement_preflight_raw",
-        lambda sd, hardware, **kwargs: (
-            calls.append((sd, hardware, kwargs))
-            or (np.zeros((1, 2), dtype="<i4"), report)
-        ),
-    )
-
-    marker = object()
-    hardware = {"sample_rate": 48_000, "input": {"card": "APE", "pcm": 1}}
-    ratios = audio_io.assert_measurement_preconditions(marker, hardware, seconds=1.5)
-
-    assert ratios == [0.001, 0.002]
-    assert calls == [(marker, hardware, {"seconds": 1.5, "settle_seconds": 0.5})]
+    assert raw.flags.c_contiguous and raw.flags.owndata
+    assert report["channels"] == expected["channels"]
+    assert report["frames"] == expected["frames"]
+    assert report["resolved_input_device"] == 4
+    assert calls[0:2] == [("pcm",), ("clock",)]
+    assert calls[2][0] == "check_input"
+    assert calls[3][0] == "rec"
+    source.fill(0)
+    assert np.any(raw != 0)

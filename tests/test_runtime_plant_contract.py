@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 
 import pytest
 
@@ -71,9 +72,14 @@ def test_realtime_constructor_checks_the_strict_plant_before_sounddevice_import(
 
 
 def test_realtime_constructor_rejects_legacy_engine_lead_before_sounddevice_import(
-    monkeypatch,
+    monkeypatch, tmp_path
 ):
-    """runtime YAML만 115로 덮어도 ONNX의 실제 109 lead가 먼저 거부된다."""
+    """runtime YAML만 115로 덮어도 109 artifact가 먼저 거부된다.
+
+    Elice bootstrap에는 Jetson의 legacy ONNX를 의도적으로 전송하지 않는다. 따라서
+    이 회귀는 실제 ``runs/export`` 존재에 기대지 않고, metadata preflight가 읽는
+    최소 artifact/sidecar를 임시 경로에 만들어 같은 계약을 검증한다.
+    """
 
     original_import = builtins.__import__
 
@@ -83,5 +89,12 @@ def test_realtime_constructor_rejects_legacy_engine_lead_before_sounddevice_impo
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
+    artifact = tmp_path / "legacy_tiny.onnx"
+    artifact.write_bytes(b"metadata preflight only; no ONNX session is opened")
+    artifact.with_suffix(".json").write_text(
+        json.dumps({"digital_reference_lead_samples": 109}), encoding="utf-8"
+    )
+    cfg = _strict_runtime_cfg()
+    cfg["engine"]["onnx"] = str(artifact)
     with pytest.raises(ValueError, match="runtime=115, checkpoint=109"):
-        RealtimeANC(_strict_runtime_cfg())
+        RealtimeANC(cfg)

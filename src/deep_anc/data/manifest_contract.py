@@ -15,7 +15,6 @@ import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..config import REPO_ROOT
 from .decoder_audit import (
     DEFAULT_AUDIO_EXTENSIONS,
     DEFAULT_SEGMENT_FRAMES,
@@ -33,9 +32,16 @@ from .public_lineage import (
     PUBLIC_LINEAGE_SCHEMA,
     PublicLineageError,
     canonical_json_sha256,
+    conservative_cross_corpus_speech_lineage_keys,
     validate_dns_marker_partition,
+    validate_public_crosswalk_policy,
     validate_public_manifest_lineage,
     validate_recorded_clip_lineage,
+)
+from .recorded_generation_exclusion import (
+    RecordedGenerationExclusionError,
+    find_recorded_generation_overlaps,
+    validate_recorded_generation_exclusion,
 )
 
 
@@ -44,6 +50,7 @@ CANONICAL_MANIFEST_SCHEMA_VERSION = 4
 DECODER_AUDIT_FILE = "decoder_audit.json"
 DECODER_AUDIT_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def sha256_file(path: Path) -> str:
@@ -1103,6 +1110,12 @@ def validate_manifest_generation(
         raise ValueError("manifest generation public_lineage schema_version=1 증거가 없습니다")
     if lineage.get("lineage_schema") != PUBLIC_LINEAGE_SCHEMA:
         raise ValueError("manifest generation public_lineage schema가 canonical 값이 아닙니다")
+    try:
+        validate_public_crosswalk_policy(lineage.get("crosswalk_policy"))
+    except PublicLineageError as exc:
+        raise ValueError(
+            f"manifest generation public_lineage crosswalk_policy 오류: {exc}"
+        ) from exc
     metadata = lineage.get("metadata")
     if not isinstance(metadata, dict) or not metadata:
         raise ValueError("manifest generation public_lineage metadata가 비었습니다")
@@ -1175,7 +1188,20 @@ def validate_manifest_generation(
         raise ValueError("public_lineage와 holdout clip_lineage digest가 다릅니다")
     holdout_names = {row["clip"] for row in holdout_rows}
     holdout_content = {row["content_sha256"] for row in holdout_rows}
-    holdout_keys = {key for row in holdout_rows for key in row["lineage_keys"]}
+    # holdout artifact 자체는 immutable v1 bytes로 유지한다. 그 authoritative raw
+    # Libri key를 소비 시점에 public v2와 동일한 보수적 exclusion alias로 닫는다.
+    try:
+        holdout_keys = {
+            key
+            for row in holdout_rows
+            for key in conservative_cross_corpus_speech_lineage_keys(
+                row["lineage_keys"]
+            )
+        }
+    except PublicLineageError as exc:
+        raise ValueError(
+            f"manifest generation holdout speech alias 결속 오류: {exc}"
+        ) from exc
     leaked: list[str] = []
     for tag, entries in sorted(validated_entries.items()):
         for entry in entries:
@@ -1192,6 +1218,30 @@ def validate_manifest_generation(
             f"{leaked[:8]}"
         )
 
+    generation_exclusion = payload.get("recorded_generation_exclusion")
+    validated_generation_exclusion: dict[str, Any] | None = None
+    if generation_exclusion is not None:
+        try:
+            validated_generation_exclusion = validate_recorded_generation_exclusion(
+                generation_exclusion,
+                repo_root=contract_root,
+            )
+            generation_leaks = find_recorded_generation_overlaps(
+                validated_generation_exclusion,
+                validated_entries,
+                repo_root=contract_root,
+            )
+        except RecordedGenerationExclusionError as exc:
+            raise ValueError(
+                f"manifest generation recorded additions exclusion 오류: {exc}"
+            ) from exc
+        if generation_leaks:
+            raise ValueError(
+                "recorded generation additions와 synthetic manifest의 "
+                "basename/content/lineage 누수: "
+                f"{generation_leaks[:8]}"
+            )
+
     build_id = payload.get("build_id")
     if not isinstance(build_id, str) or _SHA256_RE.fullmatch(build_id) is None:
         raise ValueError("manifest generation build_id가 canonical SHA-256가 아닙니다")
@@ -1207,6 +1257,9 @@ def validate_manifest_generation(
     snapshot["_validated_manifest_bytes"] = validated_bytes
     snapshot["_validated_sidecar_bytes"] = sidecar_bytes
     snapshot["_validated_decoder_audit"] = decoder_audit
+    snapshot["_validated_recorded_generation_exclusion"] = (
+        validated_generation_exclusion
+    )
     # JSONL 행을 변형하지 않고, canonical v4 audit을 통과한 generation이라는 사실을
     # dataset/NoisePool 경계에 전달한다. NoisePool은 이 marker가 있을 때 재시도 대신
     # 비정상 decode를 hard fail로 취급해야 한다.

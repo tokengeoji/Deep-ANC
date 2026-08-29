@@ -5,11 +5,16 @@ import pytest
 
 from deep_anc.eval.metrics import (
     attenuation_db,
+    band_power,
     band_nmse_db,
     intersect_frequency_bands,
     nmse_db,
     octave_band_attenuation,
     segment_stats,
+)
+from deep_anc.eval.trusted_subbands import (
+    STRICT_TRUSTED_SUBBANDS_HZ,
+    strict_subband_includes_upper_edge,
 )
 
 FS = 48000
@@ -67,6 +72,31 @@ def test_intersect_frequency_bands_fails_fast(first, second, match):
 
 def test_intersect_frequency_bands_uses_measured_and_target_overlap():
     assert intersect_frequency_bands((150, 600), (80, 800), FS / 2) == (150, 600)
+
+
+def test_strict_subband_partition_does_not_double_count_1000hz_boundary():
+    """1000 Hz target은 1000–1600만 채우며 두 부대역 coverage가 될 수 없다."""
+
+    samples = 1_536
+    time = np.arange(samples, dtype=np.float64) / FS
+    target = np.sin(2.0 * np.pi * 1000.0 * time)
+    lower = STRICT_TRUSTED_SUBBANDS_HZ[2]
+    upper = STRICT_TRUSTED_SUBBANDS_HZ[3]
+    lower_power = band_power(
+        target,
+        FS,
+        lower,
+        include_upper=strict_subband_includes_upper_edge(lower),
+    )
+    upper_power = band_power(
+        target,
+        FS,
+        upper,
+        include_upper=strict_subband_includes_upper_edge(upper),
+    )
+
+    assert upper_power > 0.1
+    assert lower_power < upper_power * 1.0e-12
 
 
 def test_band_nmse_fails_when_fft_has_no_band_bin():
