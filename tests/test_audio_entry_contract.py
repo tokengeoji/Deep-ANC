@@ -57,6 +57,16 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     # 측정·수집
     "scripts/data/record_duct.py": (True, True, "실측 세션 수집. 레일 게이트 + 저장 시점 정렬 게이트"),
     "scripts/data/measure_paths_interleaved.py": (True, True, "P/S 동시 측정"),
+    "scripts/data/measure_paths_fullband_causal_v5.py": (
+        True,
+        True,
+        "v5 광대역 P/S 실측. 지연 import한 sounddevice도 동일 진입 규약 적용",
+    ),
+    "scripts/data/measure_paths_fullband_causal_v6.py": (
+        True,
+        True,
+        "v6 클록 checkpoint P/S 실측. 지연 import한 sounddevice도 동일 진입 규약 적용",
+    ),
     "scripts/data/calibrate_wideband.py": (True, True, "채널별 ESS 측정"),
     "scripts/data/set_amp_level.py": (True, True, "앰프 레벨 교정 미터"),
     # 벤치·진단 (실기 필요, 학습 산출물에 직접 들어가지 않음)
@@ -67,6 +77,11 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     "scripts/bench/measure_duct_transfer_map.py": (True, True, "덕트 전달맵 측정"),
     "scripts/bench/playback_duct_probe.py": (True, True, "재생 프로브"),
     "scripts/bench/sweep_probe_level.py": (True, True, "프로브 레벨 스윕"),
+    "scripts/jetson/audit_rt5640_zero_duplex.py": (
+        True,
+        True,
+        "RT5640 공유-rate 후보의 exact-zero 전이중 smoke. 물리 분리와 APE 전역 점유 게이트",
+    ),
     "scripts/demo/evaluate_fxlms_direct.py": (True, True, "FxLMS 실기 평가"),
 }
 
@@ -95,7 +110,11 @@ def _python_files() -> list[Path]:
 
 def _uses_sounddevice(path: Path) -> bool:
     text = path.read_text(encoding="utf-8", errors="ignore")
-    return "import sounddevice" in text
+    return (
+        "import sounddevice" in text
+        or 'import_module("sounddevice")' in text
+        or "import_module('sounddevice')" in text
+    )
 
 
 def _called_names(path: Path) -> set[str]:
