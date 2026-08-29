@@ -7,6 +7,13 @@
 #     --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
 #     --expected-transfer-manifest-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
 #     --no-update
+# full-octave 학습을 주장하는 경우에는 일반 Stage-1 bootstrap과 별도로 다음을
+# 명시해야 한다. BSD35k fx-m 같은 native >=22628 Hz machine source의 official
+# archive/lineage/full-decode/native-PSD evidence가 없으면 public corpus 다운로드나
+# 학습으로 넘어가지 않는다.
+#   --full-octave \
+#   --full-octave-highrate-machine-evidence results/provenance/...json \
+#   --expected-full-octave-highrate-machine-evidence-sha256 <64-hex>
 # EXPECTED_COMMIT은 실행 전에 신뢰한 출처에서 확인한 **전체 40자리 SHA**여야 한다.
 # EXPECTED_HOLDOUT_SHA256도 Jetson에서 확인한 canonical 파일의 64자리 SHA여야 한다.
 # 일반 Elice 실행은 canonical provenance/recorded/RIR/strict P·S 전부를 포함한 transfer
@@ -44,6 +51,12 @@ EXPECTED_DECODER_AUDIT_FILE_SHA256=""
 EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN=0
 NO_UPDATE_SEEN=0
 PREFLIGHT_ONLY=0
+FULL_OCTAVE=0
+FULL_OCTAVE_SEEN=0
+FULL_OCTAVE_HIGHRATE_EVIDENCE=""
+FULL_OCTAVE_HIGHRATE_EVIDENCE_SEEN=0
+EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256=""
+EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256_SEEN=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-update)
@@ -189,6 +202,56 @@ while [ "$#" -gt 0 ]; do
     --preflight-only)
       PREFLIGHT_ONLY=1
       ;;
+    --full-octave)
+      if [ "$FULL_OCTAVE_SEEN" -ne 0 ]; then
+        echo "[오류] --full-octave는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      FULL_OCTAVE_SEEN=1
+      FULL_OCTAVE=1
+      ;;
+    --full-octave-highrate-machine-evidence)
+      if [ "$FULL_OCTAVE_HIGHRATE_EVIDENCE_SEEN" -ne 0 ]; then
+        echo "[오류] --full-octave-highrate-machine-evidence는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      FULL_OCTAVE_HIGHRATE_EVIDENCE_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --full-octave-highrate-machine-evidence 뒤에 evidence 상대경로가 필요합니다." >&2
+        exit 2
+      fi
+      FULL_OCTAVE_HIGHRATE_EVIDENCE=$1
+      ;;
+    --full-octave-highrate-machine-evidence=*)
+      if [ "$FULL_OCTAVE_HIGHRATE_EVIDENCE_SEEN" -ne 0 ]; then
+        echo "[오류] --full-octave-highrate-machine-evidence는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      FULL_OCTAVE_HIGHRATE_EVIDENCE_SEEN=1
+      FULL_OCTAVE_HIGHRATE_EVIDENCE=${1#*=}
+      ;;
+    --expected-full-octave-highrate-machine-evidence-sha256)
+      if [ "$EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-full-octave-highrate-machine-evidence-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --expected-full-octave-highrate-machine-evidence-sha256 뒤에 64자리 SHA-256이 필요합니다." >&2
+        exit 2
+      fi
+      EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256=$1
+      ;;
+    --expected-full-octave-highrate-machine-evidence-sha256=*)
+      if [ "$EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-full-octave-highrate-machine-evidence-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256_SEEN=1
+      EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256=${1#*=}
+      ;;
     *)
       echo "[오류] 알 수 없는 인자: $1" >&2
       exit 2
@@ -224,6 +287,24 @@ elif [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ] || [ "$EXPECTED_DECODER_AUD
 fi
 if [ "$NO_UPDATE_SEEN" -ne 1 ]; then
   echo "[오류] --no-update는 필수입니다. exact checkout에서 다시 실행하세요." >&2
+  exit 2
+fi
+if [ "$FULL_OCTAVE" -eq 1 ]; then
+  if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
+    echo "[오류] --full-octave와 --preflight-only는 함께 쓸 수 없습니다. 환경을 열지 않는 source 재검증은 audit_bsd35k_highrate_machine.py verify를 직접 실행하세요." >&2
+    exit 2
+  fi
+  if [ "$FULL_OCTAVE_HIGHRATE_EVIDENCE_SEEN" -ne 1 ] || \
+     [ -z "$FULL_OCTAVE_HIGHRATE_EVIDENCE" ] || \
+     [ "$EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256_SEEN" -ne 1 ] || \
+     [[ ! "$EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[오류] --full-octave에는 high-rate machine evidence 경로와 외부 64자리 SHA-256이 모두 필수입니다." >&2
+    exit 2
+  fi
+  EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256=${EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256,,}
+elif [ "$FULL_OCTAVE_HIGHRATE_EVIDENCE_SEEN" -ne 0 ] || \
+     [ "$EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256_SEEN" -ne 0 ]; then
+  echo "[오류] full-octave high-rate machine evidence 인자는 --full-octave와 함께만 지정할 수 있습니다." >&2
   exit 2
 fi
 if [[ ! "$RAW_HASH_WORKERS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
@@ -706,6 +787,26 @@ echo "[setup] reproducibility receipt: $ENVIRONMENT_RECEIPT"
 if ! environment_complete; then
   echo "[오류] setup_env.sh 이후에도 Python/CUDA 환경 검증에 실패했습니다." >&2
   exit 1
+fi
+
+# ``--full-octave``는 Stage-1 corpus bootstrap의 별칭이 아니다. high-rate machine
+# source가 없으면 16 kHz MIMII를 upsample한 tensor가 마지막 octave를 덮는 것처럼
+# 보일 수 있으므로, 환경만 준비한 뒤 public corpus download 전에 raw-bound evidence를
+# 먼저 직접 재검증한다. evidence PASS도 causal P/S·population·execution config를
+# 대체하지 않으므로 admission-only checker가 READY일 때만 아래 download 단계로 간다.
+if [ "$FULL_OCTAVE" -eq 1 ]; then
+  echo "=== [full-octave/0] high-rate machine source + admission gate ==="
+  if ! "$VENV_PYTHON" scripts/data/audit_bsd35k_highrate_machine.py verify \
+      --evidence "$FULL_OCTAVE_HIGHRATE_EVIDENCE" \
+      --expected-file-sha256 "$EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256"; then
+    echo "[오류] full-octave native high-rate machine source/lineage/decode/PSD evidence가 PASS가 아닙니다. public corpus 다운로드·manifest·학습을 시작하지 않습니다." >&2
+    exit 1
+  fi
+  if ! "$VENV_PYTHON" scripts/train/check_full_octave_v3_admission.py \
+      --config configs/full_octave_v3_admission.yaml --markdown; then
+    echo "[오류] high-rate machine source evidence와 별개로 full-octave P/S·population·execution admission이 BLOCKED입니다. public corpus 다운로드·manifest·학습을 시작하지 않습니다." >&2
+    exit 1
+  fi
 fi
 
 PGET=("$VENV_PYTHON" "$REPO/scripts/elice/pget.py")
