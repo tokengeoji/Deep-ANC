@@ -47,12 +47,32 @@ SCAN_ROOTS = (REPO_ROOT / "src", REPO_ROOT / "scripts")
 AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     # 규약 자체를 정의하는 곳
     "src/deep_anc/audio_io.py": (False, True, "규약의 단일 출처. 장치 해석과 게이트를 제공한다"),
+    "src/deep_anc/dsp/fullband_v5_meter.py": (
+        False,
+        True,
+        "v5 meter consumer가 static 계약 뒤 현재 PortAudio device identity만 조회한다",
+    ),
     # 실기 런타임
     "src/deep_anc/realtime/run_realtime.py": (True, True, "ANC 런타임. 명시적 사용자·볼륨·장치 게이트"),
     "src/deep_anc/baselines/fxlms_core.py": (False, True, "FxLMS 오프라인 기준선 유틸리티"),
     # 측정·수집
     "scripts/data/record_duct.py": (True, True, "실측 세션 수집. 레일 게이트 + 저장 시점 정렬 게이트"),
     "scripts/data/measure_paths_interleaved.py": (True, True, "P/S 동시 측정"),
+    "scripts/data/measure_paths_fullband_causal_v5.py": (
+        True,
+        True,
+        "v5 광대역 P/S 실측. 지연 import한 sounddevice도 동일 진입 규약 적용",
+    ),
+    "scripts/data/measure_paths_fullband_causal_v6.py": (
+        True,
+        True,
+        "v6 클록 checkpoint P/S 실측. 지연 import한 sounddevice도 동일 진입 규약 적용",
+    ),
+    "scripts/data/measure_paths_broadband_interleaved.py": (
+        True,
+        True,
+        "광대역 P/S 실측. 지연 import와 입력-only preflight 뒤에만 duplex를 연다",
+    ),
     "scripts/data/calibrate_wideband.py": (True, True, "채널별 ESS 측정"),
     "scripts/data/set_amp_level.py": (True, True, "앰프 레벨 교정 미터"),
     # 벤치·진단 (실기 필요, 학습 산출물에 직접 들어가지 않음)
@@ -63,6 +83,11 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     "scripts/bench/measure_duct_transfer_map.py": (True, True, "덕트 전달맵 측정"),
     "scripts/bench/playback_duct_probe.py": (True, True, "재생 프로브"),
     "scripts/bench/sweep_probe_level.py": (True, True, "프로브 레벨 스윕"),
+    "scripts/jetson/audit_rt5640_zero_duplex.py": (
+        True,
+        True,
+        "RT5640 공유-rate 후보의 exact-zero 전이중 smoke. 물리 분리와 APE 전역 점유 게이트",
+    ),
     "scripts/demo/evaluate_fxlms_direct.py": (True, True, "FxLMS 실기 평가"),
 }
 
@@ -70,6 +95,7 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
 PRECONDITION_CALLS = frozenset(
     {
         "assert_measurement_preconditions",
+        "capture_measurement_preflight_raw",
         "assert_live_pcm_clock_preconditions",
         "input_rail_gate",  # 레일 게이트를 직접 부르는 진입점
     }
@@ -89,8 +115,34 @@ def _python_files() -> list[Path]:
 
 
 def _uses_sounddevice(path: Path) -> bool:
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    return "import sounddevice" in text
+    """직접 import와 importlib 지연 import 모두 실제 backend 사용으로 본다."""
+
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:  # pragma: no cover - 컴파일 회귀가 별도로 잡는다
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            alias.name == "sounddevice" for alias in node.names
+        ):
+            return True
+        if isinstance(node, ast.ImportFrom) and node.module == "sounddevice":
+            return True
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        called_import_module = (
+            isinstance(func, ast.Name) and func.id == "import_module"
+        ) or (
+            isinstance(func, ast.Attribute) and func.attr == "import_module"
+        )
+        if (
+            called_import_module
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "sounddevice"
+        ):
+            return True
+    return False
 
 
 def _called_names(path: Path) -> set[str]:
