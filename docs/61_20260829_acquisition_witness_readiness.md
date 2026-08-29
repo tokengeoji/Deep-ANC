@@ -83,6 +83,26 @@ manifest 부재를 알려 주는 의도된 diagnostic warning이다.
 나오는지까지만 확인한다. AB13X와 APE의 독립 시간축, mono capture, 전기 tap 부재 때문에
 이를 high-band P/S, lead, 학습 또는 ANC attenuation 근거로 승격할 수 없다.
 
+문서 commit 직후 `9c8687ce84f9c86250252923e6262733cbb4db1c`에서 같은 read-only
+inventory를 다시 확인했다. 모든 PCM stream은 `closed`였고 PulseAudio는 control node만
+열고 있었다. AB13X descriptor도 앞의 2ch adaptive playback/mono asynchronous capture와
+일치했다. J511 checker의 세 표본은 다시 모두 `None`이었다.
+
+```json
+{
+  "observed_states": ["None", "None", "None"],
+  "j511_plug_detected": false,
+  "j511_unplugged_detected": true,
+  "electrical_output_witness": false
+}
+```
+
+같은 commit에서 `check_finetune.py --config configs/train_finetune.yaml --set
+data.digital_primary_path_mode=measured`도 실행했다. exit 2로, canonical
+`data.bootstrap_receipt`와 외부 `bootstrap_receipt_sha256`가 없다는 설정 admission에서
+멈췄고 run directory를 만들지 않았다. 따라서 지금 GPU 학습을 시작하지 않는 것은 추정이
+아니라 실제 admission 결과다.
+
 ## [판정]
 
 **Contradicted -- 현재 장비 조합만으로 canonical high-band P/S timing authority를 만들 수

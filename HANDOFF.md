@@ -193,6 +193,12 @@ physical bundle checker도 raw/plan/sidecar 부재로 정상적으로 exit 1 `BL
 하드웨어 통과가 아니라 우회가 막혔다는 증거다. 최신 `dev` 전체 pytest는 0 FAIL이며 local
 canonical_v4 부재 RuntimeWarning 두 건만 남았다.
 
+문서 commit 뒤 실제 Jetson PCM inventory도 다시 읽었다. 모든 stream은 `closed`이고
+AB13X는 계속 2ch adaptive playback/mono asynchronous capture이며, J511 checker의 세 표본도
+`None`이었다. 최신 `check_finetune.py`는 `data.bootstrap_receipt`와 외부 receipt SHA가
+없어 exit 2로 멈췄고 run directory를 만들지 않았다. 즉, 현재 학습 미시작은 GPU 유휴를
+방치한 것이 아니라 canonical admission이 실제로 닫힌 결과다.
+
 정확한 실제 inventory, 4/8-input 최소 조건, safety tap 조건과 Stage-1의 별도 17세션
 순서는 [`docs/61_20260829_acquisition_witness_readiness.md`](docs/61_20260829_acquisition_witness_readiness.md)에
 기록했다. 현재 소프트웨어로 가능한 다음 단계는 새 Elice A100 exact bootstrap → DNS
