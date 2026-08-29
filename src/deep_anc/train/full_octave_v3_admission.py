@@ -1,14 +1,14 @@
 """125 Hz--8 kHz v3 학습 전용의 읽기 전용 admission preflight.
 
-이 모듈은 학습기를 만들거나 GPU/오디오 장치를 열지 않는다.  목적은 아직 없는
+이 모듈은 학습기를 만들거나 GPU/오디오 장치를 열지 않는다. 목적은 아직 없는
 full-octave P/S, 계보, sampler, DNH gradient 증거를 기존 150--1600 Hz 자료로
-대체하는 실수를 막는 것이다.  따라서 현재 source tree에서는 언제나
-``BLOCKED``를 반환한다. 실제 v3 Trainer/evaluator consumer가 별도 검증과 함께
-구현되기 전에는, 미래 artifact가 모두 있어도 이 모듈만으로 학습을 허용하지 않는다.
+대체하는 실수를 막는 것이다. v3의 causal prefix/loss/FxLMS consumer 자체는
+구현됐지만, 이 YAML은 여전히 *admission-only* checklist다. raw-bound execution
+config와 physical evidence가 없는 한 이 모듈은 학습을 허용하지 않는다.
 
-이 경계의 ``PASS``라는 말은 사용하지 않는다. ``eligible``이 true가 되는 것은
-후속 consumer branch가 이 파일의 명시적 code gate를 대체하고, raw-first artifact
-publisher와 함께 검증됐을 때뿐이다.
+개별 implementation check는 ``PASS``일 수 있어도, 이 admission-only 경계의
+``eligible``은 항상 false다. raw-first artifact publisher와 raw-bound execution
+config가 함께 검증되기 전에는 여기서 학습을 열 수 없다.
 """
 
 from __future__ import annotations
@@ -30,11 +30,18 @@ ADMISSION_CONFIG_SCHEMA = "full_octave_v3_admission_config_v1"
 ADMISSION_RESULT_SCHEMA = "full_octave_v3_admission_audit_v1"
 ADMISSION_ROLE = "admission_only_no_trainer_no_audio"
 
-# 이 branch에는 causal S*y prefix adapter, v3 trainer criterion factory, v3
-# readiness 및 v3 G4 evaluator가 없다. 이 bool을 config/receipt로 우회할 수 없게
-# 코드에 고정한다. 후속 구현 branch는 해당 consumer 테스트와 함께 별도 schema를
-# 발행해야 한다.
-V3_TRAINER_EVALUATOR_CONSUMERS_IMPLEMENTED = False
+# 아래 True는 future artifact만 보고 낙관적으로 올린 값이 아니다.
+#
+# - train/full_octave_v3_consumers.py:
+#   CausalSecondaryPrefixAdapterV1 -> P*n + S*y ->
+#   BroadbandFullOctaveLossPrimitiveV3 실제 tensor consumer
+# - eval/full_octave_v3.py:
+#   같은 binding/reference/prefix/block의 matched FxLMS 7-octave evaluator
+#
+# 두 경로의 prefix crop, 7-octave loss, FxLMS matched binding은 dedicated CPU
+# regression으로 검증한다. 그러나 현재 config의 role은 admission-only이므로 이
+# boolean은 canonical training 또는 physical G4 허용을 뜻하지 않는다.
+V3_TRAINER_EVALUATOR_CONSUMERS_IMPLEMENTED = True
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REQUIRED_FAMILIES = ("speech", "music", "environment", "machine")
@@ -609,10 +616,24 @@ def audit_full_octave_v3_admission(
             V3_TRAINER_EVALUATOR_CONSUMERS_IMPLEMENTED,
             check_id="v3_trainer_evaluator_consumer_wiring",
             detail=(
-                "이 branch에는 causal S*y prefix adapter, v3 criterion factory, v3 readiness, "
-                "7-octave/FxLMS evaluator가 아직 없습니다."
-                if not V3_TRAINER_EVALUATOR_CONSUMERS_IMPLEMENTED
-                else "v3 trainer/evaluator consumer가 구현됐습니다."
+                "causal S*y prefix -> v3 7-octave loss -> 같은 P/S/prefix/block의 "
+                "matched FxLMS surrogate evaluator가 구현·회귀 검증됐습니다."
+                if V3_TRAINER_EVALUATOR_CONSUMERS_IMPLEMENTED
+                else "v3 trainer/evaluator consumer가 아직 구현되지 않았습니다."
+            ),
+        )
+    )
+    # 이 파일의 정확한 role은 admission-only다. consumer가 구현됐어도 여기서
+    # Trainer/DataLoader/GPU를 만들거나 fixture JSON만으로 canonical training을
+    # 열 수 없다. raw-bound execution config/publisher는 physical P/S 이후 별도
+    # authority로 발행돼야 한다.
+    checks.append(
+        _check(
+            False,
+            check_id="v3_raw_bound_execution_config",
+            detail=(
+                "현재 YAML은 admission-only이며 raw-bound non-fixture binding, "
+                "실제 batch receipt 및 canonical execution config를 만들지 않습니다."
             ),
         )
     )
@@ -632,8 +653,8 @@ def audit_full_octave_v3_admission(
         "blockers": blockers,
         "next_required_implementation": (
             "새 full-octave causal P/S·population·batch·DNH artifact가 모두 raw-first로 "
-            "발행된 뒤, 별도 branch에서 v3 causal S*y trainer/readiness/evaluator를 "
-            "동시에 구현·검증해야 합니다."
+            "발행된 뒤, non-fixture binding과 canonical execution config를 별도 "
+            "authority로 발행하고 physical raw G4를 수행해야 합니다."
         ),
     }
 
