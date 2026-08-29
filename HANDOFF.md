@@ -50,7 +50,29 @@ source→ERR coherence² `0.741641`, source→REF `0.730343`, ERR↔REF `0.99206
 기록했다. 다음 물리 출력은 strict/broadband 계획의 무음 dry-run과 별도 출력 창 보고 뒤에만
 실행한다.
 
-### 0.2 2026-08-29 스피커 분리 상태의 소프트웨어 경계 복구
+### 0.2 2026-08-29 현재 gain 공식 meter PASS (strict P/S는 물리 재연결 대기)
+
+current USB AB13X/APE Stage-1 경로에서 1.5초 무출력 input preflight 뒤 ch0만 20초
+출력하고 ch1을 exact silence로 둔 fresh meter가 PASS했다. 마지막 구간 중앙값은
+`-48.197019 dBFS`로 공식 target `-50.1 ± 2 dBFS` 안이며, xrun/queue drop/예기치
+callback/중단은 모두 0이고 stream close도 확인됐다.
+
+- raw:
+  `results/calibration_interleaved/level_bootstrap/20260829_215459_1a6a12bb/meter_raw.npz`
+  SHA-256 `ed6fddae136f468f7b44539874e35b996a71db1968760f5eb1495970e15f7028`
+- receipt:
+  `results/calibration_interleaved/level_bootstrap/20260829_215459_1a6a12bb/meter_raw.receipt.json`
+  SHA-256 `71e62bd75931fe3bba901c85556a466a4146123d7de805124a3ef23ac885c334`
+- `validate_bootstrap_meter_raw(..., require_fresh=True)`와 현재 strict P/S
+  meter-bound dry-run은 모두 PASS했다. dry-run은 output/raw/session 파일을 만들지 않았다.
+
+이것은 **현재 노브의 Stage-1 측정 레벨 증거**일 뿐 새 P/S·lead·ANC·고역·quiet-zone
+evidence는 아니다. 출력 종료 직후 분리 안내를 냈으므로, 같은 gain의 12.5초 strict P/S는
+실제 재연결이 확인될 때만 fresh window 안에서 한 번 실행한다. 재연결이 확인되지 않거나
+freshness가 만료되면 raw를 재사용하거나 임계값을 완화하지 않고, 다음 안전 창에 새 meter부터
+시작한다.
+
+### 0.3 2026-08-29 스피커 분리 상태의 소프트웨어 경계 복구
 
 이번 작업에서는 오디오 장치를 열지 않았다. 다음은 실제 파일을 읽어 재확인했거나,
 fixture-only가 아닌 artifact 없이는 **BLOCKED**를 유지하도록 코드로 고정한 항목이다.
