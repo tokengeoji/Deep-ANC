@@ -278,18 +278,19 @@ def repository_audio_lock(repository_root: str | Path, *, purpose: str):
             raise RuntimeError(
                 f"같은 저장소/UID의 live audio 작업이 이미 실행 중입니다: {lock_path}"
             ) from exc
-        os.ftruncate(descriptor, 0)
-        payload = _canonical_json(
-            {"pid": os.getpid(), "uid": os.getuid(), "purpose": str(purpose)}
-        ).encode("utf-8")
-        os.write(descriptor, payload)
-        os.fsync(descriptor)
-        yield {
+        identity = {
             "path": str(lock_path.relative_to(root)),
             "pid": os.getpid(),
             "uid": os.getuid(),
             "purpose": str(purpose),
         }
+        os.ftruncate(descriptor, 0)
+        payload = _canonical_json(identity).encode("utf-8")
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise RuntimeError("audio lock identity를 완전히 기록하지 못했습니다")
+        os.fsync(descriptor)
+        yield identity
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)

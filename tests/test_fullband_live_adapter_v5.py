@@ -86,6 +86,24 @@ def _binding(preflight: dict) -> dict:
     }
 
 
+def test_repository_audio_lock_file_matches_live_validator_identity(tmp_path: Path) -> None:
+    (tmp_path / "results").mkdir()
+
+    with measurement.repository_audio_lock(
+        tmp_path, purpose="fullband_causal_v5_live_capture"
+    ) as audio_lock:
+        receipt = post.validate_held_audio_lock(
+            tmp_path,
+            audio_lock,
+            expected_purpose="fullband_causal_v5_live_capture",
+        )
+        saved = json.loads((tmp_path / audio_lock["path"]).read_text(encoding="utf-8"))
+
+    assert saved == audio_lock
+    assert receipt["exclusive_lock_observed"] is True
+    assert receipt["identity_sha256"] == post.audio_lock_identity_sha256(audio_lock)
+
+
 def _fake_static(plan: dict) -> dict:
     return {
         "exact_plan": {"envelope": {"signal_plan": plan}},
