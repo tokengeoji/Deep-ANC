@@ -17,7 +17,9 @@
 # EXPECTED_COMMIT은 실행 전에 신뢰한 출처에서 확인한 **전체 40자리 SHA**여야 한다.
 # EXPECTED_HOLDOUT_SHA256도 Jetson에서 확인한 canonical 파일의 64자리 SHA여야 한다.
 # 일반 Elice 실행은 canonical provenance/recorded/RIR/strict P·S 전부를 포함한 transfer
-# manifest의 외부 전달 SHA-256도 요구한다. --preflight-only는 code+holdout bundle만 본다.
+# manifest의 외부 전달 SHA-256도 요구한다. venv 전에는 manifest 자체의 immutable SHA
+# anchor만 확인하고, 환경이 완성된 직후 공개 raw 다운로드 전에 전체 semantic 검증을 한다.
+# --preflight-only는 code+holdout bundle만 본다.
 # 이 스크립트는 환경/데이터 준비 전용이며 어떤 학습 프로세스도 시작하지 않는다.
 # 이미 실행한 적이 있으면 완전성이 검증된 단계만 건너뛴다 (재실행 안전).
 #
@@ -470,15 +472,80 @@ verify_canonical_bundle() {
   fi
 }
 
-verify_transfer_bundle() {
-  local resolved schema_version selected_manifest selected_manifest_sha256
-  local session_count validated_transfer_sha256 file_count generation_path
-  local generation_sha256 extra
+verify_transfer_manifest_anchor() {
+  # 새 인스턴스의 system Python에는 NumPy/soundfile이 없다. 여기서는 외부에서 받은
+  # exact SHA와 regular-file/symlink 경계만 표준 라이브러리로 확인한다. manifest가
+  # 가리키는 모든 파일·generation·DNS 음향 의미 검증은 venv 직후의
+  # verify_transfer_bundle에서 반드시 다시 수행하며, 그 전에는 raw 다운로드나
+  # manifest/QA/학습을 절대 시작하지 않는다.
+  local resolved manifest_sha256 manifest_size extra
   if [ ! -s "$TRANSFER_MANIFEST" ]; then
     echo "[오류] Jetson immutable transfer manifest가 없습니다: $TRANSFER_MANIFEST" >&2
     return 1
   fi
   if ! resolved=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO/src" python3 -B - \
+      "$TRANSFER_MANIFEST" "$REPO" "$EXPECTED_TRANSFER_MANIFEST_SHA256" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from deep_anc.data.holdout_contract import HoldoutContractError, read_regular_file_snapshot
+
+manifest_path = Path(os.path.abspath(sys.argv[1]))
+root = Path(os.path.abspath(sys.argv[2]))
+expected_sha256 = sys.argv[3]
+try:
+    snapshot = read_regular_file_snapshot(
+        manifest_path,
+        root=root,
+        label="Jetson immutable transfer manifest anchor",
+        capture_bytes=False,
+    )
+except (OSError, HoldoutContractError) as exc:
+    print(f"[오류] {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if snapshot.sha256 != expected_sha256:
+    print(
+        "[오류] transfer manifest 외부 SHA-256 anchor 불일치: "
+        f"expected={expected_sha256}, actual={snapshot.sha256}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(f"{snapshot.sha256}\t{snapshot.size}")
+PY
+  ); then
+    echo "[오류] transfer manifest SHA anchor/경로 검증 실패." >&2
+    return 1
+  fi
+  if [[ "$resolved" == *$'\n'* ]]; then
+    echo "[오류] transfer manifest anchor 결과가 단일 행이 아닙니다." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r manifest_sha256 manifest_size extra <<<"$resolved"
+  if [ "$manifest_sha256" != "$EXPECTED_TRANSFER_MANIFEST_SHA256" ] || \
+     [[ ! "$manifest_size" =~ ^[1-9][0-9]*$ ]] || [ -n "$extra" ]; then
+    echo "[오류] transfer manifest anchor 출력이 유효하지 않습니다." >&2
+    return 1
+  fi
+  echo "[transfer anchor] immutable manifest SHA 확인: sha256=$manifest_sha256, bytes=$manifest_size"
+}
+
+verify_transfer_bundle() {
+  # full semantic validator는 NumPy/soundfile까지 포함한 exact venv에서만 실행한다.
+  # 이 함수는 setup 전 호출하면 안 된다.
+  local verifier_python=${1:-}
+  local resolved schema_version selected_manifest selected_manifest_sha256
+  local session_count validated_transfer_sha256 file_count generation_path
+  local generation_sha256 extra
+  if [ -z "$verifier_python" ] || [ ! -x "$verifier_python" ]; then
+    echo "[오류] full transfer validator에는 완성된 venv Python이 필요합니다." >&2
+    return 1
+  fi
+  if [ ! -s "$TRANSFER_MANIFEST" ]; then
+    echo "[오류] Jetson immutable transfer manifest가 없습니다: $TRANSFER_MANIFEST" >&2
+    return 1
+  fi
+  if ! resolved=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO/src" "$verifier_python" -B - \
       "$TRANSFER_MANIFEST" "$REPO" "$EXPECTED_TRANSFER_MANIFEST_SHA256" <<'PY'
 import os
 import sys
@@ -705,14 +772,15 @@ if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
 fi
 
 # 로컬 Jetson에서도 쓸 수 있는 --preflight-only 경계 뒤에서만 Elice 자원/대용량
-# transfer bundle을 요구한다. 아래 검사는 setup/download보다 먼저 실행돼 side effect가 없다.
+# transfer manifest를 요구한다. system Python에서는 external SHA anchor만 확인한다.
+# 전체 파일/계보/음향 의미 검증은 venv 완료 직후, 공개 raw 다운로드보다 먼저 실행된다.
 if [[ ! "$EXPECTED_TRANSFER_MANIFEST_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
   echo "[오류] 일반 Elice 실행에는 --expected-transfer-manifest-sha256 64자리가 필수입니다." >&2
   exit 2
 fi
 EXPECTED_TRANSFER_MANIFEST_SHA256=${EXPECTED_TRANSFER_MANIFEST_SHA256,,}
-if ! verify_transfer_bundle || ! hardware_storage_preflight; then
-  echo "[오류] Elice immutable input/hardware/storage preflight 실패. setup/download를 시작하지 않습니다." >&2
+if ! verify_transfer_manifest_anchor || ! hardware_storage_preflight; then
+  echo "[오류] Elice transfer SHA anchor/hardware/storage preflight 실패. setup/download를 시작하지 않습니다." >&2
   exit 1
 fi
 
@@ -786,6 +854,15 @@ fi
 echo "[setup] reproducibility receipt: $ENVIRONMENT_RECEIPT"
 if ! environment_complete; then
   echo "[오류] setup_env.sh 이후에도 Python/CUDA 환경 검증에 실패했습니다." >&2
+  exit 1
+fi
+
+# 외부 SHA로 고정한 manifest에 열거된 모든 transferred file의 exact SHA, schema,
+# recorded generation/DNS receipt와 canonical holdout 결속을 여기서 완전 검증한다.
+# 이 gate 전에는 public raw 다운로드·manifest 생성·QA·학습이 시작되지 않는다.
+if ! verify_exact_checkout || ! verify_canonical_bundle || \
+   ! verify_transfer_bundle "$VENV_PYTHON"; then
+  echo "[오류] 환경 완료 뒤 immutable transfer bundle full 검증 실패. public raw 다운로드를 시작하지 않습니다." >&2
   exit 1
 fi
 
@@ -1414,7 +1491,7 @@ cd "$REPO"
 echo "=== [4/6] manifest + RIR 뱅크 + 데이터셋 QA ==="
 # 긴 다운로드 동안 tracked code나 별도 채널로 전달한 canonical bundle이 바뀌지
 # 않았는지 manifest 생성 직전에 다시 확인한다. prepare에도 같은 외부 SHA를 전달한다.
-if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle; then
+if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle "$VENV_PYTHON"; then
   echo "[오류] 다운로드 후 manifest 준비 시작 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
 fi
@@ -1456,7 +1533,7 @@ fi
   --out "$CANONICAL_MANIFEST_DIR" \
   --decoder-audit "$DECODER_AUDIT_REPORT" \
   --hash-workers "$RAW_HASH_WORKERS"
-if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle; then
+if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle "$VENV_PYTHON"; then
   echo "[오류] manifest 준비 종료 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
 fi

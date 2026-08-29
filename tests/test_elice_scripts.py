@@ -130,8 +130,15 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert '"freeze_receipt_sha256": environment.sha256' in text
     assert "data.bootstrap_receipt" in text
     preflight_exit = text.index('if [ "$PREFLIGHT_ONLY" -eq 1 ]')
-    elice_hardware_call = text.index("if ! verify_transfer_bundle || ! hardware_storage_preflight")
-    assert preflight_exit < elice_hardware_call
+    anchor_preflight = text.index(
+        "if ! verify_transfer_manifest_anchor || ! hardware_storage_preflight"
+    )
+    environment_stage = text.index('echo "=== [1/6] 환경 (venv + torch cu121 + 패키지) ==="')
+    full_transfer_gate = text.index('! verify_transfer_bundle "$VENV_PYTHON"; then')
+    download_stage = text.index('echo "=== [2/6] 데이터 다운로드 (병렬) ==="')
+    assert preflight_exit < anchor_preflight < environment_stage < full_transfer_gate < download_stage
+    assert "verify_transfer_manifest_anchor()" in text
+    assert "full transfer validator에는 완성된 venv Python이 필요합니다" in text
     assert "GIT_NO_REPLACE_OBJECTS=1" in text
 
     runner = ELICE_SCRIPTS[2].read_text(encoding="utf-8")
@@ -320,6 +327,52 @@ def validate_transfer_manifest(path, *, repo_root, expected_sha256):
     else:
         assert result.returncode == 1
         assert "recorded schema/session 수가 일치하지 않습니다" in result.stderr
+
+
+def test_bootstrap_transfer_anchor_runs_without_site_packages(tmp_path: Path):
+    """새 Elice system Python은 optional audio/ML wheel 없이 SHA anchor만 검증한다."""
+
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    anchor = text[
+        text.index("verify_transfer_manifest_anchor() {") : text.index(
+            "verify_transfer_bundle() {"
+        )
+    ]
+    program_start = anchor.index("<<'PY'\n") + len("<<'PY'\n")
+    program_end = anchor.index("\nPY\n", program_start)
+    program = anchor[program_start:program_end]
+
+    # fixture package가 아니라 현재 tracked source를 직접 import해야, 향후
+    # ``deep_anc`` package initializer에 optional dependency가 새로 생겨도 이
+    # pre-venv 경계가 즉시 깨진다.
+    root = tmp_path / "repo"
+    manifest = root / "data/manifests/elice_transfer_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b'{"schema_version":1,"files":[]}\n')
+    expected_sha256 = _sha256(manifest)
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(REPO_ROOT / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-B",
+            "-c",
+            program,
+            str(manifest),
+            str(root),
+            expected_sha256,
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"{expected_sha256}\t{manifest.stat().st_size}"
 
 
 def test_bootstrap_binds_full_decoder_audit_to_canonical_v4_manifest_generation():
@@ -1291,6 +1344,35 @@ def test_normal_bootstrap_requires_transfer_manifest_before_hardware_or_setup(
     )
     assert result.returncode == 2
     assert "--expected-transfer-manifest-sha256" in result.stderr
+    assert not (root / ".venv").exists()
+
+
+def test_normal_bootstrap_rejects_transfer_anchor_before_hardware_or_setup(
+    tmp_path: Path,
+):
+    """fresh system Python은 full audio stack 없이 bad anchor를 먼저 막아야 한다."""
+
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    transfer = root / "data/manifests/elice_transfer_manifest.json"
+    transfer.write_bytes(b'{"schema_version":1,"files":[]}\n')
+    actual_sha = _sha256(transfer)
+    wrong_sha = ("0" if actual_sha[0] != "0" else "1") + actual_sha[1:]
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--expected-transfer-manifest-sha256",
+        wrong_sha,
+        "--no-update",
+    )
+
+    assert result.returncode == 1
+    assert "transfer manifest 외부 SHA-256 anchor 불일치" in result.stderr
+    assert "nvidia-smi" not in result.stderr
     assert not (root / ".venv").exists()
 
 

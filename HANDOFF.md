@@ -211,6 +211,30 @@ canonical_v4/DNS selection에는 쓸 수 있다. 그러나 이 bundle을 canonic
 재사용하지 않는다. DNS receipt를 받아 17세션을 수집한 뒤에는 99세션 schema v2 transfer를
 no-replace 재발행·검증 전송하고 새 receipt로 다시 결속해야 한다.
 
+### 0.9 2026-08-30 새 Elice bootstrap의 실제 pre-venv 경계 복구
+
+새 Elice clone에서 82세션 transfer manifest SHA와 recorded tree byte count는 실제로
+관측됐지만, 파일별 SHA/full semantic 검증은 아직 통과 전이었다. 종전
+`bootstrap_all.sh`는 venv를 만들기 전에 system `python3`로 full transfer validator를
+import했다. 이 import graph가 `soundfile`뿐 아니라 NumPy/Pydantic 경로까지 끌어와 fresh
+환경에서 `ModuleNotFoundError`로 실패했다. 이것은 data 부족이나 GPU 문제가 아니라
+**bootstrap 순서 결함**이며, 실패를 무시하고 다운로드·학습으로 진행하지 않는다.
+
+복구된 경계는 다음과 같다.
+
+1. system Python은 canonical holdout과 transfer manifest의 regular-file/no-symlink,
+   외부 SHA-256 anchor만 확인한다.
+2. exact A100 CUDA venv를 만든다.
+3. public raw 다운로드, manifest 생성, QA, DNS selection, 학습보다 **먼저** 그 venv에서
+   기존 full transfer validator를 실행한다. 따라서 모든 transferred file SHA, strict P/S,
+   generation/DNS receipt, recorded lineage 의미 검증은 약화되지 않는다.
+
+새 exact commit을 push한 뒤 remote checkout을 그 commit으로 바꾸고, 먼저 `--preflight-only`,
+그 다음 일반 Stage-1 bootstrap을 tmux log로 한 번 실행한다. full validator가 실패하면 raw와
+log를 보존한 채 원인을 분석하며 자동 재실행하지 않는다. 이 절은 high-band/quiet-zone
+hardware blocker를 해제하지 않으며, Stage-1 82세션 bootstrap과 추가 17세션 수집 전에는
+pretrain/fine-tune을 시작하지 않는다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
