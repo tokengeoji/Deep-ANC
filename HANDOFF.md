@@ -5,6 +5,63 @@
 > 현재 준비 브랜치: `work/v10-fullband-rt5640-contract`.
 > 현재 파일 기반 training readiness 감사: `docs/44_canonical_training_readiness_audit_20260829.md`.
 
+## 0-V14. causal S·y prefix adapter 경계 (2026-08-29)
+
+### [가설]
+
+미래 full-octave P/S를 학습으로 연결할 때 target만 S(z)에 통과시키거나 augmented
+digital-reference input으로 P(z)를 만들면 prefix의 P/S delay/FIR tail과 preview lead를
+버리고 고역 위상과 `e=P*n+S*y`를 잘못 계산할 수 있다.
+
+### [근거]
+
+- branch: `work/v14-causal-secondary-prefix-adapter`
+- binding: `src/deep_anc/train/full_octave_causal_plant_binding_v4.py`
+- adapter: `src/deep_anc/train/causal_secondary_prefix_adapter_v1.py`
+- focused test: `tests/test_causal_secondary_prefix_adapter_v1.py`
+- 상세 계약: `docs/51_causal_secondary_prefix_adapter_v1.md`
+
+### [확인 방법]
+
+```bash
+PYTHONPATH=src /home/capston/Deep_ANC/.venv/bin/python -m pytest -q \
+  tests/test_causal_secondary_prefix_adapter_v1.py
+```
+
+이 명령은 ALSA/sounddevice/GPU trainer/run directory를 열지 않는다.
+
+### [결과]
+
+`FullOctaveCausalPlantBindingV4`는 canonical v3 8 physical subband, 실제
+`TrainingTimingContract` v2 payload/digest, P pre-FIR delay/FIR peak, S delay/handoff,
+같은 raw/analysis/plant authority SHA 및 ERR/reference channel selection을 함께 검사하고
+FIR을 immutable bytes snapshot으로 복제한다. 현재 public constructor/production issuer는
+의도적으로 없고 regression fixture만 존재하므로 legacy P/S를 문자열 metadata로 재표기해
+adapter에 넣을 경로가 없다.
+`CausalSecondaryPrefixAdapterV1`는 zero-reset training segment에서 `init_states()`와
+`streaming_step()`만 사용해 256-sample block prefix→target을 전진시키고,
+clean playback timeline에서 derived lead를 사용해 `P(n)`와
+`S(concat(y_prefix,y_target))` target crop을 FP32로 계산한다. controller의 ref mic noise,
+hum/dropout은 P 입력이 될 수 없고, pre-augmentation ref는 derived `n(t+lead)`와 exact하게
+같아야 한다. clean playback `n`은 common gain/polarity/EQ 이후·input-only augmentation
+이전의 physical timeline이다. `K>0` impulse에서 `P(n)`와 잘못된 `P(n(t+lead))`를 직접
+구분하고, 임의 `d_target`, target-only S, forward() 호출은 회귀 테스트가 막는다.
+
+### [판정]
+
+**Confirmed — test fixture의 causal composition guard only.** actual raw bytes를 검증하는
+production issuer가 없으므로 binding/adapter PASS는 actual fullband raw/electrical witness/P/S,
+2/4/8 kHz attenuation, population, Trainer, checkpoint, canonical pretrain/fine-tune 또는
+deployment authority가 아니다. v11 admission의 trainer blocker는 그대로 false이며 current
+legacy Stage-1 P/S·v5/v6 fixture·v12 static witness는 public adapter input authority가 될 수 없다.
+
+### [다음 행동]
+
+future raw publisher가 actual operator bytes와 immutable raw/analysis/electrical witness를
+대조해 non-fixture binding을 발행하는 issuer를 별도 구현하고, 그 뒤 full-octave
+Trainer/evaluator admission을 연결한다. 그 전에 synchronized electrical witness hardware
+topology와 raw-first fullband P/S가 먼저 필요하다.
+
 ## 0-V11. full-octave v3 admission-only 차단 경계 (2026-08-29)
 
 ### [가설]
