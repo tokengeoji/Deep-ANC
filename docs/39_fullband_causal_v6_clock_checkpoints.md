@@ -226,10 +226,21 @@ Hann, 1,024-sample hop, 8 line×2 microphone median의 short-time rate를 8 bloc
 약 1,038–1,042 ppm 반대 방향으로 분리됐다.
 
 short-time 448 step의 mode 요약은 다음과 같다.
-이 수치는 현재 dirty v7 진단 draft에서 재현된 **non-authoritative 경향**이다.
-script provenance, raw loader/cross-binding, dirfd no-replace, failure association의 독립
-검토와 clean commit 기반 final artifact 발행 전이므로 draft 경로·SHA를 최종
-증거로 고정하지 않는다.
+clean commit `57b3ddeebae0aa0720773b5ddbb52b7c6ad61731`에서 실제 raw no-write 통합
+테스트를 통과한 뒤 다음 diagnostic-only artifact를 no-replace로 한 번 발행했다.
+
+```text
+results/fullband_causal_v6/forensics/clock_232a4e53a4eaa024d54b740a01c95fe1.json
+file SHA-256 82cc750b898dbf7a2674eb6be3b03e0eb508e928545833f6694334b3b7c04eff
+payload SHA-256 c45f488d708a9b717b33a83090e85310b250779298facda769188fb657b1a1be
+script SHA-256 fb763568df9cdd622896dd712489d0bb1e67a245a70ab7d2a252f9a00b4be671
+```
+
+artifact는 raw/post-receipt/failure/capture-id, clean repository identity, Python/NumPy/
+SciPy와 모든 분석 dependency SHA를 결속한다. `analysis_admission_eligible`,
+`clock_estimate_authority`, `canonical_training_eligible`, `deployment_eligible`,
+`attenuation_assessed`, `plant_identification_assessed`는 모두 false다. 따라서 아래 수치는
+재현 가능한 최종 **diagnostic**이지만 P/S·clock·ANC·학습 authority는 아니다.
 
 | Histogram center (ppm) | membership | membership median (ppm) |
 |---:|---:|---:|

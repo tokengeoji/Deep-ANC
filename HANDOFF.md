@@ -12,7 +12,7 @@ I2S 입력 사이를 하나의 stationary affine rate ratio `q`로 보정할 수
 
 ### [근거]
 
-- 실행 commit/branch: `872e59322527880330acd989a435cd31a2d16387`,
+- capture 실행 commit/branch: `872e59322527880330acd989a435cd31a2d16387`,
   `work/v6-clock-checkpoints`
 - 20초 level meter는 중앙값 `-48.2 dBFS`로 `-50.1±2 dBFS` 계약을 PASS했다.
 - v6 raw:
@@ -24,6 +24,11 @@ I2S 입력 사이를 하나의 stationary affine rate ratio `q`로 보정할 수
   `results/fullband_causal_v6/failure_232a4e53a4eaa024d54b740a01c95fe1.json`,
   SHA-256 `10856999254a8dc70c3696b02aed239db1b80f217a3dfd771442cedb2aacc75d`
 - capture id: `232a4e53a4eaa024d54b740a01c95fe1`
+- 최종 diagnostic-only clock artifact:
+  `results/fullband_causal_v6/forensics/clock_232a4e53a4eaa024d54b740a01c95fe1.json`,
+  file SHA-256 `82cc750b898dbf7a2674eb6be3b03e0eb508e928545833f6694334b3b7c04eff`
+- forensic clean execution commit:
+  `57b3ddeebae0aa0720773b5ddbb52b7c6ad61731` (`work/v7-nonaffine-clock`)
 
 ### [확인 방법]
 
@@ -49,6 +54,8 @@ sample Hann window와 1,024 hop으로 8개 line×두 마이크의 short-time fre
   정합하지만, 어느 소프트웨어/USB 계층이 변환하는지는 electrical loopback 없이는
   확정하지 않는다.
 - 분석·operator·P/S NPZ는 하나도 발행되지 않았다.
+- 위 최종 forensic artifact는 raw/receipt/failure와 분석 dependency SHA를 결속하며
+  `analysis/clock/training/deployment/attenuation/plant` 권한을 모두 false로 고정한다.
 
 ### [판정]
 
@@ -60,8 +67,8 @@ APE/I2S ADC와 AB13X USB DAC의 서로 다른 clock domain을 하나의 affine `
 
 ### [다음 행동]
 
-1. `work/v7-nonaffine-clock`에서 ambiguity basin receipt와 short-time diagnostic-only
-   재현 코드를 전체 테스트·clean commit으로 봉인한다.
+1. (완료) `work/v7-nonaffine-clock` commit `57b3dde`에서 ambiguity basin receipt와
+   short-time diagnostic-only 재현 코드를 전체 pytest·clean commit·push로 봉인했다.
 2. 같은 v6 acoustic capture는 반복하지 않는다. 스피커는 v7 신호·raw publisher·합성
    insert/drop/time-warp fixture와 무음 dry-run이 모두 끝날 때까지 필요하지 않다.
 3. v7은 (A) 현 하드웨어의 조건부 비-affine time-map 연구 경로와 (B) ADC/DAC 공통 clock
@@ -76,9 +83,12 @@ APE/I2S ADC와 AB13X USB DAC의 서로 다른 clock domain을 하나의 affine `
 5. Elice의 마지막 endpoint `central-01.tcp.tunnel.elice.io:56230`은 key exchange 전에
    원격에서 닫혔다. 실행 중 GPU·학습은 확인되지 않았으며, valid 광대역 P/S와 새 endpoint가
    생기기 전 canonical pretrain/fine-tune은 계속 차단한다.
-6. v5/v6 측정 파일은 Google Drive `DeepANC/jetson_measurements_20260829`에 file count,
-   bytes, `rclone check --download` 0 differences로 백업했다. 로컬 약 50 MiB는 후속
-   forensic에 필요하므로 삭제하지 않는다.
+6. v5/v6 측정 파일과 최종 forensic JSON은 Google Drive
+   `DeepANC/jetson_measurements_20260829`에 백업했다. 새 JSON은
+   `rclone check --download` 결과 0 differences/1 matching file이며 로컬·원격 MD5도
+   일치한다. 같은 이름의 중복 최상위 폴더는 삭제하지 않고
+   `jetson_measurements_20260829_duplicate_v6_backup`으로 이름을 분리했다. 로컬 약
+   50 MiB는 후속 forensic에 필요하므로 삭제하지 않는다.
 
 ## 0-A. 2026-08-29 fullband causal v6 실측 준비
 
