@@ -263,3 +263,130 @@ def test_dry_run_checks_no_replace_paths_without_touching_audio(tmp_path, monkey
     assert "덮어쓰지 않습니다" in capsys.readouterr().err
     assert existing.read_bytes() == b"immutable existing measurement"
     assert not (tmp_path / "results/channel_paths/already_used.json").exists()
+
+
+def _forbid_audio_primitives(monkeypatch):
+    """경로 거부가 실제 audio import/open보다 앞서는지 검사하는 공용 sentinel."""
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("진단 output 경로 거부 전에 audio primitive를 호출하면 안 됩니다")
+
+    for name in (
+        "assert_live_pcm_clock_preconditions",
+        "assert_measurement_preconditions",
+        "capture_input_probe",
+        "resolve_alsa_portaudio_device",
+        "collect_channel_paths",
+        "_save_results",
+    ):
+        monkeypatch.setattr(paths, name, forbidden)
+
+
+@pytest.mark.parametrize(
+    ("mode_args", "out_prefix"),
+    [
+        (["--dry-run"], "assets/measured/diagnostic_escape"),
+        (
+            ["--confirm-user-present-volume-minimum", "--confirm-speaker"],
+            "results/channel_paths/../../assets/measured/diagnostic_escape",
+        ),
+    ],
+)
+def test_output_prefix_escape_is_rejected_before_any_audio_access(
+    tmp_path, monkeypatch, capsys, mode_args, out_prefix
+):
+    """dry-run/live 모두 realpath가 diagnostic root 밖이면 장치를 건드리지 않는다."""
+
+    monkeypatch.setattr(paths, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(paths, "load_yaml", lambda _path: _hardware())
+    _forbid_audio_primitives(monkeypatch)
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "sounddevice":
+            raise AssertionError("경로 거부 전에 sounddevice import를 하면 안 됩니다")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    assert paths.main([*mode_args, "--out-prefix", out_prefix]) == 2
+    assert "results/channel_paths" in capsys.readouterr().err
+    assert not list(tmp_path.rglob("*.npz"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_dry_run_rejects_symlinked_output_prefix_escape_before_audio_access(
+    tmp_path, monkeypatch, capsys
+):
+    """repo 안의 symlink라도 realpath가 diagnostic root 밖이면 허용하지 않는다."""
+
+    root = tmp_path / "results" / "channel_paths"
+    root.mkdir(parents=True)
+    outside = tmp_path / "assets" / "measured"
+    outside.mkdir(parents=True)
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(paths, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(paths, "load_yaml", lambda _path: _hardware())
+    _forbid_audio_primitives(monkeypatch)
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "sounddevice":
+            raise AssertionError("symlink 경로 거부 전에 sounddevice import를 하면 안 됩니다")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    assert (
+        paths.main(
+            [
+                "--dry-run",
+                "--out-prefix",
+                "results/channel_paths/escape/diagnostic",
+            ]
+        )
+        == 2
+    )
+    assert "results/channel_paths" in capsys.readouterr().err
+    assert not list(outside.iterdir())
+
+
+def test_output_prefix_normalizes_inside_diagnostic_root_and_preserves_suffixes(
+    tmp_path, monkeypatch
+):
+    """안전한 ``..`` 정규화와 기존 .npz/.json prefix 호환성을 유지한다."""
+
+    monkeypatch.setattr(paths, "REPO_ROOT", tmp_path)
+    npz_path, json_path = paths._output_paths(
+        "results/channel_paths/../channel_paths/nested/capture.npz"
+    )
+
+    expected = tmp_path / "results" / "channel_paths" / "nested" / "capture"
+    assert npz_path == expected.with_suffix(".npz")
+    assert json_path == expected.with_suffix(".json")
+
+    default_npz, default_json = paths._output_paths(None)
+    assert default_npz.parent == tmp_path / "results" / "channel_paths"
+    assert default_npz.stem == default_json.stem
+    assert default_npz.stem.startswith("channel_paths_")
+
+
+@pytest.mark.parametrize("target_kind", ["outside_repo", "other_repo_directory"])
+def test_output_root_symlink_escape_is_rejected(tmp_path, monkeypatch, target_kind):
+    """root 자체가 외부 또는 다른 repo 역할로 symlink되면 기본 경로도 막는다."""
+
+    results = tmp_path / "results"
+    results.mkdir()
+    if target_kind == "outside_repo":
+        target = tmp_path.parent
+    else:
+        target = tmp_path / "assets" / "measured"
+        target.mkdir(parents=True)
+    (results / "channel_paths").symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(paths, "REPO_ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match="전용 diagnostic root"):
+        paths._output_paths(None)

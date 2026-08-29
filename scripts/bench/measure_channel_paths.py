@@ -428,6 +428,44 @@ def _repo_path(value: str) -> Path:
     return resolved
 
 
+def _channel_paths_output_root() -> Path:
+    """진단 산출물의 허용된 **실경로** root를 반환한다.
+
+    ``results/channel_paths`` 아래라는 문자열만 검사하면 ``..`` 또는 중간 symlink로
+    ``assets/measured`` 등 다른 역할의 경로에 raw를 남길 수 있다. 결과 역할은
+    diagnostic-only이므로 realpath도 Deep_ANC 내부의 이 전용 root 아래여야 한다.
+    """
+
+    repository_root = REPO_ROOT.resolve()
+    expected_root = repository_root / "results" / "channel_paths"
+    root = expected_root.resolve()
+    try:
+        # root가 repository 안이라는 것만으로는 부족하다. 예를 들어
+        # results/channel_paths -> assets/measured symlink라면 raw 역할이 섞인다.
+        root.relative_to(expected_root)
+    except ValueError as exc:
+        raise ValueError(
+            "results/channel_paths 자체의 실경로가 전용 diagnostic root 밖을 가리켜 "
+            "채널 경로 진단 결과를 저장할 수 없습니다"
+        ) from exc
+    return root
+
+
+def _require_channel_paths_output_path(path: Path) -> Path:
+    """``path``가 diagnostic output root 아래의 실경로인지 fail-closed로 확인한다."""
+
+    root = _channel_paths_output_root()
+    resolved = Path(path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            "채널 경로 진단 --out-prefix는 실경로 기준 "
+            f"results/channel_paths/ 아래여야 합니다: {resolved}"
+        ) from exc
+    return resolved
+
+
 def _output_paths(value: str | None) -> tuple[Path, Path]:
     if value is None:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -436,7 +474,13 @@ def _output_paths(value: str | None) -> tuple[Path, Path]:
         prefix = _repo_path(value)
         if prefix.suffix.lower() in {".json", ".npz"}:
             prefix = prefix.with_suffix("")
-    return prefix.with_suffix(".npz"), prefix.with_suffix(".json")
+    # suffix 제거 뒤에도 다시 검사해야 ``escape.npz``가 아닌 ``escape`` 자체가
+    # symlink인 경우를 놓치지 않는다. 두 최종 파일도 재확인해 기존 symlink artifact를
+    # 덮어쓰는 경로를 만들지 않는다.
+    prefix = _require_channel_paths_output_path(prefix)
+    npz_path = _require_channel_paths_output_path(prefix.with_suffix(".npz"))
+    json_path = _require_channel_paths_output_path(prefix.with_suffix(".json"))
+    return npz_path, json_path
 
 
 def _validate_dry_run_hardware_config(
@@ -736,6 +780,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         hardware_path = _repo_path(args.hardware)
         hardware_cfg = load_yaml(hardware_path)
+        # dry-run/live 공통으로 장치 import/open 전에 diagnostic raw의 저장 역할을
+        # 고정한다. 이후 경로 오류가 발견되면 입력 preflight조차 시작하지 않는다.
+        npz_path, json_path = _output_paths(args.out_prefix)
+        if npz_path.exists() or json_path.exists():
+            raise FileExistsError(
+                "기존 측정 결과는 덮어쓰지 않습니다. 다른 --out-prefix를 쓰세요"
+            )
         if args.dry_run:
             _audio, channels, sample_rate = _validate_dry_run_hardware_config(
                 hardware_cfg
@@ -755,11 +806,6 @@ def main(argv: list[str] | None = None) -> int:
                 preflight_seconds=args.preflight_seconds,
                 output_channels=output_channels,
             )
-            npz_path, json_path = _output_paths(args.out_prefix)
-            if npz_path.exists() or json_path.exists():
-                raise FileExistsError(
-                    "기존 측정 결과는 덮어쓰지 않습니다. 다른 --out-prefix를 쓰세요"
-                )
             report = _dry_run_report(
                 hardware_path=hardware_path,
                 sample_rate=sample_rate,
@@ -793,16 +839,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not math.isfinite(float(args.preflight_seconds)) or args.preflight_seconds <= 0.0:
             raise ValueError("preflight-seconds는 양수여야 합니다")
-        npz_path, json_path = _output_paths(args.out_prefix)
         output_channels = (int(channels["noise_out"]), int(channels["cancel_out"]))
         if set(output_channels) != {0, 1}:
             raise ValueError(
                 "noise_out/cancel_out은 서로 다른 stereo 채널 0/1이어야 합니다: "
                 f"{output_channels}"
-            )
-        if npz_path.exists() or json_path.exists():
-            raise FileExistsError(
-                "기존 측정 결과는 덮어쓰지 않습니다. 다른 --out-prefix를 쓰세요"
             )
     except (KeyError, OSError, TypeError, ValueError, FileExistsError) as exc:
         print(f"[중단] 설정 오류: {exc}", file=sys.stderr)
