@@ -1187,12 +1187,24 @@ def test_exact_highband_addition_inventory_and_split_matrix_are_frozen():
     assert generation.CANONICAL_SOURCE_POOL_ADDITIONS == {
         "data/source_pool/environment/environment_006.wav": (
             "environment",
-            25.75,
+            42.0,
             "train",
         ),
-        "data/source_pool_v2/environment/environment_012.wav": ("environment", 3.0, "test"),
-        "data/source_pool_v2/environment/environment_004.wav": ("environment", 5.9, "test"),
-        "data/source_pool_v2/environment/environment_017.wav": ("environment", 26.2, "val"),
+        "data/source_pool_v2/environment/environment_014.wav": (
+            "environment",
+            20.5,
+            "val",
+        ),
+        "data/source_pool/environment/environment_003.wav": (
+            "environment",
+            24.5,
+            "test",
+        ),
+        "data/source_pool/environment/environment_008.wav": (
+            "environment",
+            53.25,
+            "test",
+        ),
         "data/source_pool/music/music_007.wav": ("music", 54.8, "test"),
         "data/source_pool_v2/music/music_007.wav": ("music", 12.8, "test"),
         "data/source_pool_v2/music/music_012.wav": ("music", 17.1, "val"),

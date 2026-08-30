@@ -35,6 +35,30 @@
 막지 않으며, 최종 광대역 G4와 배포만 계속 막는다. 이 분리는 GPU를 일찍 검증하면서도
 실패 데이터·잘못된 timing이 canonical checkpoint에 섞이지 않게 한다.
 
+### 1.2 실제 출력 전 source admission
+
+15초 recorded addition은 스피커를 울리기 전에 exact rendered `float32` 파형으로 다음
+필요조건을 모두 통과해야 한다. 이 검사는 오디오 장치를 열지 않는다.
+
+1. 재생 진폭은 exact `0.06`, 길이는 48 kHz `720,000` frame이다.
+2. timeline estimator와 같은 `12,000 + 2×600 = 13,200` frame source span과
+   `3,000` frame hop, RMS 하한 `2e-4`를 사용한다. 유효 비율은 실제 capture gate
+   `0.90`보다 5 %p 준비 여유가 있는 `0.95` 이상이어야 한다.
+3. 공식 meter와 같은 150–1600 Hz RMS 정의를 사용한다. rendered source가 공식 meter
+   playback보다 2 dB 넘게 약하거나, quiet ERR ceiling `-64.0 dBFS`에서 coherence²
+   `0.90`에 필요한 예측 SNR을 못 채우면 거부한다.
+4. DNS selector는 strict-P 상대 대역 density만 보지 않는다. raw PCM16 → repeat/trim
+   composite → peak-normalized `0.06` → 0.1초 fade의 실제 파형에서 위 전체 preflight를
+   통과한 후보만 receipt에 넣고, selected bytes에서 다시 계산한다.
+5. source-plan builder와 `record_session_batch --dry-run`은 같은 공용 validator를 다시
+   실행한다. selector receipt가 있어도 이 단계에서 한 행이라도 미달하면 child process와
+   실제 stream을 시작하지 않는다.
+
+2026-08-30 첫 추가 수집 실패를 오프라인 재검산했을 때 기존 19행 중 environment 1행과
+DNS speech 5행은 source-RMS 필요조건만으로 가능한 비율이 각각 `0.847`,
+`0.890/0.814/0.822/0.847/0.682`라서, 물리 경로가 완벽해도 capture gate를 통과할 수
+없었다. 이 실패를 이유로 `0.90`을 낮추지 않고 selector와 plan 입구를 수정한다.
+
 ## 2. 절대 목표와 주파수 범위
 
 1. Stage-1 canonical 제어 대역은 **150–1600 Hz**다. 저역 150–600 Hz와 고역 600–1600 Hz를
@@ -72,6 +96,7 @@ PASS하기 전에는 이 문서의 17/17도 최종 광대역 배포 자격이 �
 | 최종 광대역 v2 목표 | **BLOCKED** | 150–11.314 kHz P/S·target-d coverage·matched FxLMS·다점 공간 계약 PASS | 한 저/고역 또는 한 family 악화 | 현 strict P/S는 150–1600 Hz뿐이고 82세션은 2.828 kHz 이상 joint coverage group 0. [광대역 가드레일](18_broadband_anc_guardrails.md) |
 | strict P/S | **PASS** | same capture, 48 kHz/256/low, xrun·clip 0, 반복 ≥8, 모든 부대역 consistency ≥0.9406, raw/analysis/level SHA 정합 | 지연·채널·캡처·SHA·부대역 중 하나라도 불일치 | [P](../assets/measured/primary_path_il_strict_5dc06fdd.npz), [S](../assets/measured/secondary_path_il_strict_5dc06fdd.npz), [level](../assets/measured/measurement_level_evidence.json) |
 | recorded QA·local lineage | **PASS** | 82세션 QA, aligned source, 네 family, split component 교집합 0 | 오디오/정렬/lineage 누수 또는 family/group 부족 | [manifest](../data/manifests/recorded_regrouped.jsonl), [QA](../data/manifests/recorded_qa.json), [holdout](../data/manifests/recorded_holdout.json) |
+| addition source preflight | **BLOCKED** | 19/19 exact rendered source가 timeline ratio ≥0.95, 공식 trusted level·예측 SNR PASS이고 selector/plan/dry-run 증거가 같은 bytes에 결속 | 한 source라도 무음 지속성·절대 레벨·SHA 불일치 | 공용 코드와 local source-pool 9행은 PASS. 새 DNS v3 receipt와 새 exact 19행 plan이 아직 없어 전체 세대는 BLOCKED |
 | strict 부대역 data coverage | **FAIL** | train/val/test의 family×네 부대역마다 density ≥0.25인 독립 group ≥4 | 유효 감사에서 한 행이라도 미달 | 64-segment 현장 감사에서 train 2, val 5, test 5행 부족. [schema-v2 진단 원본](../results/data_audit/recorded_subband_coverage_fullscan_20260828.json)은 결론 보존용이며 schema-v3 canonical receipt로 승격 금지 |
 | Elice bootstrap·public speech lineage | **BLOCKED** | exact clean commit, public manifest 6종, transfer/coverage report SHA 결속과 recorded holdout↔DNS speech numeric alias 교집합 0 | bytes/path/SHA/commit 불일치 또는 cross-public speech lineage 교집합 | 새 schema-v3 coverage/receipt가 없고, 원격 canonical_v4에서 보수적 numeric alias 기준 `dns_book` 340/5946/8201 및 `dns_reader` 422/652 교집합이 발견됨. namespace가 다르다는 이유만으로 PASS 금지 |
 | 역할·budget 정책 | **PASS** | 아래 역할표의 role/step/init 자격과 contract SHA exact | role 세탁, step 축소, init 자격 위조 | 코드 정책은 강제됨. 실행 artifact의 완료 여부는 별도 행에서 판단 |

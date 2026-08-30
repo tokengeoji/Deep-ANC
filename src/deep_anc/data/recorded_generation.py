@@ -44,6 +44,10 @@ from deep_anc.data.recording_level_campaign import (
     validate_recording_level_campaign,
     validate_recording_level_session_binding,
 )
+from deep_anc.data.recording_source_preflight import (
+    RecordingSourcePreflightError,
+    require_rendered_source_preflight,
+)
 from deep_anc.data.timeline import TIMELINE_METHOD, TimelineReport
 from deep_anc.dsp.invariants import REQUIRED_SOURCE_FAMILIES
 from deep_anc.data import public_lineage
@@ -153,12 +157,24 @@ CANONICAL_ADDITION_SECONDS_BY_KIND = {
 CANONICAL_SOURCE_POOL_ADDITIONS = {
     "data/source_pool/environment/environment_006.wav": (
         "environment",
-        25.75,
+        42.0,
         "train",
     ),
-    "data/source_pool_v2/environment/environment_012.wav": ("environment", 3.0, "test"),
-    "data/source_pool_v2/environment/environment_004.wav": ("environment", 5.9, "test"),
-    "data/source_pool_v2/environment/environment_017.wav": ("environment", 26.2, "val"),
+    "data/source_pool_v2/environment/environment_014.wav": (
+        "environment",
+        20.5,
+        "val",
+    ),
+    "data/source_pool/environment/environment_003.wav": (
+        "environment",
+        24.5,
+        "test",
+    ),
+    "data/source_pool/environment/environment_008.wav": (
+        "environment",
+        53.25,
+        "test",
+    ),
     "data/source_pool/music/music_007.wav": ("music", 54.8, "test"),
     "data/source_pool_v2/music/music_007.wav": ("music", 12.8, "test"),
     "data/source_pool_v2/music/music_012.wav": ("music", 17.1, "val"),
@@ -1754,6 +1770,47 @@ def _read_source_plan(
                     f"source plan row {offset} source window가 file duration을 넘습니다: "
                     f"start={start}, seconds={seconds}, duration={source_duration}"
                 )
+            source_preflight: dict[str, Any] | None = None
+            if math.isclose(
+                seconds,
+                CANONICAL_ADDITION_SECONDS,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                # 녹음 script와 같은 renderer를 source-plan 검증 단계에서 먼저
+                # 실행한다. 이 호출은 오디오 장치를 열지 않으며, 무음/저레벨 source를
+                # batch child 또는 sounddevice stream 생성 전에 차단한다.
+                from deep_anc.realtime.noise_gen import (
+                    NoiseProgram,
+                    render_recording_file_window,
+                )
+
+                try:
+                    program = NoiseProgram(
+                        {
+                            "type": "file",
+                            "file": path,
+                            "file_start_seconds": start,
+                            "amplitude": CANONICAL_RECORDING_AMPLITUDE,
+                        },
+                        48_000,
+                        file_bytes=source_snapshot.data,
+                    )
+                    rendered = render_recording_file_window(
+                        program,
+                        int(round(seconds * 48_000)),
+                        sample_rate=48_000,
+                    )
+                    source_preflight = require_rendered_source_preflight(
+                        rendered,
+                        label=f"source plan row {offset}",
+                    )
+                except (OSError, RuntimeError, ValueError, RecordingSourcePreflightError) as exc:
+                    raise RecordedGenerationError(
+                        f"source plan row {offset} 무출력 source preflight 실패: {exc}"
+                    ) from exc
+        else:
+            source_preflight = None
         rows.append(
             {
                 "source_row_number": offset,
@@ -1780,6 +1837,7 @@ def _read_source_plan(
                     if source_snapshot is not None and require_source_files
                     else None
                 ),
+                "_source_preflight": source_preflight,
             }
         )
     _validate_addition_population(rows)

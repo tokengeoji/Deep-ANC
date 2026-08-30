@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -22,6 +23,7 @@ from deep_anc.data.source_trust import (
     SourceTrustError,
     exact_clean_source_evidence,
 )
+from deep_anc.realtime.noise_gen import NoiseProgram, render_recording_file_window
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -221,6 +223,8 @@ def _write_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         )
         raw = selection._pcm16_wav_bytes(values)
         composite = selection.dns_composite_bytes_from_raw(raw)
+        source_preflight = selection._rendered_source_preflight(composite)
+        assert source_preflight["passed"] is True
         densities, covered = selection._band_density(
             selection._decode_source(raw, label="fixture raw"),
             np.asarray([1.0], dtype=np.float64),
@@ -243,6 +247,7 @@ def _write_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                     "density_ratios": densities,
                     "covered_subband_count": covered,
                 },
+                "source_preflight": source_preflight,
                 "selected_window_start_frame": 0,
             }
         )
@@ -281,6 +286,7 @@ def _write_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 "source_content_sha256": scan["content_sha256"],
                 "source_window_start_frame": 0,
                 "coverage_scan": scan["coverage_scan"],
+                "source_preflight": scan["source_preflight"],
                 "raw_output": {
                     "path": raw_path.relative_to(tmp_path).as_posix(),
                     "sha256": _sha(raw_payloads[index]),
@@ -1022,6 +1028,27 @@ def test_dns_receipt_rejects_selected_window_rebinding_even_if_resealed(
         )
 
 
+def test_dns_receipt_rejects_forged_source_preflight_even_if_fully_resealed(
+    tmp_path, monkeypatch
+):
+    receipt, payload, _parent = _write_receipt_fixture(tmp_path, monkeypatch)
+    selected = payload["selected"][-1]
+    index = int(selected["manifest_index"])
+    forged = copy.deepcopy(selected["source_preflight"])
+    timeline = forged["timeline_feasibility"]
+    timeline["eligible_windows"] = timeline["total_windows"] - 1
+    timeline["eligible_ratio"] = timeline["eligible_windows"] / timeline["total_windows"]
+    timeline["longest_ineligible_run_windows"] = 1
+    selected["source_preflight"] = forged
+    payload["scan_results"][index]["source_preflight"] = copy.deepcopy(forged)
+    _reseal(receipt, payload)
+    with pytest.raises(selection.DNSSelectionError, match="rendered source preflight"):
+        selection.validate_dns_selection_receipt(
+            repo_root=tmp_path,
+            receipt_path=receipt.relative_to(tmp_path).as_posix(),
+        )
+
+
 def test_dns_receipt_rejects_clean_source_rebinding_even_if_resealed(
     tmp_path, monkeypatch
 ):
@@ -1130,6 +1157,122 @@ def test_pcm16_scan_values_equal_actual_wav_decoder():
     assert np.array_equal(decoded, selection._pcm16_decoded_values(values))
 
 
+def test_dns_source_preflight_matches_exact_rendered_composite():
+    time = np.arange(selection.DNS_RAW_FRAMES, dtype=np.float64) / 48_000.0
+    values = sum(
+        0.04 * np.sin(2.0 * np.pi * frequency * time)
+        for frequency in (220.0, 440.0, 800.0, 1250.0)
+    )
+    raw = selection._pcm16_wav_bytes(values)
+    composite = selection.dns_composite_bytes_from_raw(raw)
+    bytes_rendered = selection._render_dns_composite_playback(composite)
+    scan_rendered = selection._render_dns_window_playback_fast(values)
+    observed = selection._rendered_source_preflight(composite)
+
+    program = NoiseProgram(
+        {
+            "type": "file",
+            "file": "fixture.wav",
+            "file_start_seconds": 0.0,
+            "amplitude": selection.DNS_PLAYBACK_AMPLITUDE,
+        },
+        selection.DNS_RAW_SAMPLE_RATE,
+        file_bytes=composite,
+    )
+    exact_rendered = np.asarray(
+        render_recording_file_window(
+            program,
+            selection.DNS_COMPOSITE_FRAMES,
+            sample_rate=selection.DNS_RAW_SAMPLE_RATE,
+            fade_seconds=selection.RECORDING_FILE_FADE_SECONDS,
+        ),
+        dtype=np.float32,
+    )
+    assert np.array_equal(bytes_rendered, exact_rendered)
+    assert np.array_equal(scan_rendered, bytes_rendered)
+    rendered = np.asarray(exact_rendered, dtype=np.float64)
+    starts = np.arange(
+        0,
+        rendered.size - selection.DNS_TIMELINE_SOURCE_SPAN_FRAMES + 1,
+        selection.DNS_TIMELINE_HOP_FRAMES,
+    )
+    rms = np.asarray(
+        [
+            np.sqrt(
+                np.mean(
+                    np.square(
+                        rendered[
+                            start : start
+                            + selection.DNS_TIMELINE_SOURCE_SPAN_FRAMES
+                        ]
+                    )
+                )
+            )
+            for start in starts
+        ]
+    )
+    expected_count = int(np.count_nonzero(rms >= selection.DNS_TIMELINE_MIN_WINDOW_RMS))
+    timeline = observed["timeline_feasibility"]
+    assert timeline["source_span_samples"] == 13_200
+    assert timeline["hop_samples"] == 3_000
+    assert timeline["total_windows"] == starts.size == 236
+    assert timeline["eligible_windows"] == expected_count
+    assert timeline["eligible_ratio"] == pytest.approx(
+        expected_count / starts.size, abs=0.0
+    )
+    assert observed["passed"] is True
+    assert observed["trusted_band_rms_dbfs"] >= observed[
+        "minimum_trusted_band_rms_dbfs"
+    ]
+
+
+def test_dns_window_source_preflight_avoids_wav_materialization(monkeypatch):
+    time = np.arange(selection.DNS_RAW_FRAMES, dtype=np.float64) / 48_000.0
+    values = sum(
+        0.04 * np.sin(2.0 * np.pi * frequency * time + 0.13)
+        for frequency in (220.0, 440.0, 800.0, 1250.0)
+    )
+    raw = selection._pcm16_wav_bytes(values)
+    composite = selection.dns_composite_bytes_from_raw(raw)
+    expected = selection._rendered_source_preflight(composite)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("full DNS scan must not encode/decode WAV per window")
+
+    monkeypatch.setattr(selection, "_pcm16_wav_bytes", forbidden)
+    monkeypatch.setattr(selection, "dns_composite_bytes_from_raw", forbidden)
+    assert selection._window_source_preflight(values) == expected
+
+
+def test_dns_source_preflight_rejects_intermittent_composite():
+    time = np.arange(selection.DNS_RAW_FRAMES, dtype=np.float64) / 48_000.0
+    values = np.zeros(selection.DNS_RAW_FRAMES, dtype=np.float64)
+    active = 24_000
+    values[:active] = sum(
+        0.04 * np.sin(2.0 * np.pi * frequency * time[:active])
+        for frequency in (220.0, 440.0, 800.0, 1250.0)
+    )
+    raw = selection._pcm16_wav_bytes(values)
+    composite = selection.dns_composite_bytes_from_raw(raw)
+    evidence = selection._rendered_source_preflight(composite)
+    assert evidence["timeline_feasibility"]["eligible_ratio"] < 0.95
+    assert evidence["passed"] is False
+
+
+def test_dns_source_preflight_rejects_continuous_out_of_band_composite():
+    time = np.arange(selection.DNS_RAW_FRAMES, dtype=np.float64) / 48_000.0
+    values = 0.05 * np.sin(2.0 * np.pi * 4_000.0 * time)
+    raw = selection._pcm16_wav_bytes(values)
+    composite = selection.dns_composite_bytes_from_raw(raw)
+
+    evidence = selection._rendered_source_preflight(composite)
+    assert evidence["timeline_feasibility"]["passed"] is True
+    assert evidence["trusted_band_rms_dbfs"] < evidence[
+        "minimum_trusted_band_rms_dbfs"
+    ]
+    assert evidence["passed"] is False
+
+
 def test_dns_density_uses_repo_numpy_fft_not_ambient_scipy(monkeypatch):
     values = np.linspace(-0.2, 0.2, 8192, dtype=np.float64)
     fir = np.asarray([0.25, 0.5, 0.25], dtype=np.float64)
@@ -1156,7 +1299,7 @@ def test_dns_density_uses_repo_numpy_fft_not_ambient_scipy(monkeypatch):
 def test_full_scan_keeps_metrics_only_and_rematerializes_selected_bytes(tmp_path):
     rows = []
     time = np.arange(selection.DNS_RAW_FRAMES, dtype=np.float64) / 48_000.0
-    for index in range(5):
+    for index in range(6):
         filename = f"book_{700 + index}_chp_1_reader_{800 + index}.wav"
         keys = list(
             public_lineage.conservative_cross_corpus_speech_lineage_keys(
@@ -1168,6 +1311,10 @@ def test_full_scan_keeps_metrics_only_and_rematerializes_selected_bytes(tmp_path
             * np.sin(2.0 * np.pi * frequency * time + index * 0.11)
             for frequency in (220.0, 440.0, 800.0, 1250.0)
         )
+        if index == 5:
+            intermittent = np.zeros_like(values)
+            intermittent[:24_000] = values[:24_000]
+            values = intermittent
         raw = selection._pcm16_wav_bytes(values)
         source = tmp_path / "data/raw/noise/speech" / filename
         source.parent.mkdir(parents=True, exist_ok=True)
@@ -1202,10 +1349,15 @@ def test_full_scan_keeps_metrics_only_and_rematerializes_selected_bytes(tmp_path
         },
         fir=np.asarray([1.0], dtype=np.float64),
     )
-    assert len(results) == 5
+    assert len(results) == 6
     assert all(set(result) == selection._SCAN_RESULT_KEYS for result in results)
     assert all(result["coverage_scan"]["covered_subband_count"] == 4 for result in results)
+    assert all(result["source_preflight"]["passed"] for result in results[:5])
+    assert results[5]["status"] == "ineligible"
+    assert results[5]["reason"] == "rendered_source_preflight_below_minimum"
+    assert results[5]["source_preflight"]["passed"] is False
     chosen = selection._select_results(results)
+    assert len(chosen) == 5
     raw, composite = selection._materialize_selected_bytes(
         repo_root=tmp_path,
         row=rows[int(chosen[0]["manifest_index"])],
@@ -1572,6 +1724,10 @@ def test_selector_requires_five_distinct_full_coverage_groups():
                 "coverage_scan": {
                     "density_ratios": [1.0, 1.0, 1.0, 1.0],
                     "covered_subband_count": 4,
+                },
+                "source_preflight": {
+                    "timeline_feasibility": {"eligible_ratio": 1.0},
+                    "passed": True,
                 },
             }
         )

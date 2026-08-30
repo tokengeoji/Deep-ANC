@@ -32,6 +32,18 @@ import numpy as np
 from .holdout_contract import read_regular_file_snapshot
 from .manifest import read_manifest_bytes
 from . import public_lineage
+from .recording_source_preflight import (
+    SOURCE_PREFLIGHT_FRAMES,
+    SOURCE_PREFLIGHT_MIN_ELIGIBLE_RATIO,
+    SOURCE_PREFLIGHT_PLAYBACK_AMPLITUDE,
+    SOURCE_PREFLIGHT_SCHEMA,
+    TIMELINE_FEASIBILITY_SCHEMA,
+    RecordingSourcePreflightError,
+    rendered_source_preflight,
+    validate_rendered_source_preflight,
+)
+from .timeline import TimelineSettings
+from deep_anc.realtime.noise_gen import RECORDING_FILE_FADE_SECONDS
 from .source_trust import (
     SELECTOR_PYCACHE_PREFIX,
     SELECTOR_RUNTIME_SCHEMA,
@@ -42,7 +54,7 @@ from .source_trust import (
 )
 
 
-DNS_SELECTION_SCHEMA_VERSION = 2
+DNS_SELECTION_SCHEMA_VERSION = 3
 DNS_SELECTION_KIND = "recorded_dns_speech_selection"
 DNS_SELECTION_GENERATION_ID = "stage1-coverage-v2"
 DNS_SELECTION_RECEIPT = (
@@ -71,9 +83,18 @@ DNS_STRICT_SUBBANDS_HZ = (
     (1000.0, 1600.0),
 )
 DNS_MIN_DENSITY_RATIO = 0.25
+DNS_PLAYBACK_AMPLITUDE = SOURCE_PREFLIGHT_PLAYBACK_AMPLITUDE
+_DNS_TIMELINE_SETTINGS = TimelineSettings(sample_rate=DNS_RAW_SAMPLE_RATE)
+DNS_TIMELINE_SOURCE_SPAN_FRAMES = (
+    _DNS_TIMELINE_SETTINGS.window_samples
+    + 2 * _DNS_TIMELINE_SETTINGS.coarse_search_samples
+)
+DNS_TIMELINE_HOP_FRAMES = _DNS_TIMELINE_SETTINGS.hop_samples
+DNS_TIMELINE_MIN_WINDOW_RMS = _DNS_TIMELINE_SETTINGS.min_window_rms
+DNS_TIMELINE_MIN_ELIGIBLE_RATIO = SOURCE_PREFLIGHT_MIN_ELIGIBLE_RATIO
 DNS_SCAN_ALGORITHM = {
     "name": "strict_primary_dns_distinct_group_coverage",
-    "version": 2,
+    "version": 3,
     "source_contract": {
         "channels": 1,
         "sample_rate": DNS_RAW_SAMPLE_RATE,
@@ -91,9 +112,25 @@ DNS_SCAN_ALGORITHM = {
     "output_composite": DNS_TRANSFORM,
     "subbands_hz": [list(value) for value in DNS_STRICT_SUBBANDS_HZ],
     "minimum_density_ratio": DNS_MIN_DENSITY_RATIO,
+    "rendered_source_preflight": {
+        "schema": SOURCE_PREFLIGHT_SCHEMA,
+        "timeline_schema": TIMELINE_FEASIBILITY_SCHEMA,
+        "playback_amplitude": DNS_PLAYBACK_AMPLITUDE,
+        "composite_frames": DNS_COMPOSITE_FRAMES,
+        "fade_seconds": RECORDING_FILE_FADE_SECONDS,
+        "source_span_samples": DNS_TIMELINE_SOURCE_SPAN_FRAMES,
+        "hop_samples": DNS_TIMELINE_HOP_FRAMES,
+        "minimum_window_rms": DNS_TIMELINE_MIN_WINDOW_RMS,
+        "minimum_eligible_ratio": DNS_TIMELINE_MIN_ELIGIBLE_RATIO,
+        "rule": (
+            "full_trusted_band_level_predicted_snr_and_all_sliding_starts_"
+            "without_tail_injection"
+        ),
+    },
     "ranking": (
         "covered_subband_count_desc,highband_1000_1600_density_desc,"
-        "minimum_subband_density_desc,total_density_desc,manifest_index_asc"
+        "minimum_subband_density_desc,total_density_desc,"
+        "timeline_eligible_ratio_desc,manifest_index_asc"
     ),
     "group_rule": "best_manifest_window_per_public_group_then_global_top5",
     "recorded_split_assignment": list(DNS_RECORDED_SPLIT_ASSIGNMENT),
@@ -116,6 +153,7 @@ _SCAN_RESULT_KEYS = {
     "status",
     "reason",
     "coverage_scan",
+    "source_preflight",
     "selected_window_start_frame",
 }
 _SELECTED_ITEM_KEYS = {
@@ -130,6 +168,7 @@ _SELECTED_ITEM_KEYS = {
     "source_content_sha256",
     "source_window_start_frame",
     "coverage_scan",
+    "source_preflight",
     "raw_output",
     "composite_output",
 }
@@ -383,6 +422,131 @@ def dns_composite_bytes_from_raw(raw_bytes: bytes) -> bytes:
     return _pcm16_wav_bytes(composite)
 
 
+def _apply_dns_playback_gain_and_fade(mono: np.ndarray) -> np.ndarray:
+    """decoded mono PCM에 실제 file gain과 수집 fade를 같은 dtype 순서로 적용한다."""
+
+    values = np.asarray(mono, dtype=np.float32)
+    if values.shape != (DNS_COMPOSITE_FRAMES,) or not np.all(np.isfinite(values)):
+        raise DNSSelectionError("DNS composite playback float32 배열이 유효하지 않습니다")
+    peak = float(np.max(np.abs(values)) + 1.0e-9)
+    rendered = np.asarray(values / peak * DNS_PLAYBACK_AMPLITUDE, dtype=np.float32)
+    ramp_frames = min(
+        int(RECORDING_FILE_FADE_SECONDS * DNS_RAW_SAMPLE_RATE),
+        rendered.size // 2,
+    )
+    if ramp_frames > 0:
+        ramp = np.linspace(0.0, 1.0, ramp_frames, dtype=np.float32)
+        rendered[:ramp_frames] *= ramp
+        rendered[-ramp_frames:] *= ramp[::-1]
+    return np.ascontiguousarray(rendered)
+
+
+def _render_dns_composite_playback(composite_raw: bytes) -> np.ndarray:
+    """``NoiseProgram(file)``+수집 fade의 exact bytes 경로를 벡터 연산으로 재현한다.
+
+    실제 generator의 file branch는 같은 mono float32 배열을 Python loop로 한 sample씩
+    복사한다. selector는 8천여 후보를 전수 스캔하므로 그 loop를 반복할 수 없다. 아래
+    계산은 같은 decode/peak/float32/fade 순서를 보존하며 회귀 테스트가 실제 generator
+    출력과 bit-exact 동등성을 강제한다.
+    """
+
+    import soundfile as sf
+
+    try:
+        info = sf.info(io.BytesIO(composite_raw))
+        data, sample_rate = sf.read(
+            io.BytesIO(composite_raw), dtype="float32", always_2d=True
+        )
+    except RuntimeError as exc:
+        raise DNSSelectionError(f"DNS composite playback decode 실패: {exc}") from exc
+    if (
+        info.format != "WAV"
+        or info.subtype != "PCM_16"
+        or info.channels != 1
+        or info.samplerate != DNS_RAW_SAMPLE_RATE
+        or info.frames != DNS_COMPOSITE_FRAMES
+        or sample_rate != DNS_RAW_SAMPLE_RATE
+        or data.shape != (DNS_COMPOSITE_FRAMES, 1)
+    ):
+        raise DNSSelectionError(
+            "DNS composite playback은 exact 720000-frame mono48k PCM16 WAV여야 합니다"
+        )
+    return _apply_dns_playback_gain_and_fade(data.mean(axis=1))
+
+
+def _render_dns_window_playback_fast(values: np.ndarray) -> np.ndarray:
+    """scan 후보를 WAV encode/decode 없이 최종 playback float32로 만든다.
+
+    canonical bytes 경로의 산술 순서를 생략하지 않는다: source를 PCM16으로 한 번
+    양자화하고 ``q/32768``로 decode한 뒤 repeat/trim, composite PCM16으로 다시
+    양자화·decode한다. 그 다음에만 file peak gain과 fade를 적용한다. selected 5개
+    validator는 이 fast path를 신뢰하지 않고 계속 실제 WAV bytes에서 재계산한다.
+    """
+
+    source = np.asarray(values, dtype=np.float64).reshape(-1)
+    if source.shape != (DNS_RAW_FRAMES,) or not np.all(np.isfinite(source)):
+        raise DNSSelectionError(
+            "DNS fast timeline scan 입력은 exact 496000-frame finite mono여야 합니다"
+        )
+    raw_pcm = _pcm16_samples(source)
+    raw_decoded = raw_pcm.astype(np.float64) / 32768.0
+    remaining = DNS_COMPOSITE_FRAMES - DNS_RAW_FRAMES
+    if remaining < 0 or remaining > DNS_RAW_FRAMES:
+        raise DNSSelectionError("DNS repeat/trim frame 계약이 fast path 범위를 벗어납니다")
+    composite_source = np.concatenate(
+        [raw_decoded, raw_decoded[:remaining]]
+    )
+    composite_pcm = _pcm16_samples(composite_source)
+    composite_decoded = composite_pcm.astype(np.float32) / 32768.0
+    return _apply_dns_playback_gain_and_fade(composite_decoded)
+
+
+def _rendered_source_preflight(composite_raw: bytes) -> dict[str, Any]:
+    """실제 15초 file playback의 timeline·trusted-band·SNR을 함께 계산한다.
+
+    timeline coarse stage가 source에서 읽는 것은 0.25초 capture 창뿐 아니라 양쪽
+    ``coarse_search_samples``까지 합친 13,200-frame span이다. 따라서 단순 전체 RMS나
+    strict-P spectrum만으로는 긴 무음/간헐음을 막을 수 없다. 선택 composite bytes를
+    실제 ``NoiseProgram`` peak normalization과 수집 fade로 렌더링한 뒤, coarse stage와
+    같은 span/hop/RMS 하한과 공식 측정 레벨 기반 absolute trusted-band/SNR 하한을
+    함께 적용한다. 이 함수는 오디오 장치를 열지 않는다.
+    """
+
+    rendered = _render_dns_composite_playback(composite_raw)
+    if (
+        DNS_COMPOSITE_FRAMES != SOURCE_PREFLIGHT_FRAMES
+        or rendered.shape != (SOURCE_PREFLIGHT_FRAMES,)
+        or not np.all(np.isfinite(rendered))
+    ):
+        raise DNSSelectionError("DNS composite rendered timeline이 유효하지 않습니다")
+    try:
+        return rendered_source_preflight(rendered)
+    except RecordingSourcePreflightError as exc:
+        raise DNSSelectionError(
+            f"DNS composite rendered source preflight 계산 실패: {exc}"
+        ) from exc
+
+
+def _validate_source_preflight(value: object, *, label: str) -> dict[str, Any]:
+    try:
+        return validate_rendered_source_preflight(value)
+    except RecordingSourcePreflightError as exc:
+        raise DNSSelectionError(f"{label} rendered source preflight 오류: {exc}") from exc
+
+
+def _window_source_preflight(values: np.ndarray) -> dict[str, Any]:
+    """scan window를 encode/decode 없는 exact-equivalent full preflight로 평가한다."""
+
+    try:
+        return rendered_source_preflight(
+            _render_dns_window_playback_fast(values)
+        )
+    except RecordingSourcePreflightError as exc:
+        raise DNSSelectionError(
+            f"DNS scan window rendered source preflight 계산 실패: {exc}"
+        ) from exc
+
+
 def _decode_source(raw: bytes, *, label: str) -> np.ndarray:
     import soundfile as sf
 
@@ -447,12 +611,15 @@ def _band_density(values: np.ndarray, fir: np.ndarray) -> tuple[list[float], int
 
 def _rank_key(result: Mapping[str, Any]) -> tuple[Any, ...]:
     scan = result["coverage_scan"]
+    preflight = result["source_preflight"]
+    timeline = preflight["timeline_feasibility"]
     densities = [float(value) for value in scan["density_ratios"]]
     return (
         -int(scan["covered_subband_count"]),
         -densities[3],
         -min(densities),
         -sum(densities),
+        -float(timeline["eligible_ratio"]),
         int(result["manifest_index"]),
     )
 
@@ -487,6 +654,7 @@ def _scan_manifest_rows(
             "status": "ineligible",
             "reason": "",
             "coverage_scan": None,
+            "source_preflight": None,
             "selected_window_start_frame": None,
         }
         try:
@@ -539,7 +707,9 @@ def _scan_manifest_rows(
                     "public source bytes SHA/size가 manifest와 다릅니다"
                 )
             values = _decode_source(source.data, label=f"DNS public source #{index}")
-            best: tuple[tuple[Any, ...], int, list[float], int] | None = None
+            best: tuple[
+                tuple[Any, ...], int, list[float], int, dict[str, Any]
+            ] | None = None
             for start in _window_starts(values.size):
                 window_values = values[start : start + DNS_RAW_FRAMES]
                 # receipt가 보존하는 것은 float decoder 배열이 아니라 PCM16 raw
@@ -548,21 +718,37 @@ def _scan_manifest_rows(
                 # 선택 뒤 source를 다시 열어 별도로 materialize한다.
                 quantized_values = _pcm16_decoded_values(window_values)
                 densities, covered = _band_density(quantized_values, fir)
-                key = (-covered, -densities[3], -min(densities), -sum(densities), start)
-                candidate = (key, start, densities, covered)
+                preflight = _window_source_preflight(window_values)
+                timeline = preflight["timeline_feasibility"]
+                key = (
+                    not bool(preflight["passed"]),
+                    -covered,
+                    -densities[3],
+                    -min(densities),
+                    -sum(densities),
+                    -float(timeline["eligible_ratio"]),
+                    start,
+                )
+                candidate = (key, start, densities, covered, preflight)
                 if best is None or key < best[0]:
                     best = candidate
             if best is None:
                 raise DNSSelectionError("DNS source에서 scan window를 만들지 못했습니다")
-            _key, start, densities, covered = best
+            _key, start, densities, covered, preflight = best
+            passed = bool(preflight["passed"])
             result.update(
                 {
-                    "status": "eligible",
-                    "reason": "",
+                    "status": "eligible" if passed else "ineligible",
+                    "reason": (
+                        ""
+                        if passed
+                        else "rendered_source_preflight_below_minimum"
+                    ),
                     "coverage_scan": {
                         "density_ratios": densities,
                         "covered_subband_count": covered,
                     },
+                    "source_preflight": preflight,
                     "selected_window_start_frame": start,
                 }
             )
@@ -658,6 +844,7 @@ def _validate_scan_inventory(
                 result.get("status") != "ineligible"
                 or result.get("reason") != "not_dns_read_speech"
                 or result.get("coverage_scan") is not None
+                or result.get("source_preflight") is not None
                 or result.get("selected_window_start_frame") is not None
             ):
                 raise DNSSelectionError(
@@ -682,6 +869,7 @@ def _validate_scan_inventory(
                 result.get("status") != "ineligible"
                 or result.get("reason") != expected_reason
                 or result.get("coverage_scan") is not None
+                or result.get("source_preflight") is not None
                 or result.get("selected_window_start_frame") is not None
             ):
                 raise DNSSelectionError(
@@ -689,11 +877,10 @@ def _validate_scan_inventory(
                 )
             continue
         scan = result.get("coverage_scan")
+        preflight = result.get("source_preflight")
         start = result.get("selected_window_start_frame")
         if (
-            result.get("status") != "eligible"
-            or result.get("reason") != ""
-            or not isinstance(scan, Mapping)
+            not isinstance(scan, Mapping)
             or set(scan) != {"density_ratios", "covered_subband_count"}
             or not isinstance(scan.get("density_ratios"), list)
             or len(scan["density_ratios"]) != len(DNS_STRICT_SUBBANDS_HZ)
@@ -717,12 +904,33 @@ def _validate_scan_inventory(
             raise DNSSelectionError(
                 f"DNS scan result #{index} eligible coverage schema가 다릅니다"
             )
+        validated_preflight = _validate_source_preflight(
+            preflight, label=f"DNS scan result #{index}"
+        )
+        expected_status = "eligible" if validated_preflight["passed"] else "ineligible"
+        expected_reason = (
+            ""
+            if validated_preflight["passed"]
+            else "rendered_source_preflight_below_minimum"
+        )
+        if (
+            result.get("status") != expected_status
+            or result.get("reason") != expected_reason
+        ):
+            raise DNSSelectionError(
+                f"DNS scan result #{index} source preflight 상태가 다릅니다"
+            )
 
 
 def _select_results(results: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     by_group: dict[str, Mapping[str, Any]] = {}
     for result in results:
-        if result.get("status") != "eligible":
+        preflight = result.get("source_preflight")
+        if (
+            result.get("status") != "eligible"
+            or not isinstance(preflight, Mapping)
+            or preflight.get("passed") is not True
+        ):
             continue
         group = str(result["group_id"])
         previous = by_group.get(group)
@@ -877,6 +1085,7 @@ def build_dns_selection_payload(
                 "source_content_sha256": result["content_sha256"],
                 "source_window_start_frame": result["selected_window_start_frame"],
                 "coverage_scan": result["coverage_scan"],
+                "source_preflight": result["source_preflight"],
                 "raw_output": {
                     "path": f"{DNS_SELECTION_BUNDLE_ROOT}/{raw_relative}",
                     "sha256": hashlib.sha256(raw_bytes).hexdigest(),
@@ -1486,6 +1695,8 @@ def validate_dns_selection_receipt(
             or isinstance(item.get("source_window_start_frame"), bool)
             or not isinstance(item.get("source_window_start_frame"), int)
             or item.get("coverage_scan") != derived_scan.get("coverage_scan")
+            or item.get("source_preflight")
+            != derived_scan.get("source_preflight")
         ):
             raise DNSSelectionError("DNS selected item이 public manifest row와 다릅니다")
         group = str(item["public_group_id"])
@@ -1559,6 +1770,17 @@ def validate_dns_selection_receipt(
                 or covered != len(DNS_STRICT_SUBBANDS_HZ)
             ):
                 raise DNSSelectionError("DNS selected strict-P coverage scan 재계산값이 다릅니다")
+            preflight = _validate_source_preflight(
+                item.get("source_preflight"),
+                label=f"DNS selected #{order}",
+            )
+            derived_preflight = _rendered_source_preflight(
+                composite_snapshot.data
+            )
+            if preflight != derived_preflight or preflight["passed"] is not True:
+                raise DNSSelectionError(
+                    "DNS selected rendered source preflight 재계산값이 다릅니다"
+                )
         validated_items.append(dict(item))
     split_counts = {
         split: sum(item["recorded_split"] == split for item in selected)

@@ -593,6 +593,101 @@ V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
 
+### 0.18 2026-08-30 source preflight 복구와 녹음 재승인
+
+사용자는 녹음을 다시 허용했다. 그러나 새 19행 plan과 무음 dry-run이 통과하기 전에는
+소리를 내지 않는다. 실제 출력 순서는 새 exact Elice bootstrap/selector → Jetson bundle
+검증 → 새 19행 plan → batch dry-run → 장치 점유 확인 → fresh 20초 meter/campaign →
+19×15초 수집이다. 예상 audible은 meter 20초 + additions 최대 285초다. 자동 retry와
+임계값 완화는 계속 금지한다.
+
+0.17의 첫 failure raw를 오프라인 독립 재계산한 결론은 다음과 같다.
+
+- `source_raw.wav`의 1초 settle은 exact zero이고 뒤 15초는 plan 원본 SHA/start
+  `25.75`/amplitude `0.06`/fade에서 재렌더한 배열과 bit-exact(`max error=0`)였다.
+  renderer와 plan binding 오류는 반증됐다.
+- timeline estimator가 실제로 읽는 source span은 `12,000 + 2×600 = 13,200` frame,
+  hop은 `3,000`, RMS 하한은 `2e-4`다. 첫 환경 source는 이 필요조건의 최대 비율이
+  `200/236=0.847458`라 capture gate `0.90`을 물리 경로와 무관하게 통과할 수 없었다.
+- 기존 19행을 같은 exact renderer로 전수 검사하면 environment 1행과 DNS speech 5행이
+  각각 `0.847458`, `0.889831/0.813559/0.822034/0.847458/0.682203`이었다. 즉
+  **6/19는 출력 전에 거절됐어야 했고**, 기존 dry-run의 PASS는 software contract 누락이었다.
+- raw lag ptp/std와 정렬 후 residual은 성공 82세션 범위였다. USB clock/timeline estimator가
+  주원인이라는 가설은 반증됐다. 다만 종료부 약 1.25초 ERR/REF 동시 바닥 하강의 물리 층은
+  전기 DAC witness가 없어 inconclusive로 보존한다.
+
+복구 중인 공용 `recording_source_preflight/v1`은 exact rendered 720,000-frame source에
+timeline eligible ratio `>=0.95`, 공식 150–1600 Hz absolute level, quiet ceiling
+`-64.0 dBFS`와 coherence² `0.90`에 필요한 predicted SNR을 동시에 강제한다. DNS selector,
+source-plan builder, batch dry-run이 같은 evidence를 재계산하고 selected DNS composite
+bytes도 다시 검증한다. strict-P 상대 density만 높은 간헐/저레벨 speech는 선택할 수 없다.
+
+새 source-pool 9행의 무출력 exact 검증은 모두 PASS했다. 환경 4행은 서로 다른 authority
+component이며 다음으로 고정했다.
+
+| split | source | start | timeline ratio | trusted 150–1600 Hz |
+|---|---|---:|---:|---:|
+| train | `environment_006.wav` | 42.00 s | 0.991525 | -39.31 dBFS |
+| val | `source_pool_v2/environment_014.wav` | 20.50 s | 0.983051 | -40.38 dBFS |
+| test | `environment_003.wav` | 24.50 s | 1.000000 | -52.49 dBFS |
+| test | `environment_008.wav` | 53.25 s | 1.000000 | -35.32 dBFS |
+
+music 5행은 timeline ratio가 모두 `1.0`, trusted level은 `-40.52`~`-33.86 dBFS`다.
+선택된 source-pool 9행은 parent82와 disjoint한 9개 component/158개 authority token이며
+상호 교집합 0이다. 관련 focused source/DNS/generation/batch 테스트는 현재 작업 tree에서
+PASS했다. 전체 pytest와 exact commit/push, Elice 새 receipt는 아직 완료 전이므로 이 절만으로
+recording/training admission을 열지 않는다.
+
+Elice는 삭제하면 안 된다. 현재 clean detached `13aaad649661cda320151d2ca02046a7d0181631`,
+A100 80GB idle, 가용 디스크 38,798,897,152B이며 public raw 36,403,604,715B와 manifest 6종의
+참조 missing 0이 보존돼 있다. 새 commit을 받은 뒤 full bootstrap과 DNS/DEMAND selector를
+즉시 다시 발행해야 한다. 기존 receipt/freeze는 `b9138e3` 결속이라 stale이다.
+
+Elice pre-delete Drive archive는 전체 원본 41,299,005,440B, SHA-256
+`a743fe4a4761b6d743171c94b6366d74fa199bb1b0361585ed27547fa627b994`를 재계산했다.
+Drive에는 9/10 part, 37,004,038,144B만 있고 이 9개는 size/SHA-256/MD5가 원본과 같다.
+누락 part 5는 4,294,967,296B, SHA-256
+`c083fc64e2e941c13795a940ccc92b8fd39889c8b91363613699713806c3da7c`다. 공유 Drive API
+quota 때문에 세 번 최종 확정에 실패했으므로 backup 완료·Elice 삭제 가능으로 판정하지 않는다.
+Jetson의 2026-08-27 고정 snapshot은 Drive 경로 집합 13,428/13,428, missing/extra 0으로
+재확인했다. 로컬에 남은 고정 객체 3,429개는 rclone MD5 check 0 differences였고, 이미 로컬에서
+정리된 FMA 8,002개와 ESC-50 2,000개의 원격 파일 수/bytes도 당시 개별 PASS receipt와 exact했다.
+Drive 파일 bytes 17,439,445,191과 과거 `du -sb` 17,441,317,063의 1,871,872-byte 차이는
+디렉터리 metadata 집계 차이이며 파일 누락이 아니다. 따라서 그 고정 snapshot 자체는 완전하다.
+다만 이후 Jetson `data/`에 생긴 신규 87개/216,813,288B와 새 results/runs/assets는 이 snapshot
+범위 밖이다. 별도 no-replace snapshot의 원격 readback 전에는 그 신규 로컬 자료를 삭제하지 않는다.
+
+### 0.19 2026-08-30 source-guard 이후 첫 15초 현장 진단
+
+사용자의 녹음 승인 뒤 먼저 장치 점유와 모든 PCM `closed`를 확인하고, 새 source preflight를
+통과한 `environment_008.wav@53.25s`, amplitude `0.06`, 15초를 **canonical plan에 결속하지
+않은 진단 1회**로 실행했다. stream 종료 직후 스피커 분리 안내를 냈고, capture gate 실패 뒤
+추가 출력은 하지 않았다.
+
+- failure root:
+  `results/diagnostic_source_guard_live/failures/20260830_215127_639247_timeline_gate_22881ff7/`
+- `failure.json` SHA-256:
+  `77dbbaf83c9cd1061852a1509856b4646bc60ca4624c3f4aed41ab608c960ddb`
+- `mics_raw.wav` SHA-256:
+  `3ee2aa6f8855deb9041cd4c26b437398c6b1903a69de66ae909c6757a4d2d949`
+- `source_raw.wav` SHA-256:
+  `90fc25891972dc272438d068a9c76b560793953381b3e81fc034f003292c0106`
+
+settle 뒤 source는 exact 720,000 frame이고 전체 15초 동안 끊기지 않았다. peak는 source
+`0.0570`, ERR `0.5846`, REF `0.7137`, ADC clip 0이었다. source-only preflight가 제거하려던
+무음/저레벨 window 문제는 이 capture에서 반증됐다. 그러나 현행 alignment 뒤에도
+source→ERR coherence²가 150--600 Hz `0.598340`, 600--1600 Hz `0.337707`, raw valid-window
+ratio `0.741525`, 잔여 robust std `3.840601 samples`라 공식 gate를 통과하지 못했다.
+source→REF도 두 대역 `0.666874/0.493331`, REF→ERR은 `0.833722/0.650410`이었다.
+
+같은 source의 2026-08-30 앞선 amplitude `0.06` 진단 두 건은 source→REF가 저역
+`0.938/0.904`, 고역 `0.877/0.874`였고, 0.85초 offset을 제외한 digital source interior는
+이번 capture와 bit-exact했다. 여러 window/quality/band/refine 폭의 오프라인 재정렬 중 최선도
+source→ERR `0.708/0.419`에 그쳐 acceptance를 회복하지 못했다. 따라서 이번 실패는 source
+선택이나 단순 renderer 오류가 아니라 **재연결 뒤 물리 경로 또는 독립 USB DAC--ADC 시간축의
+비정상 변동**일 가능성이 높다. raw를 승격하거나 gate를 낮추지 않는다. 다음 출력은 이 raw의
+오프라인 forensic이 끝나고, 원인을 구분하는 단 한 번의 bounded probe가 정해진 뒤에만 한다.
+
 ## I. 보존된 광대역 준비 기록
 
 파인튜닝은 아직 시작하지 않는다. 이번 브랜치는 준비 계약과 계보를 복구하는 중이며,
