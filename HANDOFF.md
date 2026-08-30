@@ -475,6 +475,31 @@ HEAD의 exact 일치를 요구한다. stale audio ref와 stale commit negative f
 주장하지 않는다. Stage-1 성공 뒤에도 2/4/8 kHz와 8 kHz octave 상단 11.314 kHz 최종 목표는
 동기 다채널 P/S·matched FxLMS·Level-5 actual G4가 별도로 필요하다.
 
+### 0.16 2026-08-30 Elice DEMAND selector build-id 단일 출처 복구
+
+exact commit `474d6175814fad9170e098960929903461da3814`의 Elice bootstrap은 전체 pytest
+0 FAIL과 receipt SHA-256
+`999db4c21bd8a1648ddda375b980b32f98f0e4683b3396dcc4809d4b07036e45`로 끝났다. 같은
+checkout의 DNS selector도 14파일 bundle을 발행하고 `--verify-existing`을 통과했지만,
+DEMAND selector는 8파일을 no-replace 발행한 뒤 self-validation에서 정확히 차단됐다.
+
+원인은 데이터나 threshold가 아니라 manifest generation build-id 직렬화의 코드 불일치다.
+공식 생성기와 `manifest_contract`는 `sort_keys=True`, `indent=2`, trailing newline UTF-8
+bytes의 SHA-256 `2dc54c3ad06ad6cbd512ef6757b378e8963af97ad0e6ed5b7b6357c5cdede1ec`를
+사용하지만, DEMAND immutable verifier만 compact JSON digest
+`1eb47c877321e79e91802039932b556d5cd2315724f3de1e873142d60f73091e`를 다시 계산했다.
+따라서 그 DEMAND receipt SHA-256
+`2593bf61f0d836dea032e9e1d9e672843f03d2654eff3719406ac88a1c167b98`는 **INVALID**이며
+selection authority로 사용하지 않는다. 정상 DNS bundle도 source commit이 바뀌면 stale이므로
+새 commit의 plan에 섞지 않는다.
+
+복구는 `manifest_contract.manifest_generation_build_id()`를 단일 출처로 두고 manifest
+생성기·공식 validator·DEMAND immutable verifier가 모두 같은 함수를 사용하게 한다. 회귀는
+공식 pretty digest를 수용하고, 구 compact digest로 generation/ref/receipt를 모두 다시
+봉인해도 거부하는지 검사한다. Elice 전용 hotfix, threshold 완화, invalid bundle 삭제·덮어쓰기는
+하지 않는다. 수정 commit의 전체 pytest와 clean exact bootstrap 뒤 DNS/DEMAND를 모두 새로
+발행·검증한 경우에만 Jetson으로 이관한다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.

@@ -49,13 +49,10 @@ def _generation_bytes() -> bytes:
         "fixture": "pre-exclusion-demand-generation",
         "created_at": "2026-08-30T00:00:00Z",
     }
-    basis = {
-        key: value
-        for key, value in payload.items()
-        if key not in {"build_id", "created_at"}
-    }
-    payload["build_id"] = demand._canonical_json_sha256(basis)
-    return (json.dumps(payload, sort_keys=True) + "\n").encode()
+    payload["build_id"] = manifest_contract.manifest_generation_build_id(payload)
+    return (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
 
 
 def _fixture(root: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
@@ -376,6 +373,58 @@ def test_immutable_demand_bundle_survives_live_manifest_republish(
     assert summary["selected"]["public_group_id"] == selected_group
     assert len(summary["bundle_files"]) == 8
     assert len({item["path"] for item in summary["bundle_files"]}) == 8
+
+
+def test_demand_bundle_uses_authoritative_manifest_generation_build_id_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    payload, files = _build(tmp_path, fixture)
+    _publish(tmp_path, payload, files)
+
+    generation_path = tmp_path / demand.DEMAND_SELECTION_PARENT_GENERATION
+    generation = json.loads(generation_path.read_text(encoding="utf-8"))
+    basis = {
+        key: value
+        for key, value in generation.items()
+        if key not in {"build_id", "created_at"}
+    }
+    authoritative = hashlib.sha256(
+        (
+            json.dumps(basis, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    previous_compact = demand._canonical_json_sha256(basis)
+    assert authoritative != previous_compact
+    assert (
+        manifest_contract.manifest_generation_build_id(generation)
+        == authoritative
+    )
+    assert generation["build_id"] == authoritative
+    assert (
+        demand.validate_demand_selection_receipt(repo_root=tmp_path)[
+            "manifest_generation_build_id"
+        ]
+        == authoritative
+    )
+
+    generation["build_id"] = previous_compact
+    generation_path.write_text(
+        json.dumps(generation, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    generation_raw = generation_path.read_bytes()
+    for ref_name in ("manifest_generation_origin", "manifest_generation"):
+        payload[ref_name]["sha256"] = _sha(generation_raw)
+        payload[ref_name]["size"] = len(generation_raw)
+    payload["manifest_generation"]["build_id"] = previous_compact
+    _reseal(tmp_path, payload)
+
+    with pytest.raises(
+        demand.DemandSelectionError,
+        match="manifest_generation schema/build_id",
+    ):
+        demand.validate_demand_selection_receipt(repo_root=tmp_path)
 
 
 def test_demand_bundle_blocks_pretrain_until_exclusion_sidecar_is_live(

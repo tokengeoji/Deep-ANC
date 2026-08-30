@@ -67,6 +67,17 @@ def _canonical_json_bytes(payload: dict) -> bytes:
     ).encode("utf-8")
 
 
+def manifest_generation_build_id(payload: Mapping[str, Any]) -> str:
+    """manifest generation의 사람용 시각을 제외한 canonical build identity."""
+
+    basis = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"build_id", "created_at"}
+    }
+    return hashlib.sha256(_canonical_json_bytes(basis)).hexdigest()
+
+
 def _contract_path(value: object, *, field: str, repo_root: Path) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"manifest generation {field} 경로가 비었습니다")
@@ -1245,8 +1256,7 @@ def validate_manifest_generation(
     build_id = payload.get("build_id")
     if not isinstance(build_id, str) or _SHA256_RE.fullmatch(build_id) is None:
         raise ValueError("manifest generation build_id가 canonical SHA-256가 아닙니다")
-    basis = {key: value for key, value in payload.items() if key not in {"build_id", "created_at"}}
-    expected_build_id = hashlib.sha256(_canonical_json_bytes(basis)).hexdigest()
+    expected_build_id = manifest_generation_build_id(payload)
     if build_id != expected_build_id:
         raise ValueError(
             f"manifest generation build_id 불일치: expected={expected_build_id}, "
@@ -1272,6 +1282,7 @@ __all__ = [
     "DECODER_AUDIT_FILE",
     "DECODER_AUDIT_SCHEMA_VERSION",
     "MANIFEST_GENERATION_FILE",
+    "manifest_generation_build_id",
     "decoder_audit_binding",
     "derive_decoder_accepted_members_by_tag",
     "derive_decoder_rejected_members_by_tag",

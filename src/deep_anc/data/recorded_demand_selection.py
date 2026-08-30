@@ -1288,12 +1288,11 @@ def validate_demand_selection_receipt(
     generation_payload = _load_json_object(
         generation_snapshot.data, label="DEMAND immutable manifest generation"
     )
-    generation_basis = {
-        key: value
-        for key, value in generation_payload.items()
-        if key not in {"build_id", "created_at"}
-    }
-    derived_build_id = _canonical_json_sha256(generation_basis)
+    # top-level import는 manifest_contract -> recorded_generation -> 이 모듈의
+    # 순환을 만들므로 완전히 초기화된 검증 시점에 단일 출처 helper를 불러온다.
+    from .manifest_contract import manifest_generation_build_id
+
+    derived_build_id = manifest_generation_build_id(generation_payload)
     if (
         generation_payload.get("schema_version")
         != DEMAND_MANIFEST_SCHEMA_VERSION

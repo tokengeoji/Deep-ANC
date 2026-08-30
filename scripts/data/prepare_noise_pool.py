@@ -68,6 +68,7 @@ from deep_anc.data.manifest_contract import (                  # noqa: E402
     DECODER_AUDIT_FILE,
     decoder_audit_binding,
     derive_decoder_rejected_members_by_tag,
+    manifest_generation_build_id,
     read_decoder_audit,
     validate_decoder_audit_dns_marker_partition,
     validate_decoder_audit_binding,
@@ -697,8 +698,7 @@ def _write_generation_transactionally_locked(
             if _sha256_file(audit_path) != audit_binding["sha256"] or audit_path.stat().st_size != audit_binding["size"]:
                 raise RuntimeError("staged decoder audit copy SHA/size가 source와 다릅니다")
             contract["decoder_audit"] = audit_binding
-        build_basis = _canonical_json_bytes(contract)
-        contract["build_id"] = hashlib.sha256(build_basis).hexdigest()
+        contract["build_id"] = manifest_generation_build_id(contract)
         # 사람용 시각은 build identity에 포함하지 않는다. 같은 입력은 같은 build_id다.
         contract["created_at"] = datetime.now(timezone.utc).isoformat()
         sidecar_path = staged / GENERATION_SIDECAR
