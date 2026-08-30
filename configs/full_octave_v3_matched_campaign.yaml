@@ -1,0 +1,28 @@
+# full-octave v3 physical OFF/DL/FxLMS matched campaign의 read-only receipt config.
+#
+# 이 파일은 capture/runtime/training 설정이 아니다. 기본 null 상태는 정상적으로
+# BLOCKED이며, legacy 2ch/4ch session, fixture, 임의 결과 JSON을 채워 canonical
+# physical PASS로 만들 수 없다. future campaign이 predeclared plan과 one-shot receipt를
+# immutable bytes로 발행해도, 이 checker가 확인하는 것은 선언 SHA 구조뿐이다. capture
+# adapter의 O_EXCL event history와 실제 device/stream/P/S/lineage provenance가 별도
+# authority로 구현되기 전에는 non-fixture artifact도
+# BLOCKED_UNATTESTED_PHYSICAL_PROVENANCE로 남는다.
+schema: full_octave_v3_matched_campaign_config_v1
+role: physical_matched_off_dl_fxlms_metadata_only_no_audio
+
+control_band_contract:
+  id: broadband_full_octave_88_11314_v3
+  sha256: 53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2
+  sample_rate_hz: 48000
+  block_size: 256
+
+artifacts:
+  # O_EXCL로 capture 전에 발행한 JSON plan. source/level/P/S/timing/geometry/window/
+  # limiter/hardware 및 3-condition counterbalance를 이 bytes에 먼저 고정한다.
+  campaign_plan:
+    path: null
+    sha256: null
+  # 모든 predeclared 8-input raw bundle이 나온 뒤 발행할 immutable one-shot receipt.
+  campaign_receipt:
+    path: null
+    sha256: null

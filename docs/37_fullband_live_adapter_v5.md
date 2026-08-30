@@ -2,10 +2,15 @@
 
 ## 결론과 권한 경계
 
-`scripts/data/measure_paths_fullband_causal_v5.py --execute-live`는 committed v5 신호를
-실제 장치에 한 번 제출하고, 성공·부분 실패를 모두 immutable raw로 보존하는 capture-only
-진입점이다. capture 명령은 지연 추정이나 P/S 분석을 실행하지 않는다. raw와 별도 external
-post receipt가 모두 `fsync`된 뒤에만 exact offline 명령을 출력한다.
+`scripts/data/measure_paths_fullband_causal_v5.py --execute-live`는 **향후 별도 live
+authority가 명시적으로 열릴 때에만** committed v5 신호를 실제 장치에 한 번 제출하는
+capture-only 진입점이다. capture 명령은 지연 추정이나 P/S 분석을 실행하지 않는다. raw와
+별도 external post receipt가 모두 `fsync`된 뒤에만 exact offline 명령을 출력한다.
+
+현재 tracked authority는 `plan_live_capture_enabled=false`이므로 이 명령은
+`_execute_live()`와 audio backend import 전에 exit 2로 차단된다. 아래 live 명령은 현재
+실행 지침이 아니라, authority가 code review와 새 immutable receipt로 명시적으로 열릴 때의
+미래 형식이다.
 
 이 단계가 PASS해도 다음 값은 바뀌지 않는다.
 
@@ -60,6 +65,8 @@ prebinding 및 exact error list를 묶은 `INVALID`, `analysis_admission_eligibl
 ## live 명령
 
 fresh 20초 meter가 출력한 `METER_RAW`를 그대로 쓴다. 다섯 확인은 meter와 capture가 동일하다.
+**현재는 실행하지 않는다.** tracked authority가 false이므로 아래 형식으로 호출해도 오디오를
+열지 않고 exit 2가 나와야 한다.
 
 ```bash
 .venv/bin/python scripts/data/measure_paths_fullband_causal_v5.py \

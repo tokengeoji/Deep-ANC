@@ -1,5 +1,12 @@
 # 39. Fullband causal v6 — 시간 분리 clock checkpoint 실측 계약
 
+> [!WARNING]
+> **HISTORICAL / NOT RUNNABLE.** v6 raw·분석 코드와 이 문서는 과거 forensic evidence로
+> 보존한다. 현재 `scripts/data/set_amp_level.py`는 `--mode`와 `fullband-v6`를 지원하지
+> 않으며, v6 meter/live capture를 활성 경로로 노출하지 않는다. 실행 기준은
+> [docs/36_fullband_v5_meter_followup.md](36_fullband_v5_meter_followup.md)와 실제
+> `--help`뿐이다. 아래의 v6 meter 명령은 실행하지 않는다.
+
 ## 1. 목적과 현재 권한
 
 v6는 기존 고주파 진단 캡처의 공통-clock witness 실패를 해결하기 위한 **P(z)/S(z)

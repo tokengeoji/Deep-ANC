@@ -132,6 +132,15 @@ signal-only 명령은 다음이다. 이 명령은 소리를 내지 않는다.
 스피커 연결 시간, volume 조건은 raw/analysis/training authority publisher가 모두 완성되고
 사용자 승인을 받은 뒤에만 별도로 발행한다.
 
+### 2026-08-29 실행 경계 재검증
+
+tracked `assets/contracts/fullband_causal_v5_live_capture_authority.json`의
+`plan_live_capture_enabled`는 현재 `false`다. 따라서
+`measure_paths_fullband_causal_v5.py --execute-live`는 meter 경로나 다른 인자를 주어도
+`_execute_live()`·audio primitive·`sounddevice` import보다 먼저 exit 2로 중단한다. 내부
+`_execute_live()` 직접 호출도 같은 gate를 통과해야 한다. 이 상태에서 이 명령을 실제
+출력 명령으로 해석하거나 호출하면 안 된다.
+
 ## 6. 남은 blocker
 
 1. actual raw capture와 독립 xrun/slip telemetry 증거 없음. callback frame 배열은

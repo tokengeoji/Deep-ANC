@@ -103,6 +103,11 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert 'if [ "$coverage_status" -gt 1 ]' in text
     assert 'if [ "$coverage_status" -eq 1 ]' in text
     assert "--raw-hash-workers" in text
+    assert "--full-octave" in text
+    assert "--full-octave-highrate-machine-evidence" in text
+    assert "--expected-full-octave-highrate-machine-evidence-sha256" in text
+    assert "audit_bsd35k_highrate_machine.py verify" in text
+    assert "check_full_octave_v3_admission.py" in text
     assert '--expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256"' in text
     assert "--expected-transfer-manifest-sha256" in text
     assert 'TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"' in text
@@ -926,6 +931,56 @@ def test_bootstrap_rejects_invalid_or_duplicate_raw_hash_worker_setting_before_s
     assert "--raw-hash-workers" in invalid.stderr
     assert "한 번만 지정" in duplicate.stderr
     assert not (root / "data").exists()
+
+
+def test_bootstrap_full_octave_requires_external_highrate_source_evidence_before_setup(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    missing = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--full-octave",
+        "--no-update",
+    )
+    orphan = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--full-octave-highrate-machine-evidence",
+        "results/provenance/bsd35k.json",
+        "--expected-full-octave-highrate-machine-evidence-sha256",
+        "b" * 64,
+        "--no-update",
+    )
+    preflight = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--full-octave",
+        "--full-octave-highrate-machine-evidence",
+        "results/provenance/bsd35k.json",
+        "--expected-full-octave-highrate-machine-evidence-sha256",
+        "b" * 64,
+        "--no-update",
+        "--preflight-only",
+    )
+
+    assert missing.returncode == 2
+    assert orphan.returncode == 2
+    assert preflight.returncode == 2
+    assert "high-rate machine evidence" in missing.stderr
+    assert "--full-octave와 함께만" in orphan.stderr
+    assert "--preflight-only" in preflight.stderr
+    assert not (root / "data").exists()
+    assert not (root / ".venv").exists()
 
 
 def test_bootstrap_reuse_decoder_audit_requires_both_external_sha_anchors_before_setup(

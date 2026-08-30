@@ -106,6 +106,43 @@ audit 자체, 입력 순서, manifest bytes, 첫 실패 보고 순서는 바꾸�
 생략하는 옵션이 아니며 1~32만 허용한다. vCPU·스토리지 병목이 확인되지 않은 환경은 기본값
 `1`을 유지한다.
 
+### 3.1 125 Hz–8 kHz full-octave 확장 gate
+
+위 기본 bootstrap은 기존 Stage-1 corpus를 준비하는 경로다. 이를 125/250/500/1000/2000/
+4000/8000 Hz canonical 학습으로 해석해서는 안 된다. 특히 16 kHz MIMII를 업샘플해 8 kHz
+octave의 native machine source로 세는 것을 금지한다.
+
+full-octave를 요청할 때는 실제 BSD35k `fx-m` 등 **native 22,628 Hz 이상** machine source의
+다음 evidence file과 외부에서 확인한 file SHA를 명시해야 한다.
+
+- official archive size/MD5 및 selected ZIP member ↔ extracted WAV bytes
+- official metadata에서 다시 계산한 selection·uploader lineage
+- complete decoder audit
+- deterministic native PSD와 split×band 독립 uploader coverage
+
+```bash
+# evidence 자체는 먼저 read-only로 검증한다.
+.venv/bin/python scripts/data/audit_bsd35k_highrate_machine.py verify \
+  --evidence results/provenance/bsd35k_fx_m_highrate_source.json \
+  --expected-file-sha256 "$EXPECTED_BSD35K_EVIDENCE_SHA256"
+
+# evidence와 full-octave admission이 모두 PASS일 때만 bootstrap을 시도한다.
+bash scripts/elice/bootstrap_all.sh \
+  --expected-commit "$EXPECTED_COMMIT" \
+  --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
+  --expected-transfer-manifest-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
+  --full-octave \
+  --full-octave-highrate-machine-evidence \
+    results/provenance/bsd35k_fx_m_highrate_source.json \
+  --expected-full-octave-highrate-machine-evidence-sha256 \
+    "$EXPECTED_BSD35K_EVIDENCE_SHA256" \
+  --no-update
+```
+
+evidence가 없거나 full-octave P/S·population·family batch·DNH·raw-bound execution
+admission 중 하나가 BLOCKED이면 bootstrap은 **public raw download, manifest 발행, 학습
+시작 전** 종료한다. 이 상태에서 `--preflight-only`로 high-rate evidence를 우회할 수 없다.
+
 ## 4. public raw와 manifest
 
 public raw는 Elice에서 직접 받는다. Jetson의 3–4 GiB 여유 공간에 staging하지 않는다.

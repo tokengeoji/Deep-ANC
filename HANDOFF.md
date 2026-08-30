@@ -14,16 +14,202 @@
 현재 실제 장비에서 강하게 확인된 사실은 다음과 같다.
 
 1. RT5640 드라이버와 APE 카드는 존재하지만, 2026-08-29 무음 3회 probe에서
-   `CVB-RT Jack-state`는 모두 `None`이었다. 따라서 Jetson이 J511의 HP/HS 연결을 아직
-   감지하지 못했고, 출력·P/S·ANC ON 실험은 금지다. 케이블의 실제 J511 경로와 잭 종류를
-   물리적으로 확인한 뒤에만 다시 무음 probe한다.
-2. 현재 strict P/S는 150--1600 Hz 역할의 historical evidence일 뿐, 2/4/8 kHz 광대역
-   식별·학습·배포 authority가 아니다. 기존 checkpoint·ONNX·고역 결과도 canonical
+   `CVB-RT Jack-state`는 모두 `None`이었다. 이는 **J511 HP/HS 감지 실패**이며 USB DAC
+   출력 경로의 재생 가능/불가능을 뜻하지는 않는다. 어느 출력 경로도 현장 검증되지 않았고,
+   speaker가 분리된 동안에는 출력·P/S·ANC ON 실험을 하지 않는다. 다시 연결한 뒤에도
+   장치 점유 확인→무음 preflight→사용자 입회/최소 볼륨의 짧은 검증 창 순서를 지킨다.
+2. 2026-08-29 read-only ALSA inventory에서 `card2` AB13X USB Audio의
+   `/proc/asound/card2/stream0`은 **48 kHz/S16, playback 2채널, capture 1채널**만
+   제공했다. APE의 ADMAIF 20개 열거는 8개 동기 물리 ADC 입력을 뜻하지 않는다. 모든 PCM은
+   `closed`였고 PulseAudio는 control node만 열고 있었다. 따라서 현 연결만으로는
+   `REF + NOISE_TAP + CANCEL_TAP + ERR_0..ERR_4` 8-input same-frame quiet-zone raw를
+   만들 수 없다. full-octave 다점 물리 판정에는 verified 8채널 동기 ADC/전기 tap acquisition
+   또는 동등한 hardware-frame bridge가 별도 blocker다.
+3. 현재 strict P/S는 150--1600 Hz **Stage-1에만 authoritative**하다. 2/4/8 kHz 광대역
+   식별·학습·배포 authority가 아니며, 기존 checkpoint·ONNX·고역 결과도 canonical
    성능 근거로 승격하지 않는다.
-3. 광대역 canonical 학습을 여는 최소 순서는 **동기화된 다채널 electrical witness 확보 →
+4. 광대역 canonical 학습을 여는 최소 순서는 **동기화된 다채널 electrical witness 확보 →
    fail-closed P/S raw 분석 합격 → lineage-clean public/recorded manifest 합격 →
    surrogate pretrain → recorded fine-tune → one-shot physical G4**다. 어느 하나라도 없는
    상태에서 GPU 학습을 시작하거나 성능 수치를 주장하지 않는다.
+
+### 0.1 2026-08-29 짧은 출력 경로 진단 (ANC/P/S authority 아님)
+
+사용자 입회에서 `record_duct.py`의 300 Hz/3초/ANC OFF 진단을 두 번만
+실행했고, 각 출력 stream 종료 직후 분리 안내를 냈다. 첫 minimum 조건 raw는 신호가
+잡음 바닥에 묻혔고, 사용자 승인으로 gain을 최저 위치에서 한 단계 조정한 두 번째 raw에서는 300 Hz
+source→ERR coherence² `0.741641`, source→REF `0.730343`, ERR↔REF `0.992065`가
+관측됐다. 즉, 그 짧은 조건의 noise speaker→ERR/REF 물리 경로는 진단상 살아 있다.
+
+두 capture 모두 canonical collection plan이 없는 `unbound_diagnostic`이며,
+단일 tone은 150–700 Hz timeline witness를 제공하지 못해 `timeline_gate`가 정상적으로
+거부했다(`valid_window_ratio=0`). raw를 수정·승격·재측정하지 않고 failure artifact로
+보존한다. **이는 P/S, lead, ANC 감쇠, 고역, 모델 또는 quiet-zone 증거가 아니다.**
+파일 경로·SHA·독립 재계산·다음 안전 절차는
+[`docs/57_20260829_output_route_diagnostic.md`](docs/57_20260829_output_route_diagnostic.md)에
+기록했다. 다음 물리 출력은 strict/broadband 계획의 무음 dry-run과 별도 출력 창 보고 뒤에만
+실행한다.
+
+### 0.2 2026-08-29 현재 gain 공식 meter PASS (strict P/S는 물리 재연결 대기)
+
+current USB AB13X/APE Stage-1 경로에서 1.5초 무출력 input preflight 뒤 ch0만 20초
+출력하고 ch1을 exact silence로 둔 fresh meter가 PASS했다. 마지막 구간 중앙값은
+`-48.197019 dBFS`로 공식 target `-50.1 ± 2 dBFS` 안이며, xrun/queue drop/예기치
+callback/중단은 모두 0이고 stream close도 확인됐다.
+
+- raw:
+  `results/calibration_interleaved/level_bootstrap/20260829_215459_1a6a12bb/meter_raw.npz`
+  SHA-256 `ed6fddae136f468f7b44539874e35b996a71db1968760f5eb1495970e15f7028`
+- receipt:
+  `results/calibration_interleaved/level_bootstrap/20260829_215459_1a6a12bb/meter_raw.receipt.json`
+  SHA-256 `71e62bd75931fe3bba901c85556a466a4146123d7de805124a3ef23ac885c334`
+- `validate_bootstrap_meter_raw(..., require_fresh=True)`와 현재 strict P/S
+  meter-bound dry-run은 모두 PASS했다. dry-run은 output/raw/session 파일을 만들지 않았다.
+
+이것은 **현재 노브의 Stage-1 측정 레벨 증거**일 뿐 새 P/S·lead·ANC·고역·quiet-zone
+evidence는 아니다. 출력 종료 직후 분리 안내를 냈으므로, 같은 gain의 12.5초 strict P/S는
+실제 재연결이 확인될 때만 fresh window 안에서 한 번 실행한다. 재연결이 확인되지 않거나
+freshness가 만료되면 raw를 재사용하거나 임계값을 완화하지 않고, 다음 안전 창에 새 meter부터
+시작한다.
+
+### 0.3 2026-08-29 스피커 분리 상태의 소프트웨어 경계 복구
+
+이번 작업에서는 오디오 장치를 열지 않았다. 다음은 실제 파일을 읽어 재확인했거나,
+fixture-only가 아닌 artifact 없이는 **BLOCKED**를 유지하도록 코드로 고정한 항목이다.
+
+- 82 recorded 세션은 현행 QA 기준 82/82, 95.67분, lineage component 교집합 0의
+  Stage-1 자료다. 그러나 실제 재감사
+  `results/audits/broadband_prerequisite_20260829_postrepair.json`에서
+  2.828--5.657/5.657--11.314 kHz joint independent group은 0이므로, full-octave
+  학습 자료로 승격하지 않는다.
+- `configs/full_octave_v3_execution.yaml`과
+  `scripts/train/check_full_octave_v3_execution.py`는 raw/analysis/witness/P-S
+  operator/population/sampler/DNH/non-fixture binding/training YAML/nonce receipt를
+  SHA로 교차 결속한다. 선언 SHA 구조가 모두 맞아도
+  `BLOCKED_UNATTESTED_EXECUTION_PROVENANCE`이며 성공 exit이나 Trainer·GPU·run directory를
+  만들지 않는다. typed P/S/raw/analysis/witness와 stage별 init 계약이 생기기 전에는
+  generic Stage-1 Trainer로 대체 실행하지 않는다.
+- `configs/full_octave_v3_physical_session_bundle.yaml`과
+  `scripts/data/check_full_octave_v3_physical_session_bundle.py`는 최종 quiet-zone
+  주장에 필요한 `REF + NOISE_TAP + CANCEL_TAP + ERR_0..ERR_4`의 8-input,
+  48 kHz/256/S32, BCLK/WS/absolute-frame witness, raw-first no-replace bundle만
+  선언 구조로 읽는다. 현재 null config는 audio/ALSA/GPU/network를 열지 않은
+  `BLOCKED`이며, non-fixture bytes가 맞아도
+  `BLOCKED_UNATTESTED_STRUCTURAL_RAW`와 nonzero다. 이 정보는 ANC/P/S/배포 authority가
+  아니며, capture adapter receipt·submitted PCM telemetry·native→canonical 변환 증거가
+  추가로 필요하다.
+- `configs/full_octave_v3_matched_campaign.yaml`의 OFF/DL/FxLMS Latin-square 비교와
+  `configs/full_octave_v3_level5_lifecycle.yaml`의 Level-5 미사용 source lifecycle은
+  선언된 SHA/순서가 맞아도 각각 `BLOCKED_UNATTESTED_PHYSICAL_PROVENANCE`,
+  `BLOCKED_UNATTESTED_*`로 유지한다. 현재 checker들은 self-attested JSON·checkpoint·raw
+  또는 terminal `PASS`에 성공 exit/학습/배포 authority를 주지 않는다. 실제 capture adapter
+  O_EXCL provenance, full-octave P/S·lead, native lineage inventory, 완료 checkpoint·selection,
+  독립 raw evaluator가 별도 authority로 생겨야 한다.
+- 2026-08-29 무음 실행 감사에서 v5 `--execute-live`가 false authority에도 backend로
+  진입할 수 있던 안전 결함을 수정했다. 이제 tracked
+  `fullband_causal_v5_live_capture_authority.json`의
+  `plan_live_capture_enabled=false`이면 CLI와 내부 `_execute_live()`가 모두
+  audio primitive/`sounddevice` import 전에 exit 2로 fail-closed한다. 회귀는 false
+  authority에서 execute/backend import가 각각 0회임을 검사한다. 이 변경은 live 권한을
+  여는 것이 아니라, 현재 `BLOCKED` 경계를 실제 실행에도 강제하는 것이다.
+- historical high-band raw
+  `results/experimental_high_band/20260827_fullband/20260827_203328_1b24d0c2/`
+  (raw SHA `46acda579a4ba7069844cc6824fcf4e475edc750d1b43a80cfe40a2e9ffe1ec7`)는
+  `design_band_hz=[60,8000]`이다. strict 재분석 승격은 immutable raw recipe가
+  현행 `[60,1650]` 및 required/consistency `[150,1600]`과 exact할 때만 허용하도록
+  보강했다. 따라서 sidecar marker 유무와 무관하게 이 diagnostic raw는 official P/S가
+  될 수 없다.
+
+이 구현들은 물리 측정 전 **오인 경로를 닫는** 소프트웨어 준비다. fullband raw P/S·8-input
+acquisition adapter·high-rate public corpus·고역 recorded population·raw-bound trainer loader와
+독립 physical evaluator가 없다는 실제 blocker를 PASS로 바꾸지 않는다.
+
+### 0.4 2026-08-29 현재 장비 2/4/8 kHz 결합 진단 (P/S·ANC authority 아님)
+
+현재 meter의 고정 gain에서 48 kHz/256/low, peak `0.003`으로 각 2/4/8 kHz에
+input-only 2초→NS(ch0) 2초 tone→CS(ch1) 2초 tone을 한 번씩만 실행했다. 모든 raw는
+callback xrun/clip 0, 양채널 zero flush/stream close PASS였다. 2/4 kHz의 네
+NS/CS→ERR/REF 경로와 8 kHz의 CS→ERR·양 REF 경로는 단일-tone coupling detector를
+통과했다. 8 kHz NS→ERR은 +23.30 dB 상승이 있으나 절대 tone이 `-101.775 dBFS`라
+보수적 `-100 dBFS` floor에서 `UNRESOLVED`다. 재생을 반복하거나 임계값을 낮추지 않는다.
+
+artifact SHA, 독립 raw projection, 정확한 출력 시간 및 authority 한계는
+[`docs/58_20260829_highband_coupling_diagnostic.md`](docs/58_20260829_highband_coupling_diagnostic.md)에
+기록했다. 결론은 현재 speaker가 2/4/8 kHz를 전혀 내지 못한다는 주장이 반증됐다는
+것뿐이다. USB DAC↔APE 독립 시간축과 2-input 공간 관측 한계 때문에 이 raw는
+P/S·lead·학습·ANC 감쇠·FxLMS 비교·quiet-zone 근거가 아니다.
+
+### 0.5 2026-08-29 RT5640/J511 common-clock 출력 후보 (아직 사용 불가)
+
+read-only ALSA/DT 감사에서 `APE PCM0 → ADMAIF1 → I2S1 → RT5640 → J511` route와
+APE PCM1/I2S2 ERR/REF route가 실제로 노출됐고, I2S1--6은 APE `PLL_A` 공유 후보임을
+확인했다. 따라서 USB AB13X의 adaptive/asynchronous endpoint보다 timing 구조상 유리할
+가능성은 있다. 그러나 현 J511 state는 세 번 모두 `None`, PCM은 closed, electrical/
+acoustic output witness와 hardware-frame identity는 모두 없다. 이 route는 즉시
+high-band P/S·학습·ANC 권한이 아니며 8-input quiet-zone acquisition의 대체도 아니다.
+
+근거·정확한 config SHA·무음 다음 gate는
+[`docs/59_20260829_rt5640_common_clock_route_audit.md`](docs/59_20260829_rt5640_common_clock_route_audit.md)에
+기록했다. J511 cable이 실제로 연결될 때만 `HP`/`HS` 세 번 일치부터 다시 확인한다.
+
+### 0.6 2026-08-29 현재 Stage-1 학습 admission 재확인
+
+현재 `dev`에서 `check_finetune.py --config configs/train_finetune.yaml --set
+data.digital_primary_path_mode=measured`를 실제 실행하면 canonical bootstrap receipt와
+외부 `bootstrap_receipt_sha256`가 없다는 설정 admission에서 exit 2로 멈춘다. 결과
+directory도 만들지 않았으므로, 이 fail-closed 결과를 readiness PASS나 학습 실행으로
+오인하지 않는다.
+
+82세션의 64-segment coverage 진단에는 12 family×split×subband 부족 행이 있으며, 하한은
+독립 신규 session/group 17개다. local source/lineage로 확정된 environment/music 8개와
+ESC-50 machine 4개는 보존됐지만, train 2·val 1·test 2의 DNS speech 선택은 새 Elice
+canonical_v4 bootstrap receipt와 full public manifest에서만 exact SHA로 발행할 수 있다.
+따라서 현재 12행 임시 CSV나 임의 speech source로 녹음을 시작하지 않는다.
+
+다음 학습 전 무음 순서는 새 A100 80GB Elice exact checkout/bootstrap → DNS selection
+receipt → no-replace 17행 plan/dry-run → 짧은 Stage-1 additions 수집 → coverage 재감사다.
+그 뒤에만 G0/pilot/probe/smoke/100k pretrain/50k fine-tune을 연다.
+
+### 0.7 2026-08-29 개발선 통합
+
+clean linked worktree 7개와 stale registration을 Git으로 해제했고, `dev`에 완전히
+흡수된 작업 branch와 안전하지 않은 구형 high-frequency USB experiment를 제거하는
+정리 근거를 [`docs/60_20260829_branch_consolidation.md`](docs/60_20260829_branch_consolidation.md)에
+기록했다. 이 정리는 raw/model/data를 삭제하거나 `main`에 미검증 결과를 병합하지 않는다.
+최종 상태는 `main`(배포 기준선)과 `dev`(통합 개발선)만 유지한다.
+
+### 0.8 2026-08-29 실제 acquisition witness readiness 재감사
+
+현재 Jetson ALSA 장치와 full-octave fail-closed checker를 다시 대조했다. AB13X는
+playback 2채널/capture mono 1채널의 asynchronous USB endpoint이고, APE PCM1의 ERR/REF와
+같은 hardware frame을 증명하지 못한다. J511/RT5640은 output 후보일 뿐 최근 plug state가
+세 번 `None`이고 4-input electrical witness 또는 8-input quiet-zone acquisition을 만들지
+못한다. 따라서 current device set만으로 125 Hz--8 kHz canonical P/S·학습·배포를 여는 것은
+**BLOCKED**다.
+
+무출력 static checker는 `static_gate_pass=true`와 동시에
+`electrical_witness_pass=false`, `canonical_training_eligible=false`를 반환했고, 8-input
+physical bundle checker도 raw/plan/sidecar 부재로 정상적으로 exit 1 `BLOCKED`였다. 이는
+하드웨어 통과가 아니라 우회가 막혔다는 증거다. 최신 `dev` 전체 pytest는 0 FAIL이며 local
+canonical_v4 부재 RuntimeWarning 두 건만 남았다.
+
+문서 commit 뒤 실제 Jetson PCM inventory도 다시 읽었다. 모든 stream은 `closed`이고
+AB13X는 계속 2ch adaptive playback/mono asynchronous capture이며, J511 checker의 세 표본도
+`None`이었다. 최신 `check_finetune.py`는 `data.bootstrap_receipt`와 외부 receipt SHA가
+없어 exit 2로 멈췄고 run directory를 만들지 않았다. 즉, 현재 학습 미시작은 GPU 유휴를
+방치한 것이 아니라 canonical admission이 실제로 닫힌 결과다.
+
+정확한 실제 inventory, 4/8-input 최소 조건, safety tap 조건과 Stage-1의 별도 17세션
+순서는 [`docs/61_20260829_acquisition_witness_readiness.md`](docs/61_20260829_acquisition_witness_readiness.md)에
+기록했다. 현재 소프트웨어로 가능한 다음 단계는 새 Elice A100 exact bootstrap → DNS
+selection receipt → 17행 no-replace plan/dry-run이며, final high-band는 동기 acquisition
+topology 확정 전까지 녹음·학습으로 우회하지 않는다.
+
+현재 `elice_transfer_manifest.json`은 344파일·4,689,042,188 bytes의 82세션 schema v1
+bundle이다. 현 `dev`의 docs-only 변경은 bundle bytes를 무효화하지 않으므로 새 Elice의
+canonical_v4/DNS selection에는 쓸 수 있다. 그러나 이 bundle을 canonical 학습 입력으로
+재사용하지 않는다. DNS receipt를 받아 17세션을 수집한 뒤에는 99세션 schema v2 transfer를
+no-replace 재발행·검증 전송하고 새 receipt로 다시 결속해야 한다.
 
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선

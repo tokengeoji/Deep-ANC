@@ -1,5 +1,13 @@
 # Fullband-v5 레벨 미터·입력 preflight 계약
 
+> [!WARNING]
+> **HISTORICAL / 직접 실행 금지.** 이 문서는 이전 v5 meter 경계를 보존하는 forensic
+> 기록이다. 현재 `scripts/data/set_amp_level.py`는 `--mode`를 받지 않으며, 활성 CLI는
+> `--followup-mode {strict,broadband,fullband-v5}`만 허용한다. 실행 가능한 현재 계약과
+> 명령은 [docs/36_fullband_v5_meter_followup.md](36_fullband_v5_meter_followup.md) 및
+> `.venv/bin/python scripts/data/set_amp_level.py --help`가 단일 출처다. 이 문서의 과거
+> 명령을 복사해 live 출력에 사용해서는 안 된다.
+
 ## 범위
 
 이 계약은 실제 덕트의 committed causal v5 캡처 직전에 수행하는 두 작업만 다룬다.

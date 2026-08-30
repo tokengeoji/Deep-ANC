@@ -9,6 +9,13 @@
 새 캡처만 actual int16 DAC 명령, time-domain clock witness, joint-LS 및 cubic crosscheck를
 모두 보존하며, ``--write``도 그 엄격한 schema를 만족할 때만 official pair를 만든다.
 
+``--dry-run``은 수치 진단을 위해 legacy raw를 읽을 수 있지만, official readiness를
+뜻하지는 않는다. immutable raw의 캡처 전 recipe가 현행 strict recipe와 다르면 결과를
+진단용으로만 출력하고 ``official_recipe_eligible=false`` 및 nonzero로 끝낸다. 특히
+``[60, 8000]`` historical high-band raw는 재분석 수치가 좋아도 strict P/S로 승격될 수
+없다. ``--write`` 또는 official output 경로를 준 dry-run은 official intent로 취급하므로,
+그 recipe 불일치는 분석 전에 exit 2로 막는다.
+
 무엇을 하지 않는가
 ----------------
 파라미터를 바꿔가며 "좋아 보이는" 결과를 고르는 도구가 아니다. 기본값은 측정
@@ -71,11 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--secondary-out", default=None)
     parser.add_argument(
         "--write", action="store_true",
-        help="지정하지 않으면 수치만 출력하고 아무것도 쓰지 않는다",
+        help="strict raw recipe/provenance가 모두 맞을 때만 official pair를 쓴다",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="--write 의 반대. 명시해도 되고 생략해도 기본이 dry-run 이다",
+        help=(
+            "수치 진단만 하고 쓰지 않는다. recipe 불일치 raw는 diagnostic-only "
+            "BLOCKED/nonzero이며, 0도 official readiness가 아니다"
+        ),
     )
     parser.add_argument(
         "--overwrite", action="store_true",
@@ -163,6 +173,9 @@ def load_capture(session: Path) -> dict[str, Any]:
     # 두 번 열면 그 사이 rename/swap으로 "검사한 bytes != 분석한 bytes"가 될 수 있다.
     raw_bytes = npz_path.read_bytes()
     digest = hashlib.sha256(raw_bytes).hexdigest()
+    # 이 SHA는 이번 호출이 실제로 분석한 byte snapshot을 결속할 뿐, capture 당시의
+    # external receipt나 저장소 밖의 immutable trust root를 되살리지는 못한다. 그러한
+    # receipt가 없는 legacy raw를 이 도구 자체의 SHA로 official로 만들지 않는다.
     with np.load(io.BytesIO(raw_bytes), allow_pickle=False) as data:
         meta = json.loads(str(data["metadata_json"]))
         recorded_raw = np.asarray(data["input_raw_int32"])
@@ -390,15 +403,78 @@ def require_observed_output_pcm_for_official(capture: dict[str, Any]) -> None:
         raise ValueError("legacy dewarp/warp 적용 캡처는 diagnostic-only이며 official이 될 수 없습니다")
 
 
-def require_official_analysis_contract(
-    capture: dict[str, Any], args: argparse.Namespace
+def _require_exact_raw_recipe_band(
+    value: object, *, expected: tuple[float, float], label: str
 ) -> None:
-    """official 재분석은 immutable raw에 캡처 전에 박힌 분석 계약과 exact해야 한다."""
+    """raw에 *캡처 전* 기록된 source recipe 대역을 exact하게 확인한다.
+
+    ``analysis_metadata*.json``은 raw 뒤에 생기는 파생물이라 official 승격 authority가
+    될 수 없다. 특히 과거 high-band diagnostic은 sidecar에만 상태를 기록했으므로,
+    여기서는 immutable raw ``metadata_json``의 두 원소 대역 자체만 신뢰한다.
+    """
+
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"raw {label}는 정확히 두 유한 숫자의 list여야 합니다")
+    if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value):
+        raise ValueError(f"raw {label}는 정확히 두 유한 숫자의 list여야 합니다")
+    try:
+        actual = np.asarray(value, dtype=np.float64)
+        target = np.asarray(expected, dtype=np.float64)
+    except (OverflowError, TypeError, ValueError) as exc:
+        # JSON의 arbitrary-precision int는 float64로 바꾸는 순간 OverflowError를 낼 수
+        # 있다. raw가 malformed라는 뜻이지 CLI traceback으로 빠져나갈 이유는 없으므로,
+        # 다른 recipe 위반과 같은 controlled fail-closed ValueError로 정규화한다.
+        raise ValueError(
+            f"raw {label}는 float64로 표현 가능한 정확히 두 유한 숫자의 list여야 합니다"
+        ) from exc
+    if not np.all(np.isfinite(actual)):
+        raise ValueError(f"raw {label}에 NaN/Inf를 쓸 수 없습니다")
+    if not np.array_equal(actual, target):
+        raise ValueError(
+            f"raw {label}={actual.tolist()}가 official recipe {target.tolist()}와 다릅니다"
+        )
+
+
+def require_official_raw_recipe_contract(capture: dict[str, Any]) -> None:
+    """immutable raw의 capture-before strict recipe만 확인한다.
+
+    이 검사는 external receipt, observed PCM, clock witness, joint-LS 또는 requested
+    reanalysis parameter를 증명하지 않는다. 따라서 성공은 **recipe 호환성만** 뜻하며,
+    official P/S authority나 학습 readiness가 아니다.
+    """
 
     meta = capture.get("meta", {})
     contract = meta.get("analysis_contract")
     if not isinstance(contract, dict):
         raise ValueError("strict raw analysis_contract가 없어 official 재분석할 수 없습니다")
+    # raw recipe가 strict source와 다르면 사후 analysis contract를 맞춰도 같은
+    # 실험이 아니다. 예를 들어 [60, 8000] high-band diagnostic은 sidecar marker가
+    # 유실돼도 current [60, 1650] strict P/S로 재분석·승격될 수 없어야 한다.
+    _require_exact_raw_recipe_band(
+        meta.get("design_band_hz"),
+        expected=tuple(float(value) for value in mpi.OFFICIAL_MEASUREMENT_LEVEL.design_band_hz),
+        label="design_band_hz",
+    )
+    _require_exact_raw_recipe_band(
+        meta.get("required_band_hz"),
+        expected=tuple(float(value) for value in mpi.OFFICIAL_MEASUREMENT_LEVEL.meter_band_hz),
+        label="required_band_hz",
+    )
+    _require_exact_raw_recipe_band(
+        contract.get("consistency_band_hz"),
+        expected=tuple(float(value) for value in mpi.OFFICIAL_MEASUREMENT_LEVEL.meter_band_hz),
+        label="analysis_contract.consistency_band_hz",
+    )
+
+
+def require_official_analysis_contract(
+    capture: dict[str, Any], args: argparse.Namespace
+) -> None:
+    """official 재분석은 immutable raw에 캡처 전에 박힌 분석 계약과 exact해야 한다."""
+
+    require_official_raw_recipe_contract(capture)
+    meta = capture.get("meta", {})
+    contract = meta["analysis_contract"]
     fs = int(capture["fs"])
     requested = {
         "fit_band_hz": [float(v) for v in args.fit_band],
@@ -495,8 +571,27 @@ def main(argv: list[str] | None = None) -> int:
         reject_loosening(args)
         session = cw._repo_path(args.capture_dir, require_results=True)
         capture = load_capture(session)
-    except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
+    except (KeyError, OSError, OverflowError, TypeError, ValueError, json.JSONDecodeError) as exc:
         print(f"[중단] {exc}", file=sys.stderr)
+        return 2
+
+    # output path만 지정해도 caller는 official pair의 미래 경로를 예약한 것이다. --write
+    # 없이도 그 intent를 무시하면 historical diagnostic raw의 dry-run 0이 strict
+    # preflight처럼 보일 수 있으므로, recipe mismatch는 analysis 전에 실패-폐쇄한다.
+    official_output_requested = bool(args.primary_out or args.secondary_out)
+    official_intent = write or official_output_requested
+    try:
+        require_official_raw_recipe_contract(capture)
+    except ValueError as exc:
+        raw_recipe_error: str | None = str(exc)
+    else:
+        raw_recipe_error = None
+    if official_intent and raw_recipe_error is not None:
+        print(
+            "[중단] official_recipe_eligible=false — "
+            f"{raw_recipe_error}. diagnostic raw에는 official output 경로를 지정할 수 없습니다",
+            file=sys.stderr,
+        )
         return 2
 
     meta, fs, probe = capture["meta"], capture["fs"], capture["probe"]
@@ -636,6 +731,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if not write:
         print("  [dry-run] 아무것도 쓰지 않았습니다 (--write 로 저장)")
+        if raw_recipe_error is not None:
+            print(
+                "  [BLOCKED] official_recipe_eligible=false — "
+                f"{raw_recipe_error}. 이 수치는 diagnostic-only이며 strict P/S, "
+                "학습 readiness 또는 deployment authority가 아닙니다.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "  [dry-run] official_recipe_eligible=true (raw recipe만 확인); "
+            "dry-run 성공은 official P/S readiness가 아닙니다."
+        )
         return 0 if valid else 1
     if not valid:
         print("\n[실패] 게이트 미달 — official 을 쓰지 않습니다", file=sys.stderr)

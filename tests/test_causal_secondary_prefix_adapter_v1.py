@@ -587,4 +587,7 @@ def test_module_is_device_agnostic_and_does_not_open_v3_training_gate() -> None:
     }
     assert {"sounddevice", "subprocess", "cuda", "realtime", "audio_io"}.isdisjoint(imports)
     assert ".forward(" not in source
-    assert V3_TRAINER_EVALUATOR_CONSUMERS_IMPLEMENTED is False
+    # Adapter만 있던 초기 상태와 달리, 같은 binding의 v3 loss/FxLMS consumer가
+    # 별도 regression으로 연결됐다. physical/canonical admission은 여전히 이
+    # fixture가 아니라 raw-bound authority에서 따로 닫힌다.
+    assert V3_TRAINER_EVALUATOR_CONSUMERS_IMPLEMENTED is True

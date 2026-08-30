@@ -145,11 +145,16 @@ def test_default_admission_is_structured_blocked_without_audio_or_training() -> 
         "population_authority",
         "family_balanced_batch_receipt",
         "dnh_gradient_calibration",
-        "v3_trainer_evaluator_consumer_wiring",
+        "v3_raw_bound_execution_config",
     }
+    assert next(
+        check
+        for check in report["checks"]
+        if check["id"] == "v3_trainer_evaluator_consumer_wiring"
+    )["status"] == "PASS"
 
 
-def test_future_artifacts_are_hash_and_cross_reference_bound_but_code_gate_stays_blocked(
+def test_future_artifacts_are_hash_and_cross_reference_bound_but_admission_only_cannot_execute(
     tmp_path: Path,
 ) -> None:
     report = audit_full_octave_v3_admission(
@@ -158,7 +163,12 @@ def test_future_artifacts_are_hash_and_cross_reference_bound_but_code_gate_stays
     assert report["status"] == "BLOCKED"
     assert report["eligible"] is False
     blocked = {check["id"] for check in report["checks"] if check["status"] == "BLOCKED"}
-    assert blocked == {"v3_trainer_evaluator_consumer_wiring"}
+    assert blocked == {"v3_raw_bound_execution_config"}
+    assert next(
+        check
+        for check in report["checks"]
+        if check["id"] == "v3_trainer_evaluator_consumer_wiring"
+    )["status"] == "PASS"
 
 
 def test_admission_rejects_v2_or_forged_config_contract() -> None:

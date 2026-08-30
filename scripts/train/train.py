@@ -23,6 +23,10 @@ from deep_anc.config import load_train_config, load_yaml  # noqa: E402
 from deep_anc.train.full_octave_v3_admission import (  # noqa: E402
     is_full_octave_v3_admission_config,
 )
+from deep_anc.train.full_octave_v3_execution import (  # noqa: E402
+    audit_full_octave_v3_execution,
+    is_full_octave_v3_execution_config,
+)
 from deep_anc.train.finetune_readiness import (        # noqa: E402
     require_finetune_readiness,
 )
@@ -68,6 +72,43 @@ def main() -> int:
         print(
             "[중단] full_octave_v3 admission-only config는 아직 Trainer에 사용할 수 "
             "없습니다. scripts/train/check_full_octave_v3_admission.py로만 검사하세요.",
+            file=sys.stderr,
+        )
+        return 2
+    # raw-bound full-octave v3 execution envelope도 기존 Stage-1 Trainer에 그대로
+    # 넣을 수 없다. 먼저 exact artifact/nonce receipt를 읽기 전용으로 검사한다.
+    # 이 지점은 load_train_config, resume preflight, ProcessLock, Trainer보다 앞이므로
+    # malformed/null/fixture-only envelope가 GPU나 run directory를 열 수 없다.
+    if is_full_octave_v3_execution_config(raw_config):
+        if args.overrides or args.resume:
+            print(
+                "[중단] full_octave_v3 execution envelope에는 --set/--resume을 줄 수 없습니다. "
+                "exact training YAML와 receipt SHA를 다시 발행하세요.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            execution_report = audit_full_octave_v3_execution(
+                raw_config, repo_root=Path(__file__).resolve().parents[2]
+            )
+        except (OSError, ValueError) as exc:
+            print(f"[중단] full_octave_v3 execution preflight 실패: {exc}", file=sys.stderr)
+            return 2
+        if execution_report["status"] != "READY":
+            print(
+                "[중단] full_octave_v3 execution envelope는 canonical Trainer 권한이 아닙니다 "
+                f"(status={execution_report['status']}). self-attested SHA 구조는 학습을 열 수 없으며 "
+                "scripts/train/check_full_octave_v3_execution.py로 차단 근거를 확인하세요.",
+                file=sys.stderr,
+            )
+            return 2
+        # 현재 generic Trainer는 raw-bound v3 binding loader를 소비하지 않는다. READY
+        # receipt라도 Stage-1 path를 조용히 실행하는 것보다 명시적으로 멈추는 것이
+        # 안전하다. production loader/Trainer wiring을 별도 review로 추가한 뒤에만
+        # 이 branch가 actual Trainer 진입으로 바뀐다.
+        print(
+            "[중단] full_octave_v3 execution preflight는 통과했지만 현재 Trainer에는 "
+            "raw-bound v3 binding loader가 없습니다. generic Stage-1 학습으로 대체 실행하지 않습니다.",
             file=sys.stderr,
         )
         return 2
