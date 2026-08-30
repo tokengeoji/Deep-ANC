@@ -224,7 +224,7 @@ S **37.19–80.31ms** 범위로 이동했다. 이 값에는 음향 비행시간�
 
 ```bash
 .venv/bin/python scripts/bench/measure_duct_transfer_map.py \
-  --confirm-volume-minimum
+  --confirm-volume-minimum --confirm-speaker --confirm-user-present
 ```
 
 무신호, gap 대비 driven excess 부족, 낮은 IR peak/noise, timestamp 비진행, geometry와 반대인

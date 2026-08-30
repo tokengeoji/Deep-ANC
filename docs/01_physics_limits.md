@@ -3,24 +3,28 @@
 이 문서는 "왜 어떤 소음은 지워지고 어떤 소음은 물리적으로 지울 수 없는지"를 수치로 고정한다.
 여기 있는 숫자가 데이터 합성(`data_sim.yaml`)과 학습 플랜트(`duct.yaml`)의 근거다.
 
-## 1. 실측값 (기존 anc_project 캘리브레이션에서 확인)
+## 1. 역사적 실측 진단값 (현재 official/training-ready 아님)
 
 | 항목 | 값 | 출처 |
 |---|---|---|
 | I/O 왕복지연 (block 256/low) | **30.6ms** (1470샘플) | calibration_4s.log 상호상관 피크 |
 | I/O 왕복지연 (block 512/high) | 57.1ms | calibration_4s_512.log |
-| 채택 S(z) 순수지연 | **1462샘플 = 30.46ms** | secondary_path_il.npz (150–1600Hz 일관성 **0.9990**) |
-| 채택 P(z) 순수지연 | **1602샘플 = 33.38ms** | primary_path_il.npz (동 대역 **0.9993**), **같은 capture·같은 앵커** |
+| legacy S(z) 진단 지연 | **1462샘플 = 30.46ms** | secondary_path_il.npz (당시 150–1600Hz 일관성 **0.9990**) |
+| legacy P(z) 진단 지연 | **1602샘플 = 33.38ms** | primary_path_il.npz (당시 동 대역 **0.9993**), 같은 capture·같은 앵커 |
 | **P − S** | **140샘플** | 이 측정의 **유일한 물리 불변량** — 독립 캡처 9건에서 139~141 |
 | **lead** | **116샘플** | `S 1462 + handoff 256 − P 1602`. 캡처 9건에서 115~117 |
 | S/P 신뢰 대역 (`consistency_band_hz`) | **150–1600Hz** | 동 npz. **2026-08-05 재발행에서 150–600 → 150–1600 으로 확대** |
 | 구동 대역 (`excitation_band_hz`) | P **64–1648Hz** / S **72–1640Hz** | 인터리브라 두 채널이 인접 FFT 빈을 번갈아 쓴다 — **두 경로가 다른 값이다** |
 | **실제 저역 재현 한계** | **80–150Hz** | 클린 재측정 후에도 S 부대역 일관성 **0.758** — 스피커 저역 SNR 8–10dB. **여기만 진짜 물리 한계다**. (80 Hz 는 `band_consistency_hz` 의 최저 부대역 하한이고 구동은 64~72 Hz 부터다) |
 | 3-스레드 런타임 핸드오프 | **+256샘플 = 5.33ms** | 콜백→추론→다음 콜백 1 hop (설계 C1) |
-| digital `D_noise` | **1602샘플 = 33.38ms (실측)** | primary_path_il.npz. 기하 예측 1612 와 10샘플 차 |
+| digital `D_noise` legacy 기준선 | **1602샘플 = 33.38ms** | primary_path_il.npz. 기하 예측 1612 와 10샘플 차; 신규 official 근거로 재사용 금지 |
 
 주의: S(z) 지연 30.46ms 의 대부분은 **USB/ALSA 버퍼 지연**이다 (덕트 내 음향 전파는
 CS→ERR 50mm = 0.15ms 에 불과).
+
+위 수치는 과거 캡처에서 찾은 물리 진단값이다. 해당 NPZ는 observed submitted PCM,
+q+joint-LS/cubic witness, immutable source SHA와 두 운영자 확인이 없어 readiness가 거부한다.
+새 strict 48k 캡처 전에는 어떤 값도 현재 official P/S로 간주하지 않는다.
 
 > [!CAUTION]
 > **절대 지연(1602 / 1462)은 캡처 간 재현되지 않는다.** 저장된 캡처 11건을 전수 재분석하면
@@ -57,47 +61,36 @@ d 도달:  δ_out + t_ac(NS→ERR)=3.21ms      y 도달: δ_out + t_ac(CS→ERR)
 → 예측 여유 = 3.21 − 0.15 = +3.06ms (147샘플) − 핸드오프 5.33ms = −2.27ms
 ```
 
-**실측 기준 수치 (2026-08-05 재발행, `*_il.npz`)**: d 경로 순수지연 `D_noise = 1602샘플`,
-상쇄 경로 총지연 `S_total = 1462 + 256(핸드오프) = 1718샘플`, 따라서 **`lead = 116`**.
-lead 가 0이면 모델이 116샘플(2.42ms) 뒤의 광대역 랜덤 신호를 예측해야 하므로, 현재
-Stage-1은 예측에 맡기지 않고 자기생성 소스가 주는 확정적 선행 정보를 실제 재생 스케줄에
-반영한다.
+새 학습의 정렬은 strict P/S NPZ에서만 유도한다. `TrainingTimingContract`는 P/S bulk
+`delay_samples`, compact FIR peak 지연, runtime 256-sample handoff,
+`PlantDelays.lead()`와 합성 총 선행량을 서로 다른 필드로 보존한다. recorded branch는 같은
+총 선행량에서 세션별 정렬 잔여를 빼서 lead를 유도한다.
 
-> **이력.** 이 값은 세 번 바뀌었다 — 추정 `109`(순차 ESS, S 1342) → 오염된 인터리브
-> 측정 `113`(S 1465 / P 1608) → **복구된 측정 `116`(S 1462 / P 1602)**.
-> 아래 예시에 남아 있는 `109` 는 **배포 중인 ONNX 가 그 값으로 사전학습됐기 때문에**
-> 참고로 남긴 것이다(`configs/runtime_tiny.yaml: digital_reference_lead_samples: 109`).
-> **새 학습·평가는 전부 116 / 1462 / 1602 를 쓴다** (`configs/duct.yaml` 이 단일 출처).
+정상 정렬은 수치가 무엇이든 다음 등식으로 검증한다.
 
-**현재 배포 중인 ONNX 의 digital-ref 규약은 playback FIFO lead=109다.** 런타임은 지금
-생성하고 게이트까지 적용한 블록을 모델 ref에 즉시 공급하고, 소음 ch0에 나가는 playback만
-lead 샘플만큼 FIFO로 늦춘다. 정상 구간에서 다음 관계가 성립한다(현행 실측값 기준).
-
-```
-reference[t] = playback[t + 116]
-reference[t]에 대응하는 d 도달 = 116 + D_noise(1602) = 1718샘플 뒤
-reference[t]로 만든 y 도달       = S_total(1462+256)  = 1718샘플 뒤
+```text
+reference[t]에 대응하는 synthetic d 도달 시각
+  == reference[t]로 만든 y가 S+handoff를 지나 도달하는 시각
+  == recorded session residual alignment + session-derived lead
 ```
 
-이는 모델이 미래 입력을 읽는 것이 아니다. Jetson이 재생할 소스를 먼저 알고 있어 ref를
-공급한 뒤 실제 playback을 지연하는 인과적 스케줄이다. FIFO는 시작할 때 `lead`개의 0으로
-채워지며, 학습은 연속 source를 `segment+lead`만큼 뽑아 `x_ref[t]=n[t+lead]`,
-`playback[t]=n[t]`로 동일 정렬을 재현한다. 체크포인트/ONNX 메타의 lead와 런타임 lead가
-다르면 시작 전에 거부한다. 설정 단일 출처는
-`data.digital_reference_lead_samples` / `runtime.digital_reference_lead_samples`다.
+이는 미래 입력 참조가 아니다. Jetson이 앞으로 재생할 자기생성 소스를 먼저 모델에 공급하고
+실제 playback을 FIFO로 늦추는 인과적 스케줄이다. checkpoint/ONNX/runtime의 timing contract
+SHA가 다르면 오디오 시작 전에 거부한다. 과거 수동 lead artifact는 diagnostic-only다.
 
-`D_noise` 는 더 이상 기하 추정이 아니라 **실측 P(z) 값 1602** 다
-(`configs/duct.yaml: d_noise_delay_samples: 1602`, `primary_path_npz: assets/measured/primary_path_il.npz`).
-측정은 `S(z)` 와 **같은 캡처·같은 출력 스트림**에서 인터리브로 수행해야 `P/S` 단위와
-상대 지연이 맞는다 — `scripts/data/measure_paths_interleaved.py`.
-저장된 캡처를 스피커 없이 재분석하려면 `scripts/data/reanalyse_paths_interleaved.py`.
+`D_noise=1602`와 `assets/measured/primary_path_il.npz`는 현재 설정에 남은 **legacy 진단
+기준선**이며 training-ready 실측 P(z)로 인정되지 않는다. 새 P/S는 같은 strict 캡처에서
+48k/256/low, ERR0/REF1/NS0/CS1, observed submitted PCM, q+joint-LS+cubic 및 두 운영자 확인을
+모두 보존해야 한다 — `scripts/data/measure_paths_interleaved.py`. 저장된 옛 캡처를
+`scripts/data/reanalyse_paths_interleaved.py --dry-run`으로 읽는 것은 진단만 가능하고
+누락 provenance를 되살리거나 official로 승격하지 못한다.
 
 ### 현재 Stage-1의 P(z) 대용 정책
 
 실측 `P(z)`가 없을 때 1D `p_err` RIR은 절대 장치 gain이 없고, 측정 장치 스케일의
 `S(z)`와 직접 비교할 수 없다. 실제로 이 조합은 필요한 y가 limiter ±0.2를 크게 넘어
-영출력(약 0dB)이 유리한 잘못된 목적을 만들었다. 현재 `secondary_surrogate`는
-`P(z)`의 FIR/gain에 `S(z)`를 빌리고 지연만 `D_noise`로 적용한다. 따라서
+영출력(약 0dB)이 유리한 잘못된 목적을 만들었다. 현행 `secondary_surrogate`는
+`P(z)`의 FIR/gain에 `S(z)`를 빌리고 P bulk delay는 strict primary NPZ에서 읽는다. 따라서
 P/S 스케일이 맞는 역매핑을 학습할 수 있지만 다음 제한이 있다.
 
 - checkpoint `physics_status=secondary_surrogate_representation_pretrain`
@@ -110,12 +103,12 @@ P/S 스케일이 맞는 역매핑을 학습할 수 있지만 다음 제한이 �
 외부 소음을 레퍼런스 마이크로 수음한다. 마이크가 소음을 들은 시점부터
 상쇄음이 에러 마이크에 도달할 때까지:
 
-```
-필요 예측 지평 P = S경로 지연(1462+256) − t_ac(REF→ERR 선행분 1.0m ≈ 140샘플)
-              ≈ 1718 − 140 ≈ 1578샘플 ≈ 32.9ms
+```text
+필요 예측 지평 = strict S bulk delay + handoff − REF→ERR의 측정/기하 선행분
 ```
 
-**약 33ms 뒤의 소음을 미리 알아야** 상쇄할 수 있다. 따라서:
+현 하드웨어에서는 이 지평이 광대역 비주기 소음의 상관시간보다 훨씬 길다. 정확한 수치는
+strict capture 이후 계약에서 계산하며 legacy 절대 지연을 재사용하지 않는다. 따라서:
 
 | 잡음 유형 | 상쇄 가능성 | 이유 |
 |---|---|---|
@@ -126,9 +119,9 @@ P/S 스케일이 맞는 역매핑을 학습할 수 있지만 다음 제한이 �
 ### 고전 인과성 예산과 3단계
 
 acoustic-ref 광대역이 되려면 전기적 총지연 < REF→CS 음향 전파 **2.77ms** 가 필요하다.
-현재 약 33ms → 불가능. 덕트 구조 문서의 하드웨어 개선(USB 폐기 → I2S DAC 직결,
-96kHz/32샘플 버퍼)이 3단계의 선결 조건이다. 지연이 바뀌면 `duct.yaml` 의 지연 값만
-갱신하고 파인튜닝하면 된다 (하드코딩 없음).
+현 USB/ALSA 경로에서는 불가능하다. 덕트 구조 문서의 하드웨어 개선(USB 폐기 → I2S DAC
+직결, 더 작은 버퍼)이 후속 acoustic-ref의 선결 조건이다. 지연이 바뀌면 새 strict NPZ를
+측정해 timing contract를 다시 만들며 YAML에 수동 delay를 쓰지 않는다.
 
 ## 4. 주파수 상한
 

@@ -207,7 +207,7 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_finetune_readiness.py::test_every_entry_gate_passes_at_its_declared_boundary"
         ),
-        positive_probe="일관성 = min_path_consistency 정확히, 요구 대역 = 구동 대역 양 끝 100/1000Hz",
+        positive_probe="일관성 = min_path_consistency 정확히, 절대목표 양 끝 150/1600Hz",
     ),
     GateDeclaration(
         gate_id="official_primary_path",
@@ -220,7 +220,7 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_fixture=(
             "tests/test_finetune_readiness.py::test_every_entry_gate_passes_at_its_declared_boundary"
         ),
-        positive_probe="요구 대역 상단 1000Hz 를 정확히 요구한 상태에서 통과",
+        positive_probe="요구 대역 상단 1600Hz 를 정확히 요구한 상태에서 통과",
     ),
     GateDeclaration(
         gate_id="matched_path_measurement_conditions",
@@ -385,6 +385,30 @@ GATES: tuple[GateDeclaration, ...] = (
         positive_probe="manifest SHA 일치, 최소 표본 1개에서 확인",
     ),
     GateDeclaration(
+        gate_id="recorded_transfer_snapshot",
+        owner=_READINESS,
+        what_it_asserts="canonical fine-tune이 bootstrap transfer snapshot에 결속된 recorded 파일만 사용한다",
+        negative_fixture=(
+            f"{_NEG}::test_recorded_transfer_snapshot_gate_fails_without_transfer_snapshot"
+        ),
+        positive_fixture=(
+            "tests/test_finetune_readiness.py::test_canonical_completion_verifies_selection_capability_marker_metrics_chain"
+        ),
+        positive_probe="bootstrap receipt와 transfer manifest의 64자리 SHA·inode snapshot이 일치",
+    ),
+    GateDeclaration(
+        gate_id="recorded_selection_test_once_chain",
+        owner=_READINESS,
+        what_it_asserts="recorded-val 선택과 single-use test capability 체인이 완료 결과와 일치한다",
+        negative_fixture=(
+            "tests/test_finetune_readiness.py::test_canonical_completion_verifies_selection_capability_marker_metrics_chain"
+        ),
+        positive_fixture=(
+            "tests/test_finetune_readiness.py::test_canonical_completion_verifies_selection_capability_marker_metrics_chain"
+        ),
+        positive_probe="선택/발급/소비/완료 4개 marker의 SHA 체인 검증",
+    ),
+    GateDeclaration(
         gate_id="recorded_val_g4",
         owner=_READINESS,
         what_it_asserts="독립 recorded val 평가가 G4(최악 소스 계열 포함)를 통과했다",
@@ -422,9 +446,10 @@ GATES: tuple[GateDeclaration, ...] = (
         ),
         discoverable_id=False,
         positive_fixture=(
-            "tests/test_finetune_readiness.py::test_weak_sub_band_outside_the_required_band_is_not_judged"
+            "tests/test_finetune_readiness.py::"
+            "test_all_canonical_sub_bands_pass_at_the_required_boundary"
         ),
-        positive_probe="필수 대역 하한 150Hz 밖 부대역은 판정하지 않는다 (영구 FAIL 방지)",
+        positive_probe="canonical 4개 부대역이 official hard 하한 0.95에 정확히 붙어도 통과",
     ),
     GateDeclaration(
         gate_id="official_path_delay_spread",
@@ -537,6 +562,24 @@ GATES: tuple[GateDeclaration, ...] = (
             "test_every_declared_tag_present_builds_all_manifests"
         ),
         positive_probe="선언 태그 3종을 정확히 다 채운 최소 구성 (비율 0 인 태그 1종은 요구하지 않는다)",
+    ),
+    GateDeclaration(
+        gate_id="noise_pool_recorded_holdout_required",
+        owner=_NOISE_POOL,
+        what_it_asserts=(
+            "학습용 synthetic manifest를 쓰기 전에 recorded holdout 파일이 존재하고 "
+            "최소 1개 클립을 포함하는지 확인한다"
+        ),
+        negative_fixture=(
+            "tests/test_prepare_noise_pool.py::"
+            "test_missing_holdout_fails_before_writing_any_manifest"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_prepare_noise_pool.py::"
+            "test_every_declared_tag_present_builds_all_manifests"
+        ),
+        positive_probe="recorded holdout 1개 이상과 선언 태그 3종이 있는 최소 정상 구성",
     ),
     # ---------------- G4 판정 게이트 (eval/recorded.py) ----------------
     GateDeclaration(

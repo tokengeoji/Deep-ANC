@@ -41,12 +41,34 @@ def make_scenario(noise_cfg: dict, seconds: float, fs: int, duct_cfg: dict, sp_d
     program = NoiseProgram(noise_cfg, fs)
     src = program.generate(n_samples)
     paths = duct_paths(duct_cfg, fs)
-    d_noise = duct_cfg.get("digital_reference", {}).get("d_noise_delay_samples")
-    if d_noise is None:
-        d_noise = default_d_noise_delay(duct_cfg, fs, sp_delay)
+    # 이 함수는 명시 opt-in한 legacy RIR 진단 전용이다. 폐기된 YAML 수동값을
+    # 읽지 않고 당시 geometry surrogate를 그 자리에서만 계산한다.
+    d_noise = default_d_noise_delay(duct_cfg, fs, sp_delay)
     extra = max(0, int(d_noise) - duct_distance_samples(duct_cfg, "noise_speaker", "error_mic", fs))
     d = _delay_np(fft_filter(src, paths["p_err"]), extra)
     return src.astype(np.float32), d.astype(np.float32)
+
+
+def validate_legacy_diagnostic_checkpoint(
+    saved_cfg: dict, *, allow_legacy_diagnostic_timing: bool
+) -> None:
+    """modern/canonical checkpoint를 legacy FxLMS 비교표에 넣지 못하게 한다."""
+
+    data_cfg = saved_cfg.get("data") if isinstance(saved_cfg, dict) else None
+    data_cfg = data_cfg if isinstance(data_cfg, dict) else {}
+    role = str(saved_cfg.get("experiment_role", "")) if isinstance(saved_cfg, dict) else ""
+    if role in {"canonical_pretrain", "canonical_finetune"} or data_cfg.get(
+        "training_timing_contract"
+    ) is not None:
+        raise ValueError(
+            "TrainingTimingContract/canonical checkpoint는 compare_fxlms legacy RIR "
+            "진단으로 평가할 수 없습니다"
+        )
+    if not allow_legacy_diagnostic_timing:
+        raise ValueError(
+            "compare_fxlms는 legacy geometry timing 진단 전용입니다. 재현 목적일 때만 "
+            "--allow-legacy-diagnostic-timing을 명시하세요"
+        )
 
 
 def main() -> int:
@@ -56,6 +78,11 @@ def main() -> int:
     parser.add_argument("--eval-config", default="configs/eval.yaml")
     parser.add_argument("--seconds", type=float, default=8.0)
     parser.add_argument("--out", default="results/compare_fxlms.md")
+    parser.add_argument(
+        "--allow-legacy-diagnostic-timing",
+        action="store_true",
+        help="비공식 legacy geometry/RIR 비교를 명시적으로 허용",
+    )
     args = parser.parse_args()
 
     from deep_anc.dsp.timing import handoff_samples_from_config
@@ -74,6 +101,15 @@ def main() -> int:
 
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 
+    try:
+        validate_legacy_diagnostic_checkpoint(
+            state.get("cfg", {}),
+            allow_legacy_diagnostic_timing=args.allow_legacy_diagnostic_timing,
+        )
+    except ValueError as exc:
+        print(f"[중단] {exc}", file=sys.stderr)
+        return 2
+
     # 이 스크립트는 checkpoint 의 resolved 물리(P(z) resolver, digital-reference lead)를
     # 쓰지 않는다. 그래서 corrected 규약으로 학습한 checkpoint 를 넣으면 DL 열이 조용히
     # 틀린다 — 실측으로 tone300 이 +42.86 dB 여야 하는데 -0.91 dB(증폭)로 나온다.
@@ -83,7 +119,9 @@ def main() -> int:
     # 딥러닝이 이 프로젝트의 목적이므로 FxLMS 비교기를 다시 만드는 데 시간을 쓰지 않는다.
     # 대신 **틀린 숫자를 발행하지 못하게** 막는다. 잘못된 비교표가 한 번 나가면 되돌리기
     # 어렵고, 이 스크립트의 결과에 걸린 결정은 현재 하나도 없다.
-    checkpoint_lead = int(state.get("cfg", {}).get("digital_reference_lead_samples", 0))
+    checkpoint_lead = int(
+        state.get("cfg", {}).get("data", {}).get("digital_reference_lead_samples", 0)
+    )
     checkpoint_mode = str(
         state.get("cfg", {}).get("data", {}).get("digital_primary_path_mode", "")
     )

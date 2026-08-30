@@ -445,10 +445,20 @@ def _validate_session_metadata(
         except ValueError as exc:
             _append_error(result, f"session.json: {exc}")
             continue
-        if entry.get(key) != value:
+        # canonical regrouped manifest는 split 누수를 막기 위해 ``group_id``를
+        # lineage component ID로 재작성한다. 원본 session.json은 불변으로
+        # 보존하므로, 그 안의 legacy pool group은 manifest의
+        # ``source_pool_group_id``와 대조해야 한다. canonical ID와 직접 대조하면
+        # 정상적으로 재그룹화된 82세션이 전부 거부된다.
+        expected = (
+            entry.get("source_pool_group_id")
+            if key == "group_id" and "source_pool_group_id" in entry
+            else entry.get(key)
+        )
+        if expected != value:
             _append_error(
                 result,
-                f"session.json {key}({value!r})와 manifest({entry.get(key)!r}) 불일치",
+                f"session.json {key}({value!r})와 manifest({key}={expected!r}) 불일치",
             )
 
     # 현재 수집 포맷은 session_id를 디렉터리/manifest가 소유한다. 향후 JSON에도
@@ -609,27 +619,40 @@ def _validate_alignment(
         _append_error(result, f"정렬 검사 실패: {exc}")
         return
 
-    # 원본 기준 지연은 **세션이 이미 기록해 둔 값**을 읽는다. 다시 재면 그것이
-    # 네 번째 유도가 된다 — 2026-08-06 에 실제로 그렇게 만들었다가 지웠다.
-    #   1849   P(z) 유도 (bulk 1602 + argmax 247)
-    #   1651   여기서 다시 잰 값
-    #   1507.8 세션의 timeline.raw_lag_median_samples (n=82 중앙)
-    # 세 값이 전부 달랐고, 셋 다 "재생→ERR 지연" 이라는 같은 이름을 쓰고 있었다.
-    # 세션이 저장 시점에 기록한 값이 그 세션의 사실이므로 그것을 단일 출처로 삼는다.
+    # 원본 기준 지연은 **세션이 이미 기록해 둔 값에서 부기로 복원한다.** 다시 재면
+    # 그것이 네 번째 유도가 된다 — 2026-08-06 에 실제로 그렇게 만들었다가 지웠다.
+    #
+    # ⚠ 2026-08-07 — 여기서 읽던 ``timeline.raw_lag_median_samples`` 는 source→**ERR**
+    # 이 아니다. session.json 이 ``method="ref_witness_warp_v1"``,
+    # ``witness_channel=1`` 이라고 적고 있다 — 그 lag 은 source→**REF**(witness) 다.
+    # 이름만 보고 배선해서 **같은 물리량을 두 곳에서 유도하는 결함을 다섯 번째로**
+    # 만들었다. 정렬은 source 를 witness 에 맞춰 raw_lag 만큼 민 것이므로
+    #
+    #     source→ERR = raw_lag (source→REF) + aligned_lag (정렬 후 잔여 → ERR)
+    #
+    # 두 **기록값의 합**이다. 새 추정기가 아니라 부기다. 82세션 실측:
+    #   source→REF 1507.8 (산포 188.6) · 잔여 142.5 (산포 2.1) · 합 1650.6
     raw_delay_median = float("nan")
     raw_reference = "source.wav"
+    source_ref_delay = float("nan")
     meta_path = session_path / "session.json"
     if meta_path.is_file():
         try:
             timeline = (
                 json.loads(meta_path.read_text(encoding="utf-8")).get("timeline") or {}
             )
-            value = timeline.get("raw_lag_median_samples")
-            if value is not None:
-                raw_delay_median = float(value)
+            lag = timeline.get("raw_lag_median_samples")
+            residual = timeline.get("aligned_lag_median_samples")
+            if lag is not None:
+                source_ref_delay = float(lag)
+            if lag is not None and residual is not None:
+                raw_delay_median = float(lag) + float(residual)
+                raw_reference = "timeline(raw_lag + aligned_lag)"
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
             raw_delay_median = float("nan")
+            source_ref_delay = float("nan")
     if not source_path.name.startswith("source_aligned"):
+        # 재정렬본이 없으면 학습이 읽는 파일이 곧 원본이라 위 부기가 필요 없다.
         raw_delay_median = float(delay_check.measured["median_samples"])
         raw_reference = source_path.name
 
@@ -674,6 +697,10 @@ def _validate_alignment(
             # 2026-08-06 통합 검증이 잡은 결함이고, 이름을 갈라 해소한다.
             "raw_source_err_delay_median_samples": raw_delay_median,
             "raw_source_reference_file": raw_reference,
+            # source→REF 를 **제 이름으로** 따로 낸다. 이 값을 source→ERR 자리에
+            # 넣었던 것이 2026-08-07 결함이다. 이름이 갈라져 있으면 다음 사람이
+            # 같은 실수를 하지 않는다.
+            "source_ref_delay_median_samples": source_ref_delay,
         }
     )
     result["alignment"] = alignment

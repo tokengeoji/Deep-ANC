@@ -77,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="기본: <checkpoint run>/eval_recorded_test/metrics.npz",
     )
+    parser.add_argument("--selection", default=None)
+    parser.add_argument("--test-capability", default=None)
+    parser.add_argument("--test-consumed-marker", default=None)
     parser.add_argument(
         "--out-dir",
         default=None,
@@ -105,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
                 checkpoint=checkpoint,
                 val_metrics=val_metrics,
                 test_metrics=test_metrics,
+                selection=args.selection,
+                test_capability=args.test_capability,
+                test_consumed_marker=args.test_consumed_marker,
             )
             stem = "completion"
         else:

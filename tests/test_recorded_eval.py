@@ -8,6 +8,7 @@ import torch
 
 from deep_anc.data.manifest import write_manifest
 from deep_anc.dsp.secondary_path import DifferentiableSecondaryPath, SecondaryPathData
+from deep_anc.dsp.timing import PlantDelays, TrainingTimingContract
 from deep_anc.eval.recorded import (
     RecordedEvalContext,
     RecordedSegment,
@@ -124,6 +125,15 @@ def test_context_rejects_lead_inconsistent_with_measured_primary(tmp_path):
     checkpoint = tmp_path / "model.pt"
     _path_data(secondary, delay=3)
     _path_data(primary, delay=4)
+    timing = TrainingTimingContract.derive(
+        primary_fir=np.asarray([1.0], dtype=np.float32),
+        plant_delays=PlantDelays(
+            primary_delay_samples=4,
+            secondary_delay_samples=3,
+            handoff_samples=2,
+            sample_rate=FS,
+        ),
+    )
     cfg = {
         "model": {},
         "data": {
@@ -132,6 +142,7 @@ def test_context_rejects_lead_inconsistent_with_measured_primary(tmp_path):
             "digital_primary_path_mode": "measured",
             # expected = (S 3 + handoff 2) - P 4 = 1
             "digital_reference_lead_samples": 2,
+            "training_timing_contract": timing.model_dump(),
         },
         "duct": {
             "secondary_path": {
@@ -140,7 +151,6 @@ def test_context_rejects_lead_inconsistent_with_measured_primary(tmp_path):
             },
             "digital_reference": {
                 "primary_path_npz": str(primary),
-                "d_noise_delay_samples": 4,
             },
             "acoustics": {"realistic_target_band_hz": [100, 1_000]},
         },
@@ -201,6 +211,7 @@ def test_recorded_segments_are_finite_deterministic_and_apply_lead(tmp_path):
             model_hop=4,
             max_segments_per_session=2,
             edge_trim_seconds=0.0,
+            allow_legacy_source_timeline=True,
         )
     )
     second = list(
@@ -210,6 +221,7 @@ def test_recorded_segments_are_finite_deterministic_and_apply_lead(tmp_path):
             model_hop=4,
             max_segments_per_session=2,
             edge_trim_seconds=0.0,
+            allow_legacy_source_timeline=True,
         )
     )
 
@@ -241,11 +253,90 @@ def test_recorded_segments_default_edge_trim_skips_session_boundaries(tmp_path):
             data,
             model_hop=4,
             max_segments_per_session=1,
+            allow_legacy_source_timeline=True,
         )
     )
 
     # 기본 0.25 s = 2,000 samples를 session 시작과 끝에서 모두 제외한다.
     assert [segment.start_sample for segment in segments] == [2_000]
+
+
+def _timing_data() -> dict:
+    timing = TrainingTimingContract(
+        primary_zeros_before_fir_samples=4,
+        primary_fir_peak_offset_samples=0,
+        primary_effective_delay_samples=4,
+        secondary_delay_samples=3,
+        handoff_samples=2,
+        sample_rate=FS,
+        raw_digital_reference_lead_samples=1,
+        digital_reference_lead_samples=1,
+        synthetic_total_advance_samples=5,
+    )
+    return {
+        "sample_rate": FS,
+        "segment_seconds": 8 / FS,
+        "reference_mode": "digital",
+        "recorded_lead_mode": "timeline",
+        "digital_reference_lead_samples": 1,
+        "training_timing_contract": timing.model_dump(),
+        "closed_loop": {"feedback_delay_samples": [1, 1]},
+    }
+
+
+def test_official_recorded_eval_uses_aligned_source_and_per_session_timeline_lead(
+    tmp_path,
+):
+    session = _session(tmp_path, "aligned", group="g1", family="speech")
+    source, _ = sf.read(session / "source.wav", dtype="float32")
+    aligned = source + 0.25
+    sf.write(session / "source_aligned.wav", aligned, FS, subtype="FLOAT")
+    metadata = json.loads((session / "session.json").read_text())
+    metadata["timeline"] = {"aligned_lag_median_samples": 2.0}
+    (session / "session.json").write_text(json.dumps(metadata))
+
+    segments = list(
+        iter_recorded_segments(
+            [_entry(session, "test", "aligned", "g1", "speech")],
+            _timing_data(),
+            model_hop=4,
+            max_segments_per_session=1,
+            edge_trim_seconds=0.0,
+        )
+    )
+    segment = segments[0]
+    # synthetic total advance 5 - measured aligned lag 2 = session lead 3.
+    assert segment.recorded_lead_samples == 3
+    assert segment.recorded_delay_samples == 2.0
+    assert segment.source_timeline == "source_aligned.wav"
+    assert len(segment.timing_contract_sha256) == 64
+    np.testing.assert_allclose(segment.x[0], aligned[3:11], atol=1e-6)
+
+
+def test_official_recorded_eval_rejects_source_wav_or_missing_timeline(tmp_path):
+    session = _session(tmp_path, "legacy", group="g1", family="speech")
+    entry = _entry(session, "test", "legacy", "g1", "speech")
+    with pytest.raises(FileNotFoundError, match="source_aligned.wav"):
+        list(
+            iter_recorded_segments(
+                [entry],
+                _timing_data(),
+                model_hop=4,
+                edge_trim_seconds=0.0,
+            )
+        )
+
+    source, _ = sf.read(session / "source.wav", dtype="float32")
+    sf.write(session / "source_aligned.wav", source, FS, subtype="FLOAT")
+    with pytest.raises(ValueError, match="aligned_lag_median_samples"):
+        list(
+            iter_recorded_segments(
+                [entry],
+                _timing_data(),
+                model_hop=4,
+                edge_trim_seconds=0.0,
+            )
+        )
 
 
 def test_evaluation_applies_secondary_before_warmup_cut():

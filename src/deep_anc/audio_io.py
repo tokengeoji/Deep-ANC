@@ -308,6 +308,53 @@ def assert_capture_clock_undisturbed(card_id: str) -> None:
     )
 
 
+def assert_measurement_pcm_unoccupied(hardware: dict) -> None:
+    """official 입력/출력 PCM이 다른 프로세스에 점유되지 않았음을 확인한다.
+
+    capture clock 검사만으로는 별도 USB DAC의 playback PCM 점유를 볼 수 없다.
+    두 endpoint의 정확한 ``pcm*/sub*/status``를 재생 전에 모두 확인한다.
+    status node를 읽지 못하는 것도 안전을 증명할 수 없으므로 fail-closed다.
+    """
+
+    problems: list[str] = []
+    suffix_by_direction = {"input": "c", "output": "p"}
+    for direction, suffix in suffix_by_direction.items():
+        endpoint = hardware.get(direction)
+        if not isinstance(endpoint, dict):
+            problems.append(f"audio.{direction} 설정이 없습니다")
+            continue
+        try:
+            card_index = alsa_card_index(str(endpoint["card"]))
+            pcm = int(endpoint["pcm"])
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            problems.append(f"audio.{direction} PCM 해석 실패: {exc}")
+            continue
+        status_nodes = sorted(
+            Path(f"/proc/asound/card{card_index}/pcm{pcm}{suffix}").glob(
+                "sub*/status"
+            )
+        )
+        if not status_nodes:
+            problems.append(
+                f"audio.{direction}=card{card_index}/pcm{pcm}{suffix} status가 없습니다"
+            )
+            continue
+        for status in status_nodes:
+            try:
+                first = status.read_text(encoding="utf-8").splitlines()[0].strip()
+            except (OSError, IndexError) as exc:
+                problems.append(f"{status} 상태 확인 실패: {exc}")
+                continue
+            if first != "closed":
+                problems.append(f"{status}가 점유 중입니다 ({first or 'empty'})")
+    if problems:
+        raise RuntimeError(
+            "측정 PCM 무점유를 확인하지 못했습니다:\n  - "
+            + "\n  - ".join(problems)
+            + "\n다른 측정/재생 프로세스를 종료한 뒤 다시 확인하세요."
+        )
+
+
 # ---------------------------------------------------------------------------
 # 실기 진입 규약 — 오디오 장치를 여는 모든 코드가 지켜야 하는 것
 # ---------------------------------------------------------------------------
@@ -383,6 +430,9 @@ def assert_measurement_preconditions(sd, hardware: dict, *, seconds: float = 1.5
     반환: 채널별 레일 비율(진단용). 이 함수를 부르지 않고 소리를 내는 진입점은
     ``tests/test_audio_entry_contract.py`` 가 거부한다.
     """
+
+    if isinstance(hardware.get("output"), dict):
+        assert_measurement_pcm_unoccupied(hardware)
 
     card = hardware["input"]["card"]
     assert_capture_clock_undisturbed(card)

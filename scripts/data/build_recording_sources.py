@@ -348,7 +348,14 @@ def build_family(
             "clip_count": len(clips),
             "crest_factor_db": crest,
             "rms_at_unit_peak": float(np.sqrt(np.mean(audio.astype(np.float64) ** 2))),
-            "clips": used[:12],
+            # ⚠ 2026-08-07 — 여기가 ``used[:12]`` 였다. clip_count 는 17 인데 clips 에는
+            # 12개만 적혀, **재생한 원본 256개가 어디에도 기록되지 않았다.** 누수 게이트와
+            # holdout 생성기가 이 열을 유일한 근거로 읽으므로, 기록되지 않은 클립은
+            # "재생한 적 없는 것" 이 되어 합성 학습셋에 남는다. 실제로 실측 test 세션이
+            # 재생한 ``4-117627-A-25.wav`` 가 합성 train 에 split=train 으로 살아 있었다
+            # (정규화 상호상관 0.884 @ 59.40 s, 대조군 0.069/0.089).
+            # 표시용 절단과 기록용 목록을 같은 열에 두면 안 된다.
+            "clips": list(used),
         })
         print(
             f"  {out_path.name}  group={group}  클립 {len(clips)}개  "

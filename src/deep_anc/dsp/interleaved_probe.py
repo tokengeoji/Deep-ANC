@@ -25,9 +25,12 @@ warp 는 위상 계수 ``exp(-j w D(t))`` 로 나타난다. **두 출력 채널�
     ch0(소음 스피커)  → 짝수 인덱스 톤    f = f0 + 2k*df
     ch1(상쇄 스피커)  → 홀수 인덱스 톤    f = f0 + (2k+1)*df
 
-한 번의 FFT 로 누화 없이 분리된다(빈 집합이 서로소이므로 누설을 빼면 정확히 0).
-인접 빈 사이의 warp 위상차는 ``dw * D`` 이고, df=1/6Hz·D=100샘플이면 0.002 rad 로 무시할 수
-있다. 따라서 홀수 빈의 S 를 짝수 빈 격자로 보간해도 warp 오차가 생기지 않는다.
+송신할 DAC 명령에서는 빈 집합이 서로소다. 그러나 비동기 USB DAC와 Tegra ADC 사이의
+sample-rate 오차는 ADC 격자에서 톤을 fractional bin으로 옮긴다. 그러면 guard=1 정수 FFT는
+바로 옆 채널 톤을 누설시키므로 **측정 분석에 그대로 쓰면 안 된다**. 측정 도구는 원시
+시간영역에서 반복별 실제 주기 비율 ``q``를 관측하고, 두 채널의 모든 톤을 공동 real LS로
+분리하며, 독립 cubic 재표본화 교차검증까지 통과시킨다. 이 모듈의 정수 빈은 송신 probe와
+compact-FIR 격자를 정의할 뿐 비동기 녹음의 분리 증거가 아니다.
 
 절대 지연은 이 방법으로 얻지 못한다(그것이 바로 흔들리는 양이다). 대신 이미 검증된
 기하로 고정한다 — TDOA 실측 ERR−REF 가 noise 146 / cancel −93 샘플이고 기하 예측이
@@ -134,9 +137,9 @@ def build_interleaved_probe(
 ) -> InterleavedProbe:
     """서로소 빈 집합을 쓰는 2채널 동시 자극을 만든다.
 
-    ``period_samples`` 는 정확히 정수 주기가 되도록 잡는다. 그래야 원형 FFT 에서 누설이
-    0 이 되어 두 채널이 완전히 분리된다 — 누설이 있으면 한 채널의 강한 톤이 다른 채널의
-    빈으로 새어 들어가 그 경로의 추정을 오염시킨다.
+    ``period_samples`` 는 DAC 명령에서 정확히 정수 주기가 되도록 잡는다. 따라서 송신
+    배열과 해당 스펙트럼은 정확히 재구성할 수 있다. 비동기 ADC 녹음에서는 이 사실만으로
+    채널 분리가 보장되지 않으며, 측정 도구의 q 관측+joint LS가 별도로 필요하다.
     """
 
     if sample_rate <= 0:
@@ -232,13 +235,18 @@ def channel_impulse_response(
     """한 채널의 빈-희소 전달함수를 시간영역 IR 로 되돌린다.
 
     이 채널은 ``bin_step`` 마다 하나씩만 빈을 갖는다. 나머지를 0 으로 두고 역변환하면
-    결과는 **주기 ``period_samples / bin_step`` 의 반복열**이 되고 진폭은 ``1/bin_step``
-    로 줄어든다(빗살 곱셈의 시간영역 쌍대). 따라서 ``bin_step`` 을 곱해 원래 스케일로
-    되돌리고, 한 주기만 잘라 쓴다. 덕트 IR(약 50ms)이 이 주기(기본 250ms)보다 훨씬
-    짧아야 복제본이 겹치지 않는다 — 겹치면 IR 이 자기 자신과 더해져 조용히 틀린다.
+    결과는 길이 ``period_samples / bin_step`` 인 alias 조각들로 나뉘고 진폭은
+    ``1/bin_step`` 로 줄어든다(빗살 곱셈의 시간영역 쌍대). 따라서 ``bin_step`` 을 곱해
+    원래 스케일로 되돌리고, 첫 조각만 잘라 쓴다. 덕트 IR(약 50ms)이 이 길이(기본
+    250ms)보다 훨씬 짧아야 복제본이 겹치지 않는다 — 겹치면 IR 이 자기 자신과 더해져
+    조용히 틀린다.
 
-    ``pre_roll`` 만큼 순환 이동시켜 대역제한 IR 의 **선행 링잉을 온셋 앞쪽에 남긴다**.
-    이 여유가 없으면 링잉이 주기 끝으로 감겨 들어가 onset 탐색이 앞당겨 잡힌다.
+    ``pre_roll`` 만큼 전체 IFFT 를 먼저 순환 이동시켜 대역제한 IR 의 **선행 링잉을
+    온셋 앞쪽에 남긴 뒤** 첫 조각을 자른다. 이동 전에 첫 조각을 잘라 그 조각만
+    ``np.roll`` 하면 안 된다. 기본 interleave 에서 noise 는 even bin 이라 조각이
+    periodic 이지만 cancel 은 odd bin 이라 반주기마다 부호가 바뀌는 anti-periodic
+    조각이다. 먼저 자르면 cancel 의 앞쪽으로 감긴 pre-roll 부호가 뒤집히지 않아 측정한
+    복소 전달함수와 다른 FIR 이 만들어진다.
     """
 
     selected = probe.bins_for(drive)
@@ -257,7 +265,9 @@ def channel_impulse_response(
     period = probe.period_samples // step
     if pre_roll >= period:
         raise ValueError(f"pre_roll 이 복원 주기({period})보다 큽니다")
-    return np.roll(full[:period], int(pre_roll))
+    # 전체 N-point 주기열에서 이동한 뒤 잘라야 odd-bin 채널의 anti-periodic 부호까지
+    # 보존된다. ``np.roll(full[:period], pre_roll)`` 은 even-bin 채널에서만 동치다.
+    return np.roll(full, int(pre_roll))[:period]
 
 
 def tone_snr_db(
@@ -287,8 +297,10 @@ def tone_snr_db(
 #   반복 간 |H| 비는 1.000 (크기는 완벽히 재현), 위상은 순수 시간이동조차 아니다
 #   (직선 적합 잔차 1.8~3.9 rad).
 #
-# 결과적으로 1초 창의 정수주기 FFT 가정이 깨진다 — guard=1 이면 한 채널의 톤이
-# 이웃 채널 빈으로 샌다. 그래서 주파수 분리 이전에 **시간축을 먼저 되돌려야** 한다.
+# 결과적으로 정수주기 FFT 가정이 깨진다 — guard=1 이면 한 채널의 톤이 이웃 채널
+# 빈으로 샌다. 아래의 오래된 비선형 warp 보정은 진단 전용이다. official 측정은 raw
+# adjacent-cycle q witness와 fractional-frequency joint LS를 사용하고, cubic affine
+# 재표본화 결과와 독립적으로 일치해야 한다.
 #
 # 아래 두 함수가 그 단계다. 실측 검증치(같은 캡처, 8회 반복):
 #

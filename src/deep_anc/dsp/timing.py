@@ -49,6 +49,7 @@ __all__ = [
     "PlantDelays",
     "PlantFingerprint",
     "PlantSettle",
+    "TrainingTimingContract",
     "handoff_samples_from_config",
     "intersect_frequency_bands",
     "target_band_from_config",
@@ -428,6 +429,177 @@ class PlantDelays(BaseModel):
             fir_taps=int(fir_taps),
             sample_rate=int(self.sample_rate),
         )
+
+
+class TrainingTimingContract(BaseModel):
+    """합성·실측 학습 브랜치가 공유하는 digital-reference 시간축 계약.
+
+    합성 브랜치의 ``d`` 는 NPZ ``delay_samples`` 만큼 0을 먼저
+    놓고 compact P(z) FIR을 적용한다. 즉 NPZ 값은 FIR 피크까지의
+    총지연이 아니라 **compact FIR 앞의 0 샘플 수**다. 따라서
+    상호상관으로 관측되는 재생→ERR 지연은::
+
+        primary_effective = primary_zeros_before_fir + argmax(abs(primary_fir))
+        synthetic_total_advance = primary_effective + configured_lead
+
+    이다. 실측 timeline lead도 이 총 선행량에서만 유도한다. 산식을 dataset과
+    readiness에 각각 쓰면 한쪽은 pre-FIR 0만, 다른 쪽은 FIR 최대
+    탭까지 세는 회귀가
+    생기므로 모든 소비자는 이 immutable 객체를 전달받아 값만 읽는다.
+    """
+
+    model_config = _FROZEN
+
+    schema_version: int = 2
+    primary_zeros_before_fir_samples: int
+    primary_fir_peak_offset_samples: int
+    primary_effective_delay_samples: int
+    secondary_delay_samples: int
+    handoff_samples: int
+    sample_rate: int
+    raw_digital_reference_lead_samples: int
+    digital_reference_lead_samples: int
+    synthetic_total_advance_samples: int
+
+    @model_validator(mode="after")
+    def _validate(self) -> "TrainingTimingContract":
+        if int(self.schema_version) != 2:
+            raise ValueError(
+                f"지원하지 않는 training timing schema: {self.schema_version}"
+            )
+        for name in (
+            "primary_zeros_before_fir_samples",
+            "primary_fir_peak_offset_samples",
+            "secondary_delay_samples",
+            "handoff_samples",
+            "digital_reference_lead_samples",
+        ):
+            if int(getattr(self, name)) < 0:
+                raise ValueError(f"{name} 는 0 이상이어야 합니다: {getattr(self, name)}")
+        effective = int(self.primary_zeros_before_fir_samples) + int(
+            self.primary_fir_peak_offset_samples
+        )
+        if int(self.primary_effective_delay_samples) != effective:
+            raise ValueError(
+                "primary effective 지연 유도 관계 위반: "
+                f"{self.primary_effective_delay_samples} != "
+                f"{self.primary_zeros_before_fir_samples} + "
+                f"{self.primary_fir_peak_offset_samples}"
+            )
+        if int(self.sample_rate) <= 0:
+            raise ValueError(f"sample_rate 는 양수여야 합니다: {self.sample_rate}")
+        raw_lead = (
+            int(self.secondary_delay_samples)
+            + int(self.handoff_samples)
+            - int(self.primary_zeros_before_fir_samples)
+        )
+        if int(self.raw_digital_reference_lead_samples) != raw_lead:
+            raise ValueError(
+                "raw lead 유도 관계 위반: "
+                f"{self.raw_digital_reference_lead_samples} != "
+                f"{self.secondary_delay_samples} + {self.handoff_samples} - "
+                f"{self.primary_zeros_before_fir_samples}"
+            )
+        clamped_lead = max(0, raw_lead)
+        if int(self.digital_reference_lead_samples) != clamped_lead:
+            raise ValueError(
+                "clamped lead 유도 관계 위반: "
+                f"{self.digital_reference_lead_samples} != max(0, {raw_lead})"
+            )
+        total = effective + int(self.digital_reference_lead_samples)
+        if int(self.synthetic_total_advance_samples) != total:
+            raise ValueError(
+                "합성 총 선행량 유도 관계 위반: "
+                f"{self.synthetic_total_advance_samples} != {effective} + "
+                f"{self.digital_reference_lead_samples}"
+            )
+        return self
+
+    @classmethod
+    def derive(
+        cls,
+        *,
+        primary_fir: Sequence[float],
+        plant_delays: PlantDelays,
+    ) -> "TrainingTimingContract":
+        """실제 P(z)와 :class:`PlantDelays`에서 계약을 만드는 유일한 경로.
+
+        lead int를 받지 않는다. 반드시 ``PlantDelays.lead()``의 보호된
+        유도 경로를 통해야 하며, P/S/handoff/raw/clamped 관계가 계약 자체에
+        남아 checkpoint만 읽어도 재검증할 수 있다.
+        """
+
+        zeros_before_fir = int(plant_delays.primary_delay_samples)
+        effective = cls.primary_effective_from_fir(zeros_before_fir, primary_fir)
+        peak = effective - zeros_before_fir
+        derived_lead = plant_delays.lead()
+        lead = int(derived_lead.samples)
+        return cls(
+            primary_zeros_before_fir_samples=zeros_before_fir,
+            primary_fir_peak_offset_samples=int(peak),
+            primary_effective_delay_samples=effective,
+            secondary_delay_samples=int(plant_delays.secondary_delay_samples),
+            handoff_samples=int(plant_delays.handoff_samples),
+            sample_rate=int(plant_delays.sample_rate),
+            raw_digital_reference_lead_samples=int(derived_lead.raw_samples),
+            digital_reference_lead_samples=lead,
+            synthetic_total_advance_samples=effective + lead,
+        )
+
+    @staticmethod
+    def primary_effective_from_fir(
+        primary_zeros_before_fir_samples: int,
+        primary_fir: Sequence[float],
+    ) -> int:
+        """P(z) 피크 지연만 필요한 감사 코드의 단일 유도 경로."""
+
+        try:
+            taps = [float(value) for value in primary_fir]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("P(z) FIR 은 유한한 1차원 수열이어야 합니다") from exc
+        zeros = int(primary_zeros_before_fir_samples)
+        if zeros < 0 or not taps or not all(math.isfinite(value) for value in taps):
+            raise ValueError("P(z) pre-FIR zeros/FIR 계약 위반")
+        return zeros + max(range(len(taps)), key=lambda index: abs(taps[index]))
+
+    @classmethod
+    def from_data_config(cls, data_cfg: dict) -> "TrainingTimingContract":
+        raw = (data_cfg or {}).get("training_timing_contract")
+        if not isinstance(raw, dict):
+            raise ValueError(
+                "data.training_timing_contract 가 없습니다 — timeline lead는 실제 P(z) "
+                "FIR을 포함한 단일 계약에서만 유도할 수 있습니다"
+            )
+        return cls.model_validate(raw)
+
+    def recorded_lead_samples(self, recorded_delay_samples: float) -> int:
+        """한 recorded session의 timeline lead ``K'``를 유도한다."""
+
+        observed = float(recorded_delay_samples)
+        if not math.isfinite(observed) or observed < 0.0:
+            raise ValueError(
+                f"recorded source→ERR 지연은 유한한 0 이상이어야 합니다: {observed}"
+            )
+        raw = int(round(float(self.synthetic_total_advance_samples) - observed))
+        return max(0, raw)
+
+    def recorded_total_advance_samples(
+        self, *, recorded_delay_samples: float, mode: str
+    ) -> float:
+        """dataset이 실제로 만드는 recorded 총 선행량을 반환한다."""
+
+        observed = float(recorded_delay_samples)
+        if mode == "constant":
+            lead = int(self.digital_reference_lead_samples)
+        elif mode == "timeline":
+            lead = self.recorded_lead_samples(observed)
+        else:
+            raise ValueError(f"지원하지 않는 recorded lead mode: {mode!r}")
+        return observed + float(lead)
+
+    def digest(self) -> str:
+        payload = json.dumps(self.model_dump(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class PlantSettle(BaseModel):

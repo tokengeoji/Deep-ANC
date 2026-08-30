@@ -14,7 +14,8 @@ import tty
 class RuntimeState:
     def __init__(self, start_on: bool = False) -> None:
         self.anc_enabled = bool(start_on)
-        self.noise_enabled = True
+        # 런타임은 무음/ANC OFF로 시작한다. 명시적 사용자 조작 전에는 출력 금지.
+        self.noise_enabled = False
         self.quit_event = threading.Event()
         self.reset_event = threading.Event()
         self.save_event = threading.Event()

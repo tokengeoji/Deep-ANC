@@ -9,17 +9,20 @@
 from __future__ import annotations
 
 import re
+import importlib.util
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from deep_anc.config import DEFAULT_HANDOFF_SAMPLES, REPO_ROOT
+from deep_anc.config import DEFAULT_HANDOFF_SAMPLES, REPO_ROOT, load_train_config
 from deep_anc.dsp.timing import (
     BandPlan,
     FrequencyBand,
     Lead,
     PlantDelays,
     PlantFingerprint,
+    TrainingTimingContract,
     handoff_samples_from_config,
     intersect_frequency_bands,
     target_band_from_config,
@@ -32,6 +35,26 @@ MEASURED_SECONDARY_DELAY = 1462
 MEASURED_HANDOFF = 256
 MEASURED_LEAD = 116
 MEASURED_RELATIVE_DELAY = 140
+
+
+def _load_bound_canonical(overrides: list[str] | None = None) -> dict:
+    def _bind(data: dict, *, repo_root):
+        data.update(
+            transfer_manifest="data/manifests/elice_transfer_manifest.json",
+            transfer_manifest_sha256="b" * 64,
+            recorded_transfer_aggregate_sha256="c" * 64,
+        )
+
+    values = list(overrides or []) + [
+        f"data.bootstrap_receipt_sha256={'a' * 64}",
+        f"campaign_prerequisite_sha256={'d' * 64}",
+    ]
+    with patch(
+        "deep_anc.data.transfer_contract.bind_recorded_transfer_config", _bind
+    ):
+        return load_train_config(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml", values
+        )
 
 
 def _duct_cfg(*, handoff: int = MEASURED_HANDOFF, target=(80.0, 800.0)) -> dict:
@@ -96,6 +119,94 @@ def test_negative_lead_is_clamped_but_the_raw_value_survives():
     assert int(lead) == 0
     assert lead.raw_samples == -MEASURED_RELATIVE_DELAY
     assert lead.is_clamped
+
+
+def test_training_timing_contract_is_self_contained_and_plant_derived():
+    fir = [0.0, -0.2, 0.9, 0.1]
+    delays = PlantDelays(
+        primary_delay_samples=MEASURED_PRIMARY_DELAY,
+        secondary_delay_samples=MEASURED_SECONDARY_DELAY,
+        handoff_samples=MEASURED_HANDOFF,
+        sample_rate=48_000,
+    )
+    contract = TrainingTimingContract.derive(
+        primary_fir=fir,
+        plant_delays=delays,
+    )
+
+    assert contract.primary_zeros_before_fir_samples == MEASURED_PRIMARY_DELAY
+    assert contract.primary_fir_peak_offset_samples == 2
+    assert contract.secondary_delay_samples == MEASURED_SECONDARY_DELAY
+    assert contract.handoff_samples == MEASURED_HANDOFF
+    assert contract.raw_digital_reference_lead_samples == MEASURED_LEAD
+    assert contract.digital_reference_lead_samples == MEASURED_LEAD
+    assert contract.synthetic_total_advance_samples == MEASURED_PRIMARY_DELAY + 2 + MEASURED_LEAD
+
+    forged = contract.model_dump()
+    forged["digital_reference_lead_samples"] += 1
+    with pytest.raises(Exception, match="clamped lead"):
+        TrainingTimingContract.model_validate(forged)
+
+
+def test_compact_digital_config_injects_lead_from_timing_contract_only():
+    raw = (REPO_ROOT / "configs/data_sim.yaml").read_text(encoding="utf-8")
+    assert not re.search(r"^digital_reference_lead_samples\s*:", raw, re.MULTILINE)
+
+    cfg = _load_bound_canonical()
+    contract = TrainingTimingContract.from_data_config(cfg["data"])
+    assert cfg["data"]["digital_reference_lead_samples"] == int(
+        contract.digital_reference_lead_samples
+    )
+    with pytest.raises(ValueError, match="PlantDelays.lead"):
+        _load_bound_canonical(["data.digital_reference_lead_samples=999"])
+
+
+@pytest.mark.parametrize(
+    "mode_overrides, expected",
+    [
+        (["data.digital_primary_path_mode=rir_surrogate", "data.digital_reference_lead_samples=7"], 7),
+        (["data.reference_mode=acoustic", "data.digital_reference_lead_samples=0"], 0),
+    ],
+)
+def test_noncompact_timing_modes_keep_their_explicit_legacy_lead(
+    mode_overrides, expected
+):
+    cfg = load_train_config(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        [
+            "experiment_role=diagnostic_overfit",
+            "init_eligible=false",
+            "contract_run_dir=false",
+            *mode_overrides,
+        ],
+    )
+    assert cfg["data"]["digital_reference_lead_samples"] == expected
+    assert "training_timing_contract" not in cfg["data"]
+
+
+def test_compare_fxlms_is_explicit_legacy_only_and_never_reads_manual_delay():
+    script = REPO_ROOT / "scripts/eval/compare_fxlms.py"
+    source = script.read_text(encoding="utf-8")
+    assert '.get("d_noise_delay_samples")' not in source
+    spec = importlib.util.spec_from_file_location("_compare_fxlms_timing", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    with pytest.raises(ValueError, match="legacy geometry timing 진단 전용"):
+        module.validate_legacy_diagnostic_checkpoint(
+            {"experiment_role": "diagnostic"},
+            allow_legacy_diagnostic_timing=False,
+        )
+    with pytest.raises(ValueError, match="TrainingTimingContract/canonical"):
+        module.validate_legacy_diagnostic_checkpoint(
+            {"experiment_role": "canonical_pretrain", "data": {}},
+            allow_legacy_diagnostic_timing=True,
+        )
+    module.validate_legacy_diagnostic_checkpoint(
+        {"experiment_role": "legacy_diagnostic", "data": {}},
+        allow_legacy_diagnostic_timing=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -374,7 +485,9 @@ def test_the_consumers_import_the_single_source():
         "scripts/eval/evaluate_offline.py",
         "scripts/demo/evaluate_session.py",
         "scripts/demo/render_anc_demo.py",
-        "scripts/data/measure_paths_interleaved.py",
+        # measure_paths_interleaved는 P/S 독립 delay artifact의 producer이고
+        # lead를 소비/발행하지 않는다. TrainingTimingContract는 resolved config와
+        # reanalysis/readiness/eval 소비 경계에서만 만들어진다.
         "scripts/data/reanalyse_paths_interleaved.py",
     }
     missing = {

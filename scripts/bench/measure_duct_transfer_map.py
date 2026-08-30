@@ -45,6 +45,8 @@ from deep_anc.audio_io import (  # noqa: E402
     resolve_alsa_portaudio_device,
 )
 from deep_anc.config import REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.audio_io import assert_measurement_preconditions  # noqa: E402
+from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions  # noqa: E402
 from scripts.bench import measure_channel_paths  # noqa: E402
 from scripts.data import calibrate_wideband as calibration  # noqa: E402
 
@@ -115,6 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="사용자 입회 및 물리 앰프 볼륨 최저를 확인",
     )
+    parser.add_argument("--confirm-speaker", action="store_true")
+    parser.add_argument("--confirm-user-present", action="store_true")
     return parser
 
 
@@ -176,11 +180,6 @@ def validate_options(
     sample_rate: int,
     hardware_channels: dict[str, Any],
 ) -> dict[str, int]:
-    if not args.confirm_volume_minimum:
-        raise ValueError(
-            "사용자 입회와 물리 앰프 볼륨 최저 확인 후 "
-            "--confirm-volume-minimum을 지정하세요"
-        )
     if sample_rate <= 0:
         raise ValueError("sample_rate는 양수여야 합니다")
     if args.repeats < MIN_REPEATS:
@@ -2124,10 +2123,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     # 확인 플래그는 YAML/sounddevice/장치 접근보다 먼저 검사한다.
-    if not args.confirm_volume_minimum:
+    if not (args.confirm_volume_minimum and args.confirm_speaker and args.confirm_user_present):
         print(
-            "[중단] 사용자 입회와 물리 앰프 볼륨 최저 확인 후 "
-            "--confirm-volume-minimum을 지정하세요.",
+            "[중단] 스피커 연결·사용자 입회·볼륨 최저 확인 플래그가 필요합니다: "
+            "--confirm-volume-minimum --confirm-speaker --confirm-user-present",
             file=sys.stderr,
         )
         return 2
@@ -2138,6 +2137,9 @@ def main(argv: list[str] | None = None) -> int:
         hardware = load_yaml(hardware_path)
         duct = load_yaml(duct_path)
         audio = hardware["audio"]
+        import sounddevice as sd
+        assert_live_pcm_clock_preconditions(audio)
+        assert_measurement_preconditions(sd, audio)
         sample_rate = int(audio["sample_rate"])
         channels = validate_options(
             args,

@@ -12,7 +12,10 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
@@ -26,6 +29,14 @@ from deep_anc.eval.recorded import (  # noqa: E402
     resolve_feedback_delay,
     resolve_warmup_samples,
     write_recorded_metrics,
+)
+from deep_anc.train.evaluation_contract import (  # noqa: E402
+    CAPABILITY_ENV,
+    complete_test_evaluation,
+    consume_test_capability,
+    fail_test_evaluation,
+    publish_directory_noreplace,
+    snapshot_regular_file,
 )
 
 
@@ -86,18 +97,73 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=list(DEFAULT_OCTAVE_BANDS),
     )
+    parser.add_argument("--selection", default=None)
+    parser.add_argument("--test-capability", default=None)
+    parser.add_argument("--test-consumed-marker", default=None)
+    parser.add_argument(
+        "--allow-legacy-recorded-timeline",
+        action="store_true",
+        help="진단 전용: source.wav+상수 lead 구형 평가 허용(공식 test 금지)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    consumed = None
+    staging_dir: Path | None = None
     try:
+        checkpoint = Path(args.ckpt)
+        out_dir = (
+            Path(args.out)
+            if args.out
+            else checkpoint.parent.parent / f"eval_recorded_{args.split}"
+        )
+        if out_dir.exists():
+            raise FileExistsError(f"평가 산출 디렉터리는 덮어쓸 수 없습니다: {out_dir}")
+        if args.split == "test":
+            if args.allow_legacy_recorded_timeline:
+                raise ValueError(
+                    "공식 recorded test에서는 legacy source.wav/상수 lead를 허용하지 않습니다"
+                )
+            if not all(
+                (args.selection, args.test_capability, args.test_consumed_marker)
+            ):
+                raise ValueError(
+                    "recorded test는 selection+single-use capability+consumed marker가 "
+                    "모두 필요합니다"
+                )
+            checkpoint_snapshot, manifest_snapshot, consumed = consume_test_capability(
+                selection_path=args.selection,
+                capability_path=args.test_capability,
+                consumed_marker_path=args.test_consumed_marker,
+                token=os.environ.get(CAPABILITY_ENV, ""),
+                checkpoint_path=checkpoint,
+                manifest_path=args.manifest,
+            )
+        else:
+            checkpoint_snapshot = snapshot_regular_file(checkpoint)
+            manifest_snapshot = snapshot_regular_file(args.manifest)
+            consumed = None
         context = load_recorded_eval_context(
             args.ckpt,
             allow_surrogate=args.allow_surrogate,
             device=args.device,
+            checkpoint_bytes=checkpoint_snapshot.content,
+            checkpoint_sha256=checkpoint_snapshot.sha256,
         )
-        entries = load_and_audit_recorded_manifest(args.manifest, args.split)
+        if consumed is not None and consumed.get(
+            "experiment_contract_sha256"
+        ) != context.cfg.get("experiment_contract_sha256"):
+            raise ValueError("test capability와 checkpoint embedded contract가 다릅니다")
+        consumed_marker_sha = (
+            snapshot_regular_file(args.test_consumed_marker).sha256
+            if consumed is not None
+            else ""
+        )
+        entries = load_and_audit_recorded_manifest(
+            args.manifest, args.split, manifest_bytes=manifest_snapshot.content
+        )
         model_hop = int(context.cfg["model"]["hop"])
         feedback_delay = resolve_feedback_delay(
             context.cfg["data"], args.feedback_delay_samples
@@ -127,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             segment_seconds=args.segment_seconds,
             feedback_delay_samples=feedback_delay,
             edge_trim_seconds=args.edge_trim_seconds,
+            allow_legacy_source_timeline=args.allow_legacy_recorded_timeline,
         )
         result = evaluate_recorded_segments(
             context.model,
@@ -139,15 +206,15 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             warmup_samples=warmup_samples,
         )
-        checkpoint = Path(args.ckpt)
-        out_dir = (
-            Path(args.out)
-            if args.out
-            else checkpoint.parent.parent / f"eval_recorded_{args.split}"
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
+        temporary_name = tempfile.mkdtemp(
+            prefix=f".{out_dir.name}.", suffix=".staging", dir=out_dir.parent
         )
-        markdown_path, npz_path = write_recorded_metrics(
+        staging_dir = Path(temporary_name)
+        staging_dir.rmdir()
+        staged_markdown, staged_npz = write_recorded_metrics(
             result,
-            out_dir,
+            staging_dir,
             checkpoint=checkpoint,
             manifest=args.manifest,
             split=args.split,
@@ -156,8 +223,44 @@ def main(argv: list[str] | None = None) -> int:
             allow_surrogate=args.allow_surrogate,
             edge_trim_samples=edge_trim_samples,
             warmup_samples=warmup_samples,
+            checkpoint_sha256=checkpoint_snapshot.sha256,
+            manifest_sha256=manifest_snapshot.sha256,
+            experiment_contract_sha256=str(
+                context.cfg.get("experiment_contract_sha256", "")
+            ),
+            selection_sha256=(
+                str(consumed.get("selection_sha256", "")) if consumed else ""
+            ),
+            test_capability_sha256=(
+                str(consumed.get("capability_sha256", "")) if consumed else ""
+            ),
+            test_consumed_marker_sha256=consumed_marker_sha,
+            exclusive=True,
         )
-    except (FileNotFoundError, KeyError, RuntimeError, ValueError) as exc:
+        publish_directory_noreplace(staging_dir, out_dir)
+        staging_dir = None
+        markdown_path = out_dir / staged_markdown.name
+        npz_path = out_dir / staged_npz.name
+        if consumed is not None:
+            complete_test_evaluation(
+                selection_path=args.selection,
+                capability_path=args.test_capability,
+                consumed_marker_path=args.test_consumed_marker,
+                output_dir=out_dir,
+            )
+    except (FileExistsError, FileNotFoundError, KeyError, OSError, RuntimeError, ValueError) as exc:
+        if consumed is not None:
+            try:
+                fail_test_evaluation(
+                    selection_path=args.selection,
+                    capability_path=args.test_capability,
+                    consumed_marker_path=args.test_consumed_marker,
+                    error_type=type(exc).__name__,
+                )
+            except Exception as ledger_exc:
+                print(f"[오류] test failed ledger 기록 실패: {ledger_exc}", file=sys.stderr)
+        if staging_dir is not None and staging_dir.exists():
+            shutil.rmtree(staging_dir)
         print(f"[오류] {exc}", file=sys.stderr)
         return 2
 

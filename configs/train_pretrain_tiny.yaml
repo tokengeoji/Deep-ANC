@@ -1,0 +1,75 @@
+# canonical tiny 사전학습. train_pretrain.yaml과 모델/출력 경로 외 학습 계약이 같다.
+# 파일럿/구형 [150,600] run과 섞이지 않도록 전용 신규 ckpt_dir을 쓴다.
+
+stage: open_loop
+experiment_role: canonical_pretrain
+canonical_trust_policy: canonical_pretrain_v1
+init_eligible: true
+model_config: configs/model_tiny.yaml
+data_config: configs/data_sim.yaml
+duct_config: configs/duct.yaml
+
+batch_size: 96
+num_workers: 14
+prefetch_factor: 4
+
+optimizer:
+  name: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+schedule:
+  warmup_steps: 1250
+  total_steps: 100000
+  min_lr: 1.0e-5
+
+amp: bf16
+grad_clip: 5.0
+
+loss:
+  nmse_objective: trusted_band
+  nmse_cvar_q: 0.25
+  nmse_cvar_alpha: 0.7
+  nmse_cvar_min_k: 4
+  lambda_dnh: 0.00075
+  dnh_weight_below: 1.0
+  dnh_weight_above: 2.0
+  lambda_frame: 0.5
+  nmse_frame_samples: 8192
+  nmse_frame_silence_db: -40.0
+  mrstft_ffts: [256, 512, 1024, 2048]
+  lambda_mrstft: 1.0
+  band_weight: trusted_only
+  lambda_pow: 0.0
+  lambda_sat: 1.0
+  sat_margin: 2.0
+
+val_items: 64
+eval_every: 500
+log_every: 100
+early_stop_patience: 0
+# canonical A100 1장 경로. DDP checkpoint는 아직 rank별 stochastic state를
+# 저장하지 않으므로 이 공식 실험에서 멀티 GPU를 조용히 허용하지 않는다.
+required_world_size: 1
+contract_run_dir: true
+# Elice bootstrap 직후 외부 SHA와 함께 주입해야 하는 trust anchors. null인
+# 저장소 기본값은 공식 run stamp 이전에 fail-closed한다.
+campaign_prerequisite: results/training_prerequisites/canonical_pretrain.json
+campaign_prerequisite_sha256: null
+ckpt_dir: runs
+resume: null
+seed: 20260803
+
+# pilot alpha×frame 계약은 별도 파일을 복사하지 않고 resolved override로
+# 표현한다. 승인 grid는 alpha∈{0.7,1.0} × lambda_frame∈{0.5,0.2}이고,
+# 필요할 때만 alpha=0.85를 추가한다. 각 후보는 100k schedule을 바꾸지 않고
+# `--set experiment_role=loss_pilot --set init_eligible=false \
+# --set run_until_step=20000`으로 같은 초반 곡선을 비교한다. role과 두 loss
+# 값은 contract SHA/run dir에 포함되고, run_until은 같은 run의 재개를 위해 제외된다.
+#
+# 20k recorded-val 승자를 고정한 뒤 실측 P 5k probe는 새 contract run으로 실행한다:
+#   --set experiment_role=measured_probe --set init_eligible=false \
+#   --set data.digital_primary_path_mode=measured --set run_until_step=5000 \
+#   --set init_ckpt=<selected-20k-best.pt>
+# probe도 synthetic/recorded val만 보고 test는 열지 않는다.

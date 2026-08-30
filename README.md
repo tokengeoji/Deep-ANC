@@ -35,7 +35,7 @@ FxLMS 는 적응 FIR 필터 하나로 이 문제를 풀지만, 광대역·비정
 - **스트리밍 등가성** — 오프라인 `forward` 와 블록 단위 `streaming_step` 이 수치적으로 같다
 - **ONNX / TensorRT 배포** — Jetson AGX Orin 에서 256 샘플 블록(5.33 ms 마감) 실시간 추론
 - **실측 기반 검증** — 합성 시뮬레이션이 아니라 실제 덕트 녹음 82 세션으로 평가한다
-- **진입 게이트 14 종** — 물리·데이터·체크포인트가 정합하지 않으면 학습이 시작되지 않는다
+- **진입 게이트 15 종** — 물리·데이터·체크포인트가 정합하지 않으면 학습이 시작되지 않는다
 
 ## Requirements
 
@@ -201,15 +201,11 @@ margin = 20·log10(10^(G/20) − 1)          G = 1.0 dB  →  margin = −18.27 
 교대 톤 빈으로 동시에 구동하므로, 타임베이스 워프가 두 채널에 공통으로 걸려 상대량에서
 상쇄된다.
 
-```
-P(z) 소음 → 에러      순수지연 1580 샘플     150–1600 Hz 일관성 0.9992
-S(z) 상쇄 → 에러      순수지연 1440 샘플     150–1600 Hz 일관성 0.9987
-P − S = 140 샘플                            유지 반복 32/32
-```
-
-**절대 지연은 재현되지 않지만 `P − S` 는 재현된다.** 독립 캡처에서 `P−S = 139~141`,
-그로부터 유도되는 lead 는 115~116 이다. 그래서 `P` 와 `S` 는 반드시 **같은 캡처**의
-값끼리만 함께 쓴다.
+기존 순차/초기 인터리브 측정에서는 `P−S = 139~141 samples`가 반복됐지만, 그 파일들은
+submitted int16 PCM, raw/analysis SHA, clock witness, fractional joint-LS 등 현행 strict
+provenance가 없어 **진단 자료일 뿐 official plant가 아니다**. 새 P/S는 같은 48 kHz/256/low
+스트림에서 동시에 측정하고, 모든 150–1600 Hz 부대역 일관성·xrun·clip·지연 안정성 게이트를
+통과해야 한다. strict P와 S는 같은 캡처의 값끼리만 사용한다.
 
 ### 3.3 데이터셋
 
@@ -219,10 +215,10 @@ P − S = 140 샘플                            유지 반복 32/32
 
 **실측** — 덕트에서 직접 녹음한 82 세션 / 95.7 분.
 
-| 계열 | 세션 | 그룹 |
+| 계열 | 세션 | lineage component |
 |---|---:|---:|
-| machine | 30 | 25 |
-| environment | 18 | 17 |
+| machine | 30 | 19 |
+| environment | 18 | 15 |
 | music | 18 | 18 |
 | speech | 16 | 15 |
 
@@ -249,7 +245,9 @@ G4 를 fullband 평균으로 대신할 수 없는 이유: NMSE 는 `d` 의 에�
 
 ### 4.1 이론 상한
 
-실측 P/S 에서 최적 인과 FIR (M = 2048) 을 직접 풀어 얻은 달성 가능 상한:
+아래 값은 현행 strict provenance가 없는 **legacy diagnostic P/S**에서 최적 인과 FIR
+(M = 2048)을 직접 풀어 얻은 과거 추정치다. 새 strict P/S가 고정되기 전에는 official
+달성 가능 상한이나 readiness 근거로 사용하지 않는다.
 
 ```
 150–1600 Hz   +4.83 dB
@@ -266,18 +264,17 @@ G4 를 fullband 평균으로 대신할 수 없는 이유: NMSE 는 `d` 의 에�
 > **현재 상태** — 물리 계층과 데이터 파이프라인은 검증됐고, 정정된 플랜트에서의 학습은
 > 아직 수행되지 않았다. 검증된 것과 미검증인 것을 구분해 적는다.
 
-**검증된 것**
+**보존된 진단·데이터 증거**
 
 | 항목 | 값 |
 |---|---|
-| 경로 측정 재현성 | 독립 캡처 2 회의 최적 필터 `−P/S` 일치 0.9976 (상대오차 7.7 %) |
-| `P − S` 불변량 | 140 / 141 샘플 (독립 캡처 9 건에서 139~141) |
-| 신뢰대역 일관성 | 150–1600 Hz 에서 P 0.9992 / S 0.9987 |
+| legacy 경로 진단 | 독립 캡처의 `P−S=139~141` 및 높은 필터 일치는 재측정 설계 근거로만 보존 |
 | 실측 데이터 정합성 | 82 세션 전량이 저장 시점 시간축 게이트 통과 |
-| 테스트 | 51 개 파일 / 744 케이스 통과 |
+| 테스트 | 전체 pytest 0 FAIL을 코드 게이트로 강제 |
 
 **미검증**
 
+- 현행 raw provenance를 갖춘 strict P/S가 아직 없다. legacy P/S는 readiness를 통과하지 못한다.
 - 정정된 플랜트(`[150, 1600]` 대역)로 사전학습된 체크포인트가 아직 없다. 기존 체크포인트는
   모두 `[150, 600]` 대역·폐기된 2차경로에서 학습된 것이라 파인튜닝 진입 게이트를 통과하지
   못한다.
@@ -309,54 +306,130 @@ G4 를 fullband 평균으로 대신할 수 없는 이유: NMSE 는 `d` 의 에�
 ```bash
 git clone https://github.com/Roka-jsj/Deep-ANC.git
 cd Deep-ANC
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-train.txt      # 또는 requirements-jetson.txt
+# Jetson: NVIDIA wheel/ORT preload 규약까지 포함한 유일한 설치 경로
+bash scripts/jetson/setup_jetson.sh
+# Elice: docs/05의 exact-commit/holdout bootstrap 절차 사용(학습 자동 시작 없음)
 ```
 
 ### 7.2 데이터 준비
 
 ```bash
-# 합성 소음 풀 manifest (선언한 태그의 원본이 없으면 실패한다)
-python scripts/data/prepare_noise_pool.py
+# historical builder 재현 → canonical held-out. 이 단계가 manifest보다 먼저다.
+# identify_pool_clips.py 결과는 진단용이며 canonical 입력으로 쓰지 않는다.
+.venv/bin/python scripts/data/repair_source_pool_provenance.py \
+    --repair-csv --write-active-holdout --write-regrouped-manifest --jobs 4
+EXPECTED_HOLDOUT_SHA256=$(sha256sum data/manifests/recorded_holdout.json | awk '{print $1}')
 
-# 실측 세션 → held-out → manifest → 전수 QA
-python scripts/data/make_recorded_holdout.py
-python scripts/data/make_recorded_manifest.py
-python scripts/data/validate_recorded_sessions.py
+# FMA tracks.csv와 public raw 6종을 확보한 뒤에만 합성 manifest를 세대 단위로 생성한다.
+# 선언 원본/lineage component/holdout 중 하나라도 불완전하면 실패하는 것이 정상이다.
+# 각 raw audio byte SHA도 manifest schema v2에 결속된다.
+.venv/bin/python scripts/data/prepare_noise_pool.py \
+    --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256"
+.venv/bin/python scripts/data/validate_recorded_sessions.py \
+    --manifest data/manifests/recorded_regrouped.jsonl
 ```
+
+로컬에는 public raw 6종 전체가 없으므로 위 historical repair에
+`--require-downstream-gates`를 붙이지 않는다. synthetic downstream이 BLOCKED인 상태에서
+성공으로 위장하지 않고, Elice에서 untouched raw를 받은 뒤 `prepare_noise_pool.py`가 해당
+게이트를 연다. strict P/S까지 합격한 뒤에는 `build_elice_transfer_manifest.py`로 recorded
+전체, RIR, strict raw/analysis/P/S, regrouped manifest, FMA metadata와 provenance bundle을
+결속하고 그 SHA를 full bootstrap에 전달한다. 자세한 명령은 [docs/05](docs/05_training_elice.md)다.
 
 ### 7.3 경로 측정 (스피커 출력 있음)
 
+실행 직전 운영자가 실제 배선을 `ERR mic=input 0`, `REF mic=input 1`,
+`noise speaker=output 0`, `cancel speaker=output 1`로 확인하고, 덕트의 스피커/마이크
+기하가 설정과 같고 사용자가 입회함을 확인해야 한다. 세 confirmation flag는 그 확인을 official provenance에
+기록하며, 하나라도 없으면 장치나 세션을 만들기 전에 중단한다.
+
+레벨 미터와 실제 측정은 공용 `MeasurementLevelContract`의 probe peak **0.003**을 함께
+쓴다. **코드 테스트와 무음 dry-run을 모두 통과한 뒤에만** 연속 운영 절차를 시작한다.
+meter는 input-only preflight 1.5초 뒤 nominal 20.0초/hard-max 21.0초, strict P/S는
+input-only preflight 총 3.0초 뒤 nominal 12.5초/hard-max 13.5초(무음 lead-in 0.5초 +
+자극 12.0초)다. nominal audible 합계는 **32.5초**지만 장치 기동·명령 인계 시간을 합친
+wall-clock 연결 시간은 고정값이 아니다. 각 출력 close 직후 분리하고 노브는 유지한 채 다음
+명령 직전에만 재연결한다. `[스피커 출력 종료]` 안내가 뜨면 즉시 스피커/앰프를 분리한다.
+raw 저장과 분석은 그 안내 이후 무음으로 진행된다. strict P/S가 합격하기 전에 장시간
+재녹음을 선행하지 않는다.
+
+현행 peak 0.003과 `-50.1 dBFS`의 대응은 보존된 paired raw가 있어야 한다. 최초 1회에는
+정상 live gate가 `BLOCKED`인 것이 맞으며, 명시적 bootstrap만 이 순환을 안전하게 끊는다.
+meter 명령은 submitted int16/입력 int32/telemetry를 immutable NPZ와 SHA receipt로 남긴다.
+strict 명령은 그 raw의 10분 freshness, 동일 logical hardware/channel과 ALSA physical
+fingerprint(`/proc/asound` PCM info, sysfs realpath/uevent/안정 속성),
+recipe/status/target 및 같은 앰프 노브 확인을 검증하고, 별도 probe 없이 기존 strict raw를
+두 번째 half로 사용한다. 두 raw의
+상대경로·SHA-256·재계산값이 모두 맞을 때만
+`assets/measured/measurement_level_evidence.json`을 원자 생성한 뒤 official 분석을 연다.
+
 ```bash
-python scripts/data/measure_paths_interleaved.py --confirm-volume-minimum \
-    --primary-out assets/measured/primary_path_il.npz \
-    --secondary-out assets/measured/secondary_path_il.npz
+# 1) 코드 게이트(소리 없음)
+.venv/bin/python -m pytest -q
+
+# 2) 아래 두 출력은 기존 파일이 없는 새 경로여야 한다(소리 없는 dry-run).
+.venv/bin/python scripts/data/measure_paths_interleaved.py --dry-run \
+    --primary-out results/path_measurement_next/p.npz \
+    --secondary-out results/path_measurement_next/s.npz
+
+# 3) 최초 1회: 사용자 입회·볼륨 최소, 공용 peak 0.003(출력 20초)
+.venv/bin/python scripts/data/set_amp_level.py --bootstrap-level-evidence \
+    --confirm-speaker --confirm-user-present --confirm-volume-minimum
+
+# 출력된 immutable raw 상대경로를 복사하고 앰프 노브를 바꾸지 않는다.
+METER_RAW=results/calibration_interleaved/level_bootstrap/<session>/meter_raw.npz
+
+# 4) 같은 노브에서 strict P/S(출력 스트림 12.5초, 추가 level probe 없음)
+.venv/bin/python scripts/data/measure_paths_interleaved.py \
+    --bootstrap-level-evidence --meter-raw "$METER_RAW" \
+    --confirm-same-amplifier-setting --confirm-user-present \
+    --confirm-volume-minimum \
+    --confirm-routing-and-geometry \
+    --primary-out assets/measured/primary_path_il_strict_<capture-id>.npz \
+    --secondary-out assets/measured/secondary_path_il_strict_<capture-id>.npz
 ```
+
+실제로는 meter PASS 출력에 포함된 **정확한 strict 명령 전체**를 그대로 복사한다. 이 명령은
+충돌하지 않는 `<capture-id>` 출력명을 함께 제시한다. meter 세션에는 `meter_raw.npz`와
+`meter_raw.receipt.json`, strict 세션에는 `raw_measurement.npz`, `metadata.json`,
+`analysis_results.npz`, `analysis_metadata.json`이 생긴다. 최초 bootstrap PASS 때만 paired
+evidence JSON이 생성되고, 모든 분석 gate PASS 뒤 위 새 이름의 P/S NPZ가 no-replace로
+승격된다. 기존 `primary_path_il.npz`/`secondary_path_il.npz`는 legacy라 덮어쓰지 않는다.
+canonical evidence가 이미 있는 이후 실행도 fresh meter가 필수다. 이때는
+`set_amp_level.py`를 bootstrap 옵션 없이 같은 세 confirmation으로 실행하고, 출력된
+`--meter-raw` strict 명령(bootstrap 옵션 없음)을 그대로 쓴다. 영구 evidence만으로 현재
+앰프 노브 상태를 대신할 수 없다.
 
 ### 7.4 학습
 
 ```bash
 # 사전학습
-python scripts/train/train.py --config configs/train_pretrain.yaml
+.venv/bin/python scripts/train/train.py --config configs/train_pretrain_tiny.yaml
 
-# 파인튜닝 — 진입 게이트를 통과해야 시작된다
-python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
-    --set data.digital_primary_path_mode=measured
-python scripts/train/run_finetune_pipeline.py --config configs/train_finetune.yaml
+# canonical 100k best.pt를 명시한 뒤 15/15 진입 게이트를 통과해야 시작된다.
+INIT_CKPT=runs/<canonical-pretrain-contract>/ckpt/best.pt
+.venv/bin/python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
+    --set data.digital_primary_path_mode=measured --set init_ckpt="$INIT_CKPT"
+.venv/bin/python scripts/train/run_finetune_pipeline.py \
+    --config configs/train_finetune.yaml \
+    --set data.digital_primary_path_mode=measured --set init_ckpt="$INIT_CKPT"
 ```
 
 ### 7.5 평가와 배포
 
+아래 export/배포 명령은 공식 test G4와 별도 natural-crest challenge가 모두 PASS한 뒤에만
+실행한다. 그 전에는 closed-loop나 실제 ANC ON 평가도 시작하지 않는다.
+
 ```bash
-python scripts/eval/evaluate_offline.py --ckpt runs/<run>/ckpt/best.pt --n-items 64
-python scripts/train/export_onnx.py --ckpt runs/<run>/ckpt/best.pt --out runs/export/model.onnx
-python scripts/bench/measure_inference_latency.py --config configs/runtime.yaml
+.venv/bin/python scripts/eval/evaluate_offline.py --ckpt runs/<run>/ckpt/best.pt --n-items 64
+.venv/bin/python scripts/train/export_onnx.py --ckpt runs/<run>/ckpt/best.pt --out runs/export/model.onnx
+.venv/bin/python scripts/bench/measure_inference_latency.py --config configs/runtime.yaml
 ```
 
 ### 7.6 테스트
 
 ```bash
-python -m pytest -q
+.venv/bin/python -m pytest -q
 ```
 
 ---
@@ -376,7 +449,7 @@ src/deep_anc/
 
 configs/         덕트·데이터·모델·학습·런타임·평가 설정
 scripts/         data · train · eval · bench · export · jetson
-tests/           51 개 파일 / 744 케이스
+tests/           계약·회귀·공격 fixture
 docs/            00 개요 · 01 지연 물리 · 02 하드웨어 · … · 12 시스템 요약
 ```
 

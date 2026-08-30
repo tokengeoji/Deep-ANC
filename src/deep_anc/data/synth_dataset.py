@@ -34,8 +34,11 @@ from ..config import _resolve_path, default_d_noise_delay, duct_distance_samples
 from ..dsp.duct_sim import build_rir_bank
 from ..dsp.filters import fft_filter
 from ..dsp.secondary_path import load_secondary_path
+from ..dsp.timing import PlantDelays, TrainingTimingContract
+from .manifest_contract import validate_manifest_generation
 from .noise_pool import NoisePool
 from .primary_path import resolve_digital_primary_path
+from .resumable_stream import indexed_rng, worker_global_item_indices
 from .synthetic_signals import SyntheticNoise
 
 
@@ -106,12 +109,18 @@ class SynthANCDataset(IterableDataset):
         split: str = "train",
         seed: int = 20260802,
         rir_bank: dict[str, np.ndarray] | None = None,
+        training_batch_size: int = 1,
+        resume_batch_index: int = 0,
     ) -> None:
         super().__init__()
         self.data_cfg = data_cfg
         self.duct_cfg = duct_cfg
         self.split = split
         self.seed = int(seed)
+        self.training_batch_size = int(training_batch_size)
+        self.resume_batch_index = int(resume_batch_index)
+        if self.training_batch_size < 1 or self.resume_batch_index < 0:
+            raise ValueError("training_batch_size는 1 이상, resume_batch_index는 0 이상")
         self.fs = int(data_cfg["sample_rate"])
         # 세그먼트를 런타임 블록(256 = 모델 hop 128×2)의 배수로 내림 — 모델 입력 요건
         raw_segment = int(round(float(data_cfg["segment_seconds"]) * self.fs))
@@ -119,10 +128,11 @@ class SynthANCDataset(IterableDataset):
         self.reference_mode = str(data_cfg.get("reference_mode", "digital"))
         if self.reference_mode not in ("digital", "acoustic"):
             raise ValueError(f"reference_mode: {self.reference_mode}")
-        self.digital_reference_lead = int(
-            data_cfg.get("digital_reference_lead_samples", 0)
+        configured_lead = data_cfg.get("digital_reference_lead_samples")
+        self.digital_reference_lead = (
+            None if configured_lead is None else int(configured_lead)
         )
-        if self.digital_reference_lead < 0:
+        if self.digital_reference_lead is not None and self.digital_reference_lead < 0:
             raise ValueError("digital_reference_lead_samples는 0 이상이어야 합니다")
         if self.reference_mode != "digital" and self.digital_reference_lead:
             raise ValueError(
@@ -172,11 +182,24 @@ class SynthANCDataset(IterableDataset):
             for tag, ratio in self.mix_ratio.items()
             if tag != "synthetic" and float(ratio) > 0.0
         }
+        allow_missing_sources = bool(data_cfg.get("allow_missing_source_manifests", False))
         assert_declared_sources_exist(
             self.pools,
             self.mix_ratio,
-            allow_missing=bool(data_cfg.get("allow_missing_source_manifests", False)),
+            allow_missing=allow_missing_sources,
         )
+        self._validated_pool_entries: dict[str, list[dict]] = {}
+        if self.pools and not allow_missing_sources:
+            generation = validate_manifest_generation(
+                manifest_dir,
+                required_tags=self.pools,
+            )
+            self._validated_pool_entries = {
+                tag: list(generation["_validated_entries"][tag]) for tag in self.pools
+            }
+            self.manifest_build_id = str(generation["build_id"])
+        else:
+            self.manifest_build_id = None
         self._pool_objs: dict[str, NoisePool] = {}
         self.dc_hum_prob = float(data_cfg.get("dc_hum_prob", 0.0))
 
@@ -207,8 +230,41 @@ class SynthANCDataset(IterableDataset):
                 duct_cfg, "noise_speaker", "error_mic", self.fs
             )
             self.d_noise_delay = max(0, self.d_noise_total - t_ns_err)
+            self.timing_contract = None
         else:
             self.d_noise_delay = int(self.digital_primary_path.delay_samples)
+            plant_delays = PlantDelays.from_config(
+                duct_cfg=duct_cfg,
+                secondary_delay_samples=int(sp.delay_samples),
+                primary_delay_samples=int(self.digital_primary_path.delay_samples),
+                sample_rate=self.fs,
+            )
+            self.timing_contract = TrainingTimingContract.derive(
+                primary_fir=self.digital_primary_path.fir,
+                plant_delays=plant_delays,
+            )
+            derived_lead = int(self.timing_contract.digital_reference_lead_samples)
+            if self.digital_reference_lead is None:
+                # Compact P/S와 handoff가 유일한 출처다. config가 숫자를 생략한
+                # canonical 형태에서는 여기서 계약값을 주입한다.
+                self.digital_reference_lead = derived_lead
+            elif derived_lead != self.digital_reference_lead:
+                raise ValueError(
+                    "digital_reference_lead_samples가 SynthANCDataset의 "
+                    "PlantDelays.lead()와 다릅니다: "
+                    f"configured={self.digital_reference_lead}, "
+                    f"derived={self.timing_contract.digital_reference_lead_samples}"
+                )
+            declared = data_cfg.get("training_timing_contract")
+            if declared is not None:
+                configured = TrainingTimingContract.model_validate(declared)
+                if configured != self.timing_contract:
+                    raise ValueError(
+                        "resolved training_timing_contract와 SynthANCDataset이 실제 P(z)에서 "
+                        "유도한 계약이 다릅니다"
+                    )
+        if self.digital_reference_lead is None:
+            self.digital_reference_lead = 0
 
         self.level_range = tuple(data_cfg.get("level_dbfs", [-35, -10]))
         self.snr_range = tuple(data_cfg.get("snr_mic_noise_db", [5, 30]))
@@ -223,7 +279,11 @@ class SynthANCDataset(IterableDataset):
         if tag not in self._pool_objs:
             try:
                 self._pool_objs[tag] = NoisePool(
-                    self.pools[tag], self.split, self.fs, seed=int(rng.integers(1 << 31))
+                    self.pools[tag],
+                    self.split,
+                    self.fs,
+                    seed=int(rng.integers(1 << 31)),
+                    validated_entries=self._validated_pool_entries.get(tag),
                 )
             except (FileNotFoundError, ValueError) as exc:
                 # 예전에는 여기서 한 줄 출력하고 태그를 버린 뒤 합성원으로 대체했다.
@@ -255,7 +315,7 @@ class SynthANCDataset(IterableDataset):
         if tag != "synthetic":
             pool = self._pool(tag, rng)
             if pool is not None:
-                seg = pool.sample_segment(n_samples)
+                seg = pool.sample_segment(n_samples, rng=rng)
                 rms = float(np.sqrt(np.mean(seg**2)) + 1e-9)
                 return seg / rms
         return synth.generate(n_samples)
@@ -334,10 +394,17 @@ class SynthANCDataset(IterableDataset):
     def __iter__(self):
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
         split_offset = {"train": 0, "val": 7919, "test": 15859}[self.split]
-        rng = np.random.default_rng(self.seed + split_offset + worker_id * 1009)
-        synth = SyntheticNoise(self.fs, seed=int(rng.integers(1 << 31)))
-        while True:
+        indices = worker_global_item_indices(
+            start_batch_index=self.resume_batch_index,
+            batch_size=self.training_batch_size,
+            worker_id=worker_id,
+            num_workers=num_workers,
+        )
+        for global_index in indices:
+            rng = indexed_rng(self.seed, split_offset, global_index)
+            synth = SyntheticNoise(self.fs, seed=int(rng.integers(1 << 31)))
             yield self._make_item(rng, synth)
 
 

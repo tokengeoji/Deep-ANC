@@ -3,24 +3,27 @@
 작성: 2026-08-03. 원 설계서(4개 전문 조사 종합)를 3개 독립 검증 렌즈(①물리·수치 검증, ②배포 제약 적대 검증, ③학습 실현성 검증)로 교차검증한 결과의 종합.
 **채택 규칙: 3개 렌즈 중 하나라도 기각한 항목은 로드맵에서 제외**하고 말미의 "검토 후 제외" 절에 사유와 함께 기록한다(다음 세션 재검토 방지). 조건부 기각(시점·사양 수정으로 해소되는 것)은 수정판을 해당 단계에 조건 명시 후 편입했다.
 
-불변 전제(**2026-08-05 플랜트 복구 반영**): 블록 256샘플=5.33ms, hop 128=2.67ms, 상쇄 경로 지연 **1718샘플(S 실측 1462 + 핸드오프 256)**, digital-ref 예측 요구 **−116샘플**, acoustic-ref 예측 요구 **≈1578샘플(≈32.9ms)**, 평면파 컷오프 1633Hz, Jetson P99<3ms, ONNX opset17 정적그래프·상태 명시 텐서·TRT 화이트리스트(DFT/Loop/Gather 금지), 시스템 변경 불가.
+불변 전제: 블록 256샘플=5.33ms, hop 128=2.67ms, 평면파 컷오프 1633Hz,
+Jetson P99<3ms, ONNX opset17 정적그래프·상태 명시 텐서·TRT 화이트리스트
+(DFT/Loop/Gather 금지). P/S bulk delay, compact FIR peak, 256-sample handoff, digital lead와
+acoustic prediction horizon은 숫자로 복사하지 않고 strict NPZ의 `TrainingTimingContract`에서
+유도한다. 2026-08-05 수치는 legacy 진단 기록이며 현행 official 계약이 아니다.
 
-## 0. corrected Stage-1 현재 기준선
+## 0. legacy corrected Stage-1의 교훈
 
 기존 `rir_surrogate`+미관측 랜덤 plant 학습은 P/S 스케일 불일치와 위상 경사
 상쇄로 0 출력 해에 머물렀다. corrected Stage-1은 아래 기준선으로 교체됐다.
 
 - `secondary_surrogate`: `P(z)=S(z)`로 gain/FIR 스케일을 맞춘 표현 사전학습
-- `digital_reference_lead_samples: 109`: 학습 연속 source와 런타임 playback FIFO 모두 구현
+- 당시 수동 digital lead와 playback FIFO를 구현했지만 현행 strict P/S 계약과 다르다
 - 공칭 선형 plant: η=10, drive=1, hardclip=0, delay/gain/tilt/all-pass 섭동 OFF
 - trusted NMSE로 최적화/체크포인트 선택, fullband NMSE를 do-no-harm 지표로 동시 로깅
   (**2026-08-05 플랜트 복구로 trusted 대역이 150–600Hz → 150–1600Hz 로 확대**)
 - checkpoint의 resolved config·`physics_status`·lead, ONNX JSON lead 메타, 런타임 mismatch fail-fast(legacy=0)
 
-이 단계의 체크포인트는 **representation-only**다. 고정-batch overfit 성공은
-파이프라인 진단일 뿐, 덕트 일반화 성능이 아니다. 동일 하드웨어 조건의
-실측 `P(z)`/`S(z)`로 파인튜닝하고 학습에 쓰지 않은 recorded test를 통과하기
-전에는 저역·고역·음성·음악 감쇠를 물리 성능으로 주장하지 않는다.
+이 체크포인트들은 **diagnostic-only**이며 현행 init/resume 자격이 없다. 새 strict P/S,
+historical provenance와 Elice manifest를 결속한 계약으로 tiny 100k를 처음부터 학습하고,
+학습에 쓰지 않은 recorded test를 통과하기 전에는 물리 성능을 주장하지 않는다.
 
 ---
 
@@ -49,10 +52,9 @@ THD/IMD 실측을 통과한 뒤 Stage-2 커리큘럼으로 점진 투입한다. 
   이 저장소로 복사해 출처를 남긴다. THD 수% 미만이면 신경 플랜트 등 고비용 G_nl 작업을
   회피한다 — C단계 G_nl 투자 규모 결정 게이트.
 - ② ~~**광대역 S(z) 재보정 150–600Hz → 80–1600Hz**~~ → **2026-08-05 해소.** 동시 인터리브 측정 + 오염 반복 기각으로 `consistency_band_hz` 가 **150–1600Hz** 가 됐다(150–1600Hz 일관성 P 0.9993 / S 0.9990). 남은 한계는 **80–150Hz** 뿐이다(클린 후에도 S 0.706~0.758 — 진짜 물리 한계). docs/02 §4.
-- ③ **digital-ref P(z) 실측**: 동일 앰프·볼륨·I/O 조건에서
-  `calibrate_wideband.py --output-channel noise`로 noise→ERR compact FIR+순수지연을
-  측정한다. `duct.digital_reference.primary_path_npz`와 `d_noise_delay_samples`를 함께
-  갱신하고, measured NPZ delay와 숫자가 다르면 코드가 fail-fast한다.
+- ③ **digital-ref P(z) 실측**: 공용 interleaved strict probe에서 같은 stream·반복으로
+  noise→ERR P와 cancel→ERR S의 raw/analysis/compact NPZ를 함께 만든다. config에는 P/S NPZ
+  경로만 두며 delay·FIR peak·handoff·lead는 `TrainingTimingContract`가 유도한다.
 - [Novak et al., Synchronized Swept-Sine, JAES 2015]
 
 위 실측은 모두 사용자 입회·앰프 볼륨 최저·ANC OFF 시작 상태에서만
@@ -73,13 +75,12 @@ revised-OLA 감사는 **불필요 확인 완료**: docs/04 기준 디코더 OLA�
 
 ### B0. 파인튜닝 진입 게이트
 
-1. A3에서 동일 하드웨어 조건의 `P(z)`/`S(z)`와 THD/IMD를 확보한다.
-2. 소음·음성·음악·환경·기계음을 독립 세션으로 수집하고, 화자·곡·환경·
-   기계 조건 그룹을 가로지 않는 8:1:1 split을 만든다. 현 manifest 도구의 세션
-   단위 split만으로는 source-family 층화가 완료되지 않는다. 현 절대경로
-   manifest는 Elice에서 재생성하거나 휴대 가능 규약으로 교체한다.
-3. `digital_primary_path_mode: measured`와 실측 `primary_path_npz`/`d_noise_delay_samples`를
-   선택한다. corrected Stage-1의 `secondary_surrogate` 상태로 파인튜닝하지 않는다.
+1. 동일 stream/앰프/I/O 조건의 strict `P(z)`/`S(z)`와 immutable raw provenance를 확보한다.
+2. 기존 82세션의 historical source를 재현하고 shared clip/artist/album/speaker/book의
+   transitive component를 절대 나누지 않는 split을 만든다. family별 val/test component가
+   각각 4개 미만이면 추가 녹음 전까지 차단한다.
+3. `digital_primary_path_mode: measured`와 strict `primary_path_npz`를 선택한다. timing은
+   NPZ-derived contract만 사용하고 legacy corrected checkpoint는 init/resume하지 않는다.
 4. 독립 val/test에서 trusted NMSE(현 150–1600Hz)와 fullband NMSE를 항상 동시
    제시한다. 합성 offline·실기 session 평가는 S(z) 실측대역∩덕트 목표대역에서
    trusted/fullband/간극을 Markdown+NPZ에 자동 저장하며 기존 소스별·옥타브 지표도
@@ -93,18 +94,14 @@ digital-ref의 연속 source K샘플 선행 슬라이스는 합성/실측 데이
 다른 연구 경로이며, 현 코드는 acoustic 모드의 nonzero digital lead를 거부한다.
 - [ARN TASLP 2023: 16kHz 6ms 선행까지 무손실 실증 — digital-ref 2.3ms는 안전 구간]
 
-### B2. digital-ref 참조 +109샘플 선행 공급 — 예측을 조회로 변환 (3/3 승인, P1-2)
-digital-ref 소음은 Jetson 자기생성 신호이므로 실제 재생을 FIFO로 2.27ms 늦춰
-−109샘플 예측 부담을 0으로 만든다. 정보를 창조하거나 녹음의 미래를 읽는 방식이 아니다.
-이로 인한 dB 이득은 실측 P/S+독립 test로 검증할 가설이며, 현 surrogate 수치로 물리
-성능을 예측하지 않는다.
+### B2. digital-ref 선행 공급 — 예측을 조회로 변환 (3/3 승인, P1-2)
 
-**구현 완료·corrected Stage-1에 활성**: 합성/실측 데이터셋은
-`x_ref[t]=source[t+109]`를 사용한다. 런타임은 생성 신호와 소음 FadeGate를 함께 FIFO에
-넣어 ON/OFF 전환 중에도 정렬을 보존한다. 배포 템플릿은 lead=0을 유지하므로 109 artifact
-실행 시 runtime=109를 명시해야 한다. checkpoint/ONNX JSON 메타와 다르면 오디오 시작 전
-fail-fast하며, 키가 없는 legacy artifact는 0으로 해석한다. 0 no-op·가변 블록 경계·게이트
-정렬·acoustic nonzero 거부·메타 mismatch를 단위 테스트가 강제한다.
+digital-ref 소음은 Jetson 자기생성 신호이므로 실제 재생을 FIFO로 늦춰 strict P/S가 요구한
+선행량을 제공할 수 있다. 정보 창조나 녹음 미래 참조가 아니다. 합성 branch의 총 선행량과
+실측 branch의 세션 정렬 잔여를 `TrainingTimingContract`가 같은 timeline으로 맞춘다.
+
+lead는 checkpoint/ONNX 메타에 계약 SHA와 함께 저장하고 runtime mismatch를 오디오 시작 전에
+거부한다. 과거 수동 lead artifact는 legacy로만 해석하며 새 학습이나 배포에 사용하지 않는다.
 
 ### B3. 비선형 커리큘럼 + worst-case 샘플링 (3/3 승인, P1-3)
 η/drive 선형→강비선형 어닐링 + 배치마다 NL 파라미터 k개 추첨 후 손실 최대인 것으로 역전파(민맥스). 트레이너 수 줄, 플랜트 k회 재적용만 추가라 저비용.

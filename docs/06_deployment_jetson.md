@@ -1,5 +1,9 @@
 # 06. Jetson AGX Orin 배포
 
+> **진입 조건:** ONNX/TensorRT export와 실제 ANC ON 실행은 canonical recorded test G4와
+> 별도 natural-crest challenge가 모두 PASS한 뒤에만 진행한다. 기존 corrected checkpoint와
+> ONNX는 diagnostic artifact이며 새 배포 후보가 아니다.
+
 ## 1. 환경 (구축 완료 상태 기록)
 
 | 항목 | 값 |
@@ -98,7 +102,7 @@ ONNX·지연 파이프라인을 검증하는 데는 쓸 수 있지만, 실제 no
 
 - 콜백은 **절대 대기하지 않는다** — 추론 지연 시 무음 폴백 + 데드라인 워치독.
 - 파이프라인 핸드오프 = 정확히 1 hop → 학습 플랜트의 `handoff_extra_samples: 256` 와 정합.
-  실효 지연 검증: `.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --calibrate`
+  실효 지연 검증: `.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --calibrate --confirm-speaker --confirm-user-present --confirm-volume-minimum`
   (실측과 다르면 원인을 확인하고 P/S 지연·lead를 함께 재산출한 뒤 파인튜닝).
 - `digital_reference_lead_samples` 는 자기생성 소음의 실제 재생을 그만큼 FIFO로 늦춰
   모델에 확정된 선행 신호를 제공한다. 소음 게이트도 같은 FIFO를 통과하므로 ON/OFF 전환
@@ -125,14 +129,17 @@ ONNX·지연 파이프라인을 검증하는 데는 쓸 수 있지만, 실제 no
 .venv/bin/python scripts/bench/check_audio_input.py --require-both
 # 배포 후보 (tiny + ORT) — 항상 ANC OFF 시작, A 키로 ON
 # runtime_tiny.yaml 이 lead=109 와 tiny_corrected.onnx 를 이미 가리킨다
-.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml
+.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml \
+  --confirm-speaker --confirm-user-present --confirm-volume-minimum
 # 다른 artifact 를 쓰려면 lead 를 그 artifact 메타와 반드시 같게 준다 (다르면 시작 전 거부)
 .venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml \
     --set digital_reference_lead_samples=109 \
-    --set engine.type=ort --set engine.onnx=runs/export/tiny_corrected.onnx
+    --set engine.type=ort --set engine.onnx=runs/export/tiny_corrected.onnx \
+    --confirm-speaker --confirm-user-present --confirm-volume-minimum
 # 실재하는 artifact: runs/export/{tiny_corrected.onnx, tiny_corrected_fp16.plan, tiny_long.onnx}
 # FxLMS 회귀 기준선 (기존 시스템과 동일 동작 확인용)
-.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --set controller=fxlms
+.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --set controller=fxlms \
+    --confirm-speaker --confirm-user-present --confirm-volume-minimum
 # 세션 기록 (npz)
 ... --run-seconds 60 --record results/demo_0803
 ```

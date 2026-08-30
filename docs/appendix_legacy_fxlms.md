@@ -1,7 +1,9 @@
 # 부록. 기존 anc_project (FxLMS) 분석 — 2026-08-02 전수 조사
 
 `~/anc_project` 전체(코드 3본 + 로그 8 + 모델 npz 10 + 진단 6 + WAV 5)를 읽고 정리한 기록.
-이 분석이 Deep_ANC 설계 결정(채택 S(z), 지연 규약, 안전장치 계승)의 근거다. **원본은 읽기전용.**
+이 분석은 당시 S(z) 선택과 지연 규약·안전장치 계승의 역사적 근거다. 현재 official
+interleaved schema의 근거가 아니며 어떤 legacy NPZ도 training-ready로 승격하지 않는다.
+**원본은 읽기전용.**
 
 ## 1. 소스 코드
 
@@ -19,7 +21,7 @@ FxLMSController 는 `baselines/` 사본으로 베이스라인/폴백에 사용.
 
 | npz | 측정 조건 | delay | fit | coherence | 판단 |
 |---|---|---|---|---|---|
-| `secondary_path_4s.npz` | block 256 / low | 1342 (27.96ms) | **2.14dB** | **0.40** | **최상 — Deep_ANC 채택** |
+| `secondary_path_4s.npz` | block 256 / low | 1342 (27.96ms) | **2.14dB** | **0.40** | 당시 후보 중 최상; 현재 legacy diagnostic-only |
 | `secondary_path.npz` (=4s_512) | block 512 / high | 2613 (54.4ms) | 1.09dB | 0.27 | 기존 시스템이 사용하던 것 |
 | `secondary_path_before_4s.npz` | 256 / low | 1428 | 0.55dB | 0.10 | 실패급 |
 

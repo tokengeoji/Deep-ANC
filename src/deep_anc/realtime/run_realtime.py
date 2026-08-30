@@ -28,6 +28,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict
 
 from ..audio_io import (
+    assert_measurement_preconditions,
     capture_input_probe,
     float32_to_pcm_int16,
     format_sounddevice_devices,
@@ -790,6 +791,9 @@ def main() -> int:
     parser.add_argument("--record", default=None, help="세션 npz 저장 경로")
     parser.add_argument("--calibrate", action="store_true", help="실효 지연 측정 모드")
     parser.add_argument("--list-devices", action="store_true")
+    parser.add_argument("--confirm-speaker", action="store_true")
+    parser.add_argument("--confirm-user-present", action="store_true")
+    parser.add_argument("--confirm-volume-minimum", action="store_true")
     parser.add_argument(
         "--input-probe-seconds",
         type=float,
@@ -802,7 +806,22 @@ def main() -> int:
         print(format_sounddevice_devices())
         return 0
 
+    if not (args.confirm_speaker and args.confirm_user_present and args.confirm_volume_minimum):
+        print(
+            "[중단] 런타임 출력에는 --confirm-speaker, --confirm-user-present, "
+            "--confirm-volume-minimum이 모두 필요합니다.", file=sys.stderr
+        )
+        return 2
+
     cfg = load_runtime_config(args.config, args.overrides)
+    try:
+        import sounddevice as sd
+        from ..dsp.measurement_level import assert_live_pcm_clock_preconditions
+        assert_live_pcm_clock_preconditions(cfg["hardware"]["audio"])
+        assert_measurement_preconditions(sd, cfg["hardware"]["audio"])
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"[중단] 오디오 사전점검 실패: {exc}", file=sys.stderr)
+        return 2
     # 엔진 아티팩트 확인은 **오디오 장치를 열기 전에** 한다. 마이크 프로브보다도
     # 먼저인 이유는 이 검사가 하드웨어를 전혀 건드리지 않고 즉시 끝나기 때문이다 —
     # 없는 파일 때문에 실패할 실행에 스피커를 울릴 이유가 없다.

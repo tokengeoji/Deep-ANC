@@ -366,6 +366,40 @@ def test_pre_roll_keeps_leading_ringing_in_front_of_the_onset():
     assert abs(float(rolled[-1])) < 0.1 * float(np.max(np.abs(rolled)))
 
 
+@pytest.mark.parametrize("drive", ["noise", "cancel"])
+def test_pre_roll_round_trips_complex_transfer_for_both_bin_parities(drive):
+    """최종 FIR 이 even P뿐 아니라 odd S의 복소 전달함수도 그대로 재현해야 한다.
+
+    기본 probe의 noise bin은 even이라 반주기 alias가 periodic이고, cancel bin은 odd라
+    anti-periodic이다. 첨두 위치만 검사하면 cancel pre-roll의 감긴 앞부분 부호가 틀려도
+    통과하므로, 실제 저장 계약처럼 effective delay를 적용한 전체 복소 응답을 비교한다.
+    """
+
+    probe = build_interleaved_probe(
+        sample_rate=FS,
+        period_seconds=0.125,
+        band_hz=(60.0, 1650.0),
+        amplitude=0.02,
+        tone_spacing_hz=16.0,
+    )
+    selected = probe.bins_for(drive)
+    frequencies = selected * FS / probe.period_samples
+    rng = np.random.default_rng(20260814)
+    taps = rng.normal(size=113) * np.exp(-np.arange(113) / 18.0)
+    omega = 2.0 * np.pi * frequencies / FS
+    measured = np.exp(-1j * np.outer(omega, np.arange(taps.size))) @ taps
+    pre_roll = 256
+
+    compact = channel_impulse_response(
+        probe, measured, drive=drive, pre_roll=pre_roll
+    )
+    reconstructed = (
+        np.exp(-1j * np.outer(omega, np.arange(compact.size))) @ compact
+    ) * np.exp(1j * omega * pre_roll)
+
+    np.testing.assert_allclose(reconstructed, measured, rtol=1e-11, atol=1e-11)
+
+
 def test_channel_impulse_response_rejects_pre_roll_beyond_the_period():
     probe = build_interleaved_probe(
         sample_rate=FS, period_seconds=1.0, band_hz=(70.0, 1610.0),

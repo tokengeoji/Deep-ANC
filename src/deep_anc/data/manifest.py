@@ -134,22 +134,31 @@ def write_manifest(entries: list[dict], path: str | Path) -> None:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def read_manifest(path: str | Path, split: str | None = None) -> list[dict]:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"manifest 없음: {p}")
+def read_manifest_bytes(
+    raw: bytes, *, manifest_path: str | Path, split: str | None = None
+) -> list[dict]:
+    """이미 한 번 읽은 manifest bytes를 검증·해석한다.
+
+    hash 검증 뒤 경로를 다시 여는 TOCTOU를 막기 위해 generation validator와 학습
+    loader가 같은 byte snapshot을 넘길 수 있는 진입점이다.
+    """
+
+    p = Path(manifest_path)
     if split is not None and split not in VALID_SPLITS:
         raise ValueError(f"split 은 {VALID_SPLITS} 중 하나여야 합니다: {split!r}")
 
     raw_entries: list[dict] = []
-    with open(p, "r", encoding="utf-8") as f:
-        for line_number, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            entry = json.loads(line)
-            _validate_entry(entry, index=line_number)
-            raw_entries.append(entry)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"manifest UTF-8 오류: {p}: {exc}") from exc
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        entry = json.loads(line)
+        _validate_entry(entry, index=line_number)
+        raw_entries.append(entry)
 
     # split 필터 전에 전체 매니페스트를 검사해야 group 누수를 놓치지 않는다.
     validate_group_splits(raw_entries)
@@ -164,6 +173,13 @@ def read_manifest(path: str | Path, split: str | None = None) -> list[dict]:
             entry["path"] = str((manifest_parent / entry["path"]).resolve())
         entries.append(entry)
     return entries
+
+
+def read_manifest(path: str | Path, split: str | None = None) -> list[dict]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"manifest 없음: {p}")
+    return read_manifest_bytes(p.read_bytes(), manifest_path=p, split=split)
 
 
 def scan_wavs(root: str | Path, tag: str) -> list[dict]:

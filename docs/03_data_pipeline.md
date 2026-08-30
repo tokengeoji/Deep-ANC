@@ -4,33 +4,33 @@
 
 학습 샘플 하나는 (모델 입력 x, 1차경로 소음 d) 쌍이다. 타깃 상쇄 파형은 없다 —
 손실이 미분가능 2차경로 플랜트로 에러를 직접 계산한다 (docs/04 §5).
-현재 digital Stage-1의 정렬은 다음과 같다.
+현행 digital Stage-1의 정렬은 다음 계약으로 표현한다.
 
 ```
-x[0] = x_ref   (digital: 연속 source n의 116샘플 선행분, acoustic: P_ref·n)
+x[0] = x_ref   (digital: 연속 source n의 계약 유도 선행분, acoustic: P_ref·n)
 x[1] = err_in  (에러 피드백 근사: d 를 512~1024샘플 랜덤 지연 — 캡처+블록 지연 모사)
 playback[t] = n[t]
-x_ref[t]    = n[t+109]
-d           = S_FIR·playback 을 D_noise=1602만큼 지연  # secondary surrogate
+x_ref[t]    = n[t+K]
+d           = P_contract(playback)  # secondary surrogate 또는 strict measured P
 y           = model(x)
-e           = d + S_total·y,  S_total delay=1462+256=1718
+e           = d + S_contract·y
 ```
 
-학습은 source를 `segment+109`샘플 연속으로 뽑으므로 tail zero-padding이나 파일 경계의
-가짜 패턴이 없다. 런타임도 모델 입력에서 미래 샘플을 읽는 대신 실제 noise playback을
-116샘플 FIFO로 늦춰 같은 관계를 만든다. 지연 물리는 docs/01 §3이 단일 근거다.
-(2026-08-05 플랜트 복구 전에는 109 였다 — 배포 중인 ONNX 만 아직 109 다.)
+`TrainingTimingContract`는 P/S bulk delay, compact FIR peak, 256-sample handoff,
+`PlantDelays.lead()`와 총 선행량을 구분한다. 학습은 source를 `segment+K` 연속 샘플로 뽑아
+tail padding 패턴을 만들지 않으며, runtime playback FIFO도 checkpoint 계약의 K와 같아야 한다.
+과거 수동 lead artifact는 diagnostic-only이고 새 학습/배포에 사용하지 않는다.
 
 ### digital 1차경로 모드
 
 | `digital_primary_path_mode` | d 생성 | 용도 |
 |---|---|---|
-| `secondary_surrogate` **(현재)** | 측정 S의 compact FIR/gain + `D_noise=1602` | P/S 스케일을 맞춘 표현 사전학습. 물리 성능 주장 금지 |
+| `secondary_surrogate` **(사전학습)** | 측정 S의 compact FIR/gain + strict primary NPZ의 P bulk delay | P/S 스케일을 맞춘 표현 사전학습. 물리 성능 주장 금지 |
 | `measured` | `duct.digital_reference.primary_path_npz`의 FIR/gain/delay | 같은 gain·볼륨으로 P/S를 실측한 뒤 실제 파인튜닝 |
 | `rir_surrogate` | 1D `p_err` RIR + 음향 onset을 뺀 추가지연 | 과거 호환·진단 전용. 측정 S와 단위가 달라 본 학습에 사용 금지 |
 
-`measured` 모드는 NPZ sample rate와 설정 delay가 다르면 즉시 실패한다. compact FIR과
-순수지연은 각각 정확히 한 번만 적용하며, RIR onset과 `D_noise`를 이중 계상하지 않는다.
+`measured` 모드는 strict NPZ provenance/sample rate/timing contract가 다르면 즉시 실패한다.
+compact FIR과 bulk delay는 각각 정확히 한 번만 적용하며, RIR onset을 이중 계상하지 않는다.
 
 ## 2. 소음원 구성 (`data_sim.yaml source_mix_ratio`)
 
@@ -83,6 +83,10 @@ Stage-2 커리큘럼으로 한 축씩 켠다.
 
 ## 5. 실측 수집 → 파인튜닝
 
+현재 82세션은 계보 복구 뒤 사용한다. 아래 `record_duct.py` 예시는 strict P/S와 기존 데이터
+통계가 모두 확정된 뒤 부족한 독립 component만 보충할 때의 절차다. 학습 전 장시간 재녹음을
+선행하지 않는다.
+
 ```bash
 # 출력 장치를 열지 않는 선행 게이트. recorded 세션은 ERR+REF 모두 PASS해야 한다.
 .venv/bin/python scripts/bench/check_audio_input.py --require-both
@@ -98,12 +102,11 @@ Stage-2 커리큘럼으로 한 축씩 켠다.
 .venv/bin/python scripts/data/make_recorded_manifest.py
 # 전체 파일/메타/클리핑/무음/분할 누수 QA — PASS 전에는 학습 금지
 .venv/bin/python scripts/data/validate_recorded_sessions.py
-# 파인튜닝 (실측:합성 = 7:3 혼합, digital lead=116 — 실측 P/S 에서 유도)
-.venv/bin/python scripts/train/train.py --config configs/train_finetune.yaml \
-  --set data.digital_primary_path_mode=measured
-# 학습에 쓰지 않은 test split의 독립 반사실 평가
-.venv/bin/python scripts/eval/evaluate_recorded.py \
-  --ckpt runs/finetune_tiny/ckpt/best.pt --split test
+# canonical init과 transfer trust anchor를 지정하고 readiness 15/15 뒤 pipeline 실행
+.venv/bin/python scripts/train/run_finetune_pipeline.py \
+  --config configs/train_finetune.yaml \
+  --set data.digital_primary_path_mode=measured \
+  --set init_ckpt=runs/<canonical-pretrain>/ckpt/best.pt
 ```
 
 2026-08-03 빠져 있던 pin17(REF L/R)을 재연결한 뒤 ERR/REF는 −46dBFS대, clip 0%로
@@ -112,11 +115,9 @@ Stage-2 커리큘럼으로 한 축씩 켠다.
 Jetson 시스템 설정은 바꾸지 않는다.
 
 세션 구조: `data/recorded/<시각_프로그램>/{mics.wav(2ch PCM_32), source.wav, session.json}`.
-ANC OFF 녹음이므로 **에러 마이크 신호가 곧 d(t)** 다. digital-ref 파인튜닝은 같은 세션의
-연속 `source.wav`에서 116샘플 앞선 조각을 x_ref로 쓰고, acoustic-ref는 ref 마이크 채널을
-쓴다 (`recorded_dataset.py`). 실제 수집 전에는 noise→ERR P와 cancel→ERR S를 같은 출력
-gain·볼륨으로 측정하고, checkpoint의 lead와 배포 runtime lead를 **같게** 유지한다.
-(현행 실측 lead=116. 배포 중인 ONNX 는 109 로 학습된 것이라 그 모델에는 109가 맞다.)
+ANC OFF 녹음이므로 **에러 마이크 신호가 곧 d(t)** 다. digital-ref 파인튜닝은 합성 branch의
+총 선행량에서 세션별 정렬 잔여를 뺀 lead를 `TrainingTimingContract`에서 유도하고,
+acoustic-ref는 ref 마이크 채널을 쓴다. checkpoint와 runtime timing SHA가 다르면 실패한다.
 
 ## 6. manifest 스키마와 분할 규칙
 
@@ -134,13 +135,14 @@ JSONL 한 줄 = 파일/세션 하나:
 
 1. 노이즈 풀은 **원본 파일 단위** 90/5/5 분할 (세그먼트 단위 금지)
 2. RIR 뱅크는 **변형 단위** 분할
-3. 실측 데이터는 **group_id 원자 단위 + source_family 층화** 80/10/10 분할
+3. 실측 데이터는 shared clip/artist/album/speaker/book의 **transitive lineage component**
+   원자 단위 + source-family 층화 분할. 각 family의 val/test 독립 component ≥4
 
-실측 manifest는 같은 `group_id`가 여러 split에 나타나면 쓰기·읽기·QA 단계에서 모두
-fail-fast한다. 각 family에 충분한 그룹이 있으면 양수 비율의 train/val/test에 최소 한 그룹씩
-배치한다. 구형 세션은 디렉터리명을 임시 group으로 추론하고 `metadata_inferred=true`를 남기므로,
-최종 수집에서는 화자/책·곡/원본·환경/기계조건을 직접 지정해야 한다. 공개 노이즈 풀의 기존
-파일 단위 split은 별도 source×band held-out 재평가 전까지 상관 누수 한계가 남는다.
+실측 manifest는 같은 lineage component가 여러 split에 나타나면 생성·읽기·QA 단계에서 모두
+fail-fast한다. component는 historical `sources.csv`와 FMA `tracks.csv`를 근거로 만들며,
+추정 경계만 쓰는 `identify_pool_clips.py` 결과를 권위 입력으로 사용하지 않는다. synthetic
+manifest도 raw content SHA와 canonical holdout SHA를 결속하고 recorded와의 계보 교집합을 0으로
+검증한다.
 
 `validate_recorded_sessions.py`는 저장된 파일만 블록 단위로 읽어 2채널/SR/길이/finite/RMS/
 clipping, `session.json`, source 필요 여부, group 누수, family×required-split 커버리지를 검사하고
@@ -187,5 +189,7 @@ measured P/S/lead만 사용한다. surrogate는 `--allow-surrogate`를 명시한
 ## 8. 저장 정책
 
 온더플라이 합성이므로 학습쌍을 디스크에 굳히지 않는다 — 원본 노이즈(30~50GB)만 저장.
-Elice 128GiB 스토리지에 여유 있게 들어가며, 업로드가 필요할 땐
-`.venv/bin/python scripts/data/pack_transfer.py` 로 2GB tar 샤드를 만든다.
+public raw는 Elice 128GiB 스토리지에 직접 받는다. Jetson의 recorded/RIR/strict P/S와
+계보 자료는 `build_elice_transfer_manifest.py`로 content SHA를 결속한 뒤 상대경로 그대로
+rsync/scp 스트리밍한다. 로컬 tar 복제본은 만들지 않는다. `pack_transfer.py`는 legacy
+진단 도구이며 canonical 이관에 사용하지 않는다.

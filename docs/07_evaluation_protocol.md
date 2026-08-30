@@ -52,10 +52,10 @@ trusted 수치만 제시하거나 fullband 평균으로 trusted 대역 개선을
 ## 3. 오프라인 평가 (하드웨어 불필요)
 
 ```bash
-# 테스트 split 종합 평가 → runs/<exp>/eval/{metrics.md, psd.png, spec.png, band.png}
-.venv/bin/python scripts/eval/evaluate_offline.py --ckpt runs/pretrain_base_corrected/ckpt/best.pt
-# 동일 시나리오·동일 S(z) 에서 DL vs FxLMS 표
-.venv/bin/python scripts/eval/compare_fxlms.py --ckpt runs/pretrain_base_corrected/ckpt/best.pt
+# synthetic 진단 평가. official recorded test 선택에는 사용하지 않는다.
+.venv/bin/python scripts/eval/evaluate_offline.py --ckpt runs/<contract-seed>/ckpt/best.pt
+# 동일 시나리오·동일 S(z)의 diagnostic DL vs FxLMS 표
+.venv/bin/python scripts/eval/compare_fxlms.py --ckpt runs/<contract-seed>/ckpt/best.pt
 ```
 
 무학습 체크포인트 기준값 (파이프라인 검증, 2026-08-02): FxLMS 는 tone300 +88dB(이상 조건)
@@ -67,8 +67,8 @@ control limit 0.10 조건의 역사적 baseline이며 현재 하드웨어에서 
 
 ### 현재 자동화 범위
 
-- Trainer 로그·TensorBoard·checkpoint 선택은 trusted/fullband NMSE를 동시 출력한다.
-  단, 현 val은 고정 합성 배치 최대 16개이며 recorded val/test를 소비하지 않는다.
+- Trainer 로그·checkpoint는 trusted/fullband NMSE를 동시 출력한다. 공식 fine-tune 모델
+  선택은 recorded val만 사용하고 selection bundle을 원자 고정한다.
 - `eval.metrics.intersect_frequency_bands`/`band_nmse_db`가 평가 공용 규약이다.
   trusted 대역은 항상 **S(z) `excitation_band_hz` ∩ duct 목표대역**으로 산출하고,
   빈 교집·샘플레이트 불일치는 fail-fast한다.
@@ -87,11 +87,44 @@ control limit 0.10 조건의 역사적 baseline이며 현재 하드웨어에서 
   PASS/FAIL을 `metrics.md`+`metrics.npz`에 저장한다. surrogate는 명시적
   `--allow-surrogate` 진단만 가능하며 물리 성능으로 해석하지 않는다.
 
-```bash
-.venv/bin/python scripts/eval/evaluate_recorded.py \
-  --ckpt runs/finetune_tiny/ckpt/best.pt \
-  --manifest data/manifests/recorded_train.jsonl --split test
-```
+공식 test는 이 스크립트를 임의로 직접 호출하지 않는다. `run_finetune_pipeline.py`가 val
+selection을 재검증해 발급한 campaign capability를 정확히 한 번 소비하고, staging 디렉터리에서
+완성한 결과를 no-replace로 원자 출판한다. 1시드 clear PASS 또는 검증된 2시드 final selection이
+아니면 capability가 발급되지 않는다.
+
+### 3.1 처음 듣는 소리(OOD) 검증 — 최종 목표의 필수 게이트
+
+validation/test에 들어 있지 않은 소리를 재생해 본 결과만으로는 충분하지 않다. 다음 다섯
+수준을 구분해 기록하며, **Level 5를 통과하기 전에는 새 소리에 대한 ANC 일반화를 주장하지
+않는다.**
+
+| 수준 | 미사용 조건 | 의미 |
+|---|---|---|
+| Level 1 | 같은 원본 계열의 학습 제외 파일 | 파일 단위 일반화 |
+| Level 2 | 새 화자·아티스트·앨범·기계의 독립 component | 계보 밖 개체 일반화 |
+| Level 3 | 학습에 없던 dataset의 source | dataset 이동 |
+| Level 4 | 학습에 없던 source category/자연음 | category 이동 |
+| **Level 5** | 모델 선택·계약 고정 뒤 Jetson 실제 덕트에서 새로 녹음한 speech/music/environment/machine | **현장 OOD·quiet-zone 검증** |
+
+Level 1–4의 source SHA·artist/album·speaker/book·machine/session lineage가 train/val/test와
+교집합 0인지 먼저 검사한다. Level 5는 어떤 manifest에도 넣지 않고, 모델 선택에 사용하지
+않으며, 녹음 직후 immutable raw WAV/NPZ와 source SHA를 보존한다. 각 수준에서 125, 250, 500,
+1000, 1600, 2000, 4000, 8000Hz 옥타브별 OFF/ON 전력비를 계산하고 평균·최악 10%·family별
+cluster-bootstrap CI·latency/deadline/xrun을 함께 남긴다. `attenuation > 0`만 감쇠이며 음수는
+증폭이다.
+
+최종 OOD PASS 조건은 다음을 모두 만족해야 한다.
+
+1. trusted 150–1600Hz 평균과 모든 family 최악 10%가 0dB 미만이고, fullband 평균이 0dB
+   이하이다.
+2. 2/4/8kHz는 `trusted=False`로 숨기지 않고 별도 표에 싣는다. high-band P/S가 유효한
+   경우 평균 감쇠가 양수이고, 어떤 경우에도 최악 10% 증폭이 1dB를 넘지 않아야 한다.
+3. 48kHz/256-sample 실시간에서 P99가 deadline(5.333ms)을 넘지 않고 deadline miss와 xrun이
+   0이다.
+
+raw/session artifact가 없거나 high-band clock/P/S가 무효이면 해당 수준은 **Not yet
+demonstrated/INCONCLUSIVE**로 판정한다. challenge 결과를 학습 데이터로 되돌려 넣지 않으며,
+실패할 때만 원인을 수정한 뒤 별도 재수집·재학습 루프로 돌아간다.
 
 ## 4. 실기 평가 (덕트, 사용자 입회)
 
@@ -101,7 +134,8 @@ control limit 0.10 조건의 역사적 baseline이며 현재 하드웨어에서 
 .venv/bin/python scripts/demo/evaluate_session.py --controllers fxlms dl --scenarios tone300 multitone band nonlinear
 ```
 
-프로토콜: 시나리오마다 **OFF 10s(베이스라인) → ON 30s → OFF 5s**, 게이트 램프 ±1~2s 는
+이 live ANC ON 프로토콜은 공식 recorded G4와 natural-crest challenge PASS 뒤에만 연다.
+시나리오마다 **OFF 10s(베이스라인) → ON 30s → OFF 5s**, 게이트 램프 ±1~2s 는
 분석에서 제외. 산출: `results/eval_report_<시각>.md` (전대역/밴드별 감쇠, miss/xrun) +
 세션 원시 npz. FxLMS 와 DL 은 **같은 세션 묶음에서 연속 측정**해 조건을 통일한다.
 
@@ -143,7 +177,7 @@ NPZ·JSON·Markdown(선택 PNG)에 저장한다. 출력 반응이 무음 구간�
 
 ```bash
 .venv/bin/python scripts/bench/measure_duct_transfer_map.py \
-  --confirm-volume-minimum
+  --confirm-volume-minimum --confirm-speaker --confirm-user-present
 ```
 
 ### 4.2 단일 callback FxLMS 진단

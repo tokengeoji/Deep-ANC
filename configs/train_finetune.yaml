@@ -1,23 +1,17 @@
 # Stage-2/3 파인튜닝 — 실측 녹음 혼합 + (선택) closed-loop
 # 실행: .venv/bin/python scripts/train/train.py --config configs/train_finetune.yaml
-# digital-ref 는 configs/data_sim.yaml 의 값을 그대로 쓴다 — 2026-08-05 플랜트 복구 이후
-# 그 값은 **116** 이다 (S 1462 + handoff 256 − P 1602; 독립 캡처 9건 115~117, 중앙 116).
-# (이 줄은 "+109 를 쓰며 배포 runtime 도 109 로 맞춘다"였다. 109 는 실측 P/S 이전의
-#  추정값이고, 지금은 배포 ONNX 만이 109 에 묶여 있다 — configs/runtime_tiny.yaml 참조.)
-# 기존 lead=0/무효 objective checkpoint는 init/resume에 사용하지 않는다.
-#
-# ⚠ init 후보 checkpoint(runs/pretrain_{base,tiny}_corrected/ckpt/best.pt)는
-#   cfg.trusted_band_hz = [150, 600] / lead = 109 로 학습됐다. 현재 설정이 유도하는 값은
-#   [150, 1600] / 116 이다. lead 차이는 파인튜닝이 흡수하도록 설계됐지만 **대역 차이는
-#   다르다** — 좁은 대역으로 학습한 모델은 벌점이 없던 600-1600Hz 를 적극 증폭한다
-#   (configs/duct.yaml 의 실측: [150,800] 설정에서 600-1600Hz +27.01 dB).
-#   즉 이 init 은 고역 증폭기다. 현재 completed_init_checkpoint 게이트는 이 축을 보지
-#   않으므로 PASS 한다. 사전학습을 새 대역·새 손실로 다시 돌리는 편이 옳다.
+# digital-ref 시간축은 strict primary/secondary NPZ와 handoff에서
+# TrainingTimingContract가 유도한다. P/S delay, compact P FIR peak, lead 또는 총 선행량을
+# 이 YAML에 숫자로 복사하지 않는다. legacy corrected checkpoint는 150–600 Hz/옛 plant
+# 계약이므로 init·resume 자격이 없고 diagnostic artifact로만 보존한다.
 
 # 배포 후보는 tiny 다. base 와 동일 조건(100k step, 같은 seed·데이터)으로 비교한 결과
 # held-out trusted NMSE 가 tiny 쪽이 낫고 Jetson 지연 여유도 크다. 진입점이 base 를
 # 가리키면 게이트가 열리는 순간 **배포하지 않을 모델**을 파인튜닝하게 된다.
 stage: open_loop                # 1차 파인튜닝은 open_loop, 이후 closed_loop 로 변경
+experiment_role: canonical_finetune
+canonical_trust_policy: canonical_finetune_v1
+init_eligible: false
 model_config: configs/model_tiny.yaml
 data_config: configs/data_sim.yaml
 duct_config: configs/duct.yaml
@@ -28,6 +22,8 @@ duct_config: configs/duct.yaml
 require_measured_primary_path: true
 require_init_checkpoint: true
 require_recorded_manifest: true
+required_init_experiment_role: canonical_pretrain
+require_init_eligible: true
 
 # scripts/train/check_finetune.py와 train.py가 공용하는 실패-폐쇄 진입 기준.
 # 실제 official P/S와 recorded 데이터가 없으면 어떤 항목도 우회하지 않는다.
@@ -271,9 +267,15 @@ readiness:
   max_init_best_metric_db: 0.0
   allowed_init_physics_statuses: [secondary_surrogate_representation_pretrain]
 
-init_ckpt: runs/pretrain_tiny_corrected/ckpt/best.pt
+# legacy runs/pretrain_tiny_corrected는 lead/대역/loss 계약이 다르므로 기본 init으로
+# 절대 재사용하지 않는다. canonical tiny 100k가 완료된 뒤 그 contract
+# run의 best.pt를 `--set init_ckpt=...`로 명시해야만 게이트가 열린다.
+init_ckpt: null
 
-recorded_manifest: data/manifests/recorded_train.jsonl
+# shared clip/artist/speaker/book의 transitive lineage component로 다시 나눈
+# manifest만 학습에 쓴다. 기존 recorded_train.jsonl의 group_id는 이 관계를
+# 표현하지 않으므로 샘플러에 넣을 수 없다.
+recorded_manifest: data/manifests/recorded_regrouped.jsonl
 recorded_ratio: 0.7             # 실측:합성 = 7:3 혼합 배치
 
 batch_size: 16
@@ -312,11 +314,11 @@ loss:
   # --- 절대목표 1: 대역 밖 악화 금지 (단측, S 위상 무관) ---
   # 대역 목록은 신뢰대역 여집합에서 자동 유도된다 — S npz 가 [150,600]→[150,1600] 으로
   # 넓어져도 여기에 고칠 곳이 없다.
-  # ⚠ λ 는 사전학습 시절 대역 구성에서 잡은 값이고 자동 유도된 새 대역에서 **재교정되지
-  #   않았다** (실측 ‖λ∇dnh‖/‖∇nmse‖ = 1332%, 설계 목표 20~40%). 20k step ablation 전에
-  #   그래디언트 예산을 다시 재고 λ 를 확정하라. 지금 값은 사전학습과 같게 두는 쪽을 택했다
-  #   — 두 단계가 다른 목적함수를 쓰는 것이 더 나쁘기 때문이다.
-  # λ_dnh 는 그래디언트 예산에서 정한다 — 실측 ‖λ∇dnh‖/‖∇nmse‖ = 0.348 (목표 0.2~0.4).
+  # ⚠ 이전 대역 구성에서의 λ 측정은 폐기했다. 현행 strict-S fixture 재측정과
+  #   20k step ablation 결과를 campaign prerequisite ledger에 결속한다.
+  # λ_dnh 는 그래디언트 예산에서 정한다 — strict-S fixture에서 λ=0.00025의
+  # 비중 0.088을 확인해 λ=0.00075로 재교정했으며 예상 비중은 0.264
+  # (목표 0.2~0.4)다. 원시 측정·선형 재교정은 campaign ledger에 남긴다.
   #   2026-08-06: do-no-harm 마진이 +6.0 에서 게이트 유도값 -18.27 dB 로 24 dB 조여지면서
   #   힌지가 훨씬 자주 활성화됐다. 같은 λ=0.12 의 예산 몫이 **41.8** 이 되어 목적함수를
   #   42배로 덮는다(실측 S(z) 기준. 실제 체크포인트 출력으로도 47.3 으로 일치).
@@ -324,7 +326,7 @@ loss:
   #   흘러가면 학습 전에 실패한다.
   #   ⚠ 미검증: 이 항은 **제약**이지 목적항이 아니므로, "예산 0.2~0.4" 라는 규칙 자체가
   #   제약에 맞는지는 20k step ablation 으로 확인해야 한다 (엘리스에서).
-  lambda_dnh: 0.001
+  lambda_dnh: 0.00075
   # dnh_margin_db 는 **적지 않는다** — G4 게이트 임계(1.0 dB)에서 유도된다(-18.27 dB).
   #   2026-08-06 실측: 여기 적혀 있던 +6.0 을 정확히 만족한 모델이 게이트를 8.5 dB
   #   차이로 FAIL 했다(4000 Hz 옥타브 -9.53 dB). 손실과 게이트가 서로를 모르고 각자
@@ -364,6 +366,12 @@ log_every: 100
 # Trainer의 내장 val은 합성 16개뿐이라 실측 fine-tune 종료 권한으로 쓰지 않는다.
 # 예정 step을 끝낸 뒤 독립 recorded val/test G4로 checkpoint를 판정한다.
 early_stop_patience: 0
-ckpt_dir: runs/finetune_tiny
+# canonical A100 1장 경로. DDP resume은 rank별 RNG/plant 상태를 아직 저장하지
+# 않으므로 공식 fine-tune은 world size 1로 fail-closed한다.
+required_world_size: 1
+# loader가 experiment contract SHA/seed를 포함한 새 경로로 해석한다.
+# 구형 runs/finetune_tiny와 절대 섞이지 않는다.
+contract_run_dir: true
+ckpt_dir: runs
 resume: null
 seed: 20260803

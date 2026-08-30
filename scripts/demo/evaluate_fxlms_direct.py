@@ -39,6 +39,8 @@ from deep_anc.baselines.fxlms_core import (  # noqa: E402
     rms_dbfs,
 )
 from deep_anc.config import REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.audio_io import assert_measurement_preconditions  # noqa: E402
+from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions  # noqa: E402
 
 
 DEFAULT_SECONDARY_PATH = "assets/measured/secondary_path_legacy_512high.npz"
@@ -91,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="사용자 입회와 물리 앰프 볼륨 최저를 확인",
     )
+    parser.add_argument("--confirm-speaker", action="store_true")
     return parser
 
 
@@ -1288,10 +1291,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # 사용자 확인은 config, sounddevice import, 장치 query보다 먼저 검사한다.
-    if not args.confirm_user_present_volume_minimum:
+    if not (args.confirm_user_present_volume_minimum and args.confirm_speaker):
         print(
             "[중단] 사용자 입회와 물리 앰프 볼륨 최저를 확인한 뒤 "
-            "--confirm-user-present-volume-minimum을 지정하세요.",
+            "--confirm-user-present-volume-minimum 및 --confirm-speaker를 지정하세요.",
             file=sys.stderr,
         )
         return 2
@@ -1346,6 +1349,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     import sounddevice as sd
+    try:
+        assert_live_pcm_clock_preconditions(audio)
+        assert_measurement_preconditions(sd, audio)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"[중단] 오디오 사전점검 실패: {exc}", file=sys.stderr)
+        return 2
 
     # 출력 장치를 열기 전에 ERR/REF 둘 다 raw int32로 통과해야 한다.
     try:

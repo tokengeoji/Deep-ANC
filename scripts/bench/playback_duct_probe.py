@@ -19,9 +19,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.audio_io import (  # noqa: E402
+    assert_measurement_preconditions,
     float32_to_pcm_int16,
     resolve_alsa_portaudio_device,
 )
+from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions  # noqa: E402
 from deep_anc.config import REPO_ROOT, load_runtime_config  # noqa: E402
 
 
@@ -54,13 +56,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tone-seconds", type=float, default=0.75)
     parser.add_argument("--gap-seconds", type=float, default=0.40)
     parser.add_argument("--confirm-volume-minimum", action="store_true")
+    parser.add_argument("--confirm-speaker", action="store_true")
+    parser.add_argument("--confirm-user-present", action="store_true")
     parser.add_argument("--out", default=None)
     args = parser.parse_args(argv)
 
-    if not args.confirm_volume_minimum:
+    if not (args.confirm_volume_minimum and args.confirm_speaker and args.confirm_user_present):
         print(
-            "[중단] 사용자 입회와 앰프 볼륨 최저를 확인한 뒤 "
-            "--confirm-volume-minimum을 지정하세요.",
+            "[중단] 스피커 연결·사용자 입회·볼륨 최저 플래그가 필요합니다.",
             file=sys.stderr,
         )
         return 2
@@ -71,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_runtime_config(args.config)
     audio = cfg["hardware"]["audio"]
+    import sounddevice as sd
+    assert_live_pcm_clock_preconditions(audio)
+    assert_measurement_preconditions(sd, audio)
     channels = cfg["hardware"]["channels"]
     fs = int(audio["sample_rate"])
     output_device = resolve_alsa_portaudio_device(
@@ -83,8 +89,6 @@ def main(argv: list[str] | None = None) -> int:
         frequencies = [float(value) for value in args.frequencies]
     if any(value <= 0.0 or value >= fs / 2.0 for value in frequencies):
         raise ValueError("모든 주파수는 0보다 크고 Nyquist보다 작아야 합니다")
-
-    import sounddevice as sd
 
     noise_channel = int(channels["noise_out"])
     gap = np.zeros((int(round(fs * args.gap_seconds)), 2), dtype=np.int16)

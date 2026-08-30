@@ -19,8 +19,15 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
-from ..config import REPO_ROOT
+from ..config import (
+    CANONICAL_DETERMINISM_POLICY,
+    REPO_ROOT,
+    loss_selection_sha256,
+    validate_canonical_training_policy,
+)
 from ..data.recorded_dataset import RecordedANCDataset
+from ..data.transfer_contract import bind_recorded_transfer_config
+from ..data.resumable_stream import indexed_rng
 from ..data.synth_dataset import SynthANCDataset, make_eval_batch
 from ..dsp.nonlinear import RandomNonlinear
 from ..dsp.secondary_path import DifferentiableSecondaryPath, load_secondary_path
@@ -29,7 +36,22 @@ from ..dsp.secondary_path import DifferentiableSecondaryPath, load_secondary_pat
 from ..dsp.timing import BandPlan, PlantSettle, handoff_samples_from_config
 from ..losses import ANCLoss
 from ..models import build_model
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import (
+    load_checkpoint,
+    read_checkpoint_snapshot,
+    save_checkpoint,
+    validate_resume_checkpoint_preview,
+)
+from .completion_receipt import write_completion_receipt
+from .completion_receipt import validate_completion_receipt
+from .campaign_prerequisite import validate_canonical_pretrain_prerequisites
+from .experiment_contract import (
+    CANONICAL_ROLES,
+    require_canonical_source_trust,
+    stamp_experiment_contract,
+    validate_embedded_experiment_contract,
+    validate_resume_experiment,
+)
 from .reproducibility import set_seed, snapshot_run
 
 
@@ -38,6 +60,193 @@ def _ddp_env() -> tuple[int, int, int]:
     world = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     return rank, world, local_rank
+
+
+def validate_training_world_size(cfg: dict, world_size: int) -> None:
+    """공식 단일-GPU 계약과 아직 미지원인 DDP exact-resume을 차단한다."""
+
+    world = int(world_size)
+    if world < 1:
+        raise ValueError(f"WORLD_SIZE는 1 이상이어야 합니다: {world}")
+    required = cfg.get("required_world_size")
+    if required is not None and world != int(required):
+        raise RuntimeError(
+            "학습 world-size 계약 불일치: "
+            f"required={int(required)}, actual={world}"
+        )
+    if world > 1 and cfg.get("resume"):
+        raise RuntimeError(
+            "DDP exact-resume은 rank별 torch/python/numpy 및 plant/nonlinear RNG를 "
+            "checkpoint에 저장하기 전까지 지원하지 않습니다. 단일 GPU로 재개하거나 "
+            "rank별 상태 계약을 먼저 구현하세요."
+        )
+
+
+def configure_canonical_determinism(cfg: dict, *, cuda_available: bool) -> None:
+    """공식 실행의 결정론 backend 정책을 모델/RNG 생성 전에 고정한다.
+
+    CPU smoke는 코드 경계만 증명한다. CUDA/bf16 exact-resume은 실제 A100의
+    environment/completion receipt와 별도 중단→재개 검증 산출물이 있어야 한다.
+    """
+
+    if str(cfg.get("experiment_role", "")) not in CANONICAL_ROLES:
+        return
+    policy = cfg.get("determinism_policy")
+    if policy != CANONICAL_DETERMINISM_POLICY:
+        raise ValueError("canonical determinism_policy가 승인 정책과 다릅니다")
+    allowed = tuple(policy["cublas_workspace_config_allowed"])
+    if cuda_available and os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in allowed:
+        raise RuntimeError(
+            "canonical CUDA 학습은 CUBLAS_WORKSPACE_CONFIG가 "
+            f"{list(allowed)} 중 하나여야 합니다"
+        )
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def _resume_preview_components(cfg: dict, *, model=None):
+    """live 학습 객체와 분리된 CPU model/optimizer/scheduler를 만든다."""
+
+    if model is None:
+        model = build_model(cfg["model"])
+    opt_cfg = cfg["optimizer"]
+    if str(opt_cfg.get("name", "adamw")).lower() != "adamw":
+        raise ValueError("resume preview는 adamw optimizer만 지원합니다")
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(opt_cfg["lr"]),
+        weight_decay=float(opt_cfg.get("weight_decay", 0.0)),
+        betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
+    )
+    schedule = cfg["schedule"]
+    warmup = int(schedule.get("warmup_steps", 0))
+    total = int(schedule["total_steps"])
+    min_ratio = float(schedule.get("min_lr", 1e-5)) / float(opt_cfg["lr"])
+
+    def lr_lambda(step: int) -> float:
+        if warmup > 0 and step < warmup:
+            return (step + 1) / warmup
+        progress = min(1.0, (step - warmup) / max(1, total - warmup))
+        return min_ratio + (1.0 - min_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    return model, optimizer, scheduler
+
+
+def preflight_canonical_resume(cfg: dict):
+    """ProcessLock/run 파일 생성 전 canonical resume 전체를 immutable preview한다."""
+
+    if str(cfg.get("experiment_role", "")) not in CANONICAL_ROLES or not cfg.get(
+        "resume"
+    ):
+        return None
+    run_dir = Path(str(cfg["ckpt_dir"]))
+    if not run_dir.is_absolute():
+        run_dir = REPO_ROOT / run_dir
+    validate_canonical_run_entry(cfg, run_dir, cfg["resume"])
+    resume_path = Path(str(cfg["resume"]))
+    if not resume_path.is_absolute():
+        resume_path = REPO_ROOT / resume_path
+    state, snapshot = read_checkpoint_snapshot(resume_path, map_location="cpu")
+    validate_resume_physics(state, cfg)
+    # 모델 생성의 CPU RNG 소비도 호출자 상태에 남기지 않는다. CUDA context나
+    # backend flag를 건드리지 않고 checkpoint 구조만 검증한다.
+    with torch.random.fork_rng(devices=[]):
+        model, optimizer, scheduler = _resume_preview_components(cfg)
+        validate_resume_checkpoint_preview(
+            resume_path, state, model, optimizer, scheduler
+        )
+    return state, snapshot, resume_path.absolute()
+
+
+def validate_canonical_run_entry(
+    cfg: dict, run_dir: str | Path, resume: str | Path | None
+) -> None:
+    """canonical run의 신규/정확 재개/영구 완료 경계를 산출물 생성 전에 검사."""
+
+    if str(cfg.get("experiment_role", "")) not in CANONICAL_ROLES:
+        return
+    data_cfg = cfg.get("data")
+    if not isinstance(data_cfg, dict):
+        raise ValueError("canonical 학습 data config가 없습니다")
+    if (
+        data_cfg.get("bootstrap_receipt")
+        != "data/manifests/elice_bootstrap_receipt.json"
+        or not data_cfg.get("bootstrap_receipt_sha256")
+    ):
+        raise ValueError(
+            "canonical 학습은 외부 SHA로 고정한 Elice bootstrap receipt가 필요합니다"
+        )
+    bind_recorded_transfer_config(data_cfg, repo_root=REPO_ROOT)
+    # binder가 resolved 값을 주입했다면 이미 stamp된 계약과 정확히 같아야 한다.
+    # stamp 뒤 조용히 cfg를 바꾸는 경로는 전부 거부한다.
+    validate_embedded_experiment_contract(cfg)
+    validate_canonical_training_policy(cfg)
+    validate_canonical_pretrain_prerequisites(cfg, repo_root=REPO_ROOT)
+    require_canonical_source_trust(cfg, repo_root=REPO_ROOT)
+    directory = Path(run_dir).absolute()
+    receipt = directory / "ckpt" / "completion.json"
+    if receipt.exists() or receipt.is_symlink():
+        raise FileExistsError(
+            f"완료 receipt가 있는 canonical run은 재진입할 수 없습니다: {receipt}"
+        )
+    if resume is None:
+        if directory.exists() and any(directory.iterdir()):
+            raise FileExistsError(
+                "canonical run은 resume 없이 기존 디렉터리를 덮어쓸 수 없습니다: "
+                f"{directory}"
+            )
+        return
+    requested = Path(resume)
+    if not requested.is_absolute():
+        requested = REPO_ROOT / requested
+    requested = requested.absolute()
+    expected = (directory / "ckpt" / "last.pt").absolute()
+    if requested != expected:
+        raise ValueError(
+            "canonical resume은 해당 contract run의 exact last.pt만 허용합니다: "
+            f"requested={requested}, expected={expected}"
+        )
+def validate_init_checkpoint_role(state: dict, cfg: dict) -> None:
+    """공식 fine-tune init은 완료 가능한 canonical pretrain만 허용한다."""
+
+    if not bool(cfg.get("require_init_checkpoint", False)):
+        return
+    saved_cfg = state.get("cfg")
+    if not isinstance(saved_cfg, dict):
+        raise ValueError("init checkpoint에 resolved cfg가 없습니다")
+    required_role = str(
+        cfg.get("required_init_experiment_role", "canonical_pretrain")
+    )
+    saved_role = str(saved_cfg.get("experiment_role", ""))
+    if saved_role != required_role:
+        raise ValueError(
+            "init checkpoint experiment_role이 승인된 canonical pretrain이 아닙니다: "
+            f"checkpoint={saved_role!r}, required={required_role!r}"
+        )
+    if bool(cfg.get("require_init_eligible", True)) and saved_cfg.get(
+        "init_eligible"
+    ) is not True:
+        raise ValueError(
+            "init checkpoint가 init_eligible=true가 아닙니다 — loss pilot/measured "
+            "probe checkpoint는 공식 fine-tune 초기값으로 사용할 수 없습니다"
+        )
+    if str(cfg.get("experiment_role", "")) == "canonical_finetune":
+        validate_canonical_training_policy(saved_cfg)
+        saved_loss_sha = str(saved_cfg.get("loss_selection_sha256", ""))
+        current_loss_sha = str(cfg.get("loss_selection_sha256", ""))
+        if saved_loss_sha != loss_selection_sha256(saved_cfg.get("loss") or {}):
+            raise ValueError("init checkpoint loss-selection digest가 embedded loss와 다릅니다")
+        if current_loss_sha != loss_selection_sha256(cfg.get("loss") or {}):
+            raise ValueError("fine-tune loss-selection digest가 resolved loss와 다릅니다")
+        if saved_loss_sha != current_loss_sha:
+            raise ValueError(
+                "canonical pretrain과 fine-tune loss selection이 다릅니다: "
+                f"pretrain={saved_loss_sha}, finetune={current_loss_sha}"
+            )
 
 
 def validate_training_physics(cfg: dict) -> str:
@@ -77,6 +286,85 @@ CVaR 은 평균보다 **항상 크므로** 옛 best 가 영원히 이겨 best.pt
 _LEGACY_BEST_METRIC_KEY = "nmse_trusted_db"
 
 
+def _require_finite_tensor(name: str, value: torch.Tensor) -> None:
+    if value.numel() == 0 or not bool(torch.isfinite(value.detach()).all().item()):
+        raise FloatingPointError(f"G0 finite 계약 위반: {name}에 NaN/Inf 또는 빈 tensor")
+
+
+def validate_finite_batch(batch: dict) -> None:
+    """모든 tensor 학습 입력을 forward 전에 fail-closed 검사한다."""
+
+    if not isinstance(batch, dict) or not batch:
+        raise FloatingPointError("G0 finite 계약 위반: 학습 batch가 비었습니다")
+    tensors = 0
+    for name, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            tensors += 1
+            _require_finite_tensor(f"input.{name}", value)
+    if tensors == 0:
+        raise FloatingPointError("G0 finite 계약 위반: batch에 tensor 입력이 없습니다")
+
+
+def validate_finite_output(output: torch.Tensor) -> None:
+    _require_finite_tensor("model.output", output)
+
+
+def validate_finite_loss_metrics(loss: torch.Tensor, metrics: dict) -> None:
+    """loss와 모든 보고 지표(NMSE 포함)의 finite를 강제한다."""
+
+    _require_finite_tensor("loss", loss)
+    if not isinstance(metrics, dict) or not metrics:
+        raise FloatingPointError("G0 finite 계약 위반: loss metrics가 비었습니다")
+    for name, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            _require_finite_tensor(f"metric.{name}", value)
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise FloatingPointError(
+                f"G0 finite 계약 위반: metric.{name}을 수치로 검증할 수 없습니다"
+            ) from exc
+        if not math.isfinite(numeric):
+            raise FloatingPointError(f"G0 finite 계약 위반: metric.{name}={numeric}")
+
+
+def validate_finite_gradients(model: torch.nn.Module) -> None:
+    """optimizer가 non-finite gradient를 상태에 반영하기 전에 차단한다."""
+
+    for name, parameter in model.named_parameters():
+        if parameter.grad is not None:
+            _require_finite_tensor(f"gradient.{name}", parameter.grad)
+
+
+def validate_finite_parameters(model: torch.nn.Module) -> None:
+    """optimizer step이 생성한 non-finite 가중치도 즉시 차단한다."""
+
+    for name, parameter in model.named_parameters():
+        _require_finite_tensor(f"parameter.{name}", parameter)
+
+
+def validate_g0_nmse(
+    metrics: dict,
+    *,
+    maximum_exclusive_db: float = -6.0,
+) -> float:
+    """G0 합격은 trusted NMSE가 -6 dB보다 **작을 때만**이다."""
+
+    key = "nmse_trusted_db"
+    if key not in metrics:
+        raise FloatingPointError(f"G0 계약 위반: {key}가 없습니다")
+    value = float(metrics[key])
+    limit = float(maximum_exclusive_db)
+    if not math.isfinite(value) or not math.isfinite(limit):
+        raise FloatingPointError(f"G0 계약 위반: {key}/합격선이 non-finite입니다")
+    if value >= limit:
+        raise ValueError(
+            f"G0 FAIL: {key}={value:.6f} dB >= 엄격 합격선 {limit:.6f} dB"
+        )
+    return value
+
+
 def checkpoint_best_metric_key(state: dict) -> str:
     """checkpoint 의 best_metric 이 어떤 지표인지. 표식이 없으면 legacy(평균)."""
 
@@ -105,6 +393,10 @@ def validate_resume_physics(state: dict, cfg: dict) -> None:
     옮기는 용도라 물리 모드가 달라도 된다. 반면 ``resume``은 옵티마이저와
     스케줄러 상태까지 이어받으므로 동일 실험이어야 한다.
     """
+    # lead/status 두 필드만 맞으면 구형 [150,600] loss가 현행 실험으로 재개되는 사고가
+    # 난다. 전체 resolved config와 P/S/data artifact SHA를 먼저 대조한다.
+    validate_resume_experiment(state, cfg, repo_root=REPO_ROOT)
+
     expected_lead = int(cfg.get("data", {}).get("digital_reference_lead_samples", 0))
     saved_lead = checkpoint_training_lead(state)
     if saved_lead != expected_lead:
@@ -152,28 +444,60 @@ def resolve_run_until_step(cfg: dict, schedule_total_steps: int) -> int:
 class MixedIterator:
     """합성/실측 데이터셋 혼합 (recorded_ratio 확률로 실측 배치 샘플)."""
 
-    def __init__(self, synth_iter, recorded_iter, recorded_ratio: float, seed: int) -> None:
-        import numpy as np
-
+    def __init__(
+        self,
+        synth_iter,
+        recorded_iter,
+        recorded_ratio: float,
+        seed: int,
+        *,
+        start_batch_index: int = 0,
+    ) -> None:
         self.synth = synth_iter
         self.recorded = recorded_iter
         self.ratio = float(recorded_ratio)
-        self.rng = np.random.default_rng(seed)
+        self.seed = int(seed)
+        self.batch_index = int(start_batch_index)
+        if not 0.0 <= self.ratio <= 1.0 or self.batch_index < 0:
+            raise ValueError("recorded_ratio/start_batch_index 계약 위반")
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self.recorded is not None and self.rng.random() < self.ratio:
+        use_recorded = mixed_batch_is_recorded(
+            self.seed, self.batch_index, self.ratio
+        )
+        self.batch_index += 1
+        if self.recorded is not None and use_recorded:
             return next(self.recorded)
         return next(self.synth)
 
 
+def mixed_batch_is_recorded(seed: int, batch_index: int, ratio: float) -> bool:
+    """혼합 분기를 global batch index의 순수 함수로 만든다."""
+
+    return bool(indexed_rng(seed, 0x4D4958, batch_index).random() < float(ratio))
+
+
+def mixed_branch_counts(seed: int, batches: int, ratio: float) -> tuple[int, int]:
+    """resume 지점 전 synth/recorded 소비 batch 수를 결정적으로 계산."""
+
+    total = int(batches)
+    if total < 0:
+        raise ValueError("batches는 0 이상이어야 합니다")
+    recorded = sum(
+        mixed_batch_is_recorded(seed, index, ratio) for index in range(total)
+    )
+    return total - int(recorded), int(recorded)
+
+
 class Trainer:
-    def __init__(self, cfg: dict) -> None:
+    def __init__(self, cfg: dict, *, resume_preflight=None) -> None:
         self.cfg = cfg
         self.physics_status = validate_training_physics(cfg)
         self.rank, self.world, self.local_rank = _ddp_env()
+        validate_training_world_size(cfg, self.world)
         self.is_main = self.rank == 0
         if self.world > 1 and not dist.is_initialized():
             dist.init_process_group("nccl")
@@ -183,7 +507,6 @@ class Trainer:
         )
 
         seed = int(cfg.get("seed", 0)) + self.rank
-        set_seed(seed)
 
         self.stage = str(cfg.get("stage", "open_loop"))
         if self.stage == "closed_loop" and self.world > 1:
@@ -197,11 +520,145 @@ class Trainer:
         self.run_dir = Path(cfg["ckpt_dir"])
         if not self.run_dir.is_absolute():
             self.run_dir = REPO_ROOT / self.run_dir
+        validate_canonical_run_entry(cfg, self.run_dir, cfg.get("resume"))
+
+        def _abs_checkpoint(value):
+            if value is None:
+                return None
+            return str(value) if Path(value).is_absolute() else str(REPO_ROOT / value)
+
+        # 공식 init의 role/loss/receipt/bytes를 run 파일이나 RNG/model state를 만들기
+        # 전에 모두 닫는다. 이후 weight load는 이 동일 snapshot state만 소비한다.
+        self._init_state_preview: dict | None = None
+        self._init_path_preview: Path | None = None
+        init_ckpt_preview = _abs_checkpoint(cfg.get("init_ckpt"))
+        init_required_preview = bool(cfg.get("require_init_checkpoint", False))
+        if init_required_preview and (
+            not init_ckpt_preview or not Path(init_ckpt_preview).is_file()
+        ):
+            raise FileNotFoundError(
+                f"이 학습 설정은 유효한 init_ckpt가 필수입니다: {init_ckpt_preview}"
+            )
+        if init_ckpt_preview and Path(init_ckpt_preview).is_file():
+            init_path = Path(init_ckpt_preview)
+            receipt = None
+            if init_required_preview:
+                if init_path.name != "best.pt":
+                    raise ValueError(
+                        "공식 init checkpoint는 완료 receipt에 묶인 best.pt여야 합니다"
+                    )
+                receipt = validate_completion_receipt(
+                    init_path.parent,
+                    expected_role=str(cfg.get("required_init_experiment_role")),
+                    expected_init_eligible=True,
+                    repo_root=REPO_ROOT,
+                )
+            init_state, init_snapshot = read_checkpoint_snapshot(
+                init_path, map_location="cpu"
+            )
+            if receipt is not None and init_snapshot.sha256 != receipt.get(
+                "best_checkpoint_sha256"
+            ):
+                raise ValueError("init checkpoint bytes가 completion receipt와 다릅니다")
+            validate_init_checkpoint_role(init_state, cfg)
+            if init_required_preview:
+                validate_embedded_experiment_contract(init_state["cfg"])
+                if init_state["cfg"].get("model") != cfg.get("model"):
+                    raise ValueError("init checkpoint model 설정이 fine-tune과 다릅니다")
+                if init_state["cfg"].get("trusted_band_hz") != cfg.get(
+                    "trusted_band_hz"
+                ):
+                    raise ValueError("init checkpoint trusted band가 fine-tune과 다릅니다")
+            expected_lead = int(
+                cfg["data"].get("digital_reference_lead_samples", 0)
+            )
+            saved_lead = checkpoint_training_lead(init_state)
+            tolerance = int(
+                (cfg.get("readiness", {}) or {}).get(
+                    "max_init_lead_mismatch_samples", 0
+                )
+            )
+            if abs(saved_lead - expected_lead) > tolerance:
+                raise ValueError(
+                    "init checkpoint digital-reference lead 불일치: "
+                    f"checkpoint={saved_lead}, training={expected_lead}, "
+                    f"차이 {abs(saved_lead - expected_lead)} > 허용 {tolerance} samples"
+                )
+            self._init_state_preview = init_state
+            self._init_path_preview = init_path
+
+        # DataLoader worker/prefetch RNG를 저장하는 대신 checkpoint의 절대
+        # global batch index에서 모든 item을 다시 유도한다. 데이터셋을
+        # 만들기 전에 resume step을 알아야 하므로 metadata만 먼저 읽는다.
+        self.resume_batch_index = 0
+        self._resume_state_preview: dict | None = None
+        self._resume_path_preview: Path | None = None
+        resume_value = cfg.get("resume")
+        if resume_value:
+            resume_path = Path(resume_value)
+            if not resume_path.is_absolute():
+                resume_path = REPO_ROOT / resume_path
+            if not resume_path.is_file():
+                raise FileNotFoundError(f"resume checkpoint가 없습니다: {resume_path}")
+            if resume_preflight is not None:
+                preview, _, preview_path = resume_preflight
+                if Path(preview_path).absolute() != resume_path.absolute():
+                    raise ValueError("resume preflight path가 resolved resume과 다릅니다")
+            else:
+                preview, _ = read_checkpoint_snapshot(
+                    resume_path, map_location="cpu"
+                )
+            data_stream = preview.get("data_stream")
+            if not isinstance(data_stream, dict):
+                raise ValueError(
+                    "resume checkpoint에 data_stream global batch index가 없습니다"
+                )
+            saved_step = int(preview.get("step", -1))
+            saved_batch = int(data_stream.get("global_batch_index", -1))
+            if saved_step < 0 or saved_batch != saved_step:
+                raise ValueError(
+                    "resume checkpoint step/data_stream 불일치: "
+                    f"step={saved_step}, global_batch_index={saved_batch}"
+                )
+            if not isinstance(preview.get("training_state"), dict):
+                raise ValueError(
+                    "resume checkpoint에 plant/nonlinear training_state가 없습니다"
+                )
+            self.resume_batch_index = saved_batch
+            self._resume_state_preview = preview
+            self._resume_path_preview = resume_path
+            # artifact/config 계약은 seed/model/DataLoader 등 live state를 만들기 전에 닫는다.
+            validate_resume_physics(preview, cfg)
+
+        # 모든 canonical artifact preview가 끝난 뒤에만 backend/global RNG를 바꾼다.
+        configure_canonical_determinism(
+            cfg, cuda_available=self.device.type == "cuda"
+        )
+        set_seed(seed)
 
         # ----- 모델 -----
         self.model = build_model(cfg["model"]).to(self.device)
         if self.world > 1:
             self.model = DistributedDataParallel(self.model, device_ids=[self.local_rank])
+
+        # 모델 shape와 optimizer/scheduler/RNG/training-state 전체 preview도 worker를
+        # 띄우거나 run 산출물을 만들기 전에 끝낸다. 검사용 객체에는 상태를 적용하지 않는다.
+        if self._resume_state_preview is not None:
+            raw_preview_model = (
+                self.model.module if hasattr(self.model, "module") else self.model
+            )
+            _, preview_optimizer, preview_scheduler = _resume_preview_components(
+                cfg, model=raw_preview_model
+            )
+            assert self._resume_path_preview is not None
+            validate_resume_checkpoint_preview(
+                self._resume_path_preview,
+                self._resume_state_preview,
+                self.model,
+                preview_optimizer,
+                preview_scheduler,
+            )
+            del preview_scheduler, preview_optimizer
 
         # ----- 플랜트 + 손실 -----
         duct = cfg["duct"]
@@ -319,10 +776,40 @@ class Trainer:
                 print("    scripts/data/prepare_noise_pool.py 를 실행하세요.")
                 print("=" * 70)
 
-        synth_train = SynthANCDataset(cfg["data"], duct, split="train", seed=seed)
+        batch_size = int(cfg["batch_size"])
+        recorded_for_stream = cfg.get("recorded_manifest")
+        if recorded_for_stream and not Path(recorded_for_stream).is_absolute():
+            recorded_for_stream = str(REPO_ROOT / recorded_for_stream)
+        has_recorded_stream = bool(
+            recorded_for_stream and Path(recorded_for_stream).is_file()
+        )
+        if has_recorded_stream:
+            synth_resume_batches, recorded_resume_batches = mixed_branch_counts(
+                seed,
+                self.resume_batch_index,
+                float(cfg.get("recorded_ratio", 0.5)),
+            )
+        else:
+            synth_resume_batches, recorded_resume_batches = (
+                self.resume_batch_index,
+                0,
+            )
+
+        synth_train = SynthANCDataset(
+            cfg["data"],
+            duct,
+            split="train",
+            seed=seed,
+            training_batch_size=batch_size,
+            resume_batch_index=synth_resume_batches,
+        )
+        if synth_train.timing_contract is not None:
+            cfg["data"]["training_timing_contract"] = (
+                synth_train.timing_contract.model_dump()
+            )
         loader = DataLoader(
             synth_train,
-            batch_size=int(cfg["batch_size"]),
+            batch_size=batch_size,
             num_workers=int(cfg.get("num_workers", 4)),
             prefetch_factor=int(cfg.get("prefetch_factor", 2)) if cfg.get("num_workers", 4) else None,
             pin_memory=self.device.type == "cuda",
@@ -345,13 +832,25 @@ class Trainer:
                 f"{recorded_manifest}"
             )
         if recorded_manifest and Path(recorded_manifest).exists():
-            rec = RecordedANCDataset(recorded_manifest, cfg["data"], split="train", seed=seed + 5)
+            rec = RecordedANCDataset(
+                recorded_manifest,
+                cfg["data"],
+                split="train",
+                seed=seed + 5,
+                timing_contract=synth_train.timing_contract,
+                training_batch_size=batch_size,
+                resume_batch_index=recorded_resume_batches,
+            )
             rec_loader = DataLoader(
-                rec, batch_size=int(cfg["batch_size"]), num_workers=2,
+                rec, batch_size=batch_size, num_workers=2,
                 pin_memory=self.device.type == "cuda",
             )
             self.train_iter = MixedIterator(
-                self.train_iter, iter(rec_loader), float(cfg.get("recorded_ratio", 0.5)), seed
+                self.train_iter,
+                iter(rec_loader),
+                float(cfg.get("recorded_ratio", 0.5)),
+                seed,
+                start_batch_index=self.resume_batch_index,
             )
         elif recorded_manifest and self.is_main:
             print(f"[trainer] recorded_manifest({recorded_manifest}) 없음 — 합성 데이터만 사용")
@@ -401,11 +900,23 @@ class Trainer:
         self.step = 0
         self.best_metric = float("inf")
         self.writer = None
+        resolved_snapshot = self._cfg_snapshot(cfg)
+        cfg.clear()
+        cfg.update(resolved_snapshot)
+        # resume 계약은 snapshot/log/TensorBoard 등 run 산출물을 건드리기 전에
+        # 검증한다. 불일치한 legacy last.pt가 같은 경로에 있다는 이유만으로 현재
+        # config 스냅샷을 덮거나 loss_log를 append하면 fail-closed가 아니다.
+        if self._resume_state_preview is not None:
+            validate_resume_physics(self._resume_state_preview, cfg)
         if self.is_main:
             # resolved model/data/duct까지 전부 남겨야 surrogate/실측 P(z), lead,
             # plant curriculum을 나중에 정확히 구분할 수 있다. 비밀정보는 학습
             # config에 두지 않는 저장소 규약을 따른다.
-            snapshot_run(self.run_dir, self._cfg_snapshot(cfg))
+            self.reproducibility_receipt = snapshot_run(
+                self.run_dir,
+                resolved_snapshot,
+                strict=str(cfg.get("experiment_role", "")) in CANONICAL_ROLES,
+            )
             try:
                 from torch.utils.tensorboard import SummaryWriter
 
@@ -414,22 +925,18 @@ class Trainer:
                 print("[trainer] tensorboard 미설치 — 파일 로그만 기록합니다")
         self.loss_log = open(self.run_dir / "loss_log.txt", "a", encoding="utf-8") if self.is_main else None
 
-        # init_ckpt(파인튜닝) → resume(재개) 순서로 적용 (상대경로는 저장소 루트 기준)
-        def _abs(p):
-            if p is None:
-                return None
-            return str(p) if Path(p).is_absolute() else str(REPO_ROOT / p)
-
-        init_ckpt = _abs(cfg.get("init_ckpt"))
+        # init_ckpt(파인튜닝) → resume(재개) 순서로 적용. canonical metadata/bytes는
+        # 위의 preflight에서 이미 한 번 snapshot했으며 pathname을 다시 열지 않는다.
+        init_ckpt = _abs_checkpoint(cfg.get("init_ckpt"))
         init_required = bool(cfg.get("require_init_checkpoint", False))
-        if init_required and (not init_ckpt or not Path(init_ckpt).exists()):
-            raise FileNotFoundError(
-                f"이 학습 설정은 유효한 init_ckpt가 필수입니다: {init_ckpt}"
-            )
-        if cfg.get("init_ckpt") and not Path(init_ckpt).exists() and self.is_main:
+        if cfg.get("init_ckpt") and self._init_state_preview is None and self.is_main:
             print(f"[trainer] 경고: init_ckpt({init_ckpt})가 없어 무시합니다")
-        if init_ckpt and Path(init_ckpt).exists():
-            state = load_checkpoint(init_ckpt, self.model, restore_rng=False, map_location="cpu")
+        if init_ckpt and self._init_state_preview is not None:
+            state = self._init_state_preview
+            if state is None:
+                # 비공식 optional init도 preflight에서 존재했다면 snapshot돼야 한다.
+                raise RuntimeError("init checkpoint preflight snapshot이 없습니다")
+            validate_init_checkpoint_role(state, cfg)
             expected_lead = int(cfg["data"].get("digital_reference_lead_samples", 0))
             saved_lead = checkpoint_training_lead(state)
             # 허용 오차는 readiness 게이트와 **같은 설정값**을 읽는다. 같은 규칙을 두 곳에
@@ -452,43 +959,44 @@ class Trainer:
                     f"(차이 {abs(saved_lead - expected_lead)}, 허용 {tolerance}) — "
                     "surrogate 물리로 학습한 잠정값을 실측값으로 옮긴다"
                 )
+            state = load_checkpoint(
+                init_ckpt,
+                self.model,
+                restore_rng=False,
+                map_location="cpu",
+                preloaded_state=state,
+            )
             if self.is_main:
                 print(f"[trainer] init_ckpt 로드: {init_ckpt} (step {state.get('step')})")
-        resume = _abs(cfg.get("resume"))
+        resume = _abs_checkpoint(cfg.get("resume"))
         if resume and Path(resume).exists():
-            state = load_checkpoint(resume, self.model, self.optimizer, self.scheduler, map_location="cpu")
+            # 모델/optimizer/scheduler를 변형하기 **전에** metadata와 artifact 계약을
+            # 검사한다. 구형 checkpoint가 우연히 lead만 같아도 여기서 차단된다.
+            state = self._resume_state_preview
+            if state is None:
+                raise RuntimeError("resume checkpoint preflight snapshot이 없습니다")
             validate_resume_physics(state, cfg)
+            state = load_checkpoint(
+                resume,
+                self.model,
+                self.optimizer,
+                self.scheduler,
+                map_location="cpu",
+                preloaded_state=self._resume_state_preview,
+            )
+            try:
+                stochastic = state["training_state"]
+                self.criterion.plant.rng.bit_generator.state = stochastic["plant_rng"]
+                if self.criterion.nonlinear is not None:
+                    self.criterion.nonlinear.rng.bit_generator.state = stochastic[
+                        "nonlinear_rng"
+                    ]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "resume checkpoint plant/nonlinear RNG를 복원할 수 없습니다"
+                ) from exc
             self.step = int(state.get("step", 0))
             self.best_metric = float(state.get("best_metric", float("inf")))
-            if not checkpoint_best_metric_is_comparable(state):
-                # 다른 지표끼리 min 비교하면 조용히 잘못된 best 가 고정된다. 2026-08-05
-                # 이전 checkpoint 의 best 는 trusted **평균**(예: −19.54)이고 지금은
-                # CVaR 이라 항상 평균이 이긴다 → best.pt 가 영원히 갱신되지 않는다.
-                if self.is_main:
-                    print(
-                        "[trainer 경고] resume checkpoint 의 best_metric 이 "
-                        f"'{checkpoint_best_metric_key(state)}' 기준입니다 — 현재 기준"
-                        f" '{BEST_METRIC_KEY}' 과 비교할 수 없어 best_metric 을 "
-                        "초기화합니다"
-                    )
-                self.best_metric = float("inf")
-            else:
-                # 구버전 last.pt는 eval에서 best 갱신 직전에 저장되어 best_metric이
-                # 한 회 늦을 수 있다. 같은 run의 best.pt가 있으면 더 좋은 값을
-                # authority로 사용해 재개 직후 나쁜 val이 best.pt를 덮어쓰지 못하게 한다.
-                best_path = self.run_dir / "ckpt" / "best.pt"
-                if best_path.exists():
-                    try:
-                        best_state = torch.load(
-                            best_path, map_location="cpu", weights_only=False
-                        )
-                        if checkpoint_best_metric_is_comparable(best_state):
-                            self.best_metric = min(
-                                self.best_metric,
-                                float(best_state.get("best_metric", float("inf"))),
-                            )
-                    except (OSError, RuntimeError, ValueError, TypeError):
-                        pass
             if self.is_main:
                 print(f"[trainer] 재개: step {self.step}, best {self.best_metric:.3f}")
 
@@ -503,17 +1011,39 @@ class Trainer:
             cvar_scope="rank_local" if self.world > 1 else "global",
         )
 
+    def _training_state_snapshot(self) -> dict:
+        """global RNG 밖 학습 구성요소의 순차 RNG 상태."""
+
+        return {
+            "schema_version": 1,
+            "plant_rng": copy.deepcopy(self.criterion.plant.rng.bit_generator.state),
+            "nonlinear_rng": (
+                None
+                if self.criterion.nonlinear is None
+                else copy.deepcopy(
+                    self.criterion.nonlinear.rng.bit_generator.state
+                )
+            ),
+        }
+
     # ---------- 스텝 ----------
 
     def _forward_loss(self, batch: dict) -> tuple[torch.Tensor, dict]:
+        validate_finite_batch(batch)
         x = batch["x"].to(self.device, non_blocking=True)
         d = batch["d"].to(self.device, non_blocking=True)
         if self.stage == "closed_loop":
-            return self._closed_loop_forward(x, d)
-        y = self.model(x)
-        # open_loop 도 정착 구간을 버린다. 예전에는 closed_loop 만 skip 을 넘겼고
-        # 실측 배치(open_loop)는 e[0:1721] = d[0:1721] 을 그대로 손실에 넣었다.
-        return self.criterion(y, d, loss_start_sample=self.loss_start_sample)
+            loss, metrics = self._closed_loop_forward(x, d)
+        else:
+            y = self.model(x)
+            validate_finite_output(y)
+            # open_loop 도 정착 구간을 버린다. 예전에는 closed_loop 만 skip 을 넘겼고
+            # 실측 배치(open_loop)는 e[0:1721] = d[0:1721] 을 그대로 손실에 넣었다.
+            loss, metrics = self.criterion(
+                y, d, loss_start_sample=self.loss_start_sample
+            )
+        validate_finite_loss_metrics(loss, metrics)
+        return loss, metrics
 
     def _closed_loop_forward(self, x: torch.Tensor, d: torch.Tensor) -> tuple[torch.Tensor, dict]:
         """Stage-2: 프레임 순차 unroll — 시뮬레이션 e 를 err 입력으로 되먹임 [H1/H3].
@@ -564,6 +1094,7 @@ class Trainer:
             e_hist[..., : y_so_far.shape[-1]] = d[..., : y_so_far.shape[-1]] + s_y
 
         y = torch.cat(y_parts, dim=-1)
+        validate_finite_output(y)
         # 폐루프 워밍업과 플랜트 정착 중 **더 긴 쪽**을 버린다.
         skip = max(int(warmup_s * self.fs), self.loss_start_sample)
         # 절단은 손실 내부에서 플랜트 적용 "후"에 수행 (결함 #2/#5)
@@ -575,11 +1106,14 @@ class Trainer:
         with torch.no_grad():
             x = self.val_batch["x"].to(self.device)
             d = self.val_batch["d"].to(self.device)
+            validate_finite_batch({"x": x, "d": d})
             raw = self.model.module if hasattr(self.model, "module") else self.model
             y = raw(x)
-            _, metrics = self.criterion(
+            validate_finite_output(y)
+            loss, metrics = self.criterion(
                 y, d, loss_start_sample=self.loss_start_sample
             )
+            validate_finite_loss_metrics(loss, metrics)
         self.model.train()
         self.criterion.train()
         return metrics
@@ -611,9 +1145,15 @@ class Trainer:
                 loss, metrics = self._forward_loss(batch)
 
             loss.backward()
+            validate_finite_gradients(self.model)
             if self.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.grad_clip
+                )
+                _require_finite_tensor("gradient.global_norm", grad_norm.reshape(1))
+                validate_finite_gradients(self.model)
             self.optimizer.step()
+            validate_finite_parameters(self.model)
             self.scheduler.step()
             self.step += 1
 
@@ -689,6 +1229,7 @@ class Trainer:
                         self.model, self.optimizer, self.scheduler,
                         self.step, self.best_metric,
                         self._cfg_snapshot(cfg),
+                        training_state=self._training_state_snapshot(),
                     )
                     if is_best:
                         save_checkpoint(
@@ -696,6 +1237,7 @@ class Trainer:
                             self.model, self.optimizer, self.scheduler,
                             self.step, self.best_metric,
                             self._cfg_snapshot(cfg),
+                            training_state=self._training_state_snapshot(),
                         )
                         print(f"[eval] best 갱신 → {val_nmse:.2f} dB", flush=True)
                     else:
@@ -714,7 +1256,12 @@ class Trainer:
                 self.model, self.optimizer, self.scheduler,
                 self.step, self.best_metric,
                 self._cfg_snapshot(cfg),
+                training_state=self._training_state_snapshot(),
             )
+            if self.step == self.total_steps:
+                write_completion_receipt(
+                    self.run_dir / "ckpt", repo_root=REPO_ROOT
+                )
             print(
                 f"학습 구간 종료: step {self.step}/{self.total_steps}, "
                 f"best trusted val NMSE {self.best_metric:.2f} dB"
@@ -745,16 +1292,30 @@ def cfg_snapshot(
     out = copy.deepcopy(cfg)
     data_cfg = out.get("data", {})
     lead = int(data_cfg.get("digital_reference_lead_samples", 0))
-    out["digital_reference_lead_samples"] = lead
-    out["physics_status"] = validate_training_physics(out)
+    derived: dict[str, object] = {
+        "digital_reference_lead_samples": lead,
+        "physics_status": validate_training_physics(out),
+    }
     if trusted_band_hz is not None:
-        out["trusted_band_hz"] = [float(v) for v in trusted_band_hz]
+        derived["trusted_band_hz"] = [float(v) for v in trusted_band_hz]
     if best_metric_key is not None:
-        out["best_metric_key"] = str(best_metric_key)
+        derived["best_metric_key"] = str(best_metric_key)
     if loss_start_sample is not None:
-        out["loss_start_sample"] = int(loss_start_sample)
+        derived["loss_start_sample"] = int(loss_start_sample)
     if cvar_scope is not None:
         # DDP 에서 topk 는 랭크 로컬이다. world>1 이면 각 랭크의 상위 q 합집합이
         # 글로벌 상위 q 를 덮으므로 실효 분위가 넓어진다 — 산출물에 남긴다.
-        out["nmse_cvar_scope"] = str(cvar_scope)
+        derived["nmse_cvar_scope"] = str(cvar_scope)
+    already_stamped = "experiment_contract_sha256" in out
+    for key, value in derived.items():
+        if already_stamped and out.get(key) != value:
+            raise ValueError(
+                f"최종 contract stamp 뒤 파생 설정 {key}가 바뀌었습니다: "
+                f"stamped={out.get(key)!r}, runtime={value!r}"
+            )
+        out[key] = value
+    if not already_stamped:
+        out = stamp_experiment_contract(out, repo_root=REPO_ROOT)
+    else:
+        validate_embedded_experiment_contract(out)
     return out
