@@ -56,14 +56,14 @@ loss:
   # 대역 목록을 여기 적지 않는다. 신뢰 대역(개선 요구 대역)을 경계에서 빼서 만든다 —
   # S npz 의 consistency_band 가 넓어져도 따라오고, 겹침이 구조적으로 불가능하다.
   # 이전 합성/실측 대표 출력에서 사용하던 0.12는 폐기된 legacy 값이다.
-  # 현행 strict-S fixture를 다시 측정한 결과 λ=0.00025의 비중은 0.088로
-  # 하한에 못 미쳤고, λ=0.00075에서 0.264(목표 0.2~0.4)가 되었다.
-  # 원시 측정·선형 재교정은 campaign ledger에 남긴다.
+  # 과거 0.264는 strict-S라도 loss_start_sample=0으로 잰 값이다. 현행 strict-S와
+  # 정착 절단 fixture는 0.130이며, canonical 승인에는 실제 A100 모델/배치와 같은
+  # loss_start_sample을 결속한 campaign ledger의 0.2~0.4 증거가 필요하다.
   #   2026-08-06: do-no-harm 마진이 +6.0 에서 게이트 유도값 -18.27 dB 로 24 dB 조여지면서
   #   힌지가 훨씬 자주 활성화됐다. 같은 λ=0.12 의 예산 몫이 **41.8** 이 되어 목적함수를
   #   42배로 덮는다(실측 S(z) 기준. 실제 체크포인트 출력으로도 47.3 으로 일치).
-  #   tests/test_loss_gradient_budget.py 가 이 값을 걸어 두므로 λ 가 예산 밖으로
-  #   흘러가면 학습 전에 실패한다.
+  #   tests/test_loss_gradient_budget.py 는 strict S·정착 절단 전달을 회귀 검사하고,
+  #   실행별 승인값은 campaign ledger가 fail-closed로 검사한다.
   #   ⚠ 미검증: 이 항은 **제약**이지 목적항이 아니므로, "예산 0.2~0.4" 라는 규칙 자체가
   #   제약에 맞는지는 20k step ablation 으로 확인해야 한다 (엘리스에서).
   lambda_dnh: 0.00075
@@ -76,9 +76,9 @@ loss:
   dnh_weight_above: 2.0         # 신뢰대역 위 (결함 3 진원지, 1633-6000Hz 최악 +19.9 dB)
 
   # --- 시간 국소성 ---
-  # 1.5초 한 FFT 로는 최악 아이템이 +0.00 dB 인데 같은 배치를 0.125초 프레임으로 보면
-  # 최악 프레임이 +10.82 dB, 증폭 프레임 12.2% 다. 8192 = 48kHz 에서 170 ms.
-  lambda_frame: 0.5
+  # frame은 metric-only다. signed frame-CVaR(0.5/0.2)은 영출력 붕괴를 재현했으므로
+  # one-sided/item-wise guard 검증 전에는 gradient에 넣지 않는다.
+  lambda_frame: 0.0
   nmse_frame_samples: 8192
   nmse_frame_silence_db: -40.0  # 무음 프레임이 CVaR 을 먹는 것을 막는다
 

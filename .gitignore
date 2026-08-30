@@ -32,6 +32,8 @@ venv/
 .tensorboard/
 .pytest_cache/
 .ipynb_checkpoints/
+# 설계상한은 P/S sha로 무효화되는 보조 캐시다. 측정 원본·provenance가 아니다.
+/assets/measured/.design_ceiling_cache.json
 
 # 편집기/OS
 .vscode/

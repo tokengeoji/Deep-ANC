@@ -15,6 +15,15 @@ import torch
 import yaml
 
 from deep_anc.config import REPO_ROOT, load_train_config, load_yaml
+from deep_anc.data.decoder_audit import (
+    DEFAULT_AUDIO_EXTENSIONS,
+    DEFAULT_SEGMENT_FRAMES,
+    DEFAULT_SEGMENT_GRID_DENOMINATOR,
+    DEFAULT_SEQUENTIAL_CHUNK_FRAMES,
+    MAX_DECODED_PCM_ABS,
+    MIN_DECODED_RMS,
+    decoder_fingerprint,
+)
 from deep_anc.data.manifest import read_manifest, write_manifest
 from deep_anc.data.public_lineage import (
     PUBLIC_LINEAGE_SCHEMA,
@@ -766,10 +775,66 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
         "music": music_entries,
         "speech": speech_entries,
     }
+    audit_inventory = []
+    for entry in sorted(
+        speech_entries + music_entries,
+        key=lambda item: Path(str(item["path"])).relative_to(root).as_posix(),
+    ):
+        raw_path = Path(str(entry["path"]))
+        audit_inventory.append(
+            {
+                "relative_path": raw_path.relative_to(root).as_posix(),
+                "content_sha256": entry["content_sha256"],
+                "content_size": entry["content_size"],
+                "decision": "accept",
+            }
+        )
+    decoder_runtime_fingerprint = decoder_fingerprint()
+    decoder_audit = {
+        "schema_version": 1,
+        "status": "complete",
+        "audit_policy": {
+            "audio_extensions": sorted(DEFAULT_AUDIO_EXTENSIONS),
+            "sequential_chunk_frames": list(DEFAULT_SEQUENTIAL_CHUNK_FRAMES),
+            "segment_frames": DEFAULT_SEGMENT_FRAMES,
+            "segment_grid_denominator": DEFAULT_SEGMENT_GRID_DENOMINATOR,
+            "max_decoded_pcm_abs": MAX_DECODED_PCM_ABS,
+            "min_decoded_rms": MIN_DECODED_RMS,
+        },
+        "decoder_fingerprint": decoder_runtime_fingerprint,
+        "decoder_fingerprint_sha256": canonical_json_sha256(decoder_runtime_fingerprint),
+        "inventory": audit_inventory,
+        "inventory_sha256": canonical_json_sha256(audit_inventory),
+        "accepted_inventory_sha256": canonical_json_sha256(
+            [
+                {
+                    "relative_path": row["relative_path"],
+                    "content_sha256": row["content_sha256"],
+                    "content_size": row["content_size"],
+                }
+                for row in audit_inventory
+            ]
+        ),
+    }
+    decoder_audit_path = manifest_dir / "decoder_audit.json"
+    decoder_audit_path.write_text(
+        json.dumps(decoder_audit, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    decoder_audit_binding = {
+        "schema_version": 1,
+        "file": "decoder_audit.json",
+        "sha256": hashlib.sha256(decoder_audit_path.read_bytes()).hexdigest(),
+        "size": decoder_audit_path.stat().st_size,
+        "inventory_sha256": decoder_audit["inventory_sha256"],
+        "accepted_inventory_sha256": decoder_audit["accepted_inventory_sha256"],
+        "decoder_fingerprint": decoder_runtime_fingerprint,
+        "decoder_fingerprint_sha256": decoder_audit["decoder_fingerprint_sha256"],
+    }
     manifest_lineage = validate_public_manifest_lineage(entries_by_tag)
     components = manifest_lineage["components"]
     generation = {
-        "schema_version": 3,
+        "schema_version": 4,
         "training_eligible": True,
         "seed": 20260802,
         "data_config": str(data_config),
@@ -778,6 +843,7 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
         "holdout_sha256": hashlib.sha256(holdout.read_bytes()).hexdigest(),
         "raw_roots": [str(root / "raw")],
         "manifests": manifests,
+        "decoder_audit": decoder_audit_binding,
         "public_lineage": {
             "schema_version": 1,
             "lineage_schema": PUBLIC_LINEAGE_SCHEMA,

@@ -4,6 +4,7 @@
 # 이 파일은 감독자가 매 작업 후 다시 읽으므로 작업을 덧붙이면 재기동 없이 반영된다.
 
 schema_version: 1
+execution_class: legacy_diagnostic
 gpu: 0
 python: .venv/bin/python
 state_dir: runs/queue

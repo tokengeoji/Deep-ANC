@@ -1,5 +1,7 @@
-# 실시간 런타임 설정 (Jetson)
-# 실행: python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml
+# legacy diagnostic runtime 설정 (Jetson)
+# 현재 Base checkpoint는 strict P/S=115와 맞지 않는 lead=109 artifact다. 실제
+# sounddevice/engine 시작 전 strict plant 계약에서 거부되어야 하며, canonical fine-tune
+# 배포 설정은 완료한 모델 artifact를 받은 뒤 별도로 만든다.
 
 hardware_config: configs/hardware_jetson.yaml
 duct_config: configs/duct.yaml
@@ -22,9 +24,9 @@ controller: dl                  # dl | fxlms
 # 실패-폐쇄라 사고는 없었지만, "기본 설정이 시작 자체를 못 한다"는 것은 아무도 이
 # 경로를 켜 본 적이 없다는 뜻이다.
 #
-# ⚠ 109 는 checkpoint 와의 정합값일 뿐 실측 플랜트값이 아니다. 실측 lead 는 116 이다
-#   (S 1462 + handoff 256 − P 1602). 파인튜닝이 116 으로 끝나면 새 checkpoint 와 함께
-#   이 값을 116 으로 올린다. 자세한 근거는 configs/runtime_tiny.yaml 의 같은 키 주석.
+# ⚠ 109 는 checkpoint 와의 정합값일 뿐 현재 strict 플랜트값이 아니다. strict lead는
+#   S.delay 1245 + handoff 256 − P.delay 1386 = 115다. 숫자만 바꾸는 것은 weight
+#   timing을 바꾸지 않으므로 금지한다. 자세한 근거는 configs/runtime_tiny.yaml을 보라.
 digital_reference_lead_samples: 109
 
 engine:

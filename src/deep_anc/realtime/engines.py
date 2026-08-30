@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Protocol
 
@@ -31,6 +32,52 @@ def checkpoint_digital_reference_lead_samples(state: dict) -> int:
     # 개발 중 full cfg를 저장했던 임시 artifact도 읽을 수 있게 한다.
     data_cfg = cfg.get("data", {}) or {}
     return int(data_cfg.get("digital_reference_lead_samples", 0))
+
+
+def engine_digital_reference_lead_samples_from_config(
+    runtime_cfg: dict,
+) -> int | None:
+    """엔진을 생성하지 않고 artifact metadata의 digital lead만 읽는다.
+
+    이 함수는 runtime preflight에서 sounddevice import보다 먼저 쓴다. 추론 엔진을
+    실제로 열어 GPU/ORT 세션을 만들 필요 없이, runtime lead와 artifact lead의 모순을
+    잡아 입력 probe조차 시작하지 않게 한다. FxLMS는 checkpoint/ONNX artifact가 없으므로
+    ``None``을 반환한다.
+    """
+
+    if str(runtime_cfg.get("controller", "dl")) == "fxlms":
+        return None
+    engine = runtime_cfg.get("engine") or {}
+    kind = str(engine.get("type", "torch"))
+    if kind == "torch":
+        import torch
+
+        path = Path(str(engine.get("ckpt", "")))
+        if not path.is_file():
+            raise FileNotFoundError(f"torch checkpoint가 없습니다: {path}")
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(state, dict):
+            raise ValueError(f"torch checkpoint 형식이 아닙니다: {path}")
+        return checkpoint_digital_reference_lead_samples(state)
+    if kind not in {"ort", "trt"}:
+        raise ValueError(f"알 수 없는 엔진: {kind}")
+    if kind == "ort":
+        artifact = Path(str(engine.get("onnx", "")))
+        metadata = artifact.with_suffix(".json")
+    else:
+        artifact = Path(str(engine.get("plan", "")))
+        metadata = Path(str(engine.get("onnx_meta"))) if engine.get("onnx_meta") else artifact.with_suffix(".json")
+    if not artifact.is_file():
+        raise FileNotFoundError(f"{kind} engine artifact가 없습니다: {artifact}")
+    if not metadata.is_file():
+        raise FileNotFoundError(f"{kind} engine metadata가 없습니다: {metadata}")
+    try:
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{kind} engine metadata를 읽을 수 없습니다: {metadata}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{kind} engine metadata 최상위가 mapping이 아닙니다: {metadata}")
+    return int(payload.get("digital_reference_lead_samples", 0))
 
 
 def _load_ckpt_model(ckpt_path: str | Path):

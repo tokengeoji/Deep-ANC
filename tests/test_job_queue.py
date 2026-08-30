@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -465,6 +466,26 @@ def test_real_queue_files_load(tmp_path):
         spec = load_queue(REPO_ROOT / "configs" / "elice" / name)
         assert spec.jobs
         assert spec.gpu in (0, 1)
+        assert spec.execution_class == "legacy_diagnostic"
+
+
+def test_real_legacy_queue_cannot_start_without_explicit_acknowledgement():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/elice/job_queue.py",
+            "run",
+            "--queue",
+            "configs/elice/queue_gpu1.yaml",
+            "--dry-run",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--allow-legacy-diagnostic" in result.stderr
 
 
 def test_real_queues_do_not_share_job_ids_or_ckpt_dirs():

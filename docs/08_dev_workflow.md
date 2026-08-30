@@ -104,18 +104,19 @@ git diff --check
   holdout, 두 CSV와 provenance report 결속
 - [ ] A100 80GB 한 장과 가용 128 GiB
 - [ ] torch 2.5.1+cu121/CUDA 12.1 environment receipt
-- [ ] untouched public raw 6종과 content-hashed manifest 재생성
+- [ ] untouched public raw 6종을 복수 full-decode/seek decoder audit으로 전수 검증하고,
+  audit-bound `data/manifests/canonical_v4` content-hashed manifest 재생성
 - [ ] noise QA, recorded QA, 전체 pytest
-- [ ] canonical init만 FAIL인 readiness 14/15
+- [ ] canonical init만 FAIL인 readiness 15/16
 
 ### 5.4 학습과 평가
 
 - [ ] strict S 기준 `lambda_dnh` gradient 비중 0.2–0.4
 - [ ] G0 trusted NMSE < −6 dB
-- [ ] 4개 20k+5k loss 후보와 필요 시 alpha 0.85를 val-only로 선택
+- [ ] frame-metric-only 2개 alpha 20k+5k 후보와 필요 시 alpha 0.85를 val-only로 선택
 - [ ] A100 200–500 smoke와 중단/재개 등가 receipt
 - [ ] 선택 tiny 계약의 새 100k canonical pretrain
-- [ ] readiness 15/15 뒤 open-loop 50k fine-tune
+- [ ] readiness 16/16 뒤 open-loop 50k fine-tune
 - [ ] val selection 고정 뒤 campaign one-shot test G4 PASS
 - [ ] G4 뒤 natural-crest challenge PASS
 
@@ -130,7 +131,7 @@ G4와 crest challenge 전에는 closed-loop, ONNX export, 실제 ANC ON 평가�
 | Elice 준비 | `scripts/elice/bootstrap_all.sh` |
 | strict P/S | `scripts/data/set_amp_level.py` → `measure_paths_interleaved.py` |
 | readiness | `scripts/train/check_finetune.py` |
-| canonical pretrain | `scripts/train/train.py --config configs/train_pretrain_tiny.yaml` |
+| canonical pretrain | `docs/05`의 bootstrap SHA·ledger SHA·winner alpha·CUBLAS를 모두 넣은 `scripts/train/train.py --config configs/train_pretrain_tiny.yaml` |
 | fine-tune | `scripts/train/run_finetune_pipeline.py --config configs/train_finetune.yaml` |
 | recorded 평가 | `scripts/eval/evaluate_recorded.py` |
 

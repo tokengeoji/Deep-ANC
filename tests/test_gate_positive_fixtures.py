@@ -132,18 +132,18 @@ def test_the_same_battery_one_notch_past_the_limit_does_fire():
 # ======================================================================================
 # 런타임 시작 게이트 — 출하 설정 그대로, 경계값에서
 # ======================================================================================
-def test_runtime_lead_gate_accepts_the_measured_lead_116_exactly():
-    """런타임 lead 게이트: 확정 플랜트 lead **116 정확 일치**에서 통과한다 (여유 0).
+def test_runtime_lead_gate_accepts_the_measured_lead_115_exactly():
+    """런타임 lead 게이트: 현재 strict 플랜트 lead **115 정확 일치**에서 통과한다 (여유 0).
 
-    lead = S 1462 + handoff 256 − P 1602 = 116. 한 샘플만 어긋나도 거부돼야 한다
+    lead = S 1245 + handoff 256 − P 1386 = 115. 한 샘플만 어긋나도 거부돼야 한다
     (실측: δ=16 샘플이면 600Hz 에서 부호가 뒤집혀 +1.40 dB 증폭이다).
     """
 
     from deep_anc.realtime.run_realtime import validate_digital_reference_lead
 
-    assert validate_digital_reference_lead("digital", 116, 116) == 116
+    assert validate_digital_reference_lead("digital", 115, 115) == 115
     with pytest.raises(ValueError):
-        validate_digital_reference_lead("digital", 116, 115)
+        validate_digital_reference_lead("digital", 115, 114)
 
 
 def test_runtime_input_preflight_accepts_a_quiet_room_at_90_percent_of_its_limits(

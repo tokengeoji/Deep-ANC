@@ -267,11 +267,15 @@ def cached_design_ceiling_db(
     taps: int = 2048,
     cache_path: "Path | None" = None,
 ) -> DesignCeiling:
-    """아티팩트 sha256 을 키로 캐시한다. **P/S 를 다시 재면 자동으로 무효화된다.**
+    """아티팩트 sha256 을 키로, 명시적으로 지정한 위치에만 캐시한다.
 
     2048 탭 정규방정식은 게이트마다 풀기에는 비싸다(수십 초). 그렇다고 값을 설정에
     적어 두면 그것이 바로 이번에 고친 fail-open 이다. 캐시 키에 아티팩트 sha 가 들어가
     있으므로, 배선을 고쳐 P/S 를 다시 재는 순간 캐시가 빗나가고 다시 풀린다.
+
+    ``cache_path`` 를 생략하면 계산만 수행하고 파일을 쓰지 않는다. 측정 NPZ 옆에
+    캐시를 두면 read-only 감사가 추적된 측정 자산을 수정할 수 있으므로, 호출자는
+    필요할 때만 ``results/`` 등 비추적 산출물 경로를 명시해야 한다.
     """
 
     import hashlib
@@ -300,11 +304,9 @@ def cached_design_ceiling_db(
             f"{float(sample_rate):.1f}",
         ]
     )
-    cache_path = Path(cache_path) if cache_path is not None else (
-        primary_path.parent / ".design_ceiling_cache.json"
-    )
+    cache_path = Path(cache_path) if cache_path is not None else None
     store: dict = {}
-    if cache_path.is_file():
+    if cache_path is not None and cache_path.is_file():
         try:
             store = json.loads(cache_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -339,13 +341,14 @@ def cached_design_ceiling_db(
         "primary": str(primary_path),
         "secondary": str(secondary_path),
     }
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(store, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(cache_path)
-    except OSError:
-        pass
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(store, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(cache_path)
+        except OSError:
+            pass
     return result
 
 

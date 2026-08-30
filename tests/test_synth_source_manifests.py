@@ -19,9 +19,10 @@ import json
 import warnings
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from deep_anc.data.synth_dataset import assert_declared_sources_exist
+from deep_anc.data.synth_dataset import SynthANCDataset, assert_declared_sources_exist
 
 
 def _manifest(tmp_path: Path, tag: str) -> str:
@@ -78,6 +79,31 @@ def test_all_declared_manifests_present_passes(tmp_path: Path) -> None:
 
 def test_synthetic_only_configuration_passes(tmp_path: Path) -> None:
     assert_declared_sources_exist({}, {"synthetic": 1.0})
+
+
+def test_canonical_manifest_marker_enables_noise_pool_fail_closed_mode(monkeypatch) -> None:
+    """v4 audit marker가 dataset→NoisePool 경계에서 사라지면 안 된다."""
+
+    received: dict[str, object] = {}
+
+    class ProbePool:
+        def __init__(self, *_args, **kwargs) -> None:
+            received.update(kwargs)
+
+    monkeypatch.setattr("deep_anc.data.synth_dataset.NoisePool", ProbePool)
+    dataset = object.__new__(SynthANCDataset)
+    dataset.pools = {"music": ["fixture.jsonl"]}
+    dataset.split = "train"
+    dataset.fs = 48_000
+    dataset._pool_objs = {}
+    dataset._validated_pool_entries = {"music": [{"split": "train"}]}
+    dataset._canonical_decoder_audited = True
+
+    pool = dataset._pool("music", np.random.default_rng(1))
+
+    assert isinstance(pool, ProbePool)
+    assert received["canonical_decoder_audited"] is True
+    assert received["validated_entries"] == [{"split": "train"}]
 
 
 # ------------------------------------------------------------------- 탈출구는 시끄럽다

@@ -84,6 +84,7 @@ bash scripts/elice/bootstrap_all.sh \
   --expected-commit "$EXPECTED_COMMIT" \
   --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
   --expected-transfer-manifest-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
+  --raw-hash-workers 8 \
   --no-update
 ```
 
@@ -98,6 +99,12 @@ bash scripts/elice/bootstrap_all.sh \
 
 긴 다운로드의 직전과 직후에도 code와 transfer bundle을 다시 검증한다. bootstrap 잠금은 동시
 데이터 준비를 차단하며, 실행 중인 `train.py`가 있으면 manifest를 건드리지 않는다.
+
+`--raw-hash-workers 8`은 A100 80GB/16 vCore 인스턴스에서 **이미 완료된 decoder audit의
+원본 SHA-256·size 재대조와 manifest transaction postcondition**만 병렬화한다. PCM decoder
+audit 자체, 입력 순서, manifest bytes, 첫 실패 보고 순서는 바꾸지 않는다. 이 값은 검증을
+생략하는 옵션이 아니며 1~32만 허용한다. vCPU·스토리지 병목이 확인되지 않은 환경은 기본값
+`1`을 유지한다.
 
 ## 4. public raw와 manifest
 
@@ -121,11 +128,21 @@ dns_fullband, speech, music, demand, machine, esc50
 ```
 
 manifest schema는 각 raw audio content SHA, lineage component와 holdout SHA를 결속한다.
+여기에 더해 canonical schema v4는 `data/raw` 전체를 65,536·262,144-frame full sequential
+decode와 고정 seek grid로 읽은 `decoder_audit.json`을 transaction 안에서 함께 복사한다.
+audit은 현재 Python/SoundFile/libsndfile/libmpg123 fingerprint, raw inventory SHA/size, stderr
+warning·decode error·nonfinite·peak>2·RMS≤1e-8의 판정을 보존한다. reject raw는 원본을
+수정·삭제하지 않고 새 v4 manifest에서만 제외한다. audit 당시와 다른 decoder 환경, raw
+추가/변경, reject와 같은 content SHA, audit 없는 v3 manifest는 모두 canonical 학습을 막는다.
+`NoisePool`도 v4 경계에서는 이후 decode 이상을 다른 파일로 재시도하지 않고 즉시 실패한다.
 recorded/holdout와 synthetic train·val·test의 원본 계보 교집합은 모두 0이어야 한다.
 
-bootstrap 종료 후 noise QA, recorded QA, 전체 pytest와 readiness를 다시 실행한다.
+bootstrap은 `results/provenance/decoder_audit.json`을 먼저 만들고
+`data/manifests/canonical_v4/`에 새 세대를 발행한 뒤, 이 경로만 대상으로 noise QA를 실행한다.
+기존 `data/manifests/` v3 세대는 forensic/diagnostic 자료로 보존하며 canonical 설정이 읽지
+않는다. bootstrap 종료 후 noise QA, recorded QA, 전체 pytest와 readiness를 다시 실행한다.
 strict P/S·transfer/public corpus가 모두 정상이고 canonical init만 없는 상태가
-**14/15 PASS**다. 그보다 적으면 학습을 시작하지 않는다.
+**15/16 PASS**다. 그보다 적으면 학습을 시작하지 않는다.
 
 ## 5. 사전학습 계약 선택
 
@@ -134,23 +151,49 @@ gain/polarity/EQ와 input-only mic noise만 켜고, 1차 실행의 session mixin
 
 1. strict S로 `lambda_dnh`의 gradient 비중이 주 NMSE의 0.2–0.4인지 측정한다.
 2. 고정 batch G0에서 trusted NMSE < −6 dB와 timing metadata를 확인한다.
-3. seed `20260803`으로 다음 4개를 20k surrogate-pretrain + 5k measured probe한다.
+3. seed `20260803`으로 frame-metric-only 상태에서 다음 2개를 20k surrogate-pretrain
+   + 5k measured probe한다. signed frame-CVaR는 λ=0.5와 0.2가 모두 fixed-batch
+   control에서 영출력 붕괴를 재현해 후보에서 제외한다.
 
 ```text
-alpha ∈ {0.7, 1.0} × lambda_frame ∈ {0.5, 0.2}
+alpha ∈ {0.7, 1.0}, lambda_frame = 0.0
 ```
 
-test는 열지 않고 recorded val만 사용한다. 차이가 0.2 dB 이내거나 alpha 1.0이 불안정하면
-alpha 0.85를 추가한다. 계속 동률이면 단순한 alpha 0.7을 선택한다. pilot/probe checkpoint는
+test는 열지 않고 recorded val만 사용한다. 차이가 0.2 dB 이내이면
+alpha 0.85(`lambda_frame=0`)를 추가한다. alpha 1.0의 non-finite/실행 실패는 현재
+"불안정"이라는 수기 표기로 0.85를 자동 승인하지 않는다. pre-forward model·batch·RNG를
+재실행해 검증하는 immutable failure receipt가 준비되기 전까지는 canonical을 차단하고 raw를
+보존한다. 계속 동률이면 단순한 alpha 0.7을 선택한다.
+frame은 170 ms metric으로 계속 기록해 후보 비교·원인 분석에 사용한다. 고정 local pass
+threshold는 아직 증거가 없으므로 성능 주장에는 쓰지 않으며, signed frame gradient를
+되살리려면 one-sided/item-wise v2 guard와 별도 control evidence가 필요하다.
+pilot/probe checkpoint는
 `init_eligible=false`라 canonical init이 될 수 없다.
 
 선택 계약을 campaign prerequisite ledger로 고정한 뒤 tiny 100k를 처음부터 실행한다.
 `configs/train_pretrain_tiny.yaml`은 canonical A100 한 장 전용이다. 실행 디렉터리는 계약 SHA와
 seed에서 파생하며 기존 경로를 덮어쓰지 않는다.
 
+아래 값은 모두 같은 Elice exact checkout에서 읽고, `ALPHA`는 raw pilot selection으로
+유도한 값만 쓴다. bare `train.py --config ...`는 의도적으로 fail-closed한다.
+
 ```bash
-.venv/bin/python scripts/train/train.py --config configs/train_pretrain_tiny.yaml
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+BOOT=$(sha256sum data/manifests/elice_bootstrap_receipt.json | awk '{print $1}')
+LEDGER=$(sha256sum results/training_prerequisites/canonical_pretrain.json | awk '{print $1}')
+ALPHA=0.7  # raw pilot winner(0.7/0.85/1.0) 값으로 교체
+
+.venv/bin/python scripts/train/train.py \
+  --config configs/train_pretrain_tiny.yaml \
+  --set data.bootstrap_receipt_sha256="$BOOT" \
+  --set campaign_prerequisite_sha256="$LEDGER" \
+  --set loss.nmse_cvar_alpha="$ALPHA"
 ```
+
+`scripts/elice/run_pretrain.sh`, `run_parallel_models.sh`, `queue_gpu0.yaml`,
+`queue_gpu1.yaml`은 historical legacy diagnostic 전용이며 canonical 명령으로 사용할 수 없다.
+실행하려면 별도의 legacy acknowledgement가 필요하고, canonical evidence·init·성능 근거로
+승격되지 않는다.
 
 자동 resume은 없다. 동일한 `experiment_contract_sha256`와 global sample index/RNG 상태를 가진
 같은 실행의 `last.pt`만 명시적으로 재개한다.
@@ -158,6 +201,9 @@ seed에서 파생하며 기존 경로를 덮어쓰지 않는다.
 ```bash
 .venv/bin/python scripts/train/train.py \
   --config configs/train_pretrain_tiny.yaml \
+  --set data.bootstrap_receipt_sha256="$BOOT" \
+  --set campaign_prerequisite_sha256="$LEDGER" \
+  --set loss.nmse_cvar_alpha="$ALPHA" \
   --resume runs/<canonical-contract-seed>/ckpt/last.pt
 ```
 
@@ -166,7 +212,7 @@ recorded-val `best.pt`, best metric/step 관계를 결속해야 init 자격이 �
 
 ## 6. 공식 파인튜닝과 test
 
-canonical 100k `best.pt`를 `init_ckpt`로 명시하고 readiness **15/15 PASS**를 먼저 확인한다.
+canonical 100k `best.pt`를 `init_ckpt`로 명시하고 readiness **16/16 PASS**를 먼저 확인한다.
 
 ```bash
 INIT_CKPT=runs/<canonical-pretrain>/ckpt/best.pt

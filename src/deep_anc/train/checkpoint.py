@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .a100_pretrain_smoke import A100_PRETRAIN_SMOKE_ROLE
 from .evaluation_contract import FileSnapshot, snapshot_regular_file
 
 
@@ -67,6 +68,26 @@ def _validate_training_state_preview(value: object) -> None:
             raise ValueError(f"resume checkpoint {key}를 복원할 수 없습니다") from exc
 
 
+def _is_unselected_smoke_stop_metric(
+    *, checkpoint: Path, state: dict, saved_cfg: dict, best_metric: float
+) -> bool:
+    """첫 eval 전 bounded smoke stop.pt의 ``+inf`` selection sentinel만 허용한다."""
+
+    if (
+        checkpoint.name != "stop.pt"
+        or str(saved_cfg.get("experiment_role", "")) != A100_PRETRAIN_SMOKE_ROLE
+        or best_metric != float("inf")
+    ):
+        return False
+    try:
+        step = int(state.get("step", -1))
+        run_until = int(saved_cfg.get("run_until_step", -1))
+        eval_every = int(saved_cfg.get("eval_every", -1))
+    except (TypeError, ValueError):
+        return False
+    return 200 <= step <= 500 and step == run_until and step < eval_every
+
+
 def validate_resume_checkpoint_preview(
     path: str | Path,
     state: dict,
@@ -77,7 +98,13 @@ def validate_resume_checkpoint_preview(
     """어떤 live state도 바꾸기 전에 exact-resume 전체 schema를 검증한다."""
 
     checkpoint = Path(path)
-    if checkpoint.name != "last.pt":
+    saved_cfg_preview = state.get("cfg") if isinstance(state.get("cfg"), dict) else {}
+    is_smoke_stop = (
+        str(saved_cfg_preview.get("experiment_role", ""))
+        == A100_PRETRAIN_SMOKE_ROLE
+        and checkpoint.name == "stop.pt"
+    )
+    if checkpoint.name != "last.pt" and not is_smoke_stop:
         raise ValueError(f"resume은 last.pt만 허용합니다: {checkpoint}")
     raw_model = model.module if hasattr(model, "module") else model
     expected_model = raw_model.state_dict()
@@ -129,13 +156,19 @@ def validate_resume_checkpoint_preview(
     ):
         raise ValueError("resume checkpoint step/data_stream schema가 불일치합니다")
     best_metric = float(state.get("best_metric", float("nan")))
-    if not math.isfinite(best_metric):
+    if not math.isfinite(best_metric) and not _is_unselected_smoke_stop_metric(
+        checkpoint=checkpoint,
+        state=state,
+        saved_cfg=saved_cfg_preview,
+        best_metric=best_metric,
+    ):
         raise ValueError("resume checkpoint best_metric이 유효하지 않습니다")
     _validate_rng_preview(state.get("rng"))
-    saved_cfg = state.get("cfg") if isinstance(state.get("cfg"), dict) else {}
+    saved_cfg = saved_cfg_preview
     if str(saved_cfg.get("experiment_role", "")) in {
         "canonical_pretrain",
         "canonical_finetune",
+        A100_PRETRAIN_SMOKE_ROLE,
     }:
         cuda_rng = state["rng"].get("cuda")
         if not isinstance(cuda_rng, list) or len(cuda_rng) != 1:

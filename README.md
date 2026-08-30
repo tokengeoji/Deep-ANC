@@ -403,10 +403,17 @@ canonical evidence가 이미 있는 이후 실행도 fresh meter가 필수다. �
 ### 7.4 학습
 
 ```bash
-# 사전학습
-.venv/bin/python scripts/train/train.py --config configs/train_pretrain_tiny.yaml
+# 사전학습 — raw campaign ledger 발행 뒤에만 실행한다.
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+BOOT=$(sha256sum data/manifests/elice_bootstrap_receipt.json | awk '{print $1}')
+LEDGER=$(sha256sum results/training_prerequisites/canonical_pretrain.json | awk '{print $1}')
+ALPHA=0.7  # raw pilot winner(0.7/0.85/1.0) 값으로 교체
+.venv/bin/python scripts/train/train.py --config configs/train_pretrain_tiny.yaml \
+    --set data.bootstrap_receipt_sha256="$BOOT" \
+    --set campaign_prerequisite_sha256="$LEDGER" \
+    --set loss.nmse_cvar_alpha="$ALPHA"
 
-# canonical 100k best.pt를 명시한 뒤 15/15 진입 게이트를 통과해야 시작된다.
+# canonical 100k best.pt를 명시한 뒤 16/16 진입 게이트를 통과해야 시작된다.
 INIT_CKPT=runs/<canonical-pretrain-contract>/ckpt/best.pt
 .venv/bin/python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
     --set data.digital_primary_path_mode=measured --set init_ckpt="$INIT_CKPT"

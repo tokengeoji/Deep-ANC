@@ -36,6 +36,12 @@ scenarios:                      # scripts/demo/evaluate_session.py 시나리오
 # 측정 대역에 소스 에너지가 이 비율 미만이면 headline 감쇠를 발행하지 않는다.
 min_source_energy_fraction_in_measure_band: 0.5
 
+# 각 octave의 감쇠값은 OFF 구간에서 실제 ch0으로 재생한 source의 해당 octave PSD가
+# 20 Hz–Nyquist 평균 PSD의 이 비율 이상일 때만 발행한다. ERR 마이크의 잡음 floor가
+# 아니라 source 출력으로 판정한다. octave 폭으로 정규화하므로 48 kHz broadband의
+# 125 Hz도 보존하면서 80–1000 Hz source의 2 kHz filter tail은 무효가 된다.
+min_source_energy_density_ratio_in_octave_band: 0.25
+
 protocol:
   baseline_seconds: 10          # ANC OFF 베이스라인
   on_seconds: 30                # ANC ON

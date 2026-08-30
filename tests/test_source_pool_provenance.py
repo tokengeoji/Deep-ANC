@@ -594,7 +594,13 @@ def test_regular_file_snapshot_detects_path_retarget_during_single_fd_read(
         return real_read(descriptor, count)
 
     monkeypatch.setattr(contract.os, "read", retarget_after_open)
-    with pytest.raises(contract.HoldoutContractError, match="retarget"):
+    # 일부 filesystem은 open FD가 unlink될 때 ctime도 바꾼다. 이 경우 pathname
+    # retarget 검사보다 먼저 same-FD 변경 검사가 fail-closed로 멈추며, 둘 다
+    # 안전하게 동일 race를 거부한 결과다.
+    with pytest.raises(
+        contract.HoldoutContractError,
+        match=r"파일이 변경됐습니다|retarget됐습니다",
+    ):
         contract.read_regular_file_snapshot(
             target, root=tmp_path, label="fixture evidence"
         )

@@ -25,15 +25,31 @@ import pytest
 import soundfile as sf
 import yaml
 
+import deep_anc.data.manifest_contract as manifest_contract
+
 from deep_anc.data.holdout_contract import EXPECTED_HISTORICAL_BUILDERS
+from deep_anc.data.decoder_audit import (
+    DEFAULT_AUDIO_EXTENSIONS,
+    DEFAULT_SEGMENT_FRAMES,
+    DEFAULT_SEGMENT_GRID_DENOMINATOR,
+    DEFAULT_SEQUENTIAL_CHUNK_FRAMES,
+    MAX_DECODED_PCM_ABS,
+    MIN_DECODED_RMS,
+    decoder_fingerprint,
+)
 from deep_anc.data.public_lineage import (
+    DNS_MARKER_TAG_ROOTS,
+    DNS_NOISE_MARKERS,
+    DNS_SPEECH_MARKER,
     ESC50_METADATA,
     FMA_TRACKS,
     LIBRISPEECH_CHAPTERS,
     PUBLIC_LINEAGE_SCHEMA,
     PublicLineageBuild,
     canonical_json_sha256,
+    validate_dns_marker_partition,
 )
+from deep_anc.data.manifest import scan_wavs
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/data/prepare_noise_pool.py"
 FS = 48_000
@@ -153,10 +169,77 @@ def _build_tree(tmp_path: Path, present_tags: dict[str, float], ratios: dict[str
     return tmp_path
 
 
-def _run(module, root: Path, monkeypatch) -> int:
+def _write_decoder_audit(
+    root: Path,
+    *,
+    decisions: dict[str, str] | None = None,
+    path: str = "results/decoder_audit.json",
+) -> str:
+    """prepare fixture의 raw inventory를 canonical decoder-audit v1 형식으로 쓴다."""
+
+    decisions = decisions or {}
+    inventory = []
+    for audio in sorted((root / "data/raw").rglob("*.wav")):
+        relative = audio.relative_to(root).as_posix()
+        inventory.append(
+            {
+                "relative_path": relative,
+                "content_sha256": hashlib.sha256(audio.read_bytes()).hexdigest(),
+                "content_size": audio.stat().st_size,
+                "decision": decisions.get(relative, "accept"),
+            }
+        )
+    payload = {
+        "schema_version": 1,
+        "status": "complete",
+        "audit_policy": {
+            "audio_extensions": sorted(DEFAULT_AUDIO_EXTENSIONS),
+            "sequential_chunk_frames": list(DEFAULT_SEQUENTIAL_CHUNK_FRAMES),
+            "segment_frames": DEFAULT_SEGMENT_FRAMES,
+            "segment_grid_denominator": DEFAULT_SEGMENT_GRID_DENOMINATOR,
+            "max_decoded_pcm_abs": MAX_DECODED_PCM_ABS,
+            "min_decoded_rms": MIN_DECODED_RMS,
+        },
+        "decoder_fingerprint": decoder_fingerprint(),
+        "inventory": inventory,
+    }
+    payload["decoder_fingerprint_sha256"] = canonical_json_sha256(
+        payload["decoder_fingerprint"]
+    )
+    payload["inventory_sha256"] = canonical_json_sha256(inventory)
+    payload["accepted_inventory_sha256"] = canonical_json_sha256(
+        [
+            {
+                "relative_path": row["relative_path"],
+                "content_sha256": row["content_sha256"],
+                "content_size": row["content_size"],
+            }
+            for row in inventory
+            if row["decision"] == "accept"
+        ]
+    )
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _run(
+    module,
+    root: Path,
+    monkeypatch,
+    *,
+    decoder_audit: str | None = "auto",
+    hash_workers: int = 1,
+) -> int:
     monkeypatch.setattr(module, "REPO_ROOT", root)
     holdout = root / "data/manifests/recorded_holdout.json"
     expected = hashlib.sha256(holdout.read_bytes()).hexdigest() if holdout.is_file() else "0" * 64
+    if decoder_audit == "auto":
+        decoder_audit = _write_decoder_audit(root)
 
     def fixture_holdout_validator(path, *, repo_root, expected_sha256=None):
         actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -169,7 +252,14 @@ def _run(module, root: Path, monkeypatch) -> int:
             "clip_lineage": payload["clip_lineage"],
         }
 
-    def fixture_public_lineage(entries_by_tag, *, tag_roots, repo_root, holdout_lineage):
+    def fixture_public_lineage(
+        entries_by_tag,
+        *,
+        tag_roots,
+        repo_root,
+        holdout_lineage,
+        **lineage_kwargs,
+    ):
         rows_by_tag = {}
         components = {}
         for tag, entries in sorted(entries_by_tag.items()):
@@ -229,6 +319,55 @@ def _run(module, root: Path, monkeypatch) -> int:
             "holdout_clips_sha256": holdout_lineage["clips_sha256"],
             "excluded_by_tag": {tag: 0 for tag in sorted(entries_by_tag)},
         }
+        # 실제 public lineage parser를 쓰지 않는 이 fixture도 canonical v4의 DNS
+        # marker partition/postcommit 경계를 통과해야 한다. marker member는 raw
+        # source tag root 기준으로 만들며, rejected member는 caller가 audit inventory
+        # 전체에서 투영한 값만 사용한다.
+        rejected_members = lineage_kwargs.get("decoder_rejected_members_by_tag")
+        inventory_sha = lineage_kwargs.get("decoder_audit_inventory_sha256")
+        dns_tags = {
+            tag
+            for tag, relative in DNS_MARKER_TAG_ROOTS.items()
+            if any(
+                Path(item) == repo_root / relative
+                for item in tag_roots.get(tag, [])
+            )
+            or isinstance(rejected_members, dict) and tag in rejected_members
+        }
+        if dns_tags:
+            for tag in sorted(dns_tags):
+                source_root = repo_root / DNS_MARKER_TAG_ROOTS[tag]
+                assert source_root in [Path(item) for item in tag_roots.get(tag, [])]
+                accepted = {
+                    Path(item["path"]).relative_to(source_root).as_posix()
+                    for item in entries_by_tag.get(tag, [])
+                    if source_root in Path(item["path"]).parents
+                }
+                rejected = set((rejected_members or {}).get(tag, ()))
+                members = sorted(accepted | rejected)
+                if tag == "speech":
+                    marker = repo_root / DNS_SPEECH_MARKER
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text("\n".join(members) + "\n", encoding="utf-8")
+                else:
+                    # tiny fixture에는 single shard만 쓰되 public checker의 two-marker
+                    # layout을 그대로 만든다.
+                    for index, relative in enumerate(DNS_NOISE_MARKERS):
+                        marker = repo_root / relative
+                        marker.parent.mkdir(parents=True, exist_ok=True)
+                        marker.write_text(
+                            ("\n".join(members) + "\n") if index == 0 else "",
+                            encoding="utf-8",
+                        )
+            partition = validate_dns_marker_partition(
+                entries_by_tag,
+                tag_roots=tag_roots,
+                repo_root=repo_root,
+                decoder_rejected_members_by_tag=rejected_members,
+                decoder_audit_inventory_sha256=inventory_sha,
+            )
+            assert partition is not None
+            evidence["decoder_rejected_marker_partition"] = partition
         return PublicLineageBuild(
             rows_by_tag,
             {tag: 0 for tag in sorted(entries_by_tag)},
@@ -237,17 +376,18 @@ def _run(module, root: Path, monkeypatch) -> int:
 
     monkeypatch.setattr(module, "validate_holdout_contract", fixture_holdout_validator)
     monkeypatch.setattr(module, "build_public_lineage", fixture_public_lineage)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "prepare_noise_pool.py",
-            "--out",
-            "data/manifests",
-            "--expected-holdout-sha256",
-            expected,
-        ],
-    )
+    argv = [
+        "prepare_noise_pool.py",
+        "--out",
+        "data/manifests",
+        "--expected-holdout-sha256",
+        expected,
+        "--hash-workers",
+        str(hash_workers),
+    ]
+    if decoder_audit is not None:
+        argv.extend(["--decoder-audit", decoder_audit])
+    monkeypatch.setattr(sys, "argv", argv)
     return module.main()
 
 
@@ -307,6 +447,7 @@ def test_every_declared_tag_present_builds_all_manifests(tmp_path, monkeypatch, 
     sidecar = json.loads(
         (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
     )
+    assert sidecar["schema_version"] == 4
     assert sidecar["training_eligible"] is True
     assert sidecar["holdout_sha256"] == hashlib.sha256(
         (root / "data/manifests/recorded_holdout.json").read_bytes()
@@ -316,8 +457,51 @@ def test_every_declared_tag_present_builds_all_manifests(tmp_path, monkeypatch, 
         assert metadata["sha256"] == hashlib.sha256(
             (root / "data/manifests" / f"{tag}.jsonl").read_bytes()
         ).hexdigest()
+    audit_binding = sidecar["decoder_audit"]
+    copied_audit = root / "data/manifests/decoder_audit.json"
+    assert copied_audit.is_file()
+    assert audit_binding["file"] == "decoder_audit.json"
+    assert audit_binding["sha256"] == hashlib.sha256(copied_audit.read_bytes()).hexdigest()
+    assert audit_binding["size"] == copied_audit.stat().st_size
     # 비율 0 인 태그는 만들지도, 요구하지도 않는다.
     assert not (root / "data/manifests/demand.jsonl").exists()
+
+
+def test_parallel_raw_hash_workers_preserve_a_canonical_generation(
+    tmp_path, monkeypatch, capsys
+):
+    """병렬 SHA도 transaction postcondition까지 통과해야만 사용할 수 있다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 0.5, "speech": 0.5},
+        ratios={"esc50": 0.5, "speech": 0.5, "synthetic": 0.1},
+    )
+
+    assert _run(module, root, monkeypatch, hash_workers=2) == 0
+    capsys.readouterr()
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["schema_version"] == 4
+    assert sidecar["training_eligible"] is True
+    assert set(sidecar["manifests"]) == {"esc50", "speech"}
+
+
+def test_hash_workers_outside_the_bounded_range_fail_before_manifest_write(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+
+    assert _run(module, root, monkeypatch, hash_workers=0) == 2
+    assert "--hash-workers" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
 
 
 def test_missing_holdout_fails_before_writing_any_manifest(tmp_path, monkeypatch, capsys):
@@ -334,6 +518,404 @@ def test_missing_holdout_fails_before_writing_any_manifest(tmp_path, monkeypatch
     assert _run(module, root, monkeypatch) == 1
     assert "held-out 목록이 없습니다" in capsys.readouterr().err
     assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_training_generation_requires_completed_decoder_audit_before_writing(
+    tmp_path, monkeypatch, capsys
+):
+    """v3까지는 raw decoder 결과 없이도 canonical generation을 쓸 수 있었다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+
+    assert _run(module, root, monkeypatch, decoder_audit=None) == 2
+    assert "--decoder-audit" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_decoder_reject_rows_are_excluded_and_copied_audit_is_bound(
+    tmp_path, monkeypatch
+):
+    """audit가 reject한 파일은 retry 후보로 남기지 않고 manifest에서 제거한다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    rejected = "data/raw/esc50_family/esc50/clip_000.wav"
+    audit = _write_decoder_audit(root, decisions={rejected: "reject"})
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 0
+    manifest = root / "data/manifests/esc50.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    assert all(Path(row["path"]).relative_to(root).as_posix() != rejected for row in rows)
+
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    copied = root / "data/manifests/decoder_audit.json"
+    assert sidecar["decoder_audit"]["sha256"] == hashlib.sha256(copied.read_bytes()).hexdigest()
+    assert sidecar["decoder_audit"]["accepted_inventory_sha256"] == canonical_json_sha256(
+        [
+            {
+                "relative_path": row["relative_path"],
+                "content_sha256": row["content_sha256"],
+                "content_size": row["content_size"],
+            }
+            for row in json.loads(copied.read_text(encoding="utf-8"))["inventory"]
+            if row["decision"] == "accept"
+        ]
+    )
+
+
+def test_decoder_reject_marker_projection_uses_full_audit_not_scan_results(tmp_path):
+    """sf.info가 못 여는 WAV도 audit reject면 DNS marker partition에 남아야 한다."""
+
+    root = tmp_path
+    source = root / "data/raw/noise/speech"
+    _write_clips(source, 1)
+    accepted_path = source / "book_12_chp_3_reader_4.wav"
+    (source / "clip_000.wav").rename(accepted_path)
+    rejected_member = "nested/book_13_chp_4_reader_5.wav"
+    rejected_path = source / rejected_member
+    rejected_path.parent.mkdir(parents=True)
+    # 확장자는 WAV이지만 soundfile metadata를 읽을 수 없는 raw — scan_wavs가 생략한다.
+    rejected_path.write_bytes(b"not a decodable wav")
+    audit_path = _write_decoder_audit(
+        root,
+        decisions={rejected_path.relative_to(root).as_posix(): "reject"},
+    )
+    audit = manifest_contract.read_decoder_audit(
+        root / audit_path,
+        repo_root=root,
+        label="broken DNS marker fixture audit",
+    )
+    scanned = scan_wavs(source, "speech")
+    assert [Path(entry["path"]).name for entry in scanned] == [accepted_path.name]
+    projection = manifest_contract.derive_decoder_rejected_members_by_tag(
+        audit,
+        tag_roots={"speech": [source]},
+        repo_root=root,
+        label="broken DNS marker fixture projection",
+    )
+    assert projection == {"speech": (rejected_member,)}
+    marker = root / DNS_SPEECH_MARKER
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{accepted_path.name}\n{rejected_member}\n", encoding="utf-8")
+    partition = validate_dns_marker_partition(
+        {"speech": scanned},
+        tag_roots={"speech": [source]},
+        repo_root=root,
+        decoder_rejected_members_by_tag=projection,
+        decoder_audit_inventory_sha256=audit["inventory_sha256"],
+    )
+    assert partition is not None
+    assert partition["tags"]["speech"]["rejected_members"] == [rejected_member]
+
+
+def test_prepare_binds_scan_skipped_dns_reject_to_generation_partition(
+    tmp_path, monkeypatch
+):
+    """producer가 scan 결과가 아닌 audit inventory projection을 build evidence로 넘긴다."""
+
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"speech": 1.0},
+        ratios={"speech": 1.0},
+    )
+    generic_source = root / "data/raw/speech_family/speech"
+    source = root / "data/raw/noise/speech"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    generic_source.rename(source)
+    rejected_member = "nested/undecodable.wav"
+    rejected = source / rejected_member
+    rejected.parent.mkdir(parents=True)
+    rejected.write_bytes(b"not a decodable wav")
+    audit = _write_decoder_audit(
+        root,
+        decisions={rejected.relative_to(root).as_posix(): "reject"},
+    )
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 0
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    partition = sidecar["public_lineage"]["decoder_rejected_marker_partition"]
+    assert partition["tags"]["speech"]["rejected_members"] == [rejected_member]
+    validate_manifest_generation(
+        root / "data/manifests",
+        required_tags={"speech"},
+        repo_root=root,
+    )
+
+
+def test_prepare_keeps_librispeech_out_of_dns_marker_reject_partition(
+    tmp_path, monkeypatch
+):
+    """Elice처럼 DNS와 LibriSpeech root가 같이 있어도 DNS marker만 exact partition한다."""
+
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"speech": 1.0},
+        ratios={"speech": 1.0},
+    )
+    generic_source = root / "data/raw/speech_family/speech"
+    dns_source = root / "data/raw/noise/speech"
+    dns_source.parent.mkdir(parents=True, exist_ok=True)
+    generic_source.rename(dns_source)
+    libri_source = root / "data/raw/speech/LibriSpeech"
+    _write_clips(libri_source, 1)
+    dns_rejected_member = "nested/dns-undecodable.wav"
+    dns_rejected = dns_source / dns_rejected_member
+    dns_rejected.parent.mkdir(parents=True)
+    dns_rejected.write_bytes(b"not a decodable wav")
+    libri_rejected = libri_source / "libri-undecodable.wav"
+    libri_rejected.write_bytes(b"not a decodable wav")
+    audit = _write_decoder_audit(
+        root,
+        decisions={
+            dns_rejected.relative_to(root).as_posix(): "reject",
+            libri_rejected.relative_to(root).as_posix(): "reject",
+        },
+    )
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 0
+    sidecar = json.loads(
+        (root / "data/manifests/manifest_generation.json").read_text(encoding="utf-8")
+    )
+    partition = sidecar["public_lineage"]["decoder_rejected_marker_partition"]
+    assert partition["tags"]["speech"]["tag_roots"] == ["data/raw/noise/speech"]
+    assert partition["tags"]["speech"]["rejected_members"] == [dns_rejected_member]
+    validate_manifest_generation(
+        root / "data/manifests",
+        required_tags={"speech"},
+        repo_root=root,
+    )
+
+
+def test_decoder_audit_path_index_is_cached_once_per_raw_root_context(
+    tmp_path, monkeypatch
+):
+    """큰 corpus도 entry마다 inventory 전체를 다시 index하지 않아야 한다."""
+
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit_path = _write_decoder_audit(root)
+    audit = manifest_contract.read_decoder_audit(
+        root / audit_path,
+        repo_root=root,
+        label="cache fixture audit",
+    )
+    entries = [
+        {
+            "path": str(path),
+            "content_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "content_size": path.stat().st_size,
+        }
+        for path in sorted((root / "data/raw").rglob("*.wav"))
+    ]
+    original = manifest_contract._decoder_audit_index
+    calls = 0
+
+    def counted_index(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(manifest_contract, "_decoder_audit_index", counted_index)
+    for index, entry in enumerate(entries):
+        manifest_contract.validate_decoder_audit_manifest_entry(
+            audit,
+            entry,
+            repo_root=root,
+            raw_roots=[root / "data/raw"],
+            label=f"cache fixture entry #{index}",
+        )
+    assert calls == 1
+
+    # 동일 audit라도 raw-root 경계가 달라지면 stale absolute-path cache를 재사용하지 않는다.
+    manifest_contract.validate_decoder_audit_manifest_entry(
+        audit,
+        entries[0],
+        repo_root=root,
+        raw_roots=[root / "data"],
+        label="cache fixture changed root",
+    )
+    assert calls == 2
+
+
+def test_failed_raw_inventory_verification_does_not_leave_a_path_index(
+    tmp_path,
+):
+    """불완전 audit는 다음 caller가 파생 cache를 신뢰하게 해서는 안 된다."""
+
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit_path = _write_decoder_audit(root)
+    audit = manifest_contract.read_decoder_audit(
+        root / audit_path,
+        repo_root=root,
+        label="failed cache fixture audit",
+    )
+    _write_clips(root / "data/raw/unlisted", 1)
+
+    with pytest.raises(ValueError, match="raw inventory가 audit와 다릅니다"):
+        manifest_contract.validate_decoder_audit_raw_inventory(
+            audit,
+            repo_root=root,
+            raw_roots=[root / "data/raw"],
+            label="failed cache fixture",
+        )
+    assert "_index_by_raw_path" not in audit
+    assert "_index_context" not in audit
+
+
+def test_tampered_decoder_audit_inventory_digest_blocks_generation(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit = _write_decoder_audit(root)
+    path = root / audit
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["inventory"][0]["content_sha256"] = "0" * 64
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "inventory SHA 불일치" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_decoder_audit_must_match_the_current_decoder_runtime(
+    tmp_path, monkeypatch, capsys
+):
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit = _write_decoder_audit(root)
+    path = root / audit
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["decoder_fingerprint"]["soundfile"] = "not-the-current-runtime"
+    payload["decoder_fingerprint_sha256"] = canonical_json_sha256(
+        payload["decoder_fingerprint"]
+    )
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "현재 runtime" in capsys.readouterr().err
+
+
+def test_decoder_audit_without_full_scan_recipe_blocks_generation(
+    tmp_path, monkeypatch, capsys
+):
+    """inventory만 그럴듯한 얕은 header audit은 canonical evidence가 아니다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit = _write_decoder_audit(root)
+    path = root / audit
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["audit_policy"]["sequential_chunk_frames"] = [65_536]
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "full sequential scan" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_decoder_audit_raw_inventory_addition_blocks_generation(
+    tmp_path, monkeypatch, capsys
+):
+    """태그 밖 raw 추가도 audit 전체성 계약을 무효화해야 한다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    audit = _write_decoder_audit(root)
+    _write_clips(root / "data/raw/unclassified", 1)
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "raw inventory가 audit와 다릅니다" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_accept_row_with_rejected_content_duplicate_blocks_generation(
+    tmp_path, monkeypatch, capsys
+):
+    """경로를 바꾼 duplicate가 reject raw를 다시 학습 분포에 넣으면 안 된다."""
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    rejected = root / "data/raw/esc50_family/esc50/clip_000.wav"
+    accepted_duplicate = root / "data/raw/esc50_family/esc50/clip_001.wav"
+    accepted_duplicate.write_bytes(rejected.read_bytes())
+    audit = _write_decoder_audit(
+        root,
+        decisions={rejected.relative_to(root).as_posix(): "reject"},
+    )
+
+    assert _run(module, root, monkeypatch, decoder_audit=audit) == 1
+    assert "reject 행과 중복" in capsys.readouterr().err
+    assert not (root / "data/manifests/esc50.jsonl").exists()
+
+
+def test_schema_v3_generation_is_diagnostic_only_and_cannot_feed_training(
+    tmp_path, monkeypatch
+):
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"esc50": 1.0},
+        ratios={"esc50": 1.0, "synthetic": 0.1},
+    )
+    assert _run(module, root, monkeypatch) == 0
+    sidecar_path = root / "data/manifests/manifest_generation.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["schema_version"] = 3
+    sidecar_path.write_text(json.dumps(sidecar, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="diagnostic-only"):
+        validate_manifest_generation(
+            root / "data/manifests", required_tags={"esc50"}, repo_root=root
+        )
 
 
 def test_allow_corpus_leak_is_an_explicit_diagnostic_only_escape_hatch(
@@ -577,7 +1159,8 @@ def test_generation_binds_raw_audio_content_and_returns_one_read_snapshot(
     )
     entries = snapshot["_validated_entries"]["esc50"]
     assert entries and all("content_sha256" in row for row in entries)
-    assert snapshot["schema_version"] == 3
+    assert snapshot["schema_version"] == 4
+    assert snapshot["_canonical_decoder_audited"] is True
 
     # validator가 반환한 entry는 검증했던 동일 byte snapshot이다. 이후 JSONL 교체가
     # snapshot을 바꾸지 않으며, raw bytes 교체는 다음 소비 검증에서 즉시 실패한다.
@@ -590,10 +1173,60 @@ def test_generation_binds_raw_audio_content_and_returns_one_read_snapshot(
     (manifest_dir / "esc50.jsonl").write_bytes(
         snapshot["_validated_manifest_bytes"]["esc50"]
     )
-    with pytest.raises(ValueError, match="raw content SHA 불일치"):
+    with pytest.raises(ValueError, match="raw (inventory SHA/size|content SHA).*(다릅니다|불일치)"):
         validate_manifest_generation(
             manifest_dir,
             required_tags={"esc50"},
+            repo_root=root,
+        )
+
+
+def test_manifest_validator_rederives_dns_reject_partition_after_sidecar_tamper(
+    tmp_path, monkeypatch
+):
+    """build_id를 다시 계산해도 forged marker reject evidence는 통과하면 안 된다."""
+
+    from deep_anc.data.manifest_contract import validate_manifest_generation
+
+    module = _load_script()
+    root = _build_tree(
+        tmp_path,
+        present_tags={"speech": 1.0},
+        ratios={"speech": 1.0},
+    )
+    generic_source = root / "data/raw/speech_family/speech"
+    dns_source = root / "data/raw/noise/speech"
+    dns_source.parent.mkdir(parents=True, exist_ok=True)
+    generic_source.rename(dns_source)
+    assert _run(module, root, monkeypatch) == 0
+    manifest_dir = root / "data/manifests"
+    validate_manifest_generation(
+        manifest_dir,
+        required_tags={"speech"},
+        repo_root=root,
+    )
+    sidecar_path = manifest_dir / "manifest_generation.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    partition = sidecar["public_lineage"]["decoder_rejected_marker_partition"]
+    partition["tags"]["speech"]["rejected_members"] = ["forged/missing.wav"]
+    partition["tags"]["speech"]["rejected_member_count"] = 1
+    partition["tags"]["speech"]["rejected_members_sha256"] = canonical_json_sha256(
+        ["forged/missing.wav"]
+    )
+    basis = {
+        key: value
+        for key, value in sidecar.items()
+        if key not in {"build_id", "created_at"}
+    }
+    sidecar["build_id"] = hashlib.sha256(
+        manifest_contract._canonical_json_bytes(basis)
+    ).hexdigest()
+    sidecar_path.write_bytes(manifest_contract._canonical_json_bytes(sidecar))
+
+    with pytest.raises(ValueError, match="marker partition.*재계산 결과"):
+        validate_manifest_generation(
+            manifest_dir,
+            required_tags={"speech"},
             repo_root=root,
         )
 

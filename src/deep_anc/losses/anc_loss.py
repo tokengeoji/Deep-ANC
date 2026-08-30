@@ -209,9 +209,11 @@ class ANCLoss(nn.Module):
         self.frame_samples = int(cfg.nmse_frame_samples)
         self.frame_hop = int(cfg.frame_hop_samples())
         self.frame_silence_db = float(cfg.nmse_frame_silence_db)
-        if self.lambda_frame > 0.0:
-            if self.trusted_band_hz is None:
-                raise ValueError("lambda_frame > 0 이면 trusted_band_hz 가 필요합니다")
+        if self.lambda_frame > 0.0 and self.trusted_band_hz is None:
+            raise ValueError("lambda_frame > 0 이면 trusted_band_hz 가 필요합니다")
+        # λ=0 후보도 frame metric은 계속 산출한다. 버퍼를 λ 조건에 묶으면
+        # metric-only 모드가 첫 forward에서 AttributeError로 죽어 관측 자체가 불가능하다.
+        if self.trusted_band_hz is not None:
             self.register_buffer(
                 "frame_win", torch.hann_window(self.frame_samples), persistent=False
             )
@@ -441,6 +443,9 @@ class ANCLoss(nn.Module):
         y: torch.Tensor,
         d: torch.Tensor,
         perturb: dict | None = None,
+        *,
+        loss_start_sample: int = 0,
+        nl_params: dict | None = None,
     ) -> dict[str, float]:
         """각 항이 ``∂/∂y`` 예산에서 차지하는 몫: ``‖λ·∇term‖ / ‖∇nmse‖``.
 
@@ -457,10 +462,21 @@ class ANCLoss(nn.Module):
 
         ⚠ 값은 ``y`` 에 의존한다. ``y=0`` 에서는 dnh 가 0 이라 무의미하므로, 학습 중간을
         닮은 y(신뢰대역 일부 상쇄 + 대역 밖 누설)에서 재라.
+
+        ``loss_start_sample`` / ``perturb`` / ``nl_params`` 는 :meth:`forward` 와
+        같은 의미다. 예산 측정이 학습이 실제로 버리는 plant 정착 구간을 포함하면,
+        같은 S(z)라도 전혀 다른 목적함수의 비율을 보고하게 된다. 따라서 campaign
+        evidence는 Trainer가 쓴 값을 그대로 넘겨야 한다.
         """
 
         y = y.detach().clone().requires_grad_(True)
-        total, _ = self.forward(y, d, perturb=perturb)
+        total, _ = self.forward(
+            y,
+            d,
+            loss_start_sample=loss_start_sample,
+            perturb=perturb,
+            nl_params=nl_params,
+        )
         terms = self._last_terms
         norms: dict[str, float] = {}
         for name, (weight, term) in terms.items():
@@ -576,11 +592,16 @@ class ANCLoss(nn.Module):
         # 프레임 국소성
         l_frame = y.new_zeros(())
         frame_worst_db: float | None = None
-        if self.lambda_frame > 0.0 and self.trusted_band_hz is not None:
+        frame_valid_count: int | None = None
+        # frame은 학습 가중치와 별개로 항상 관측한다. 가중치가 0인 안전한
+        # warm-up/candidate에서도 순간 증폭을 숨기면, "학습은 안정적"이라는 말과
+        # "국소적으로도 안전"이라는 말을 구분할 수 없다.
+        if self.trusted_band_hz is not None:
             if e_flat.shape[-1] >= self.frame_samples:
                 fr_db, valid = self._framed_band_nmse_db(
                     e_flat, d_flat, self.trusted_band_hz
                 )
+                frame_valid_count = int(valid.sum().detach())
                 if bool(valid.any()):
                     selected = fr_db[valid]
                     l_frame = self._worst_aggregate(selected)
@@ -619,6 +640,8 @@ class ANCLoss(nn.Module):
         }
         if frame_worst_db is not None:
             metrics["frame_worst_db"] = frame_worst_db
+        if frame_valid_count is not None:
+            metrics["frame_valid_count"] = float(frame_valid_count)
         metrics.update(dnh_metrics)
         if nmse_trusted_db is not None:
             mean_db = float(nmse_trusted_db.mean().detach())

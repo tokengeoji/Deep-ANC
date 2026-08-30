@@ -229,7 +229,7 @@ def test_runtime_lead_gate_fails_when_checkpoint_disagrees():
     """
 
     with pytest.raises(ValueError, match="lead 불일치"):
-        validate_digital_reference_lead("digital", 116, 109)
+        validate_digital_reference_lead("digital", 115, 109)
 
     # 정상: 같으면 통과하고 정규화된 값을 돌려준다.
-    assert validate_digital_reference_lead("digital", 116, 116) == 116
+    assert validate_digital_reference_lead("digital", 115, 115) == 115

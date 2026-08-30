@@ -24,16 +24,14 @@ from deep_anc.train.process_lock import (               # noqa: E402
     resolve_run_dir,
 )
 from deep_anc.train.trainer import (                   # noqa: E402
+    STRICT_RUN_ROLES,
     Trainer,
     preflight_canonical_resume,
 )
 
 
 def requires_same_run_lock(cfg: dict) -> bool:
-    return str(cfg.get("experiment_role", "")) in {
-        "canonical_pretrain",
-        "canonical_finetune",
-    } or any(
+    return str(cfg.get("experiment_role", "")) in STRICT_RUN_ROLES or any(
         bool(cfg.get(name, False))
         for name in (
             "require_measured_primary_path",

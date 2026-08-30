@@ -1,7 +1,7 @@
 #!/bin/bash
 # 새 Elice 인스턴스 부트스트랩 — exact code + canonical holdout + 환경 + 데이터 검증.
 # 사용 (새 인스턴스의 홈에서):
-#   git clone https://github.com/Roka-jsj/Deep-ANC.git && cd Deep-ANC
+#   git clone https://github.com/Roka-jsj/Deep-ANC.git Deep_ANC && cd Deep_ANC
 #   bash scripts/elice/bootstrap_all.sh \
 #     --expected-commit "$EXPECTED_COMMIT" \
 #     --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
@@ -31,6 +31,13 @@ EXPECTED_HOLDOUT_SHA256=""
 EXPECTED_HOLDOUT_SHA256_SEEN=0
 EXPECTED_TRANSFER_MANIFEST_SHA256=""
 EXPECTED_TRANSFER_MANIFEST_SHA256_SEEN=0
+RAW_HASH_WORKERS=1
+RAW_HASH_WORKERS_SEEN=0
+REUSE_DECODER_AUDIT=0
+EXPECTED_DECODER_AUDIT_SHA256=""
+EXPECTED_DECODER_AUDIT_SHA256_SEEN=0
+EXPECTED_DECODER_AUDIT_FILE_SHA256=""
+EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN=0
 NO_UPDATE_SEEN=0
 PREFLIGHT_ONLY=0
 while [ "$#" -gt 0 ]; do
@@ -105,6 +112,76 @@ while [ "$#" -gt 0 ]; do
       EXPECTED_TRANSFER_MANIFEST_SHA256_SEEN=1
       EXPECTED_TRANSFER_MANIFEST_SHA256=${1#*=}
       ;;
+    --raw-hash-workers)
+      if [ "$RAW_HASH_WORKERS_SEEN" -ne 0 ]; then
+        echo "[오류] --raw-hash-workers는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      RAW_HASH_WORKERS_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --raw-hash-workers 뒤에 1~32 정수가 필요합니다." >&2
+        exit 2
+      fi
+      RAW_HASH_WORKERS=$1
+      ;;
+    --raw-hash-workers=*)
+      if [ "$RAW_HASH_WORKERS_SEEN" -ne 0 ]; then
+        echo "[오류] --raw-hash-workers는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      RAW_HASH_WORKERS_SEEN=1
+      RAW_HASH_WORKERS=${1#*=}
+      ;;
+    --reuse-decoder-audit)
+      if [ "$REUSE_DECODER_AUDIT" -ne 0 ]; then
+        echo "[오류] --reuse-decoder-audit은 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      REUSE_DECODER_AUDIT=1
+      ;;
+    --expected-decoder-audit-sha256)
+      if [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-decoder-audit-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_SHA256_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --expected-decoder-audit-sha256 뒤에 64자리 SHA-256이 필요합니다." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_SHA256=$1
+      ;;
+    --expected-decoder-audit-sha256=*)
+      if [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-decoder-audit-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_SHA256_SEEN=1
+      EXPECTED_DECODER_AUDIT_SHA256=${1#*=}
+      ;;
+    --expected-decoder-audit-file-sha256)
+      if [ "$EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-decoder-audit-file-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --expected-decoder-audit-file-sha256 뒤에 64자리 SHA-256이 필요합니다." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_FILE_SHA256=$1
+      ;;
+    --expected-decoder-audit-file-sha256=*)
+      if [ "$EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-decoder-audit-file-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN=1
+      EXPECTED_DECODER_AUDIT_FILE_SHA256=${1#*=}
+      ;;
     --preflight-only)
       PREFLIGHT_ONLY=1
       ;;
@@ -126,12 +203,36 @@ if [[ ! "$EXPECTED_HOLDOUT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
   exit 2
 fi
 EXPECTED_HOLDOUT_SHA256=${EXPECTED_HOLDOUT_SHA256,,}
+if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then
+  if [[ ! "$EXPECTED_DECODER_AUDIT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[오류] audit 재사용에는 --expected-decoder-audit-sha256가 필요합니다." >&2
+    exit 2
+  fi
+  if [[ ! "$EXPECTED_DECODER_AUDIT_FILE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[오류] audit 재사용에는 --expected-decoder-audit-file-sha256가 필요합니다." >&2
+    exit 2
+  fi
+  EXPECTED_DECODER_AUDIT_SHA256=${EXPECTED_DECODER_AUDIT_SHA256,,}
+  EXPECTED_DECODER_AUDIT_FILE_SHA256=${EXPECTED_DECODER_AUDIT_FILE_SHA256,,}
+elif [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ] || [ "$EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN" -ne 0 ]; then
+  echo "[오류] decoder audit SHA 인자는 --reuse-decoder-audit과 함께만 지정할 수 있습니다." >&2
+  exit 2
+fi
 if [ "$NO_UPDATE_SEEN" -ne 1 ]; then
   echo "[오류] --no-update는 필수입니다. exact checkout에서 다시 실행하세요." >&2
   exit 2
 fi
+if [[ ! "$RAW_HASH_WORKERS" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]]; then
+  echo "[오류] --raw-hash-workers는 1~32 정수여야 합니다." >&2
+  exit 2
+fi
 
-REPO=${DEEP_ANC_BOOTSTRAP_REPO:-"$HOME/Deep-ANC"}
+# 호출 위치나 clone 디렉터리 이름에 의존하지 않는다. 실제 스크립트 위치에서 저장소
+# root를 계산하므로 Elice의 ``~/Deep_ANC``와 사용자의 다른 clone 이름 모두 같은
+# exact checkout을 검사한다. 명시 환경변수는 테스트/운영에서만 이 기본값을 덮는다.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+DEFAULT_REPO=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)
+REPO=${DEEP_ANC_BOOTSTRAP_REPO:-"$DEFAULT_REPO"}
 if ! cd "$REPO"; then
   echo "[오류] 저장소에 들어갈 수 없습니다: $REPO" >&2
   exit 1
@@ -160,6 +261,11 @@ HOLDOUT_MANIFEST="$REPO/data/manifests/recorded_holdout.json"
 HOLDOUT_VALIDATOR="$REPO/src/deep_anc/data/holdout_contract.py"
 TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"
 TRANSFER_VALIDATOR_MODULE="deep_anc.data.transfer_contract"
+# Canonical 학습은 raw 전수 decoder audit과 한 세대로 발행한 v4 manifest만 읽는다.
+# audit 원본은 결과 증거로 보존하고, prepare transaction이 같은 bytes를 canonical
+# directory에 복사해 sidecar와 결속한다.
+CANONICAL_MANIFEST_DIR="data/manifests/canonical_v4"
+DECODER_AUDIT_REPORT="results/provenance/decoder_audit.json"
 
 verify_exact_checkout() {
   local current_commit hidden_flags replace_refs
@@ -1079,10 +1185,36 @@ if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bun
   echo "[오류] 다운로드 후 manifest 준비 시작 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
 fi
+# MP3 등의 header/일부 seek만 정상인 raw를 NoisePool retry가 다른 파일로 조용히
+# 대체하지 못하게, 모든 공개 raw를 복수 접근 방식으로 먼저 전수 decode한다. reject는
+# forensic evidence로 report에 남기되, --allow-rejections으로 audit 자체는 성공시켜
+# prepare가 audit의 accepted inventory만 canonical v4 세대에 넣도록 한다. 이미 끝난
+# audit을 재사용하려면 파일/semantic SHA, 현재 decoder fingerprint, raw 전체
+# SHA/size를 먼저 fail-closed로 대조해야 하며, 다음 prepare transaction도 같은
+# raw 재대조를 다시 수행한다. 재사용 실패 시 새 audit으로 자동 fallback하지 않는다.
+if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then
+  echo "[decoder audit] 외부 SHA로 고정한 완료 audit을 재사용 전 전수 검증합니다."
+  "$VENV_PYTHON" scripts/data/verify_decoder_audit_reuse.py \
+    --root . \
+    --audit "$DECODER_AUDIT_REPORT" \
+    --scan-root data/raw \
+    --expected-audit-sha256 "$EXPECTED_DECODER_AUDIT_SHA256" \
+    --expected-file-sha256 "$EXPECTED_DECODER_AUDIT_FILE_SHA256" \
+    --hash-workers "$RAW_HASH_WORKERS"
+else
+  "$VENV_PYTHON" scripts/data/audit_decoder_eligibility.py \
+    --root . \
+    --scan-root data/raw \
+    --out "$DECODER_AUDIT_REPORT" \
+    --allow-rejections
+fi
 "$VENV_PYTHON" scripts/data/prepare_noise_pool.py \
   --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
   --recorded-source-pool-csv data/source_pool_v2/sources.csv \
-  --recorded-source-pool-csv data/source_pool/sources.csv
+  --recorded-source-pool-csv data/source_pool/sources.csv \
+  --out "$CANONICAL_MANIFEST_DIR" \
+  --decoder-audit "$DECODER_AUDIT_REPORT" \
+  --hash-workers "$RAW_HASH_WORKERS"
 if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle; then
   echo "[오류] manifest 준비 종료 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
@@ -1107,7 +1239,9 @@ if ! rir_bank_complete "$RIR_BANK"; then
   echo "[오류] 신뢰한 transferred RIR bank의 shape/finite 검증 실패. bootstrap은 이를 재생성하거나 덮어쓰지 않습니다." >&2
   exit 1
 fi
-"$VENV_PYTHON" scripts/data/validate_noise_pool.py
+"$VENV_PYTHON" scripts/data/validate_noise_pool.py \
+  --manifest-dir "$CANONICAL_MANIFEST_DIR" \
+  --out "$CANONICAL_MANIFEST_DIR/dataset_qa.md"
 
 echo "=== [5/6] 검증 (pytest) ==="
 "$VENV_PYTHON" -m pytest -q

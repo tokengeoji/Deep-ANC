@@ -3114,6 +3114,8 @@ def _audit_plant_confidence_ceiling(
             band_lo, band_hi = (
                 float(v) for v in tuple(readiness_cfg["measured_design_ceiling_band_hz"])[:2]
             )
+            # readiness의 계산은 cache hit도 신뢰하지 않는다. 측정 자산을 수정하지
+            # 않는 기본 no-write 경로로, 매번 실제 P/S 에서 다시 푼다.
             solved = cached_design_ceiling_db(
                 _repo_path(primary["path"]),
                 _repo_path(secondary["path"]),

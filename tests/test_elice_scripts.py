@@ -84,6 +84,11 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert text.count("verify_exact_checkout") >= 3
     assert '["git", "ls-tree", "-r", "-z", "--full-tree", commit]' in text
     assert "prepare_noise_pool.py" in text
+    assert "--reuse-decoder-audit" in text
+    assert "--expected-decoder-audit-sha256" in text
+    assert "--expected-decoder-audit-file-sha256" in text
+    assert "verify_decoder_audit_reuse.py" in text
+    assert "--raw-hash-workers" in text
     assert '--expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256"' in text
     assert "--expected-transfer-manifest-sha256" in text
     assert 'TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"' in text
@@ -125,6 +130,32 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert '--set run_until_step="$PILOT_STEPS"' in search_runner
     assert 'eval_pilot_${artifact}' in search_runner
     assert "eta_probe.txt" in search_runner
+
+
+def test_bootstrap_binds_full_decoder_audit_to_canonical_v4_manifest_generation():
+    """기존 manifest가 있어도 canonical 학습이 audit 결속 세대만 읽어야 한다."""
+
+    bootstrap = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    data_config = (REPO_ROOT / "configs/data_sim.yaml").read_text(encoding="utf-8")
+
+    assert "noise_manifest_dir: data/manifests/canonical_v4" in data_config
+    assert 'CANONICAL_MANIFEST_DIR="data/manifests/canonical_v4"' in bootstrap
+    assert 'DECODER_AUDIT_REPORT="results/provenance/decoder_audit.json"' in bootstrap
+
+    audit_call = bootstrap.index('"$VENV_PYTHON" scripts/data/audit_decoder_eligibility.py')
+    prepare_call = bootstrap.index('"$VENV_PYTHON" scripts/data/prepare_noise_pool.py')
+    validate_call = bootstrap.index('"$VENV_PYTHON" scripts/data/validate_noise_pool.py')
+    assert audit_call < prepare_call < validate_call
+    assert "--root ." in bootstrap[audit_call:prepare_call]
+    assert "--scan-root data/raw" in bootstrap[audit_call:prepare_call]
+    assert '--out "$DECODER_AUDIT_REPORT"' in bootstrap[audit_call:prepare_call]
+    assert "--allow-rejections" in bootstrap[audit_call:prepare_call]
+    assert '--out "$CANONICAL_MANIFEST_DIR"' in bootstrap[prepare_call:validate_call]
+    assert '--decoder-audit "$DECODER_AUDIT_REPORT"' in bootstrap[prepare_call:validate_call]
+    assert '--manifest-dir "$CANONICAL_MANIFEST_DIR"' in bootstrap[validate_call:]
+    assert '--out "$CANONICAL_MANIFEST_DIR/dataset_qa.md"' in bootstrap[validate_call:]
+    assert 'if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then' in bootstrap[audit_call - 1800:prepare_call]
+    assert "재사용 실패 시 새 audit으로 자동 fallback하지 않는다" in bootstrap
 
 
 def test_setup_env_requires_exact_torch_cuda_and_writes_freeze_receipt():
@@ -207,6 +238,49 @@ def _run_bootstrap_gate(root: Path, *args: str) -> subprocess.CompletedProcess[s
         timeout=10,
         check=False,
     )
+
+
+def test_bootstrap_derives_default_repo_from_its_own_path(tmp_path: Path):
+    """Elice clone 이름이 Deep-ANC가 아니어도 하드코딩 경로로 실패하지 않는다."""
+
+    root, _commit = _make_bootstrap_git_repo(tmp_path)
+    underscore_root = tmp_path / "Deep_ANC"
+    root.rename(underscore_root)
+    root = underscore_root
+    script = root / "scripts/elice/bootstrap_all.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(ELICE_SCRIPTS[0], script)
+    subprocess.run(["git", "add", str(script.relative_to(root))], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "bootstrap script fixture"],
+        cwd=root,
+        check=True,
+    )
+    env = os.environ.copy()
+    env.pop("DEEP_ANC_BOOTSTRAP_REPO", None)
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--expected-commit",
+            "0" * 40,
+            "--expected-holdout-sha256",
+            "1" * 64,
+            "--no-update",
+            "--preflight-only",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert str(root) not in result.stderr
+    assert "저장소에 들어갈 수 없습니다" not in result.stderr
+    assert "expected commit" in result.stderr
 
 
 def _sha256(path: Path) -> str:
@@ -632,6 +706,72 @@ def test_bootstrap_requires_explicit_no_update_before_setup(tmp_path: Path):
 
     assert result.returncode == 2
     assert "--no-update는 필수" in result.stderr
+    assert not (root / "data").exists()
+    assert not (root / ".venv").exists()
+
+
+def test_bootstrap_rejects_invalid_or_duplicate_raw_hash_worker_setting_before_setup(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    invalid = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--raw-hash-workers",
+        "0",
+        "--no-update",
+    )
+    duplicate = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--raw-hash-workers",
+        "8",
+        "--raw-hash-workers=8",
+        "--no-update",
+    )
+
+    assert invalid.returncode == 2
+    assert duplicate.returncode == 2
+    assert "--raw-hash-workers" in invalid.stderr
+    assert "한 번만 지정" in duplicate.stderr
+    assert not (root / "data").exists()
+
+
+def test_bootstrap_reuse_decoder_audit_requires_both_external_sha_anchors_before_setup(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+
+    missing = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--reuse-decoder-audit",
+        "--no-update",
+    )
+    orphan = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+        "--expected-decoder-audit-sha256",
+        "b" * 64,
+        "--no-update",
+    )
+
+    assert missing.returncode == 2
+    assert orphan.returncode == 2
+    assert "--expected-decoder-audit-sha256" in missing.stderr
+    assert "--reuse-decoder-audit" in orphan.stderr
     assert not (root / "data").exists()
     assert not (root / ".venv").exists()
 
@@ -1160,6 +1300,25 @@ def test_bootstrap_default_is_environment_data_only_without_legacy_runner():
     assert "학습은 시작하지 않음" in text
 
 
+def test_legacy_launchers_require_an_explicit_acknowledgement():
+    pretrain = subprocess.run(
+        ["bash", str(ELICE_SCRIPTS[3])],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    parallel = subprocess.run(
+        ["bash", str(ELICE_SCRIPTS[2])],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert pretrain.returncode == 2
+    assert parallel.returncode == 2
+    assert "canonical tiny" in pretrain.stderr
+    assert "legacy base/tiny" in parallel.stderr
+
+
 def _make_fake_runner(
     tmp_path: Path,
     *,
@@ -1210,6 +1369,7 @@ def test_parallel_runner_does_not_overwrite_existing_log(tmp_path: Path):
     result = subprocess.run(
         ["bash", "scripts/elice/run_parallel_models.sh"],
         cwd=root,
+        env={**os.environ, "DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC": "1"},
         capture_output=True,
         text=True,
         timeout=10,
@@ -1228,6 +1388,7 @@ def test_parallel_runner_reports_immediate_process_exit(tmp_path: Path):
     result = subprocess.run(
         ["bash", "scripts/elice/run_parallel_models.sh"],
         cwd=root,
+        env={**os.environ, "DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC": "1"},
         capture_output=True,
         text=True,
         timeout=15,
@@ -1257,6 +1418,7 @@ def test_parallel_runner_rolls_back_survivor_on_partial_start_failure(tmp_path: 
     result = subprocess.run(
         ["bash", "scripts/elice/run_parallel_models.sh"],
         cwd=root,
+        env={**os.environ, "DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC": "1"},
         capture_output=True,
         text=True,
         timeout=15,

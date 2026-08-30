@@ -138,6 +138,22 @@ demonstrated/INCONCLUSIVE**로 판정한다. challenge 결과를 학습 데이�
 시나리오마다 **OFF 10s(베이스라인) → ON 30s → OFF 5s**, 게이트 램프 ±1~2s 는
 분석에서 제외. 산출: `results/eval_report_<시각>.md` (전대역/밴드별 감쇠, miss/xrun) +
 세션 원시 npz. FxLMS 와 DL 은 **같은 세션 묶음에서 연속 측정**해 조건을 통일한다.
+여기서 OFF/ON은 **ANC control만** 끄고/켜는 상태다. noise speaker source는 세 구간 내내
+계속 재생해야 하며, 새 raw NPZ에는 이 요청 상태를 `live_protocol_schema`,
+`noise_enabled_requested`, `anc_enabled_*_requested`로 명시한다. source/`anc_gain` 원신호와
+함께 교차검증하므로 무음 baseline을 ANC 감쇠라고 해석할 수 없다.
+
+`evaluate_session.py`가 새로 만든 raw NPZ/`metrics.csv`에서는 옥타브별로 OFF 구간의
+실제 noise 출력 `source`의 band 전력 비율·폭 정규화 PSD 비율과 `source_energy_valid`
+mask를 함께 보존한다. 각 octave의 PSD가 20 Hz–Nyquist 평균 PSD의 설정 비율(기본 25%)
+미만이면 공개 `band_<Hz>_att_db`와 raw `octave_attenuation_db`는 `NaN`/`무효`다.
+계산 자체는 `*_unqualified_att_db`에 진단용으로만 남으며, 그 값을 고역 증폭 또는 감쇠
+주장에 사용하면 안 된다. 이 gate는 **source가 해당 octave에 실제로 재생되었는지**만
+확인한다. ERR의 SNR/coherence, P/S 신뢰대역, xrun/deadline, OFF/ON drift는 별도 조건이다.
+
+이 필드가 없는 과거 live session은 source-energy 검증 전 legacy artifact다. 기존 숫자를
+소급해 canonical 또는 고주파 현장 성능으로 승격하지 않으며, 필요한 경우 immutable raw의
+`source` 트랙으로 별도 재분석하고 provenance를 새로 발행한다.
 
 ### 4.1 덕트 전달경로의 시간-주파수 지도
 

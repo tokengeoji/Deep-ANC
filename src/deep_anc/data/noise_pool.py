@@ -22,6 +22,15 @@ MIN_DECODED_RMS = 1e-8
 
 
 class NoisePool:
+    """Manifest 기반 랜덤 세그먼트 샘플러.
+
+    ``canonical_decoder_audited``는 schema-v4 manifest contract가 raw content와
+    decoder audit을 모두 검증한 뒤에만 켜는 fail-closed 경계다. 이 모드에서는
+    audit 이후의 decoder 오류·rate drift·비정상 PCM을 다른 entry로 바꿔 숨기지
+    않는다. 반대로 legacy/diagnostic manifest의 기본값은 기존처럼 손상 entry를
+    이번 pool에서 제외하고 재시도한다.
+    """
+
     def __init__(
         self,
         manifest_paths: list[str | Path],
@@ -30,9 +39,13 @@ class NoisePool:
         seed: int | None = None,
         *,
         validated_entries: list[dict] | None = None,
+        canonical_decoder_audited: bool = False,
     ) -> None:
+        if not isinstance(canonical_decoder_audited, bool):
+            raise TypeError("canonical_decoder_audited는 bool이어야 합니다")
         self.sample_rate = int(sample_rate)
         self.rng = np.random.default_rng(seed)
+        self.canonical_decoder_audited = canonical_decoder_audited
         self.entries: list[dict] = []
         if validated_entries is not None:
             self.entries.extend(
@@ -100,6 +113,17 @@ class NoisePool:
         finally:
             os.close(descriptor)
 
+    @staticmethod
+    def _canonical_decode_failure(entry: dict, exc: Exception) -> RuntimeError:
+        """Audit-bound pool의 decode drift를 provenance와 함께 fail-closed한다."""
+
+        path = str(entry.get("path", "<unknown>"))
+        return RuntimeError(
+            "canonical decoder-audited NoisePool decode 계약 위반 — "
+            "audit 통과 뒤에는 다른 파일로 재시도하지 않고 학습을 중단합니다: "
+            f"{path}; {type(exc).__name__}: {exc}"
+        )
+
     def sample_segment(
         self,
         n_samples: int,
@@ -109,8 +133,9 @@ class NoisePool:
         """길이 가중 랜덤 파일에서 무작위 구간을 읽어 48kHz 모노로 반환.
 
         manifest 생성 때 헤더를 읽었더라도 MP3의 중간 프레임이 손상됐을 수 있다.
-        디코딩 실패 파일은 이 worker의 풀에서 제외하고 다른 파일로 재시도해 장기
-        학습 전체가 단일 손상 파일 때문에 중단되지 않게 한다.
+        legacy/diagnostic pool은 디코딩 실패 파일을 이 worker의 풀에서 제외하고 다른
+        파일로 재시도한다. 반면 ``canonical_decoder_audited=True``는 이미 전수 audit을
+        통과한 분포라는 계약이므로 같은 상황을 decoder drift로 보고 즉시 중단한다.
         """
         draw_rng = self.rng if rng is None else rng
         # global-index 학습 경로는 한 item이 과거 item의 decode 성공/실패 상태에
@@ -147,38 +172,56 @@ class NoisePool:
                             f"manifest/sample-rate header 불일치: {verified_rate} != {file_sr}"
                         )
                     if total <= need_src:
-                        data, _rate, _total = self._read_validated_audio(
+                        data, decoded_rate, _total = self._read_validated_audio(
                             entry, start=None, stop=None
                         )
                     else:
                         start = int(draw_rng.integers(0, total - need_src))
-                        data, _rate, _total = self._read_validated_audio(
+                        data, decoded_rate, _total = self._read_validated_audio(
                             entry, start=start, stop=start + need_src
+                        )
+                    if decoded_rate != file_sr:
+                        raise ValueError(
+                            "manifest/decoder read sample-rate 불일치: "
+                            f"{decoded_rate} != {file_sr}"
                         )
                 else:
                     info = sf.info(path)
                     total = int(info.frames)
+                    info_rate = int(info.samplerate)
+                    if info_rate != file_sr:
+                        raise ValueError(
+                            "manifest/decoder header sample-rate 불일치: "
+                            f"{info_rate} != {file_sr}"
+                        )
                     if total <= need_src:
-                        data, _ = sf.read(path, dtype="float32", always_2d=True)
+                        data, decoded_rate = sf.read(
+                            path, dtype="float32", always_2d=True
+                        )
                     else:
                         start = int(draw_rng.integers(0, total - need_src))
-                        data, _ = sf.read(
+                        data, decoded_rate = sf.read(
                             path,
                             start=start,
                             stop=start + need_src,
                             dtype="float32",
                             always_2d=True,
                         )
+                    if int(decoded_rate) != file_sr:
+                        raise ValueError(
+                            "manifest/decoder read sample-rate 불일치: "
+                            f"{decoded_rate} != {file_sr}"
+                        )
                 mono = data.mean(axis=1)
                 if mono.size == 0 or not np.isfinite(mono).all():
                     raise RuntimeError("비어 있거나 유한하지 않은 오디오")
                 decoded_peak = float(np.max(np.abs(mono)))
-                decoded_rms = float(np.sqrt(np.mean(mono * mono)))
                 if decoded_peak > MAX_DECODED_PCM_ABS:
                     raise RuntimeError(
                         "decoder가 PCM 범위를 벗어난 값을 반환했습니다: "
                         f"peak={decoded_peak:.6g} > {MAX_DECODED_PCM_ABS}"
                     )
+                decoded_rms = float(np.sqrt(np.mean(mono * mono)))
                 if decoded_rms <= MIN_DECODED_RMS:
                     raise RuntimeError(
                         "decoder segment가 무음/퇴화했습니다: "
@@ -193,11 +236,16 @@ class NoisePool:
                         mono, self.sample_rate // g, file_sr // g
                     )
 
+                if not np.isfinite(mono).all():
+                    raise RuntimeError("resample 뒤 오디오가 유한하지 않습니다")
+
                 if mono.size < n_samples:
                     reps = int(np.ceil(n_samples / mono.size))
                     mono = np.tile(mono, reps)
                 return mono[:n_samples].astype(np.float32)
             except (OSError, RuntimeError, ValueError) as exc:
+                if self.canonical_decoder_audited:
+                    raise self._canonical_decode_failure(entry, exc) from exc
                 last_error = exc
                 active_weights[index] = 0.0
 

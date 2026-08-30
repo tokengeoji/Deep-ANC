@@ -18,6 +18,7 @@ nominal plant에서는 손실이 내려가는지, 관측 불가능한 plant 증�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -39,9 +40,52 @@ from deep_anc.train.trainer import (
     validate_finite_parameters,
     validate_g0_nmse,
 )
+from deep_anc.train.campaign_evidence import publish_g0_evidence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 _DEAD_KEY = re.compile(r"loss\.([A-Za-z_][A-Za-z0-9_]*)=")
+_LOSS_TERM_FIELDS = {
+    "mrstft": "lambda_mrstft",
+    "dnh": "lambda_dnh",
+    "frame": "lambda_frame",
+    "sat": "lambda_sat",
+    "pow": "lambda_pow",
+}
+
+
+def resolved_config_sha256(cfg: dict) -> str:
+    """진단 로그가 서로 다른 seed/config를 같은 control로 오인하지 않게 한다."""
+
+    payload = json.dumps(
+        cfg,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def fixed_batch_sha256(batch: dict[str, torch.Tensor]) -> str:
+    """고정-batch 진단의 실제 입력 바이트를 이름·dtype·shape와 함께 결속한다."""
+
+    digest = hashlib.sha256()
+    for name in sorted(batch):
+        value = batch[name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"G0 batch.{name}가 Tensor가 아닙니다: {type(value).__name__}")
+        cpu = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(cpu.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(json.dumps(list(cpu.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(cpu.numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _warned_keys(loss_cfg: dict) -> tuple[str, ...]:
@@ -136,7 +180,9 @@ def isolate_nmse(loss_cfg: dict) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/train_pretrain.yaml")
+    # campaign receipt는 tiny canonical derivative config에서만 유효하다. legacy
+    # train_pretrain.yaml 기본값으로 receipt를 만들고 뒤늦게 거부되는 낭비를 막는다.
+    parser.add_argument("--config", default="configs/train_pretrain_tiny.yaml")
     parser.add_argument("--model-config", default="configs/model_tiny.yaml")
     parser.add_argument("--mode", choices=["nominal", "augmented"], default="nominal")
     parser.add_argument("--steps", type=int, default=500)
@@ -165,6 +211,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--disable-loss-term",
+        action="append",
+        choices=sorted(_LOSS_TERM_FIELDS),
+        default=[],
+        help=(
+            "지정한 보조 손실 항만 0으로 끄는 통제 실험(여러 번 지정 가능). "
+            "--nmse-only와 함께 쓸 수 없습니다."
+        ),
+    )
+    parser.add_argument(
         "--require-nmse-db", type=float, default=-6.0,
         help="최종 NMSE가 이 값 미만이 아니면 종료코드 2를 반환합니다(기본 G0: -6 dB).",
     )
@@ -176,6 +232,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="진단 전용: G0 NMSE 합격선을 적용하지 않습니다.",
     )
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument(
+        "--bootstrap-receipt-sha256",
+        default=None,
+        help=(
+            "campaign G0 receipt를 만들 때 결속할 Elice bootstrap SHA-256. "
+            "--evidence-dir와 함께 필수입니다."
+        ),
+    )
+    parser.add_argument(
+        "--evidence-dir",
+        default=None,
+        help=(
+            "성공한 approved G0의 immutable raw checkpoint/batch/receipt directory. "
+            "기존 directory는 절대 덮어쓰지 않습니다."
+        ),
+    )
     return parser
 
 
@@ -207,6 +279,9 @@ def build_diagnostic_overrides(args: argparse.Namespace, ckpt_dir: str) -> list[
         overrides.append(
             f"data.digital_reference_lead_samples={int(args.lead_samples)}"
         )
+    bootstrap_sha = getattr(args, "bootstrap_receipt_sha256", None)
+    if bootstrap_sha is not None:
+        overrides.append(f"data.bootstrap_receipt_sha256={str(bootstrap_sha).lower()}")
     if args.mode == "augmented":
         overrides.extend(
             [
@@ -229,6 +304,8 @@ def build_diagnostic_overrides(args: argparse.Namespace, ckpt_dir: str) -> list[
                 ),
             ]
         )
+    for term in args.disable_loss_term:
+        overrides.append(f"loss.{_LOSS_TERM_FIELDS[term]}=0.0")
     return overrides
 
 
@@ -238,6 +315,12 @@ def main() -> int:
 
     if args.steps < 1 or args.batch_size < 1 or args.log_every < 1:
         parser.error("steps, batch-size, log-every는 1 이상이어야 합니다")
+    if args.nmse_only and args.disable_loss_term:
+        parser.error("--nmse-only와 --disable-loss-term은 함께 사용할 수 없습니다")
+    if args.evidence_dir is not None:
+        bootstrap = str(args.bootstrap_receipt_sha256 or "").lower()
+        if len(bootstrap) != 64 or any(char not in "0123456789abcdef" for char in bootstrap):
+            parser.error("--evidence-dir에는 64자리 --bootstrap-receipt-sha256이 필요합니다")
 
     diagnostic_dir = tempfile.mkdtemp(prefix=f"deep_anc_overfit_{args.mode}_")
     overrides = build_diagnostic_overrides(args, diagnostic_dir)
@@ -262,6 +345,17 @@ def main() -> int:
     optimizer = trainer.optimizer
     batch = next(trainer.train_iter)
     batch = {k: v.clone() for k, v in batch.items()}
+    print(
+        "[diagnostic contract] "
+        f"config={Path(args.config).as_posix()} "
+        f"resolved_config_sha256={resolved_config_sha256(cfg)} "
+        f"seed={cfg.get('seed')} "
+        f"role={cfg.get('experiment_role')} "
+        f"loss_start_sample={trainer.loss_start_sample} "
+        f"batch_sha256={fixed_batch_sha256(batch)} "
+        f"deterministic_algorithms={torch.are_deterministic_algorithms_enabled()}",
+        flush=True,
+    )
 
     model.train()
     if args.mode == "nominal":
@@ -303,14 +397,17 @@ def main() -> int:
             print(
                 f"step {step:5d} | loss {metrics['loss']:9.4f} | "
                 f"nmse {metrics['nmse_db']:8.3f} dB | grad {grad_norm:9.3e} | "
-                f"y_rms {y_rms:8.5f} | y_peak {y_peak:8.5f}",
+                f"y_rms {y_rms:8.5f} | y_peak {y_peak:8.5f} | "
+                f"mrstft {metrics['mrstft']:8.4f} | dnh {metrics['dnh']:8.4f} | "
+                f"frame {metrics['frame']:8.4f} | sat {metrics['sat']:8.4f}",
                 flush=True,
             )
 
     elapsed = time.monotonic() - start
     assert initial_loss is not None
     print(
-        f"결과 mode={args.mode} primary={args.primary_mode} lead={lead_samples}: "
+        f"결과 mode={args.mode} primary={args.primary_mode} lead={lead_samples} "
+        f"disabled={','.join(args.disable_loss_term) or 'none'}: "
         f"loss {initial_loss:.4f} -> {final_metrics['loss']:.4f}, "
         f"NMSE {final_metrics['nmse_db']:.3f} dB, "
         f"{args.steps / max(elapsed, 1e-9):.2f} step/s"
@@ -328,6 +425,22 @@ def main() -> int:
         except (FloatingPointError, ValueError) as exc:
             print(f"[실패] {exc}", file=sys.stderr)
             return 2
+    if args.evidence_dir is not None:
+        raw_model = model.module if hasattr(model, "module") else model
+        receipt = publish_g0_evidence(
+            repo_root=REPO_ROOT,
+            output_dir=args.evidence_dir,
+            cfg=cfg,
+            model_state=raw_model.state_dict(),
+            batch={"x": batch["x"], "d": batch["d"]},
+            steps=args.steps,
+            mode=args.mode,
+            primary_mode=args.primary_mode,
+            require_nmse_db=args.require_nmse_db,
+            nmse_only=args.nmse_only,
+            disable_loss_terms=args.disable_loss_term,
+        )
+        print(f"[campaign G0] raw receipt → {receipt}", flush=True)
     return 0
 
 

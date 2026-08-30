@@ -1,9 +1,15 @@
 #!/bin/bash
-# 2×GPU 모델 병렬 학습: GPU0=base, GPU1=tiny (사용자 지정 운용 방식).
-# GPU 1장뿐이면 base 만 실행한다. nohup — SSH 끊겨도 계속 돈다.
+# historical 2×GPU legacy 모델 비교 실행기. canonical tiny에는 사용 금지.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 VENV_PYTHON="$PWD/.venv/bin/python"
+
+if [ "${DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC:-}" != "1" ]; then
+  echo "[중단] run_parallel_models.sh는 legacy base/tiny diagnostic 전용입니다." >&2
+  echo "       canonical tiny는 docs/05_training_elice.md의 ledger-bound 명령을 사용하세요." >&2
+  echo "       과거 결과 재현만 필요하면 DEEP_ANC_ALLOW_LEGACY_DIAGNOSTIC=1을 명시하세요." >&2
+  exit 2
+fi
 
 if [ ! -x "$VENV_PYTHON" ]; then
   echo "[오류] $VENV_PYTHON 없음 — setup_env.sh 를 먼저 실행하세요." >&2

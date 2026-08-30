@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 
 from ..config import (
     CANONICAL_DETERMINISM_POLICY,
+    PRETRAIN_DERIVATIVE_STRICT_ROLES,
     REPO_ROOT,
     loss_selection_sha256,
     validate_canonical_training_policy,
@@ -45,14 +46,29 @@ from .checkpoint import (
 from .completion_receipt import write_completion_receipt
 from .completion_receipt import validate_completion_receipt
 from .campaign_prerequisite import validate_canonical_pretrain_prerequisites
+from .a100_pretrain_smoke import (
+    A100_PRETRAIN_SMOKE_ROLE,
+    validate_a100_pretrain_smoke_config,
+    write_a100_pretrain_smoke_phase_telemetry,
+)
 from .experiment_contract import (
     CANONICAL_ROLES,
-    require_canonical_source_trust,
+    require_exact_source_trust,
     stamp_experiment_contract,
     validate_embedded_experiment_contract,
     validate_resume_experiment,
 )
 from .reproducibility import set_seed, snapshot_run
+
+
+# pilot/probe는 canonical init 자체는 아니지만, winner를 결정하는 raw evidence다.
+# non-strict snapshot으로 같은 contract directory를 재실행해 best/last를 바꾸거나,
+# CUDA 결정론 설정 없이 seed 차이를 선택 결과로 오인하면 안 된다.
+STRICT_RUN_ROLES = (
+    CANONICAL_ROLES
+    | frozenset({A100_PRETRAIN_SMOKE_ROLE})
+    | PRETRAIN_DERIVATIVE_STRICT_ROLES
+)
 
 
 def _ddp_env() -> tuple[int, int, int]:
@@ -89,7 +105,7 @@ def configure_canonical_determinism(cfg: dict, *, cuda_available: bool) -> None:
     environment/completion receipt와 별도 중단→재개 검증 산출물이 있어야 한다.
     """
 
-    if str(cfg.get("experiment_role", "")) not in CANONICAL_ROLES:
+    if str(cfg.get("experiment_role", "")) not in STRICT_RUN_ROLES:
         return
     policy = cfg.get("determinism_policy")
     if policy != CANONICAL_DETERMINISM_POLICY:
@@ -139,7 +155,7 @@ def _resume_preview_components(cfg: dict, *, model=None):
 def preflight_canonical_resume(cfg: dict):
     """ProcessLock/run 파일 생성 전 canonical resume 전체를 immutable preview한다."""
 
-    if str(cfg.get("experiment_role", "")) not in CANONICAL_ROLES or not cfg.get(
+    if str(cfg.get("experiment_role", "")) not in STRICT_RUN_ROLES or not cfg.get(
         "resume"
     ):
         return None
@@ -167,7 +183,8 @@ def validate_canonical_run_entry(
 ) -> None:
     """canonical run의 신규/정확 재개/영구 완료 경계를 산출물 생성 전에 검사."""
 
-    if str(cfg.get("experiment_role", "")) not in CANONICAL_ROLES:
+    role = str(cfg.get("experiment_role", ""))
+    if role not in STRICT_RUN_ROLES:
         return
     data_cfg = cfg.get("data")
     if not isinstance(data_cfg, dict):
@@ -185,8 +202,16 @@ def validate_canonical_run_entry(
     # stamp 뒤 조용히 cfg를 바꾸는 경로는 전부 거부한다.
     validate_embedded_experiment_contract(cfg)
     validate_canonical_training_policy(cfg)
-    validate_canonical_pretrain_prerequisites(cfg, repo_root=REPO_ROOT)
-    require_canonical_source_trust(cfg, repo_root=REPO_ROOT)
+    if role == A100_PRETRAIN_SMOKE_ROLE:
+        validate_a100_pretrain_smoke_config(cfg, repo_root=REPO_ROOT)
+    elif role in CANONICAL_ROLES:
+        validate_canonical_pretrain_prerequisites(cfg, repo_root=REPO_ROOT)
+    # loss_pilot/measured_probe는 canonical ledger를 만들기 전의 evidence라 ledger
+    # 자체는 아직 요구하지 않는다. 위 공통 bootstrap/P/S/embedded-contract/source
+    # 검증과 아래 no-overwrite/explicit-resume 경계는 canonical과 동일하게 적용된다.
+    require_exact_source_trust(
+        cfg, repo_root=REPO_ROOT, roles=STRICT_RUN_ROLES
+    )
     directory = Path(run_dir).absolute()
     receipt = directory / "ckpt" / "completion.json"
     if receipt.exists() or receipt.is_symlink():
@@ -204,10 +229,19 @@ def validate_canonical_run_entry(
     if not requested.is_absolute():
         requested = REPO_ROOT / requested
     requested = requested.absolute()
-    expected = (directory / "ckpt" / "last.pt").absolute()
+    # canonical/pretrain·finetune은 mutable last.pt만 exact resume input으로
+    # 허용한다. 별도 init-ineligible smoke role만 runner가 hard-link로 보존한
+    # immutable sibling stop.pt를 actual split input으로 쓴다.
+    expected_name = "stop.pt" if role == A100_PRETRAIN_SMOKE_ROLE else "last.pt"
+    expected = (directory / "ckpt" / expected_name).absolute()
     if requested != expected:
+        rule = (
+            "canonical resume은 해당 contract run의 exact last.pt만 허용합니다"
+            if role != A100_PRETRAIN_SMOKE_ROLE
+            else "A100 smoke resume은 해당 prerequisite run의 immutable stop.pt만 허용합니다"
+        )
         raise ValueError(
-            "canonical resume은 해당 contract run의 exact last.pt만 허용합니다: "
+            f"{rule}: "
             f"requested={requested}, expected={expected}"
         )
 def validate_init_checkpoint_role(state: dict, cfg: dict) -> None:
@@ -591,6 +625,7 @@ class Trainer:
         # global batch index에서 모든 item을 다시 유도한다. 데이터셋을
         # 만들기 전에 resume step을 알아야 하므로 metadata만 먼저 읽는다.
         self.resume_batch_index = 0
+        self.resume_checkpoint_sha256: str | None = None
         self._resume_state_preview: dict | None = None
         self._resume_path_preview: Path | None = None
         resume_value = cfg.get("resume")
@@ -601,11 +636,11 @@ class Trainer:
             if not resume_path.is_file():
                 raise FileNotFoundError(f"resume checkpoint가 없습니다: {resume_path}")
             if resume_preflight is not None:
-                preview, _, preview_path = resume_preflight
+                preview, resume_snapshot, preview_path = resume_preflight
                 if Path(preview_path).absolute() != resume_path.absolute():
                     raise ValueError("resume preflight path가 resolved resume과 다릅니다")
             else:
-                preview, _ = read_checkpoint_snapshot(
+                preview, resume_snapshot = read_checkpoint_snapshot(
                     resume_path, map_location="cpu"
                 )
             data_stream = preview.get("data_stream")
@@ -625,6 +660,9 @@ class Trainer:
                     "resume checkpoint에 plant/nonlinear training_state가 없습니다"
                 )
             self.resume_batch_index = saved_batch
+            # 재개는 뒤에서 path를 다시 열지 않고 이 immutable preview state를 적용한다.
+            # phase telemetry에 이 bytes SHA를 남겨 stop.pt와 직접 대조한다.
+            self.resume_checkpoint_sha256 = str(resume_snapshot.sha256)
             self._resume_state_preview = preview
             self._resume_path_preview = resume_path
             # artifact/config 계약은 seed/model/DataLoader 등 live state를 만들기 전에 닫는다.
@@ -912,10 +950,19 @@ class Trainer:
             # resolved model/data/duct까지 전부 남겨야 surrogate/실측 P(z), lead,
             # plant curriculum을 나중에 정확히 구분할 수 있다. 비밀정보는 학습
             # config에 두지 않는 저장소 규약을 따른다.
+            reproducibility_cfg = resolved_snapshot
+            if str(cfg.get("experiment_role", "")) == A100_PRETRAIN_SMOKE_ROLE:
+                # stop(예: 300) → resume(500)은 같은 target의 **운영** 차이일 뿐
+                # config snapshot의 학습 의미가 달라진 것이 아니다. strict no-replace
+                # snapshot에는 이 두 operational field를 남기지 않고, 실제 값은 각
+                # immutable checkpoint cfg와 phase telemetry에 보존한다.
+                reproducibility_cfg = copy.deepcopy(resolved_snapshot)
+                reproducibility_cfg.pop("resume", None)
+                reproducibility_cfg.pop("run_until_step", None)
             self.reproducibility_receipt = snapshot_run(
                 self.run_dir,
-                resolved_snapshot,
-                strict=str(cfg.get("experiment_role", "")) in CANONICAL_ROLES,
+                reproducibility_cfg,
+                strict=str(cfg.get("experiment_role", "")) in STRICT_RUN_ROLES,
             )
             try:
                 from torch.utils.tensorboard import SummaryWriter
@@ -1133,6 +1180,8 @@ class Trainer:
         self.model.train()
         self.criterion.train()
         t0 = time.time()
+        run_started = time.monotonic()
+        last_train_metrics: dict[str, float] = {}
 
         while self.step < self.run_until_step:
             batch = next(self.train_iter)
@@ -1156,6 +1205,9 @@ class Trainer:
             validate_finite_parameters(self.model)
             self.scheduler.step()
             self.step += 1
+            last_train_metrics = {
+                str(key): float(value) for key, value in metrics.items()
+            }
 
             if self.is_main and self.step % log_every == 0:
                 lr = self.scheduler.get_last_lr()[0]
@@ -1262,6 +1314,28 @@ class Trainer:
                 write_completion_receipt(
                     self.run_dir / "ckpt", repo_root=REPO_ROOT
                 )
+            if str(cfg.get("experiment_role", "")) == A100_PRETRAIN_SMOKE_ROLE:
+                if self.device.type == "cuda":
+                    peak_allocated = int(torch.cuda.max_memory_allocated(self.device))
+                    peak_reserved = int(torch.cuda.max_memory_reserved(self.device))
+                else:
+                    peak_allocated = 0
+                    peak_reserved = 0
+                telemetry_path = write_a100_pretrain_smoke_phase_telemetry(
+                    self.run_dir,
+                    cfg,
+                    start_step=int(self.resume_batch_index),
+                    completed_step=int(self.step),
+                    elapsed_seconds=float(time.monotonic() - run_started),
+                    device=str(self.device),
+                    cuda_available=self.device.type == "cuda",
+                    device_count=int(torch.cuda.device_count()),
+                    max_memory_allocated_bytes=peak_allocated,
+                    max_memory_reserved_bytes=peak_reserved,
+                    resume_checkpoint_sha256=self.resume_checkpoint_sha256,
+                    final_train_metrics=last_train_metrics,
+                )
+                print(f"[a100 smoke] telemetry → {telemetry_path}", flush=True)
             print(
                 f"학습 구간 종료: step {self.step}/{self.total_steps}, "
                 f"best trusted val NMSE {self.best_metric:.2f} dB"

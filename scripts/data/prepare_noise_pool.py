@@ -30,6 +30,7 @@ speech 0.15 / music 0.10 을 선언해도 실제로는 그 0.25 가 전부 synth
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -62,7 +63,18 @@ from deep_anc.data.manifest import (                            # noqa: E402
     scan_wavs,
     write_manifest,
 )
+from deep_anc.data.manifest_contract import (                  # noqa: E402
+    CANONICAL_MANIFEST_SCHEMA_VERSION,
+    DECODER_AUDIT_FILE,
+    decoder_audit_binding,
+    derive_decoder_rejected_members_by_tag,
+    read_decoder_audit,
+    validate_decoder_audit_dns_marker_partition,
+    validate_decoder_audit_binding,
+    validate_decoder_audit_manifest_entry,
+)
 from deep_anc.data.public_lineage import (                      # noqa: E402
+    DNS_MARKER_TAG_ROOTS,
     PublicLineageError,
     build_public_lineage,
     canonical_json_sha256,
@@ -105,6 +117,30 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _progress(message: str) -> None:
+    """장시간 canonical manifest 준비의 phase를 즉시 로그로 남긴다.
+
+    이 출력은 사람/운영자용 observability이며 manifest bytes, split, audit binding에는
+    포함하지 않는다. background bootstrap의 stdout이 block-buffered여도 phase 전환을
+    바로 판별할 수 있도록 flush한다.
+    """
+
+    print(f"[진행] {message}", flush=True)
+
+
+def _hash_workers(value: int) -> int:
+    """명시적 raw SHA worker 수를 제한한다.
+
+    기본값 1은 기존 호출의 실행 순서와 자원 사용을 보존한다. Elice처럼 충분한
+    vCPU가 확인된 환경에서만 CLI로 늘리며, 검증 결과·manifest bytes·오류 보고
+    순서는 입력 순서를 유지하도록 아래 executor.map으로 고정한다.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 32:
+        raise ValueError("--hash-workers는 1 이상 32 이하 정수여야 합니다")
+    return value
+
+
 def _canonical_json_bytes(payload: dict) -> bytes:
     return (
         json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
@@ -112,13 +148,16 @@ def _canonical_json_bytes(payload: dict) -> bytes:
 
 
 def _bind_audio_content_hashes(
-    entries: list[dict], *, raw_roots: list[Path]
+    entries: list[dict], *, raw_roots: list[Path], hash_workers: int = 1
 ) -> list[dict]:
     """manifest 경로/헤더뿐 아니라 실제 raw audio bytes를 각 행에 결속한다."""
 
+    worker_count = _hash_workers(hash_workers)
     bound: list[dict] = []
     lexical_roots = [Path(os.path.abspath(root)) for root in raw_roots]
-    for index, entry in enumerate(entries):
+
+    def _bind_one(indexed_entry: tuple[int, dict]) -> dict:
+        index, entry = indexed_entry
         path = Path(str(entry.get("path") or ""))
         absolute = Path(os.path.abspath(path))
         allowed = next(
@@ -140,7 +179,16 @@ def _bind_audio_content_hashes(
         item["path"] = str(snapshot.path)
         item["content_sha256"] = snapshot.sha256
         item["content_size"] = snapshot.size
-        bound.append(item)
+        return item
+
+    indexed_entries = list(enumerate(entries))
+    if worker_count == 1:
+        bound.extend(_bind_one(item) for item in indexed_entries)
+    else:
+        # executor.map은 입력 순서대로 결과/예외를 전달한다. 병렬 SHA 계산이
+        # manifest row 순서나 실패 보고 순서를 바꾸지 않게 하는 경계다.
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            bound.extend(executor.map(_bind_one, indexed_entries))
     return bound
 
 
@@ -242,9 +290,11 @@ def _verify_committed_generation(
     *,
     data_config: Path,
     holdout_path: Path | None,
+    hash_workers: int = 1,
 ) -> None:
     """backup 삭제 전 새 세대와 입력 계약의 commit postcondition을 재계산한다."""
 
+    worker_count = _hash_workers(hash_workers)
     sidecar = read_regular_file_snapshot(
         out_dir / GENERATION_SIDECAR,
         root=REPO_ROOT,
@@ -253,7 +303,22 @@ def _verify_committed_generation(
     if sidecar.data != _canonical_json_bytes(contract):
         raise RuntimeError("committed generation sidecar bytes가 staged contract와 다릅니다")
     contract_raw_roots = [REPO_ROOT / value for value in contract["raw_roots"]]
+    committed_decoder_audit: dict | None = None
+    if contract.get("schema_version") == CANONICAL_MANIFEST_SCHEMA_VERSION:
+        try:
+            committed_decoder_audit = validate_decoder_audit_binding(
+                contract.get("decoder_audit"),
+                manifest_dir=out_dir,
+                repo_root=REPO_ROOT,
+                raw_roots=contract_raw_roots,
+                raw_inventory_workers=worker_count,
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"committed decoder audit 결속이 깨졌습니다: {exc}") from exc
+    elif contract.get("training_eligible"):
+        raise RuntimeError("학습용 committed manifest는 canonical schema v4여야 합니다")
     committed_entries: dict[str, list[dict]] = {}
+    committed_audio_entries: list[tuple[str, int, dict]] = []
     for tag, metadata in sorted(contract["manifests"].items()):
         snapshot = read_regular_file_snapshot(
             out_dir / str(metadata["file"]),
@@ -267,31 +332,73 @@ def _verify_committed_generation(
             snapshot.data, manifest_path=out_dir / str(metadata["file"])
         )
         committed_entries[tag] = entries
-        for index, entry in enumerate(entries):
-            audio = Path(str(entry["path"]))
-            absolute = Path(os.path.abspath(audio))
-            allowed = next(
-                (
-                    root
-                    for root in contract_raw_roots
-                    if absolute == root or root in absolute.parents
-                ),
-                None,
-            )
-            if allowed is None:
-                raise RuntimeError(f"committed {tag} raw path가 declared root 밖입니다: {audio}")
-            audio_snapshot = read_regular_file_snapshot(
-                absolute,
-                root=allowed,
-                label=f"committed {tag} raw audio #{index}",
-                capture_bytes=False,
-            )
-            if audio_snapshot.sha256 != entry.get("content_sha256"):
-                raise RuntimeError(f"prepare 중 {tag} raw audio bytes가 바뀌었습니다: {audio}")
-    if contract.get("schema_version") == 3:
+        committed_audio_entries.extend(
+            (tag, index, entry) for index, entry in enumerate(entries)
+        )
+
+    def _verify_committed_audio(item: tuple[str, int, dict]) -> None:
+        tag, index, entry = item
+        audio = Path(str(entry["path"]))
+        absolute = Path(os.path.abspath(audio))
+        allowed = next(
+            (
+                root
+                for root in contract_raw_roots
+                if absolute == root or root in absolute.parents
+            ),
+            None,
+        )
+        if allowed is None:
+            raise RuntimeError(f"committed {tag} raw path가 declared root 밖입니다: {audio}")
+        audio_snapshot = read_regular_file_snapshot(
+            absolute,
+            root=allowed,
+            label=f"committed {tag} raw audio #{index}",
+            capture_bytes=False,
+        )
+        if audio_snapshot.sha256 != entry.get("content_sha256"):
+            raise RuntimeError(f"prepare 중 {tag} raw audio bytes가 바뀌었습니다: {audio}")
+        if audio_snapshot.size != entry.get("content_size"):
+            raise RuntimeError(f"prepare 중 {tag} raw audio size가 바뀌었습니다: {audio}")
+        if committed_decoder_audit is not None:
+            try:
+                validate_decoder_audit_manifest_entry(
+                    committed_decoder_audit,
+                    entry,
+                    repo_root=REPO_ROOT,
+                    raw_roots=contract_raw_roots,
+                    label=f"committed {tag} raw audio #{index}",
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"committed {tag} decoder audit row 결속이 깨졌습니다: {exc}"
+                ) from exc
+
+    if worker_count == 1:
+        for item in committed_audio_entries:
+            _verify_committed_audio(item)
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for _ in executor.map(_verify_committed_audio, committed_audio_entries):
+                pass
+    if contract.get("schema_version") == CANONICAL_MANIFEST_SCHEMA_VERSION:
         lineage = contract.get("public_lineage")
         if not isinstance(lineage, dict):
             raise RuntimeError("committed 학습 세대에 public_lineage가 없습니다")
+        if committed_decoder_audit is None:
+            raise RuntimeError("committed 학습 세대에 decoder audit가 없습니다")
+        try:
+            validate_decoder_audit_dns_marker_partition(
+                lineage,
+                committed_entries,
+                committed_decoder_audit,
+                repo_root=REPO_ROOT,
+                label="committed decoder audit DNS marker partition",
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"committed decoder audit DNS marker partition이 깨졌습니다: {exc}"
+            ) from exc
         summary = validate_public_manifest_lineage(committed_entries)
         if (
             summary["component_count"] != lineage.get("manifest_component_count")
@@ -435,6 +542,8 @@ def write_generation_transactionally(
     training_eligible: bool,
     raw_roots: list[Path] | None = None,
     public_lineage: dict | None = None,
+    decoder_audit: dict | None = None,
+    hash_workers: int = 1,
 ) -> dict:
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     with _generation_process_lock(out_dir):
@@ -447,6 +556,8 @@ def write_generation_transactionally(
             training_eligible=training_eligible,
             raw_roots=raw_roots,
             public_lineage=public_lineage,
+            decoder_audit=decoder_audit,
+            hash_workers=hash_workers,
         )
 
 
@@ -460,6 +571,8 @@ def _write_generation_transactionally_locked(
     training_eligible: bool,
     raw_roots: list[Path] | None,
     public_lineage: dict | None,
+    decoder_audit: dict | None,
+    hash_workers: int,
 ) -> dict:
     """검증된 manifest 세트와 provenance sidecar를 세대 단위로 교체한다.
 
@@ -492,8 +605,12 @@ def _write_generation_transactionally_locked(
         roots_for_contract = raw_roots or [REPO_ROOT]
         if training_eligible and not isinstance(public_lineage, dict):
             raise ValueError("학습용 manifest 세대에는 public_lineage 증거가 필수입니다")
+        if training_eligible and not isinstance(decoder_audit, dict):
+            raise ValueError("학습용 manifest 세대에는 완료된 decoder audit 증거가 필수입니다")
+        if not training_eligible and decoder_audit is not None:
+            raise ValueError("diagnostic-only manifest에는 canonical decoder audit을 결속하지 않습니다")
         contract = {
-            "schema_version": 3 if training_eligible else 2,
+            "schema_version": CANONICAL_MANIFEST_SCHEMA_VERSION if training_eligible else 2,
             "training_eligible": bool(training_eligible),
             "seed": int(seed),
             "data_config": str(data_config.relative_to(REPO_ROOT)),
@@ -514,6 +631,18 @@ def _write_generation_transactionally_locked(
         }
         if public_lineage is not None:
             contract["public_lineage"] = public_lineage
+        if decoder_audit is not None:
+            audit_snapshot = decoder_audit.get("_snapshot")
+            if audit_snapshot is None or not isinstance(getattr(audit_snapshot, "data", None), bytes):
+                raise ValueError("decoder audit source snapshot bytes가 없습니다")
+            audit_binding = decoder_audit_binding(decoder_audit)
+            audit_path = staged / DECODER_AUDIT_FILE
+            audit_path.write_bytes(audit_snapshot.data)
+            _fsync_file(audit_path)
+            # source audit와 staged copy가 같은 bytes인지 파일 자체에서 다시 확인한다.
+            if _sha256_file(audit_path) != audit_binding["sha256"] or audit_path.stat().st_size != audit_binding["size"]:
+                raise RuntimeError("staged decoder audit copy SHA/size가 source와 다릅니다")
+            contract["decoder_audit"] = audit_binding
         build_basis = _canonical_json_bytes(contract)
         contract["build_id"] = hashlib.sha256(build_basis).hexdigest()
         # 사람용 시각은 build identity에 포함하지 않는다. 같은 입력은 같은 build_id다.
@@ -526,7 +655,10 @@ def _write_generation_transactionally_locked(
 
         out_dir.mkdir(parents=True, exist_ok=True)
         _fsync_directory(out_dir.parent)
-        names = [f"{tag}.jsonl" for tag in sorted(prepared)] + [GENERATION_SIDECAR]
+        names = [f"{tag}.jsonl" for tag in sorted(prepared)]
+        if decoder_audit is not None:
+            names.append(DECODER_AUDIT_FILE)
+        names.append(GENERATION_SIDECAR)
         existed: dict[str, bool] = {}
         for name in names:
             target = out_dir / name
@@ -549,6 +681,7 @@ def _write_generation_transactionally_locked(
                     contract,
                     data_config=data_config,
                     holdout_path=holdout_path,
+                    hash_workers=hash_workers,
                 )
         except BaseException as original_error:
             # 하나의 복구가 실패해도 나머지 대상 복구를 끝까지 시도한다. 실패한 backup은
@@ -730,7 +863,30 @@ def main() -> int:
             "합성 manifest에서 추가 제외해 예약/활성 원본 누수를 막는다"
         ),
     )
+    parser.add_argument(
+        "--decoder-audit",
+        default=None,
+        help=(
+            "완료된 decoder eligibility audit JSON. 학습용(v4) manifest에서는 필수이며, "
+            "transaction이 같은 bytes를 output의 decoder_audit.json으로 복사해 결속한다"
+        ),
+    )
+    parser.add_argument(
+        "--hash-workers",
+        type=int,
+        default=1,
+        help=(
+            "raw SHA-256 검증 worker 수(기본 1, 1~32). 입력 순서·manifest bytes는 "
+            "바꾸지 않으며, 충분한 vCPU가 검증된 원격 bootstrap에서만 명시적으로 늘린다"
+        ),
+    )
     args = parser.parse_args()
+
+    try:
+        hash_workers = _hash_workers(args.hash_workers)
+    except ValueError as exc:
+        print(f"[실패] hash worker 설정 오류: {exc}", file=sys.stderr)
+        return 2
 
     plan = PoolPlan(
         pools=declared_pools(REPO_ROOT / args.data_config),
@@ -772,6 +928,28 @@ def main() -> int:
         print(f"[실패] raw root 경로 계약 위반: {exc}", file=sys.stderr)
         return 1
 
+    decoder_audit_evidence: dict | None = None
+    if not args.allow_corpus_leak:
+        if not isinstance(args.decoder_audit, str) or not args.decoder_audit.strip():
+            print(
+                "[실패] 학습용 manifest에는 --decoder-audit 완료 artifact가 필수입니다. "
+                "decoder eligibility audit 없이 retry가 불량 raw를 조용히 대체하는 것을 막습니다.",
+                file=sys.stderr,
+            )
+            return 2
+        audit_value = Path(args.decoder_audit)
+        audit_path = audit_value if audit_value.is_absolute() else REPO_ROOT / audit_value
+        try:
+            decoder_audit_evidence = read_decoder_audit(
+                audit_path,
+                repo_root=REPO_ROOT,
+                label="prepare decoder audit",
+            )
+        except (OSError, ValueError) as exc:
+            print(f"[BLOCKED] decoder audit 검증 실패: {exc}", file=sys.stderr)
+            return 1
+        _progress("decoder audit schema/fingerprint/inventory 검증 완료")
+
     tag_dirs: dict[str, list[Path]] = {}
     try:
         for root in roots:
@@ -780,6 +958,37 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         print(f"[실패] raw tree 안전 검사 실패: {exc}", file=sys.stderr)
         return 1
+
+    # scan_wavs가 decoder가 열지 못한 파일을 건너뛰더라도, DNS official archive
+    # marker와의 complete partition에는 그 audit-reject member가 반드시 남아야 한다.
+    # 이 projection은 accepted scan 결과가 아니라 audit inventory 전체에서 만든다.
+    decoder_rejected_marker_members: dict[str, tuple[str, ...]] | None = None
+    if decoder_audit_evidence is not None:
+        marker_tag_roots: dict[str, list[Path]] = {}
+        for tag, relative in DNS_MARKER_TAG_ROOTS.items():
+            expected = Path(os.path.abspath(REPO_ROOT / relative))
+            # ``speech`` tag에는 DNS read_speech와 LibriSpeech tree가 함께 있을 수
+            # 있다. marker projection은 official DNS archive root 하나만 대상으로
+            # 하고, LibriSpeech reject는 일반 public lineage에만 남긴다.
+            marker_tag_roots[tag] = [
+                path
+                for path in tag_dirs.get(tag, [])
+                if Path(os.path.abspath(path)) == expected
+            ]
+        try:
+            decoder_rejected_marker_members = derive_decoder_rejected_members_by_tag(
+                decoder_audit_evidence,
+                tag_roots=marker_tag_roots,
+                repo_root=REPO_ROOT,
+                label="prepare decoder audit DNS marker projection",
+            )
+        except ValueError as exc:
+            print(
+                f"[BLOCKED] decoder audit DNS marker projection 검증 실패: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        _progress("decoder audit DNS marker reject projection 완료")
 
     # ---- 실측과 겹치는 원본 제외 (D1) -------------------------------------------
     # 같은 오디오가 두 브랜치에 동시에 들어가면 모델은 같은 입력에 **상충하는 정답**을
@@ -877,18 +1086,77 @@ def main() -> int:
     # 실패 실행은 기존 manifest를 한 바이트도 바꾸지 않아야 한다.
     hashed_by_tag: dict[str, list[dict]] = {}
     sources_by_tag: dict[str, list[Path]] = {}
+    decoder_rejected_by_tag: dict[str, int] = {}
     for pool in plan.pools:
+        _progress(f"{pool.tag}: raw scan 시작")
         sources = tag_dirs.get(pool.tag, [])
+        # marker partition은 scan 결과가 0이어도 tag root 자체를 알아야 한다. 이후
+        # missing required tag gate는 accepted 항목 0을 별도로 fail-closed 처리한다.
+        sources_by_tag[pool.tag] = sources
         entries: list[dict] = []
         for src in sources:
             entries.extend(scan_wavs(src, pool.tag))
         if not entries:
             continue
+        _progress(
+            f"{pool.tag}: {len(entries)}개 raw content SHA 결속 시작 "
+            f"(workers={hash_workers})"
+        )
         try:
-            entries = _bind_audio_content_hashes(entries, raw_roots=roots)
+            entries = _bind_audio_content_hashes(
+                entries,
+                raw_roots=roots,
+                hash_workers=hash_workers,
+            )
         except OSError as exc:
             print(f"[실패] {pool.tag} raw content hash 실패: {exc}", file=sys.stderr)
             return 1
+        _progress(f"{pool.tag}: raw content SHA 결속 완료")
+        if decoder_audit_evidence is not None:
+            _progress(f"{pool.tag}: decoder audit entry 결속 시작 ({len(entries)}개)")
+            accepted_entries: list[dict] = []
+            rejected = 0
+            for index, entry in enumerate(entries):
+                if index and index % 1_000 == 0:
+                    _progress(
+                        f"{pool.tag}: decoder audit entry {index}/{len(entries)} 검증"
+                    )
+                absolute = Path(os.path.abspath(Path(str(entry.get("path") or ""))))
+                try:
+                    relative = absolute.relative_to(REPO_ROOT).as_posix()
+                except ValueError:
+                    relative = ""
+                audit_row = decoder_audit_evidence.get(
+                    "_inventory_by_relative_path", {}
+                ).get(relative)
+                if not isinstance(audit_row, dict):
+                    print(
+                        f"[BLOCKED] decoder audit inventory에 없는 raw가 있습니다: "
+                        f"{pool.tag}#{index} {absolute}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if audit_row.get("decision") == "reject":
+                    rejected += 1
+                    continue
+                try:
+                    validate_decoder_audit_manifest_entry(
+                        decoder_audit_evidence,
+                        entry,
+                        repo_root=REPO_ROOT,
+                        raw_roots=roots,
+                        label=f"prepare {pool.tag} raw audio #{index}",
+                    )
+                except ValueError as exc:
+                    print(f"[BLOCKED] decoder audit row 검증 실패: {exc}", file=sys.stderr)
+                    return 1
+                accepted_entries.append(entry)
+            entries = accepted_entries
+            decoder_rejected_by_tag[pool.tag] = rejected
+            _progress(
+                f"{pool.tag}: decoder audit entry 결속 완료 "
+                f"(accept={len(entries)}, reject={rejected})"
+            )
         hashed_by_tag[pool.tag] = entries
         sources_by_tag[pool.tag] = sources
 
@@ -914,12 +1182,24 @@ def main() -> int:
             # training 세대에서만 source-pool 추가 exclusion을 전달한다.
             if extra_excluded_basenames:
                 lineage_kwargs["extra_excluded_basenames"] = extra_excluded_basenames
+            if decoder_rejected_marker_members is not None:
+                lineage_kwargs["decoder_rejected_members_by_tag"] = (
+                    decoder_rejected_marker_members
+                )
+                lineage_kwargs["decoder_audit_inventory_sha256"] = str(
+                    decoder_audit_evidence["inventory_sha256"]
+                )
+            _progress("public lineage component 구성 시작")
             lineage_build = build_public_lineage(
                 hashed_by_tag,
-                tag_roots=sources_by_tag,
+                tag_roots=tag_dirs,
                 repo_root=REPO_ROOT,
                 holdout_lineage=clip_lineage,
                 **lineage_kwargs,
+            )
+            _progress(
+                "public lineage component 구성 완료 "
+                f"(components={lineage_build.evidence['component_count']})"
             )
             # transitive component가 tag를 가로지를 수 있으므로 모든 tag를 한 번에
             # 분할하되, 각 public tag 안에도 val/test가 생기게 계층화한다. 단일
@@ -954,6 +1234,7 @@ def main() -> int:
                 group_key="group_id",
                 stratify_key=stratify_tag,
             )
+            _progress("public lineage split 배정 완료")
             assigned_by_tag: dict[str, list[dict]] = {
                 tag: [] for tag in hashed_by_tag
             }
@@ -962,6 +1243,7 @@ def main() -> int:
                 tag = str(item.pop("_public_lineage_tag"))
                 assigned_by_tag[tag].append(item)
             manifest_lineage = validate_public_manifest_lineage(assigned_by_tag)
+            _progress("public lineage split 누수 검증 완료")
         except PublicLineageError as exc:
             print(f"[BLOCKED] public corpus 계보를 증명할 수 없습니다: {exc}", file=sys.stderr)
             return 1
@@ -1029,6 +1311,7 @@ def main() -> int:
             return 1
 
     try:
+        _progress("canonical manifest transaction 시작")
         generation = write_generation_transactionally(
             prepared,
             out_dir=out_dir,
@@ -1038,6 +1321,8 @@ def main() -> int:
             training_eligible=not args.allow_corpus_leak,
             raw_roots=roots,
             public_lineage=public_lineage_evidence,
+            decoder_audit=decoder_audit_evidence,
+            hash_workers=hash_workers,
         )
     except (OSError, ValueError, RuntimeError) as exc:
         print(
@@ -1068,6 +1353,8 @@ def main() -> int:
         n_train = sum(1 for e in entries if e["split"] == "train")
         total_h = sum(e["duration_s"] for e in entries) / 3600.0
         suffix = f", held-out 제외 {dropped}" if dropped else ""
+        if decoder_rejected_by_tag.get(tag, 0):
+            suffix += f", decoder reject 제외 {decoder_rejected_by_tag[tag]}"
         where = ", ".join(str(p.relative_to(REPO_ROOT)) for p in sources)
         print(
             f"{tag}: {len(entries)}개 파일 ({total_h:.1f}h), train {n_train}{suffix} "

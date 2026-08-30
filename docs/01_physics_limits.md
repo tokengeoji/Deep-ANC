@@ -26,6 +26,22 @@ CS→ERR 50mm = 0.15ms 에 불과).
 q+joint-LS/cubic witness, immutable source SHA와 두 운영자 확인이 없어 readiness가 거부한다.
 새 strict 48k 캡처 전에는 어떤 값도 현재 official P/S로 간주하지 않는다.
 
+### 현재 strict P/S (2026-08-27, official)
+
+현재 학습·runtime timing의 단일 출처는
+`capture_id=5ac1313488c8434bb4d672a36503df59`이다. P/S는 같은 raw·analysis SHA,
+48 kHz/256/low, xrun 0, 19 kept repeats를 공유한다.
+
+| 항목 | 현재 strict 값 |
+|---|---:|
+| P `delay_samples` / `bulk_delay_samples` | 1386 / 1642 |
+| S `delay_samples` / `bulk_delay_samples` | 1245 / 1501 |
+| handoff | 256 |
+| **lead** | **115** (`1245 + 256 − 1386`) |
+| P/S 150–1600 Hz consistency | 0.999821 / 0.999716 |
+
+이 150–1600 Hz 식별은 모델 감쇠나 2–8 kHz ANC 성능을 증명하지 않는다.
+
 > [!CAUTION]
 > **절대 지연(1602 / 1462)은 캡처 간 재현되지 않는다.** 저장된 캡처 11건을 전수 재분석하면
 > 유효 9건 전부에서 `P−S = 139~141`, `lead = 115~117` 이지만 절대 지연은

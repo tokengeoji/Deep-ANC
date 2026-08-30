@@ -1,7 +1,7 @@
 # Jetson 데이터 Google Drive 백업 기록
 
 최초 시작: 2026-08-27 (KST)  
-상태: **업로드 진행 중 — 원본 삭제 금지 상태**
+상태: **순차 업로드 진행 중 — 검증 완료한 개별 public 원본만 부분 정리**
 
 ## 백업 대상과 무결성 기준
 
@@ -22,17 +22,27 @@
 
 ## 실행 상태
 
-처음 실행한 전체 `data` 복사는 하위 디렉터리 전용 복사와 겹쳐 중복 객체가 생길
-수 있어 중단했다. 이후 다음 네 경로만 단일 목적지의 같은 상대경로로 복사한다.
+처음 실행한 전체 `data` 복사는 하위 디렉터리 전용 복사와 겹치고 Google Drive
+요청률 제한을 일으킬 수 있어 중단했다. 하위 경로를 병렬로 재개한 시도에서도
+`RATE_LIMIT_EXCEEDED`가 관찰되어 해당 작업을 중단하고, 이미 올라간 객체를
+그대로 둔 채 `setsid`로 분리한 저요청률 순차 복사를 재개했다. 현재 순차 작업은
+다음 경로를 정확한 동일 목적지에 차례로 복사한다.
 
 ```text
-data/raw
+data/raw/music
+data/raw/noise
+data/raw/speech
 data/recorded
 data/recorded_broken
+data/source_pool
 data/source_pool_v2
+data/manifests
+data/rir_bank
 ```
 
-명령은 `rclone copy`이며 `sync`, `move`, 원본 삭제 옵션을 사용하지 않는다. 따라서
+현재 작업은 `--fast-list`, `--checkers 2`, `--transfers 2`, `--tpslimit 4`,
+`--drive-pacer-min-sleep 250ms`를 사용한다. 명령은 `rclone copy`이며 `sync`,
+`move`, 원본 삭제 옵션을 사용하지 않는다. 따라서
 현재는 원본과 이미 올라간 원격 파일 모두 보존된다. 업로드가 끝난 뒤에만 다음을
 실행한다.
 
@@ -41,6 +51,22 @@ data/source_pool_v2
 3. 원격 중복 경로가 없는지 목록을 검사한다.
 4. manifest SHA를 다시 대조하고 백업 receipt를 Drive에 기록한다.
 5. 검증된 경로만 휴지통으로 이동하거나 정확한 목록을 삭제한다.
+
+### 2026-08-28 부분 검증·정리 receipt
+
+순차 작업과 다른 source를 삭제하지 않도록, 삭제 전에는 해당 source의 `rclone copy`
+종료, local/remote 파일 수·바이트 대조, `rclone check --one-way` 0 differences, 실행
+프로세스 미점유를 각각 확인했다.
+
+| Local path | Drive 검증 | 삭제 결과 | 보존한 항목 |
+|---|---|---|---|
+| `data/raw/music/fma_small` | 8,002 files, 7,975,472,258 bytes, fixed manifest SHA 일치, `rclone check` 0 differences | 삭제 완료 | `fma_metadata/tracks.csv` |
+| `data/raw/noise/esc50/ESC-50-master/audio` | 2,000 files, 882,088,000 bytes, `rclone check --one-way`: 0 differences / 2,000 matching | 삭제 완료 | `meta/esc50.csv` 및 ESC-50 repository metadata |
+
+`data/raw/speech`는 이 기록 시점에도 전송 중이므로 표의 검증·삭제 대상이 아니다.
+그 외 `recorded`, `recorded_broken`, `source_pool`, `source_pool_v2`도 각 경로의
+전송·검증이 끝나기 전까지 보존한다. 검증된 Drive 사본에서 복구할 수 있지만, Jetson의
+로컬 삭제 자체는 되돌릴 수 없으므로 다음 후보도 같은 순서로만 처리한다.
 
 ## 삭제·보존 정책
 

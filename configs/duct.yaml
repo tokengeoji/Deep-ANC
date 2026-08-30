@@ -67,4 +67,11 @@ digital_reference:
   # 이전 primary_path_il.npz는 legacy diagnostic artifact로만 보존한다.
   primary_path_npz: assets/measured/primary_path_il_strict_5dc06fdd.npz
 
+# strict P/S와 같은 앰프 설정에서 얻은 레벨 증거. 실시간 digital-reference DL은
+# 이 raw/analysis SHA까지 P/S와 일치하는지 오디오 장치를 열기 전에 확인한다.
+# canonical 모델이 생기기 전 legacy ONNX/checkpoint를 실제 덕트 모델처럼 실행하지
+# 못하게 하는 물리 계약의 일부다.
+strict_measurement:
+  measurement_level_evidence: assets/measured/measurement_level_evidence.json
+
 # 입출력 정규화 스케일은 모델 설정(model_*.yaml io_scale)이 단일 출처다 (감사 M8)

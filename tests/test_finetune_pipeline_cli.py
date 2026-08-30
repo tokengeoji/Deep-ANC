@@ -411,6 +411,11 @@ def test_canonical_pretrain_also_requires_the_same_run_lock():
     assert train_entry.requires_same_run_lock(
         {"experiment_role": "canonical_finetune"}
     )
+    assert train_entry.requires_same_run_lock(
+        {"experiment_role": "a100_pretrain_smoke"}
+    )
+    assert train_entry.requires_same_run_lock({"experiment_role": "loss_pilot"})
+    assert train_entry.requires_same_run_lock({"experiment_role": "measured_probe"})
     assert not train_entry.requires_same_run_lock(
         {"experiment_role": "diagnostic_overfit"}
     )

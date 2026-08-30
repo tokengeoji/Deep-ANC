@@ -3,7 +3,7 @@
 
     job_queue.py verify --queue configs/elice/queue_gpu1.yaml    # 스키마 검증만
     job_queue.py plan   --queue configs/elice/queue_gpu1.yaml    # 실행 예정 순서
-    job_queue.py run    --queue configs/elice/queue_gpu1.yaml    # 감독자 기동
+    job_queue.py run --allow-legacy-diagnostic --queue configs/elice/queue_gpu1.yaml
     job_queue.py run    --queue ... --dry-run                    # GPU 무접촉 예행
 
 감독자는 어떤 작업 실패에도 종료하지 않는다. 종료하는 순간 GPU 가 놀기 때문이다.
@@ -43,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu", type=int, default=None, help="큐의 gpu 와 일치해야 한다")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--allow-legacy-diagnostic",
+        action="store_true",
+        help="legacy_diagnostic 큐를 실제 실행할 때만 명시한다",
+    )
+    parser.add_argument(
         "--exit-when-drained",
         action="store_true",
         help="큐가 마르면 종료한다(기본은 살아남아 큐 파일 추가를 계속 확인)",
@@ -76,8 +81,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[중단] --gpu {args.gpu} 가 큐의 gpu {spec.gpu} 와 다릅니다", file=sys.stderr)
         return EXIT_SPEC
 
+    if (
+        args.command == "run"
+        and spec.execution_class == "legacy_diagnostic"
+        and not args.allow_legacy_diagnostic
+    ):
+        print(
+            "[중단] legacy_diagnostic 큐는 canonical 학습을 만들 수 없습니다. "
+            "과거 진단을 의도한 경우에만 --allow-legacy-diagnostic를 명시하세요.",
+            file=sys.stderr,
+        )
+        return EXIT_SPEC
+
     if args.command == "verify":
-        print(f"[OK] {spec.source}: gpu={spec.gpu}, 작업 {len(spec.jobs)}개, adopt {len(spec.adopt)}개")
+        print(f"[OK] {spec.source}: class={spec.execution_class}, gpu={spec.gpu}, 작업 {len(spec.jobs)}개, adopt {len(spec.adopt)}개")
         return EXIT_OK
 
     if args.command == "plan":

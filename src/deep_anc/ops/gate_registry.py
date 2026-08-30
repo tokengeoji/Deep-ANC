@@ -883,9 +883,24 @@ GATES: tuple[GateDeclaration, ...] = (
         negative_fixture=f"{_NEG}::test_runtime_lead_gate_fails_when_checkpoint_disagrees",
         discoverable_id=False,
         positive_fixture=(
-            "tests/test_gate_positive_fixtures.py::test_runtime_lead_gate_accepts_the_measured_lead_116_exactly"
+            "tests/test_gate_positive_fixtures.py::test_runtime_lead_gate_accepts_the_measured_lead_115_exactly"
         ),
-        positive_probe="확정 lead 116 정확 일치 (여유 0, 1 샘플 어긋나면 거부)",
+        positive_probe="현재 strict lead 115 정확 일치 (여유 0, 1 샘플 어긋나면 거부)",
+    ),
+    GateDeclaration(
+        gate_id="runtime_strict_plant_contract",
+        owner="src/deep_anc/realtime/plant_contract.py",
+        what_it_asserts="digital-reference DL runtime이 strict P/S·raw provenance에서 유도한 lead와 일치한다",
+        negative_fixture=(
+            "tests/test_runtime_plant_contract.py::"
+            "test_runtime_strict_plant_contract_rejects_the_legacy_109_sample_lead"
+        ),
+        discoverable_id=False,
+        positive_fixture=(
+            "tests/test_runtime_plant_contract.py::"
+            "test_runtime_strict_plant_contract_accepts_the_actual_115_sample_contract"
+        ),
+        positive_probe="same-capture P=1386/S=1245/handoff=256 → lead 115, raw/analysis/level SHA까지 대조",
     ),
     GateDeclaration(
         gate_id="runtime_engine_artifact_preflight",
