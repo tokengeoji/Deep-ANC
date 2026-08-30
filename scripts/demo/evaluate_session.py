@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from deep_anc.audio_io import capture_input_probe                         # noqa: E402
 from deep_anc.config import REPO_ROOT, load_runtime_config, load_yaml     # noqa: E402
 from deep_anc.dsp.secondary_path import load_secondary_path                # noqa: E402
+from deep_anc.dsp.timing import BandPlan                                   # noqa: E402
 from deep_anc.eval.artifacts import (                                      # noqa: E402
     atomic_write_text,
     run_directory,
@@ -172,11 +173,11 @@ def main() -> int:
         raise ValueError(
             f"S(z) sample_rate={sp.sample_rate}Hz != runtime sample_rate={fs_config}Hz"
         )
-    trusted = intersect_frequency_bands(
-        sp.trusted_band_hz(),
-        initial_cfg["duct"]["acoustics"]["realistic_target_band_hz"],
-        fs_config / 2.0,
-    )
+    trusted = BandPlan.resolve(
+        plant_trusted_band_hz=sp.trusted_band_hz(),
+        duct_cfg=initial_cfg["duct"],
+        sample_rate=fs_config,
+    ).optimize.as_tuple()
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = (

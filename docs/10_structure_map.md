@@ -21,12 +21,12 @@ configs/train_*.yaml ──load_train_config(config.py:73)──▶ cfg{model,da
   SynthANCDataset(data/synth_dataset.py)              n(t) [T=1.5s→71,936샘플(256 배수 내림)]
   ├ RIR 뱅크: data/rir_bank/duct_rirs_v1.npz (build_rir_bank.py 300변형; 분할 5/5/90% 하드코딩)
   │   duct.yaml positions_m/reflection/duct.* ──dsp/duct_sim.py 영상법──▶ p_ref / p_err / f_fb
-  ├ digital-ref: x_ref=n[t+K], K=109(현 corrected Stage-1)
+  ├ digital-ref: x_ref=n[t+K], K=116(실측 P/S 유도. 배포 중 ONNX artifact 는 109)
   │   └ d=P(z)*n[t]; primary_path.resolve_digital_primary_path 선택
   │      ├ secondary_surrogate(현 Stage-1): P FIR/gain=S FIR/gain, 지연 D_noise
   │      ├ measured(파인튜닝): primary_path_npz FIR+실측 순수지연을 각 1회
   │      └ rir_surrogate(legacy/비교): p_err RIR + D_noise−t_ac(NS→ERR) [이중계상 방지]
-  │   D_noise = duct.digital_reference.d_noise_delay_samples(null → 기하추정 1489 = 1342−7+154)
+  │   D_noise = duct.digital_reference.d_noise_delay_samples = 1602 (실측 P(z))
   ├ err_in = delay(d, fb∈[512,1024]) + 마이크잡음(snr_mic_noise_db)
   │          + 전원 험(dc_hum_prob=0.2; 50/60Hz+2차) + 채널드롭아웃(0.15/0.15 하드코딩)
   ▼
@@ -36,10 +36,10 @@ x=[B,2,T] ──HybridANCNet(models/hybrid_anc.py: /io_scale(model_*.yaml에 0.0
   ▼
 ANCLoss(losses/anc_loss.py, FP32 강제)
   y → RandomNonlinear(현 Stage-1: drive=1, SEF η=10, hardclip=0 → 사실상 선형)
-    → DifferentiableSecondaryPath(현 Stage-1: 지연 1342+핸드오프256,
+    → DifferentiableSecondaryPath(현 Stage-1: 지연 1462+핸드오프256,
        jitter/gain/tilt=0, allpass=false → 관측 가능한 공칭 plant 고정)
   e = d + S(G(y))
-    ├ 최적화/체크포인트: trusted NMSE(S 실측 150–600 ∩ 목표 80–800 = 150–600Hz)
+    ├ 최적화/체크포인트: trusted NMSE(S 실측 150–1600 ∩ 목표 80–1600 = 150–1600Hz)
     ├ 동시 관측: fullband NMSE(do-no-harm)
     └ + λ·MRSTFT×W(f)[curriculum_a: 80–800Hz ×3, >1633Hz ×0.25]
        + λ_pow·|y|² + λ_clip·relu(|y|−0.18)²
@@ -63,11 +63,12 @@ recorded test 전에는 물리 감쇠 주장에 쓰지 않는다.
 ```
 best.pt(resolved cfg/physics_status/lead 포함) ──export_onnx.py(블록256, 상태 명시 I/O, ORT 등가 검증)
         ──▶ model.onnx + model.json(lead 메타; 런타임 mismatch fail-fast, legacy=0)
-        ──scripts/export/build_trt.sh──▶ model_fp16.plan (+메타 json 복사)
+        ──scripts/export/build_trt.sh──▶ <name>_fp16.plan (+메타 json 복사)
+          실재: runs/export/{tiny_corrected.onnx, tiny_corrected_fp16.plan, tiny_long.onnx}
 runtime.yaml ──load_runtime_config(config.py:91)──▶ RealtimeANC(realtime/run_realtime.py, 3-스레드)
   [콜백]  int32 입력 → DCBlocker → in_ring / NoiseProgram(noise.*)
-          생성 신호+소음 게이트 → DigitalReferenceBuffer → 109샘플 늦은 ch0
-          생성 신호는 즉시 ref_digital(`ref[t]=source[t+K]`, K=109 artifact)
+          생성 신호+소음 게이트 → DigitalReferenceBuffer → K샘플 늦은 ch0
+          생성 신호는 즉시 ref_digital(`ref[t]=source[t+K]`, K = artifact 의 lead)
           out_ring.pop_latest → SafetySupervisor.limit(0.2) → FadeGate → ch1(int16)
   [추론]  ref(digital=소스|mic) + err → engine.step(hop=256, ==block_size 강제) → out_ring
           (1 hop 핸드오프 = 학습 handoff_extra_samples=256 과 정합 [C1])
@@ -94,7 +95,7 @@ measure_duct_transfer_map.py(단일 stream/time-division ESS 또는 multitone)
   → NS→REF/ERR + CS→REF/ERR 반복 IR·magnitude/phase/coherence/group delay
   → 같은 I2S ERR-REF TDOA / PortAudio ADC-DAC timestamp / 절대지연을 분리 저장
   → 안정 지연일 때만 acoustic/digital 인과성 예산을 유효화; NPZ+JSON+Markdown(+PNG)
-run_realtime --calibrate: 3-스레드 실효지연 측정 vs (1342+256) 대조
+run_realtime --calibrate: 3-스레드 실효지연 측정 vs (1462+256) 대조
 
 Trainer: trusted/fullband NMSE 동시 집계, trusted로 best 선택
 eval/metrics.py: S(z) excitation∩duct target 교집합 + 공용 band NMSE 규약
@@ -160,7 +161,7 @@ init_ckpt/recorded_manifest/recorded_ratio/freeze_encoder(파인튜닝) → Trai
 `require_measured_primary_path: true`는 digital 파인튜닝에서 surrogate P(z)를 시작 전에 거부한다.
 `require_init_checkpoint: true`는 초기 checkpoint 누락을 거부하고, Trainer는 저장 lead와
 파인튜닝 lead가 다르면 가중치를 적용한 직후 즉시 실패한다.
-`loss.nmse_objective=trusted_band`는 S 실측 대역∩덕트 목표대역(현 150–600Hz)을
+`loss.nmse_objective=trusted_band`는 S 실측 대역∩덕트 목표대역(현 150–1600Hz)을
 최적화하고 fullband NMSE를 동시 로깅한다. `best.pt`는 trusted val 기준이다.
 체크포인트 스냅샷에는 `physics_status`와 lead/trusted band alias가 남는다.
 

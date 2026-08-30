@@ -19,12 +19,15 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
-from ..config import DEFAULT_HANDOFF_SAMPLES, REPO_ROOT
+from ..config import REPO_ROOT
 from ..data.recorded_dataset import RecordedANCDataset
 from ..data.synth_dataset import SynthANCDataset, make_eval_batch
 from ..dsp.nonlinear import RandomNonlinear
 from ..dsp.secondary_path import DifferentiableSecondaryPath, load_secondary_path
-from ..losses import ANCLoss, intersect_frequency_bands
+# 지연·대역 부기의 단일 출처. trainer 가 handoff/대역을 스스로 유도하면 게이트와
+# 갈라진다 — 실제로 lead 가 109 와 113 으로 갈라졌다 (발생기 A).
+from ..dsp.timing import BandPlan, PlantSettle, handoff_samples_from_config
+from ..losses import ANCLoss
 from ..models import build_model
 from .checkpoint import load_checkpoint, save_checkpoint
 from .reproducibility import set_seed, snapshot_run
@@ -57,6 +60,34 @@ def validate_training_physics(cfg: dict) -> str:
     if primary_mode == "measured":
         return "measured_primary_path"
     return f"{primary_mode}_representation_pretrain"
+
+
+BEST_METRIC_KEY = "nmse_trusted_cvar_db"
+"""``best.pt`` 선택 기준이 **무엇을 잰 값인지**.
+
+2026-08-05 이전에는 trusted **평균**이었다. 평가 게이트 G4 는 그때도 family 별
+``worst10_mean_db < 0`` (= CVaR@10%)을 요구하고 있었다 — 평가는 최악값을 보는데
+학습과 checkpoint 선택만 평균을 봤고, 그 불일치가 "평균은 좋은데 게이트는 FAIL"
+(결함 4)을 만들었다. 이제 셋이 같은 종류의 양을 본다.
+
+이 라벨을 checkpoint 에 박아 두지 않으면 서로 다른 지표끼리 ``min`` 비교하게 되고,
+CVaR 은 평균보다 **항상 크므로** 옛 best 가 영원히 이겨 best.pt 가 갱신되지 않는다.
+"""
+
+_LEGACY_BEST_METRIC_KEY = "nmse_trusted_db"
+
+
+def checkpoint_best_metric_key(state: dict) -> str:
+    """checkpoint 의 best_metric 이 어떤 지표인지. 표식이 없으면 legacy(평균)."""
+
+    saved_cfg = state.get("cfg", {}) or {}
+    return str(saved_cfg.get("best_metric_key", _LEGACY_BEST_METRIC_KEY))
+
+
+def checkpoint_best_metric_is_comparable(state: dict) -> bool:
+    """지금 기준과 같은 양을 잰 best_metric 인가."""
+
+    return checkpoint_best_metric_key(state) == BEST_METRIC_KEY
 
 
 def checkpoint_training_lead(state: dict) -> int:
@@ -183,9 +214,7 @@ class Trainer:
         pp = cfg["data"].get("plant_perturbation", {})
         plant = DifferentiableSecondaryPath(
             sp,
-            handoff_extra_samples=int(
-                duct["secondary_path"].get("handoff_extra_samples", DEFAULT_HANDOFF_SAMPLES)
-            ),
+            handoff_extra_samples=handoff_samples_from_config(duct),
             delay_jitter_range=tuple(pp.get("delay_jitter_range", [0, 0])),
             gain_db_range=tuple(pp.get("gain_db", [0.0, 0.0])),
             tilt_db_per_octave_range=tuple(pp.get("gain_tilt_db_per_octave", [0.0, 0.0])),
@@ -201,12 +230,16 @@ class Trainer:
         )
         acoustics = duct.get("acoustics", {})
         cutoff = float(acoustics.get("plane_wave_cutoff_hz", 1633.0))
-        target_band = tuple(acoustics.get("realistic_target_band_hz", [80.0, 1000.0]))
-        self.trusted_band_hz = intersect_frequency_bands(
-            tuple(sp.trusted_band_hz()),
-            target_band,
-            self.fs / 2.0,
+        # 대역은 BandPlan 이 유일하게 유도한다. 예전에는 이 세 줄이 trainer /
+        # eval.recorded / evaluate_offline / evaluate_session / render_anc_demo 에
+        # **다섯 벌** 복붙돼 있었고, S npz 의 신뢰대역을 넓혀도 따라오지 않는 곳이 생겼다.
+        self.band_plan = BandPlan.resolve(
+            plant_trusted_band_hz=sp.trusted_band_hz(),
+            duct_cfg=duct,
+            sample_rate=self.fs,
         )
+        target_band = self.band_plan.target.as_tuple()
+        self.trusted_band_hz = self.band_plan.optimize.as_tuple()
         if self.is_main:
             print(
                 "[trainer] NMSE trusted band: "
@@ -220,20 +253,43 @@ class Trainer:
                     "[trainer 경고] surrogate P(z) 표현 사전학습입니다 — "
                     "실측 덕트 감쇠 성능으로 해석하지 마세요."
                 )
+        # 리미터 한계는 **모델이 단일 출처**다. 예전에는 loss.clip_margin 과
+        # model.limiter.limit 이 서로 다른 두 곳에 적힌 같은 물리량이었고, trainer 가
+        # 부등식 하나로 대조하는 것이 전부였다 (감사 L8). 이제 손실이 모델 값을
+        # 그대로 받는다 — 두 번째 유도가 존재하지 않는다.
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
         self.criterion = ANCLoss(
             plant, cfg["loss"], self.fs, nonlinear=nonlinear,
             cutoff_hz=cutoff, target_band_hz=target_band,
             trusted_band_hz=self.trusted_band_hz,
+            limiter_limit=float(raw_model.limit),
         ).to(self.device)
 
-        # 헤드룸 정합: 손실 클립 마진 < 모델 소프트리미터 한계 (감사 L8)
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        clip_margin = float(cfg["loss"].get("clip_margin", 0.18))
-        if clip_margin >= raw_model.limit:
-            raise ValueError(
-                f"loss.clip_margin({clip_margin}) 은 모델 limiter.limit({raw_model.limit}) "
-                "보다 작아야 합니다"
-            )
+        # S(z) 총지연 + FIR 정착 구간은 y 가 무엇이든 e = d 로 고정된다.
+        # 합성 d 는 P(z) 지연 때문에 그 구간이 비어 있어 공짜지만(trusted 하한 −59.8 dB),
+        # 실측 d 는 실신호가 들어 있어 노출된다(하한 mean −20.3 / CVaR10 −10.1 / worst
+        # −4.8 dB). 평균 집계에서는 0.03 dB 로 작아 보였지만 CVaR 로 바꾸는 순간
+        # 달성 불가능한 목표에 그래디언트가 집중된다 — 두 변경은 반드시 같이 간다.
+        # 값의 단일 출처는 PlantSettle 이고, 평가기 warmup 도 같은 값을 하한으로 쓴다.
+        self.plant_settle = PlantSettle.derive(
+            secondary_delay_samples=int(sp.delay_samples),
+            handoff_samples=handoff_samples_from_config(duct),
+            fir_taps=int(sp.fir.size),
+            sample_rate=self.fs,
+        )
+        self.loss_start_sample = int(
+            cfg.get("loss_start_sample", self.plant_settle.samples)
+        )
+        if self.loss_start_sample < 0:
+            raise ValueError("loss_start_sample 은 0 이상이어야 합니다")
+        if self.is_main:
+            print(f"[trainer] loss_start_sample {self.plant_settle.describe()}")
+            if self.loss_start_sample != self.plant_settle.samples:
+                print(
+                    f"[trainer 경고] loss_start_sample 이 설정으로 "
+                    f"{self.loss_start_sample} 로 덮였습니다 — 정착 구간 "
+                    f"{self.plant_settle.samples} 와 다릅니다"
+                )
 
         # ----- 데이터 -----
         # 비-synthetic 태그의 manifest 존재를 명시 검사 — 조용한 합성 폴백으로
@@ -301,7 +357,12 @@ class Trainer:
             print(f"[trainer] recorded_manifest({recorded_manifest}) 없음 — 합성 데이터만 사용")
 
         val_ds = SynthANCDataset(cfg["data"], duct, split="val", seed=1234)
-        self.val_batch = make_eval_batch(val_ds, n_items=min(16, int(cfg["batch_size"])))
+        # CVaR 목적함수는 분위 추정이다. 16개면 q=0.25 가 top-4 뿐이라 추정이 흔들린다.
+        # val 배치는 학습 batch_size 와 무관하게 키울 수 있다(그래디언트가 없다).
+        self.val_items = int(cfg.get("val_items", 64))
+        if self.val_items < 1:
+            raise ValueError(f"val_items 는 1 이상이어야 합니다: {self.val_items}")
+        self.val_batch = make_eval_batch(val_ds, n_items=self.val_items)
 
         # ----- 옵티마이저/스케줄 -----
         opt_cfg = cfg["optimizer"]
@@ -344,7 +405,7 @@ class Trainer:
             # resolved model/data/duct까지 전부 남겨야 surrogate/실측 P(z), lead,
             # plant curriculum을 나중에 정확히 구분할 수 있다. 비밀정보는 학습
             # config에 두지 않는 저장소 규약을 따른다.
-            snapshot_run(self.run_dir, cfg_snapshot(cfg, self.trusted_band_hz))
+            snapshot_run(self.run_dir, self._cfg_snapshot(cfg))
             try:
                 from torch.utils.tensorboard import SummaryWriter
 
@@ -399,23 +460,48 @@ class Trainer:
             validate_resume_physics(state, cfg)
             self.step = int(state.get("step", 0))
             self.best_metric = float(state.get("best_metric", float("inf")))
-            # 구버전 last.pt는 eval에서 best 갱신 직전에 저장되어 best_metric이
-            # 한 회 늦을 수 있다. 같은 run의 best.pt가 있으면 더 좋은 값을 authority로
-            # 사용해 재개 직후 나쁜 val이 best.pt를 덮어쓰지 못하게 한다.
-            best_path = self.run_dir / "ckpt" / "best.pt"
-            if best_path.exists():
-                try:
-                    best_state = torch.load(
-                        best_path, map_location="cpu", weights_only=False
+            if not checkpoint_best_metric_is_comparable(state):
+                # 다른 지표끼리 min 비교하면 조용히 잘못된 best 가 고정된다. 2026-08-05
+                # 이전 checkpoint 의 best 는 trusted **평균**(예: −19.54)이고 지금은
+                # CVaR 이라 항상 평균이 이긴다 → best.pt 가 영원히 갱신되지 않는다.
+                if self.is_main:
+                    print(
+                        "[trainer 경고] resume checkpoint 의 best_metric 이 "
+                        f"'{checkpoint_best_metric_key(state)}' 기준입니다 — 현재 기준"
+                        f" '{BEST_METRIC_KEY}' 과 비교할 수 없어 best_metric 을 "
+                        "초기화합니다"
                     )
-                    self.best_metric = min(
-                        self.best_metric,
-                        float(best_state.get("best_metric", float("inf"))),
-                    )
-                except (OSError, RuntimeError, ValueError, TypeError):
-                    pass
+                self.best_metric = float("inf")
+            else:
+                # 구버전 last.pt는 eval에서 best 갱신 직전에 저장되어 best_metric이
+                # 한 회 늦을 수 있다. 같은 run의 best.pt가 있으면 더 좋은 값을
+                # authority로 사용해 재개 직후 나쁜 val이 best.pt를 덮어쓰지 못하게 한다.
+                best_path = self.run_dir / "ckpt" / "best.pt"
+                if best_path.exists():
+                    try:
+                        best_state = torch.load(
+                            best_path, map_location="cpu", weights_only=False
+                        )
+                        if checkpoint_best_metric_is_comparable(best_state):
+                            self.best_metric = min(
+                                self.best_metric,
+                                float(best_state.get("best_metric", float("inf"))),
+                            )
+                    except (OSError, RuntimeError, ValueError, TypeError):
+                        pass
             if self.is_main:
                 print(f"[trainer] 재개: step {self.step}, best {self.best_metric:.3f}")
+
+    def _cfg_snapshot(self, cfg: dict) -> dict:
+        """이 실행이 쓴 목적함수/절단 규약까지 포함한 스냅샷."""
+
+        return cfg_snapshot(
+            cfg,
+            self.trusted_band_hz,
+            best_metric_key=BEST_METRIC_KEY,
+            loss_start_sample=self.loss_start_sample,
+            cvar_scope="rank_local" if self.world > 1 else "global",
+        )
 
     # ---------- 스텝 ----------
 
@@ -425,7 +511,9 @@ class Trainer:
         if self.stage == "closed_loop":
             return self._closed_loop_forward(x, d)
         y = self.model(x)
-        return self.criterion(y, d)
+        # open_loop 도 정착 구간을 버린다. 예전에는 closed_loop 만 skip 을 넘겼고
+        # 실측 배치(open_loop)는 e[0:1721] = d[0:1721] 을 그대로 손실에 넣었다.
+        return self.criterion(y, d, loss_start_sample=self.loss_start_sample)
 
     def _closed_loop_forward(self, x: torch.Tensor, d: torch.Tensor) -> tuple[torch.Tensor, dict]:
         """Stage-2: 프레임 순차 unroll — 시뮬레이션 e 를 err 입력으로 되먹임 [H1/H3].
@@ -476,7 +564,8 @@ class Trainer:
             e_hist[..., : y_so_far.shape[-1]] = d[..., : y_so_far.shape[-1]] + s_y
 
         y = torch.cat(y_parts, dim=-1)
-        skip = int(warmup_s * self.fs)
+        # 폐루프 워밍업과 플랜트 정착 중 **더 긴 쪽**을 버린다.
+        skip = max(int(warmup_s * self.fs), self.loss_start_sample)
         # 절단은 손실 내부에서 플랜트 적용 "후"에 수행 (결함 #2/#5)
         return self.criterion(y, d, loss_start_sample=skip, perturb=perturb, nl_params=nl_params)
 
@@ -488,7 +577,9 @@ class Trainer:
             d = self.val_batch["d"].to(self.device)
             raw = self.model.module if hasattr(self.model, "module") else self.model
             y = raw(x)
-            _, metrics = self.criterion(y, d)
+            _, metrics = self.criterion(
+                y, d, loss_start_sample=self.loss_start_sample
+            )
         self.model.train()
         self.criterion.train()
         return metrics
@@ -547,19 +638,41 @@ class Trainer:
 
             if self.step % eval_every == 0:
                 val_metrics = self._validate_metrics()
-                val_nmse = val_metrics["nmse_trusted_db"]
+                # best 선택도 최악값 기준. 평가 G4 가 family 별 worst10(=CVaR@10%)을
+                # 보는데 선택만 평균을 보면, 게이트에서 떨어질 checkpoint 를 best 로
+                # 저장하게 된다 (결함 4 재현 경로).
+                val_mean = float(val_metrics["nmse_trusted_db"])
+                val_nmse = float(
+                    val_metrics.get("nmse_trusted_cvar_db", val_metrics["nmse_trusted_db"])
+                )
+                val_worst = float(val_metrics.get("nmse_trusted_worst_db", float("nan")))
                 val_fullband_nmse = val_metrics["nmse_fullband_db"]
                 stop_flag = torch.zeros(1, device=self.device)
                 if self.is_main:
                     print(
-                        f"[eval] step {self.step}: val trusted NMSE {val_nmse:.2f} dB | "
-                        f"fullband NMSE {val_fullband_nmse:.2f} dB",
+                        f"[eval] step {self.step}: val trusted CVaR {val_nmse:+.2f} dB "
+                        f"(mean {val_mean:+.2f}, worst {val_worst:+.2f}) | "
+                        f"fullband {val_fullband_nmse:+.2f} dB | "
+                        f"대역밖 최악 {val_metrics.get('dnh_worst_db', float('nan')):+.2f} dB",
                         flush=True,
                     )
                     if self.writer:
-                        # 기존 대시보드의 val/nmse_db는 trusted 목적함수 alias로 유지.
+                        # 기존 대시보드의 val/nmse_db는 목적함수 alias로 유지.
                         self.writer.add_scalar("val/nmse_db", val_nmse, self.step)
-                        self.writer.add_scalar("val/nmse_trusted_db", val_nmse, self.step)
+                        self.writer.add_scalar("val/nmse_trusted_db", val_mean, self.step)
+                        for key in (
+                            "nmse_trusted_cvar_db",
+                            "nmse_trusted_worst_db",
+                            "dnh",
+                            "dnh_worst_db",
+                            "frame_worst_db",
+                            "sat",
+                            "sat_u_over_limit_max",
+                        ):
+                            if key in val_metrics:
+                                self.writer.add_scalar(
+                                    f"val/{key}", val_metrics[key], self.step
+                                )
                         self.writer.add_scalar(
                             "val/nmse_fullband_db", val_fullband_nmse, self.step
                         )
@@ -575,14 +688,14 @@ class Trainer:
                         self.run_dir / "ckpt" / "last.pt",
                         self.model, self.optimizer, self.scheduler,
                         self.step, self.best_metric,
-                        cfg_snapshot(cfg, self.trusted_band_hz),
+                        self._cfg_snapshot(cfg),
                     )
                     if is_best:
                         save_checkpoint(
                             self.run_dir / "ckpt" / "best.pt",
                             self.model, self.optimizer, self.scheduler,
                             self.step, self.best_metric,
-                            cfg_snapshot(cfg, self.trusted_band_hz),
+                            self._cfg_snapshot(cfg),
                         )
                         print(f"[eval] best 갱신 → {val_nmse:.2f} dB", flush=True)
                     else:
@@ -600,7 +713,7 @@ class Trainer:
                 self.run_dir / "ckpt" / "last.pt",
                 self.model, self.optimizer, self.scheduler,
                 self.step, self.best_metric,
-                cfg_snapshot(cfg, self.trusted_band_hz),
+                self._cfg_snapshot(cfg),
             )
             print(
                 f"학습 구간 종료: step {self.step}/{self.total_steps}, "
@@ -613,12 +726,21 @@ class Trainer:
 def cfg_snapshot(
     cfg: dict,
     trusted_band_hz: tuple[float, float] | None = None,
+    *,
+    best_metric_key: str | None = None,
+    loss_start_sample: int | None = None,
+    cvar_scope: str | None = None,
 ) -> dict:
     """체크포인트/실행 폴더에 남길 완전한 resolved 설정.
 
     과거에는 모델과 몇 개 필드만 저장해 P/S 경로·증강·소스 분포를 복원할 수
     없었다. 학습 입력 설정 전체를 보존하고, 배포가 즉시 검사할 lead alias와
     물리 유효성 라벨을 최상위에도 명시한다.
+
+    ``best_metric_key`` 는 ``best_metric`` 이 **무엇을 잰 값인지**를 박아 둔다.
+    2026-08-05 이전 checkpoint 의 best 는 trusted 평균이고 이후는 CVaR 이다. 두
+    지표를 min 비교하면 조용히 잘못된 best 가 고정되므로, 이 키가 다르면 재개 시
+    best 를 리셋한다.
     """
     out = copy.deepcopy(cfg)
     data_cfg = out.get("data", {})
@@ -627,4 +749,12 @@ def cfg_snapshot(
     out["physics_status"] = validate_training_physics(out)
     if trusted_band_hz is not None:
         out["trusted_band_hz"] = [float(v) for v in trusted_band_hz]
+    if best_metric_key is not None:
+        out["best_metric_key"] = str(best_metric_key)
+    if loss_start_sample is not None:
+        out["loss_start_sample"] = int(loss_start_sample)
+    if cvar_scope is not None:
+        # DDP 에서 topk 는 랭크 로컬이다. world>1 이면 각 랭크의 상위 q 합집합이
+        # 글로벌 상위 q 를 덮으므로 실효 분위가 넓어진다 — 산출물에 남긴다.
+        out["nmse_cvar_scope"] = str(cvar_scope)
     return out

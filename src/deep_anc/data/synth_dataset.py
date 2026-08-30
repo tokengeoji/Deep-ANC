@@ -23,6 +23,9 @@ d 경로만 만든다 (소음 ch0 은 콜백에서 직접 생성되므로 핸드
 
 from __future__ import annotations
 
+import warnings
+from pathlib import Path
+
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
@@ -34,6 +37,55 @@ from ..dsp.secondary_path import load_secondary_path
 from .noise_pool import NoisePool
 from .primary_path import resolve_digital_primary_path
 from .synthetic_signals import SyntheticNoise
+
+
+def assert_declared_sources_exist(
+    pools: dict[str, list[str]],
+    mix_ratio: dict[str, float],
+    *,
+    allow_missing: bool = False,
+) -> None:
+    """선언한 소스 태그의 manifest 가 **전부 있는지** 구성 시점에 확인한다.
+
+    왜 구성 시점인가
+    ----------------
+    예전에는 ``_pool()`` 이 manifest 를 못 열면 한 줄 출력하고 태그를 버린 뒤
+    합성원으로 대체했다. 그 코드는 **DataLoader 워커 안에서** 돈다 — 출력은 아무도 안
+    보는 로그로 가고, 그때는 이미 학습이 시작된 뒤다. 2026-08-06 실측: 선언 비중
+    **0.70**(speech 0.15 · music 0.10 · machine 0.07 · demand 0.08 · dns_fullband 0.30)
+    이 통째로 사라진 채 100k step 을 돌 뻔했다. 그 학습은 **음성과 음악을 한 번도 보지
+    못한 모델**을 만들고, 그것은 절대목표 2(모든 소리를 제거, 최악값 기준)를 정면으로
+    위반한다. 60시간을 태운 뒤에야 알게 된다.
+
+    ``allow_missing`` 은 진단 전용이다. 학습 설정에 넣지 마라 — 넣는 순간 이 게이트가
+    사라지고, 사라진 것을 알려 주는 것은 이 문장뿐이다.
+    """
+
+    missing = [
+        (tag, float(mix_ratio.get(tag, 0.0)), paths[0])
+        for tag, paths in sorted(pools.items())
+        if not Path(paths[0]).is_file()
+    ]
+    if not missing:
+        return
+    weight = sum(item[1] for item in missing)
+    detail = "\n".join(f"    {tag} (선언 비중 {ratio:.2f}) — {path}" for tag, ratio, path in missing)
+    message = (
+        f"선언한 소스 태그 {len(missing)}개의 manifest 가 없습니다 "
+        f"(합계 선언 비중 {weight:.2f}):\n{detail}\n"
+        "  이 상태로 학습하면 그 태그가 조용히 합성원으로 대체되어, 선언한 "
+        "source_mix_ratio 와 다른 분포로 돌게 됩니다.\n"
+        "  둘 중 하나를 하세요: (1) scripts/data/prepare_noise_pool.py 로 manifest 를 "
+        "만든다, (2) configs/data_sim.yaml 의 source_mix_ratio 에서 그 태그를 지운다.\n"
+        "  ⚠ (2)는 절대목표 2(모든 소리를 제거)의 해당 소스를 포기하는 선언이므로 "
+        "사람이 판단해야 합니다."
+    )
+    if allow_missing:
+        warnings.warn(f"[진단 모드] {message}", RuntimeWarning, stacklevel=2)
+        for tag, _, _ in missing:
+            pools.pop(tag, None)
+        return
+    raise FileNotFoundError(message)
 
 
 def _delay_np(x: np.ndarray, delay: int) -> np.ndarray:
@@ -109,8 +161,6 @@ class SynthANCDataset(IterableDataset):
         }[split]
 
         # 소스 풀 — source_mix_ratio 의 키가 곧 태그다 ('synthetic' 제외).
-        # manifest(data/manifests/<tag>.jsonl)가 없는 태그는 합성원으로 자동 폴백하므로,
-        # 데이터셋을 나중에 추가해도 설정 변경 없이 활성화된다 (speech/music 등).
         # acoustic-ref 는 전용 소스 구성을 사용 (주기성↑ + 예측불가 성분 무해화 학습) [로드맵 A2]
         if self.reference_mode == "acoustic" and data_cfg.get("source_mix_ratio_acoustic"):
             self.mix_ratio = dict(data_cfg["source_mix_ratio_acoustic"])
@@ -122,6 +172,11 @@ class SynthANCDataset(IterableDataset):
             for tag, ratio in self.mix_ratio.items()
             if tag != "synthetic" and float(ratio) > 0.0
         }
+        assert_declared_sources_exist(
+            self.pools,
+            self.mix_ratio,
+            allow_missing=bool(data_cfg.get("allow_missing_source_manifests", False)),
+        )
         self._pool_objs: dict[str, NoisePool] = {}
         self.dc_hum_prob = float(data_cfg.get("dc_hum_prob", 0.0))
 
@@ -170,10 +225,20 @@ class SynthANCDataset(IterableDataset):
                 self._pool_objs[tag] = NoisePool(
                     self.pools[tag], self.split, self.fs, seed=int(rng.integers(1 << 31))
                 )
-            except (FileNotFoundError, ValueError):
-                print(f"[synth_dataset] {tag} manifest 없음 — 합성원으로 대체합니다")
-                self.pools.pop(tag)
-                return None
+            except (FileNotFoundError, ValueError) as exc:
+                # 예전에는 여기서 한 줄 출력하고 태그를 버린 뒤 합성원으로 대체했다.
+                # 이 코드는 **DataLoader 워커 안에서** 돈다 — 출력은 아무도 안 보는
+                # 로그로 가고, 그때는 이미 학습이 시작된 뒤다. 실제로 선언 비중 0.70
+                # (speech·music·machine·demand·dns_fullband)이 통째로 사라진 채
+                # 100k step 을 돌 뻔했다. 구성 시점 검사(assert_declared_sources_exist)가
+                # 정상 경로이고, 여기까지 왔다면 그 검사를 우회한 것이므로 멈춘다.
+                raise RuntimeError(
+                    f"소스 태그 '{tag}' 의 manifest 를 열 수 없습니다: "
+                    f"{self.pools[tag]} — {type(exc).__name__}: {exc}\n"
+                    "선언한 source_mix_ratio 와 다른 데이터로 학습하는 것을 막기 위해 "
+                    "중단합니다. scripts/data/prepare_noise_pool.py 로 manifest 를 "
+                    "만들거나 source_mix_ratio 에서 그 태그를 지우세요."
+                ) from exc
         return self._pool_objs[tag]
 
     def _sample_source(

@@ -11,6 +11,10 @@ import math
 import numpy as np
 from scipy import signal
 
+# 대역 산술의 단일 출처 (발생기 A — 같은 함수가 두 벌 있었다).
+from ..dsp.do_no_harm import octave_band_edges_hz
+from ..dsp.timing import intersect_frequency_bands
+
 _EPS = 1.0e-12
 
 
@@ -26,37 +30,6 @@ def nmse_db(d: np.ndarray, e: np.ndarray) -> float:
     if d.size == 0 or e.size == 0:
         raise ValueError("NMSE 계산에는 비어 있지 않은 d/e 신호가 필요합니다")
     return float(10.0 * np.log10((np.mean(e**2) + _EPS) / (np.mean(d**2) + _EPS)))
-
-
-def intersect_frequency_bands(
-    first: tuple[float, float] | list[float],
-    second: tuple[float, float] | list[float],
-    nyquist_hz: float,
-) -> tuple[float, float]:
-    """두 유효 주파수 대역의 교집을 반환하고 빈 교집은 거부한다."""
-
-    def _validate(name: str, band: tuple[float, float] | list[float]) -> tuple[float, float]:
-        try:
-            if len(band) != 2:
-                raise ValueError
-            lo, hi = (float(v) for v in band)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} 대역은 [lo, hi] 형식이어야 합니다: {band}") from exc
-        if not (math.isfinite(lo) and math.isfinite(hi)):
-            raise ValueError(f"{name} 대역은 유한한 값이어야 합니다: {band}")
-        if not (0.0 <= lo < hi <= nyquist):
-            raise ValueError(f"잘못된 {name} 대역: {band} (Nyquist={nyquist:g}Hz)")
-        return lo, hi
-
-    nyquist = float(nyquist_hz)
-    if not math.isfinite(nyquist) or nyquist <= 0.0:
-        raise ValueError(f"Nyquist 주파수는 유한한 양수여야 합니다: {nyquist_hz}")
-    first_lo, first_hi = _validate("첫 번째", first)
-    second_lo, second_hi = _validate("두 번째", second)
-    lo, hi = max(first_lo, second_lo), min(first_hi, second_hi)
-    if lo >= hi:
-        raise ValueError(f"주파수 대역 교집이 비어 있습니다: {first} ∩ {second}")
-    return lo, hi
 
 
 def band_nmse_db(
@@ -123,9 +96,9 @@ def octave_band_attenuation(
             trusted_band_hz, trusted_band_hz, sample_rate / 2.0
         )
     out: list[dict] = []
-    sqrt2 = np.sqrt(2.0)
     for fc in centers_hz:
-        lo, hi = fc / sqrt2, fc * sqrt2
+        # 경계식은 손실 대역 정렬에도 쓰인다 — 복붙하지 않고 단일 출처를 부른다.
+        lo, hi = octave_band_edges_hz(float(fc))
         if hi >= sample_rate / 2 * 0.98:
             continue
         sos = signal.butter(4, [lo, hi], btype="bandpass", fs=sample_rate, output="sos")

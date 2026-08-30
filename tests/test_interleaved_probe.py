@@ -25,7 +25,9 @@ from deep_anc.dsp.interleaved_probe import (
     dewarp_recording,
     estimate_repeat_delay,
     estimate_transfer,
+    relative_tau_outliers,
     schroeder_phases,
+    timebase_drift,
     tone_snr_db,
     track_warp,
 )
@@ -585,3 +587,103 @@ def test_align_repeats_flags_a_corrupted_repeat():
 def test_complex_consistency_needs_two_repeats():
     with pytest.raises(ValueError):
         complex_consistency(np.ones((1, 10), dtype=complex))
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-05 결함 1 — 오염 반복이 official 로 들어간 사건의 회귀 테스트.
+#
+# 아래 배열은 전부 실측이다(캡처 20260804_235822_03f4c088). 합성이 아니라 실제로
+# 게이트를 통과해버린 값이라, 이 테스트가 깨지면 같은 사건이 다시 일어난다는 뜻이다.
+# ---------------------------------------------------------------------------
+
+MEASURED_NOISE_TAU = np.array([
+    0.0, 15.41, 20.52, 25.78, 30.36, 34.93, 39.28, 43.53,
+    47.78, 52.33, 56.73, 55.65, 36.84, 17.56, -2.39, -21.83,
+])
+MEASURED_CANCEL_TAU = np.array([
+    0.0, 14.21, 19.39, 24.68, 29.27, 33.63, 37.87, 42.07,
+    46.65, 50.85, 55.37, 23.54, 4.66, -14.19, -32.65, -50.89,
+])
+
+
+def test_relative_tau_gate_rejects_the_measured_frame_slip():
+    """P−S 상대 τ 는 같은 출력 스트림의 불변량이다 — 튀면 버퍼 슬립이다."""
+
+    bad, deviation, centre = relative_tau_outliers(
+        MEASURED_NOISE_TAU, MEASURED_CANCEL_TAU, tolerance_samples=3.0
+    )
+    assert np.array_equal(np.flatnonzero(bad), np.array([11, 12, 13, 14, 15]))
+    # 앵커(반복 0)는 τ 가 양쪽 모두 구조적으로 0 이라 중앙값 계산에서 빠진다.
+    assert 1.0 < centre < 1.6
+    # 정상군 최대 편차와 오염군 최소 편차 사이가 실제로 비어 있어야 임계가 의미 있다.
+    assert deviation[np.flatnonzero(~bad)].max() < 2.0
+    assert deviation[np.flatnonzero(bad)].min() > 4.0
+
+
+def test_relative_tau_gate_survives_contamination_majority():
+    """오염이 과반이어도 통과시키면 안 된다 — MAD 스케일 임계가 실패하는 지점이다.
+
+    실측 캡처 2건(225546, 225856)에서 MAD 가 1.35/1.95 로 부풀어 MAD 기반 허용치가
+    12~17 샘플이 됐고 32 샘플 슬립 블록을 통째로 통과시켰다. 고정 임계는 그렇지 않다.
+    """
+
+    relative = np.concatenate([np.full(4, 1.2), np.full(12, 33.0)])
+    bad, _, _ = relative_tau_outliers(
+        relative, np.zeros_like(relative), tolerance_samples=3.0
+    )
+    # 중앙값이 오염군 쪽으로 넘어가므로 이번엔 **정상군 4개**가 이탈로 잡힌다.
+    # 어느 쪽이든 두 무리를 갈라놓는 것이 목적이고, 통째로 통과시키지 않는 것이 핵심이다.
+    assert int(bad.sum()) == 4
+    mad = np.median(np.abs(relative[1:] - np.median(relative[1:])))
+    assert mad == 0.0 or 3.0 < 3.0 * 1.4826 * mad, "MAD 스케일이었다면 임계가 부풀었다"
+
+
+def test_relative_tau_gate_rejects_mismatched_lengths():
+    with pytest.raises(ValueError):
+        relative_tau_outliers(np.zeros(5), np.zeros(6), tolerance_samples=3.0)
+    with pytest.raises(ValueError):
+        relative_tau_outliers(np.zeros(5), np.zeros(5), tolerance_samples=0.0)
+
+
+def test_timebase_drift_flags_the_measured_warmup_transient():
+    """워밍업 4주기(0.5s)로는 스트림이 정상상태에 못 든다 — 실측 τ 궤적이 증거다."""
+
+    # 판정은 두 채널의 평균 궤적으로 한다 — warp 는 공통 성분이라 평균이 잡음을 줄인다.
+    common = 0.5 * (MEASURED_NOISE_TAU + MEASURED_CANCEL_TAU)
+    drift, median = timebase_drift(common)
+    assert median == pytest.approx(4.38, abs=0.02)
+    deviation = np.abs(drift - median)
+    assert deviation[0] == pytest.approx(10.44, abs=0.02)   # 정상상태 아님
+    assert deviation[1] == pytest.approx(5.60, abs=0.02)
+    assert deviation[2:10].max() < 1.0                      # 정상 구간
+    # 반복 10 부터는 프레임 슬립 전이 — 드리프트 게이트도 독립적으로 이것을 잡는다.
+    assert deviation[10] > 2.0
+    assert np.all(deviation[[0, 1]] > 2.0)                  # 임계 2.0 으로 기각된다
+
+
+def test_timebase_drift_needs_three_repeats():
+    with pytest.raises(ValueError):
+        timebase_drift(np.array([0.0, 1.0]))
+
+
+def test_align_repeats_anchor_selects_the_reference_repeat():
+    freq = np.linspace(150.0, 1200.0, 200)
+    rng = np.random.default_rng(21)
+    truth = rng.normal(size=freq.size) + 1j * rng.normal(size=freq.size)
+    shifts = np.array([0.0, 12.0, -31.0, 47.5, -8.25])
+    stack = np.stack([truth * np.exp(-2j * np.pi * freq * s / FS) for s in shifts])
+
+    _, taus, scores = align_repeats(freq, stack, sample_rate=FS, anchor=3)
+    # 앵커는 자기 자신과의 상관이 1 이고 τ 가 0 이다.
+    assert taus[3] == pytest.approx(0.0, abs=1e-9)
+    assert scores[3] == pytest.approx(1.0, abs=1e-9)
+    # 나머지 τ 는 앵커 기준으로 재정의된다 — 절대값이 아니라 규약에 달린 양이다.
+    assert np.allclose(taus, shifts - shifts[3], atol=0.3)
+
+
+def test_align_repeats_rejects_anchor_out_of_range():
+    freq = np.linspace(150.0, 1200.0, 64)
+    stack = np.ones((3, freq.size), dtype=complex)
+    for anchor in (-1, 3):
+        with pytest.raises(ValueError, match="anchor"):
+            align_repeats(freq, stack, sample_rate=FS, anchor=anchor)

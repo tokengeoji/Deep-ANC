@@ -7,24 +7,25 @@
 현재 digital Stage-1의 정렬은 다음과 같다.
 
 ```
-x[0] = x_ref   (digital: 연속 source n의 109샘플 선행분, acoustic: P_ref·n)
+x[0] = x_ref   (digital: 연속 source n의 116샘플 선행분, acoustic: P_ref·n)
 x[1] = err_in  (에러 피드백 근사: d 를 512~1024샘플 랜덤 지연 — 캡처+블록 지연 모사)
 playback[t] = n[t]
 x_ref[t]    = n[t+109]
-d           = S_FIR·playback 을 D_noise=1489만큼 지연  # secondary surrogate
+d           = S_FIR·playback 을 D_noise=1602만큼 지연  # secondary surrogate
 y           = model(x)
-e           = d + S_total·y,  S_total delay=1342+256=1598
+e           = d + S_total·y,  S_total delay=1462+256=1718
 ```
 
 학습은 source를 `segment+109`샘플 연속으로 뽑으므로 tail zero-padding이나 파일 경계의
 가짜 패턴이 없다. 런타임도 모델 입력에서 미래 샘플을 읽는 대신 실제 noise playback을
-109샘플 FIFO로 늦춰 같은 관계를 만든다. 지연 물리는 docs/01 §3이 단일 근거다.
+116샘플 FIFO로 늦춰 같은 관계를 만든다. 지연 물리는 docs/01 §3이 단일 근거다.
+(2026-08-05 플랜트 복구 전에는 109 였다 — 배포 중인 ONNX 만 아직 109 다.)
 
 ### digital 1차경로 모드
 
 | `digital_primary_path_mode` | d 생성 | 용도 |
 |---|---|---|
-| `secondary_surrogate` **(현재)** | 측정 S의 compact FIR/gain + `D_noise=1489` | P/S 스케일을 맞춘 표현 사전학습. 물리 성능 주장 금지 |
+| `secondary_surrogate` **(현재)** | 측정 S의 compact FIR/gain + `D_noise=1602` | P/S 스케일을 맞춘 표현 사전학습. 물리 성능 주장 금지 |
 | `measured` | `duct.digital_reference.primary_path_npz`의 FIR/gain/delay | 같은 gain·볼륨으로 P/S를 실측한 뒤 실제 파인튜닝 |
 | `rir_surrogate` | 1D `p_err` RIR + 음향 onset을 뺀 추가지연 | 과거 호환·진단 전용. 측정 S와 단위가 달라 본 학습에 사용 금지 |
 
@@ -97,7 +98,7 @@ Stage-2 커리큘럼으로 한 축씩 켠다.
 .venv/bin/python scripts/data/make_recorded_manifest.py
 # 전체 파일/메타/클리핑/무음/분할 누수 QA — PASS 전에는 학습 금지
 .venv/bin/python scripts/data/validate_recorded_sessions.py
-# 파인튜닝 (실측:합성 = 7:3 혼합, digital lead=109 유지)
+# 파인튜닝 (실측:합성 = 7:3 혼합, digital lead=116 — 실측 P/S 에서 유도)
 .venv/bin/python scripts/train/train.py --config configs/train_finetune.yaml \
   --set data.digital_primary_path_mode=measured
 # 학습에 쓰지 않은 test split의 독립 반사실 평가
@@ -112,9 +113,10 @@ Jetson 시스템 설정은 바꾸지 않는다.
 
 세션 구조: `data/recorded/<시각_프로그램>/{mics.wav(2ch PCM_32), source.wav, session.json}`.
 ANC OFF 녹음이므로 **에러 마이크 신호가 곧 d(t)** 다. digital-ref 파인튜닝은 같은 세션의
-연속 `source.wav`에서 109샘플 앞선 조각을 x_ref로 쓰고, acoustic-ref는 ref 마이크 채널을
+연속 `source.wav`에서 116샘플 앞선 조각을 x_ref로 쓰고, acoustic-ref는 ref 마이크 채널을
 쓴다 (`recorded_dataset.py`). 실제 수집 전에는 noise→ERR P와 cancel→ERR S를 같은 출력
-gain·볼륨으로 측정하고, checkpoint의 lead=109와 배포 runtime lead=109를 유지한다.
+gain·볼륨으로 측정하고, checkpoint의 lead와 배포 runtime lead를 **같게** 유지한다.
+(현행 실측 lead=116. 배포 중인 ONNX 는 109 로 학습된 것이라 그 모델에는 109가 맞다.)
 
 ## 6. manifest 스키마와 분할 규칙
 

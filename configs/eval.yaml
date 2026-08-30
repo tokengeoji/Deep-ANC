@@ -3,10 +3,13 @@
 # 옥타브 밴드 중심 주파수 (125Hz–8kHz) [교차검증 L2 — 63Hz/16kHz는 마이크·S(z) 유효대역 밖]
 octave_bands_hz: [125, 250, 500, 1000, 2000, 4000, 8000]
 
-# S(z) 신뢰 대역 — 이 구간 밖 수치는 리포트에 "신뢰 낮음" 표기.
-# secondary_path_il.npz consistency_band=[150,600] 과 같아야 한다. 그 npz 의 구동 대역은
-# 64-1648Hz 지만 반복 일관성이 0.90 을 넘는 구간은 150-600Hz 뿐이다.
-trusted_band_hz: [150, 600]
+# S(z) 신뢰 대역은 **여기서 선언하지 않는다.**
+# 2026-08-06: `trusted_band_hz: [150, 600]` 을 지웠다. 어떤 코드도 이 키를 읽은 적이 없고
+# (평가기는 전부 BandPlan.resolve(sp.trusted_band_hz(), duct.realistic_target_band_hz, fs/2)
+# 로 유도한다), 값 자체도 이미 틀려 있었다 — 플랜트 복구 후 실제 신뢰대역은 [150, 1600] 이다.
+# 죽은 설정이 권위 있어 보이면서 틀린 값을 들고 있는 것이 이 저장소가 반복한 사고다.
+# 단일 출처: assets/measured/secondary_path_il.npz 의 consistency_band_hz
+#            ∩ configs/duct.yaml acoustics.realistic_target_band_hz ∩ [0, fs/2].
 
 # 시나리오는 프로젝트 절대 목표 2가지를 분리 측정한다:
 #   기능1(저주파+고주파 노이즈 제거): tone300/multitone/band(저역) + hf_tone/hf_band(고역)

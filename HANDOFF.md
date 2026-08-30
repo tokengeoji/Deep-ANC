@@ -1,28 +1,442 @@
 # HANDOFF — 세션 인수인계 (다음 AI 에이전트/개발자용)
 
-> **"이어서 진행해줘"를 받았다면**: §0 라이브 상태 → §2 현재 상태 → §3 다음 단계 순으로 실행하라.
+> **"이어서 진행해줘"를 받았다면**: §0 라이브 상태 → §0.5 다음 단계 순으로 실행하라.
 > 규칙은 [AGENTS.md](AGENTS.md)가 단일 출처. 이 파일은 작업 상태가 바뀔 때마다 갱신할 것.
-> 최종 갱신: 2026-08-04 14:40 KST
+> 최종 갱신: **2026-08-07**
 
-## 0. 라이브 상태 (가장 먼저 확인할 것 — 시각은 참고용, 실상태는 아래 명령으로)
+## 0. 라이브 상태
 
-- **Elice 인스턴스**: `elicer@central-01.tcp.tunnel.elice.io` **포트 47863**, 2×A100 80GB.
-  pem = 이 Jetson의 `~/.ssh/elice.pem` (커밋 금지). 32 vCPU, 디스크 84G 여유.
-- **모든 GPU 작업이 끝났다. 회수도 완료됐다 → 인스턴스를 삭제할 것.**
-  두 감독자는 `drained` 상태로 살아 있으며 `recommendation: teardown`을 표시한다.
-  큐에 작업을 덧붙이면 다시 일한다(감독자가 300초마다 큐 파일을 재로드).
-  - PID는 재기동하면 바뀐다. 권위 있는 소유자는 `runs/.job_queue_gpu{0,1}.lock`의 owner JSON이다.
-  - **`tier` 필드는 현재 메타데이터일 뿐 강제되지 않는다.** 감독자는 큐에 적힌 순서대로
-    실행한다. Tier-B를 "다른 GPU의 Tier-A ETA 안에서만"으로 제한하려면 별도 구현이 필요하다.
-    지금 큐는 순서 자체가 우선순위를 반영하도록 배열해 뒀다.
-- **감독자 인계 실적** — 원래대로면 GPU1은 3.4시간, GPU0은 무기한 유휴였다.
-  - GPU1: 01:16:32 구 watcher 종료 → 01:17:10 작업 시작 = **유휴 38초**
-  - GPU0: 04:48:34 base 종료 → 04:49:10 작업 시작 = **유휴 36초**
-- **완료된 GPU 작업**: `search_tiny_control` 20k → 승자 선정 → 재판정 →
-  `seed_repeat_control_20k` → `seed_repeat_tiny_long_20k` → `decide_seed_repeat`,
-  base best/last held-out 평가, tiny best/last 동일조건 평가, 회수 번들.
-  승자가 대조군이라 100k 연장은 하지 않았다 — `pretrain_tiny_corrected` 100k 완주본이
-  이미 있어 같은 학습을 반복하는 것이 낭비이기 때문이다.
+**브랜치 `fix/finetune-readiness-repair`** (main 에서 분기, 아직 merge 안 됨).
+최종 갱신 **2026-08-07 00:30 KST**. 학습·파인튜닝은 **엘리스에서** 한다(사용자 결정).
+로컬은 녹음과 코드 정확성 담당이고, 로컬에서 할 수 있는 것은 아래 §0.5-1 하나만 남았다.
+
+### 진입 게이트: 12 PASS / 2 FAIL
+
+```
+python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
+    --set data.digital_primary_path_mode=measured
+```
+
+| FAIL | 담당 | 비고 |
+|---|---|---|
+| `completed_init_checkpoint` | **엘리스** | 체크포인트 26개 전부 `[150,600]`. 재사전학습 필요 |
+| `corpus_disjoint` | **엘리스** | `dns_fullband` 0.30 · `demand` 0.08 · `machine` 0.07 = 0.45 미확보 |
+
+**로컬에서 할 수 있는 것은 끝났다.** 남은 둘은 이 장비에서 불가능하다
+(디스크 8.4G, DNS 압축본만 15.7G).
+
+### 하드웨어 — 해결됐다 (2026-08-06)
+
+```
+P(z) 소음→ERR  순수지연 1580  150-1600Hz 일관성 0.9992  유지반복 32/32
+S(z) 상쇄→ERR  순수지연 1440  150-1600Hz 일관성 0.9987
+P − S = 140                  (반복 2: 1563/1422, P−S 141)
+독립 캡처 2회의 최적필터 -P/S 일치 0.9976 (오차 7.7%)
+```
+
+아침의 앰프 채널 결합(P−S 가 140→1 로 붕괴)이 배선 변경으로 해소됐다.
+마이크 무신호 진단 사다리는 [docs/02 §2.1~2.2](docs/02_hardware_setup.md) 에 있다 —
+**마이크는 병합 DTB 의 핀먹스 오버레이에 의존한다**(`~/FxLMS/realtime_fxlms/boot_fix/`).
+
+⚠ **공식 아티팩트를 교체하지 않았다.** 재측정본(`results/plant_verify/`)이 공식본과
+최적필터 기준 37~40% 다르지만, 검증 결과 원인은 플랜트 드리프트가 아니라 **공식 캡처가
+8/4 녹음보다 6.3~8.7 dB 뜨거운 노브에서 잡힌 것**이다. 그리고 rep2 는 lead 115 라
+`path_delay_and_lead` 를 FAIL 시킨다. 교체하려면 재분석 봉투 키
+(`reanalysed`/`source_capture_id`/`source_npz_sha256`)를 먼저 채워야 한다 — 없으면
+봉투 검사가 조용히 건너뛰어진다(`finetune_readiness.py:325-327`).
+
+### 실측 데이터 — 82세션 95.7분
+
+```
+계열          세션  그룹   train/val/test 그룹
+environment    18    17      9 / 4 / 4
+machine        30    25     17 / 4 / 4
+music          18    18     10 / 4 / 4
+speech         16    15      7 / 4 / 4
+```
+
+8/4 녹음 46세션(v1 소스) + 8/6 녹음 36세션(v2 소스). 두 시기의 음향은 동일하다 —
+세션 기반 교차검증(스피커 무사용, `src/deep_anc/data/path_from_sessions.py`):
+REF→ERR 복소일치 0.9658~0.9949, source→ERR 0.9663~0.9892 (이득만 +2.1~+5.2 dB 다름).
+
+### 0.4 ✅ 해소 — 두 학습 브랜치가 30 ms 다른 과제를 배우고 있었다 (2026-08-07)
+
+`measured_source_delay_agreement` 가 **재현되지 않는 양**(실측 절대 지연, 82세션 산포
+189 샘플 vs 허용 64)을 기준으로 삼고 있었다. 걱정 자체는 옳았지만 비교 대상이 틀렸다.
+
+파고들었더니 **진짜 결함이 그 뒤에 있었다**::
+
+    recorded_lead_mode = "constant"  (기본값)
+      합성  x_ref 가 d 보다  D_noise 1602 + K 116 = 1718 샘플 앞선다
+      실측  x_ref 가 d 보다  잔여 142.5 + K 116  =  258 샘플 앞선다
+      → 1460 샘플 (30.4 ms) 어긋남
+
+파인튜닝은 합성 30% + 실측 70% 다. 같은 모델이 두 브랜치에서 **다른 예측 과제**를
+배운다 — 이 상태로 60시간을 돌리면 결과가 무의미하다.
+
+고치는 기계장치(`RecordedLeadPlan.timeline`)는 이미 있었는데 **배선이 끊겨 있었다**.
+`d_noise_delay_samples` 가 duct.yaml 에 있고 `RecordedANCDataset` 은 data_cfg 만 받아서,
+켜면 "d_noise_delay_samples 가 필요합니다" 로 실패했다. 그래서 아무도 켜지 못했다.
+
+- `config.py` 가 duct → data 로 값을 **통과**시킨다 (유도가 아니라 복사)
+- `data_sim.yaml` 에 `recorded_lead_mode: timeline`
+- 게이트를 **총 선행량** 일치로 재설계 — 잔여 지연은 82세션에서 142.0~144.1,
+  std 0.32 로 재현되고 기하 예측 140 과 2.5 샘플 안에서 일치한다
+
+실측 확인 (48세션 전부): 합성 1718 vs 실측 1717.5~1718.5, 차이 **+0.1 샘플**.
+
+### 0.5 ⛔ 물리 한계 — 옥타브 500 Hz
+
+```
+official 플랜트 (P1602/S1462/lead 116, M=2048) 의 옥타브별 설계 상한
+  옥타브  125 [150.0,  176.8]  +19.891 dB
+  옥타브  250 [176.8,  353.6]  +19.648
+  옥타브  500 [353.6,  707.1]   +2.159   ← 병목
+  옥타브 1000 [707.1, 1414.2]   +5.223
+  옥타브 2000 [1414.2, 1600.0]  +7.384
+  (전대역 [150,1600] 은 +4.827 — 저역의 여유가 중역의 병목을 가린다)
+```
+
+옥타브 500 을 반으로 쪼개면 353.6–500 이 5.47, 500–707.1 이 5.97 dB 다. 널이 깊어서가
+아니라 **한 옥타브 안에서 인과 FIR 이 서로 모순되는 등화를 요구받는다.** FIR 길이
+(2048↔4096)와 정규화(1e-7~1e-5) 전 범위에서 안정하므로 **학습·정규화로 풀리지 않는다.**
+
+2026-08-06 사용자 결정: 하드웨어를 바꿀 수 없으므로 **여유를 3.0 → 0.5 로 줄인다.**
+`target 1.0 + margin 0.5 = 1.5 < 2.159` 로 성립한다.
+
+### 0.6 배포 지연 실측 (2026-08-06)
+
+```
+configs/runtime_tiny.yaml · --steps 2000 (듀티 100%)
+  ORT (CPU)       P50 1.13 ms   P99 1.24 ms
+  TRT (GPU FP16)  P50 0.30 ms   P99 0.46 ms      ← 3.8배 빠름
+  예산 5.33 ms · 게이트 3.0 ms — 둘 다 통과
+```
+
+⚠ 듀티 100% 측정이다. 실제 ANC 듀티는 약 6% 이고 그때 GPU 거버너가 306 MHz(최소)로
+내려간다 — 실측 확인. 배포 전에 듀티 6% 조건에서 다시 재야 한다.
+
+## 0.5 다음 단계 ("이어서 진행해줘" 는 여기부터 위에서 아래로)
+
+> 2026-08-06 개정. 이전 판본의 1-A("앰프 구동 레벨을 교정해야 한다 — 이것부터")는
+> **같은 문서 §0 이 반증한 가설**이었다(레벨을 14.6 dB 내려도 결합비가 10% 만 움직였다).
+> 그 항목이 다음 세션을 네 번째로 볼륨을 돌리게 만들 뻔했다. 삭제했다.
+
+### 1. 재녹음 33세션 — 로컬에서 해야 하는 유일한 실기 작업 (소리 38.5분)
+
+**먼저 GPU 작업이 없는지 확인하라.** 부하가 있으면 XRUN 으로 세션이 거부된다.
+
+```bash
+# ① 마이크 확인 (소리 없음, 3초). EXIT=0 이어야 한다.
+.venv/bin/python scripts/data/record_duct.py --program silence --seconds 3 --out-root /tmp/rec_check
+
+# ② 데스크톱 오디오가 APE 카드를 놓게 한다 (PLL_A 재조정 방지)
+pactl set-card-profile alsa_card.platform-sound off
+
+# ③ 앰프 레벨 교정 (소리 20초). 목표값은 도구가 띄운다 — 문서에 되쓰지 마라.
+.venv/bin/python scripts/data/set_amp_level.py --confirm-speaker
+
+# ④ P/S 확인 (소리 6초). P−S = 140 ± 3 이 통과 기준.
+.venv/bin/python scripts/data/measure_paths_interleaved.py --confirm-volume-minimum \
+    --primary-out results/channel_check/p.npz --secondary-out results/channel_check/s.npz
+
+# ⑤ 재녹음 — **v2 가 기본값이다**. 계열별로 쪼갤 수 있고 중단해도 재개된다.
+.venv/bin/python scripts/data/record_session_batch.py --confirm-speaker \
+    --amplitude 0.06 --families speech
+.venv/bin/python scripts/data/record_session_batch.py --confirm-speaker \
+    --amplitude 0.06 --families machine environment music
+
+# ⑥ 매니페스트·QA·게이트 (소리 없음)
+.venv/bin/python scripts/data/make_recorded_holdout.py     # 세션이 재생한 풀에서 유도
+.venv/bin/python scripts/data/make_recorded_manifest.py
+.venv/bin/python scripts/data/validate_recorded_sessions.py
+.venv/bin/python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
+    --set data.digital_primary_path_mode=measured
+```
+
+⚠ 마이크 핀은 2026-08-06 하루에 **세 번** 빠졌다. ⑤ 전에 고정을 단단히 할 것 —
+38.5분 도중에 빠지면 그 시간이 통째로 날아간다.
+
+### 2. 엘리스에서 할 것 (사용자 결정: 데이터셋·사전학습·파인튜닝 전부 엘리스)
+
+로컬 디스크는 8.4 G 뿐이고 DNS 압축본만 15.7 G 다. 참고 폴더 3곳과 디스크 전체를
+뒤졌지만 dns_fullband·demand·machine 원본은 이 장비 어디에도 없다.
+
+```bash
+# ① 유실 코퍼스 확보 → manifest (엘리스에서)
+#    dns_fullband 0.30 · demand 0.08 · machine 0.07 = 선언 비중 0.45
+.venv/bin/python scripts/data/prepare_noise_pool.py     # EXIT=0 이 될 때까지
+
+# ② 재사전학습 — trusted_band [150,1600] 으로. 현행 체크포인트는 전부 [150,600] 이다.
+#    Orin 실측 0.44~0.455 it/s(bs16,tiny) → 100k step ≈ 61~63시간. A100 이면 훨씬 짧다.
+
+# ③ 파인튜닝 — 재녹음 데이터를 올린 뒤
+```
+
+⚠ **`allow_missing_source_manifests` 를 학습 설정에 넣지 마라.** 그 키를 켜면 선언한
+소스가 조용히 합성원으로 대체되고, 음성·음악을 한 번도 못 본 모델이 나온다(절대목표 2 위반).
+2026-08-06 이전에는 그것이 **기본 동작**이었다.
+
+### 3. 손실 λ 교정과 게이트 임계 대조 — **재학습 전에 반드시** (§0.6 결함 3)
+
+do-no-harm 항 자체는 들어갔지만 **세 가지가 남아 있다.**
+
+- **λ_dnh 가 새 대역 구성에서 재교정되지 않았다.** 실측 그래디언트 비 **1333%**(목표 20~40%).
+  `sat` 162% / `frame` 46% / `mrstft` 27%. 20k step ablation 전에 한산할 때 다시 재라.
+- **힌지 마진(`dnh_margin_db: 6.0`)과 G4 임계(`MAX_OUT_OF_BAND_AMPLIFICATION_DB = 1.0`)가
+  서로를 모른다.** 마진을 정확히 만족하는 모델이 게이트를 옥타브 전 대역에서
+  **8~9 dB 차이로 FAIL** 한다(직접 실행 확인). 힌지는 `|S·y|²/|d|²`, 게이트는 `e/d` —
+  물리량이 다른데 대조 코드도 테스트도 없다. (`losses/config.py:239` vs `eval/recorded.py:789`)
+- **출하 `nmse_cvar_alpha: 0.7` 은 배분을 뒤집지 않는다.** 최악 4개 몫 0.17% → 1.7% 로 10배
+  늘 뿐, 최상 4개가 여전히 **19배**를 가져간다. 배분을 완전히 뒤집는 것은 `alpha=1.0` 뿐인데
+  어떤 출하 config 도 1.0 을 쓰지 않고 **출하 설정의 최악값 거동을 강제하는 테스트가 없다.**
+  초기 5k step 분산을 보고 0.85~1.0 으로 올릴지 판단하라.
+- ✅ `configs/train_finetune.yaml` 은 이미 `band_weight: trusted_only` / `lambda_frame: 0.5`
+  로 정정됐다(커밋 `612152c`). 폐기 키도 정리됐다.
+
+> ✅ **2026-08-06 해소** (커밋 83c6954 · ff5de1b). 힌지 마진은 이제 G4 임계에서
+> **유도된다** — `src/deep_anc/dsp/do_no_harm.py` 가 단일 출처이고
+> `margin = 20·log10(10^(G/20) − 1) = −18.27 dB` 다. 설정에 값을 되쓰면 `LossConfig` 가
+> 거부한다. 대역도 옥타브 경계에 정렬시켰다(가로지르면 한 옥타브에 에너지를 몰 수 있었다).
+> λ_dnh 는 0.12 → **0.001** 로 재교정했다(실측 예산비 41.8 → 0.348, 목표 0.2~0.4).
+> 측정은 `ANCLoss.gradient_budget` 하나이고 `tests/test_loss_gradient_budget.py` 가
+> 예산을 걸어 둔다. 남은 미검증 2건은 그 파일 docstring 참조.
+
+
+---
+
+### 4. 코퍼스 누수 마무리 (§0.6 D1) — 재녹음 불필요, 매니페스트 작업만
+
+held-out 목록은 생성됐다(`data/manifests/recorded_holdout.json`, 691 클립)고
+`prepare_noise_pool.py --holdout` 이 구성 단계에서 차단하는 것까지 확인했다.
+**남은 것**: manifest 격리 때문에 실데이터 양성 확인이 미완. 그리고 `music` 의 `group_id` 를
+FMA 트랙 ID 버킷 → **아티스트/앨범**으로 바꾸려면 `fma_metadata`(tracks.csv, 342MB)가 필요하다.
+
+---
+
+### 5. 남은 발생기 제거 (§0.7) — 이걸 안 하면 같은 결함이 또 나온다
+
+전부 **직접 실행으로 확인**했고 지금 저장소에 살아 있다. 상세는
+[docs/12 §5.4](docs/12_system_summary.md#54-남은-발생기--다음-세션이-반드시-처리할-것).
+
+**✅ 커밋 `612152c` 에서 해소된 것** (재확인 완료):
+신뢰대역 유도식 5곳 복붙 → **`BandPlan.resolve(...)` 단일 출처** ·
+`intersect_frequency_bands` 두 번 정의 → **`dsp/timing.py:147` 한 곳** ·
+`configs/eval*.yaml` 죽은 `trusted_band_hz` → **삭제** ·
+`measured_design_ceiling_db 6.53` → **`4.58` + `measured_design_ceiling_band_hz: [150,1600]`**
+(이전 값은 요구 대역보다 2 dB 낙관적인 fail-open 이었고 오판정 방향이 정확히 고역 방치였다) ·
+lead 가 trainer/게이트에서 109 vs 113 으로 갈라지던 것 → **`PlantDelays.lead()`** 로만 생성
+가능(손으로 쓰면 `TypeError`) · 서로 다른 플랜트 비교 → **`PlantFingerprint`** 가 차단.
+
+**⚠ 아직 살아 있는 것** (전부 직접 실행으로 확인):
+
+| # | 발생기 | 왜 급한가 |
+|---|---|---|
+| ~~1~~ | ~~source→ERR 지연 궤적이 **두 벌**~~ | **해소** (2026-08-06). `invariants.measure_stream_delay_trajectory` 는 `data.timeline.measure_delay_trajectory` 로 위임만 한다. 재정렬 47세션 47/47 PASS 재확인 |
+| ~~3~~ | ~~게이트 메타 테스트가 위양성을 강제하지 않는다~~ | **해소**. `GATES` 73개 전부 `positive_fixture` 보유(런타임 pydantic 강제) |
+| ~~4~~ | ~~`build_engine` 이 handoff 를 duct cfg 에서 다시 읽는다~~ | **해소**. `PipelineHandoffBudget` 사용 |
+| 2 | do-no-harm 힌지 마진 6.0 dB 와 G4 임계 1.0 dB 가 **서로를 모른다** (`losses/config.py:239` vs `eval/recorded.py:789`) | 손실을 만족한 모델이 게이트를 8~9 dB 차이로 FAIL. **여전히 살아 있다** |
+| 5 | 지연궤적 유효창 비율 임계가 **두 곳** — `realign …:53` 0.90 vs `invariants:375` | **부분 해소** (2026-08-06 통합 검증). 바닥이 0.50→**0.77** 로 올라갔고 realign 이 import 시점에 순서를 단언한다. 단일 유도로 합치는 것은 남았다 |
+| 6 | 게이트 미선언 탐지가 **소유 파일 16개 중 1개**에서만 돈다 (`tests/test_gate_registry.py:35 _SCANNED_SOURCES`) | 새 게이트를 선언 없이 만드는 경로가 열려 있다. 실측: `return 1` 을 가진 scripts/ 16개 중 게이트 선언은 3개뿐(12개 미선언) |
+
+**해야 할 것**: 남은 #2(손실↔게이트 임계 불일치)를 잇고, #6 의 12개를 사람이 하나씩 판정하라.
+
+---
+
+### 6. 런타임 안전 — 오발동 2건 → **둘 다 해소** (2026-08-06)
+
+- ~~**OUTPUT_DC 워치독이 영평균 저역 상쇄음을 DC 로 오인한다.**~~ → 53 ms 이동평균을
+  **2 Hz 1차 저역통과 + AC 대비 우세도**로 바꿨다. 20~1600 Hz × 위상 × 진폭(합법 천장의
+  0.90~1.00배) 배터리에서 오발동 0건, 진짜 DC 검출은 그대로(0.19 → 53 ms, 0.015 → 171 ms).
+- ~~**fail-closed 발산 워치독**이 외부 소음에 123 ms 만에 mute~~ → "의심 → 상쇄 출력을
+  즉시 0 으로 페이드(= mute 와 음향적으로 동일한 보호) → 1.0 s 무상쇄 재측정 → 판정" 으로
+  바꿨다. 재개는 "ANC 를 꺼도 에러가 안 줄었다"를 **실측한** 경우뿐이고, 연속 미결 3회면
+  fail-closed mute. **남은 위험**: 프로브(1 s)보다 짧은 과도 버스트는 여전히 오판 mute 가능.
+- ~~`configs/runtime*.yaml` 의 폐기 키~~ → 제거됨. 두 설정 모두 `legacy_notes=()` 확인.
+
+---
+
+### 7. 무료 기하 개선 (0 샘플 비용, 13–17 dB 이득)
+
+ERR 마이크를 CS 에서 **100 mm 이상** 떨어뜨려 **측벽 중앙높이**에 달아라.
+`H = D_e − t(REF→CS)` 항등식상 **ERR 위치는 H 에 정확히 0 의 영향**이고, CS 근접장/(1,0)
+모드 오염만 사라진다. ⚠ **미검증**: `configs/duct.yaml` 의
+`positions_m.error_mic_cross_section_m` 이 아직 없다. 벽면 장착으로 판명되면 S 신뢰 상한을
+1200 Hz 로 낮춰야 한다(실측 `|S|` 가 1448 Hz −10.1 dB → 1640 Hz −25.0 dB 로 하강하는 것이
+벽면 강결합을 반증하는 정황이지만 직접 확인은 아니다).
+
+---
+
+### 8. 하지 말 것
+
+- **`tiny_wide` 용량 실험** — 근거가 철회됐다(§0.6). 재녹음 이후에 다시 판단한다.
+- **`runs/finetune_tiny` 결과를 현재 플랜트 성능으로 인용** — 그 학습은 S 1465 / lead 113
+  (폐기된 오염 아티팩트)에서 나왔다.
+- **게이트 임계 완화** — 절대 금지. 재녹음이 게이트를 못 채워도 게이트를 낮추지 않는다.
+
+## 0.6 결함 대장 (전부 검증됨 — 상태 표기 2026-08-06)
+
+| # | 결함 | 상태 |
+|---|---|---|
+| **1** | 학습에 쓴 `S(z)` 형상이 **54% 틀림** (오염 반복 5개를 게이트가 통과) | ✅ **수정** — 재발행 + 게이트 신설 |
+| **2** | recorded 80세션 **시간축 붕괴** | ⚠ **발생기는 고침, 데이터는 재녹음 필요** |
+| **3** | 대역 밖 **2–8 kHz 를 15–22 dB 증폭** | ⚠ **부분** — 손실 항 추가, λ 미교정 |
+| **D1** | 코퍼스 누수 — 실측 `music` 60/60 이 합성 풀에 존재 | ⚠ **부분** — held-out 생성, 게이트 양성 확인 미완 |
+| **D2** | 실측 지연이 설정과 ~250 샘플 어긋남 | ⚠ 교차검증 게이트 신설됨. 재녹음 후 재판정 |
+| **D3** | G4 판정 자체가 통계 해상도 미달 | ⚠ 미해결 — 녹음 보강 필요 |
+| **D4** | `music` `group_id` 가 FMA 트랙 ID 버킷 | ⚠ 미해결 — `fma_metadata` 필요 |
+| **D5** | 크레스트 제한 10 dB 가 계열 차이를 지움 | ⚠ 미해결 — 권고안 아래 |
+| **RT** | 런타임 안전 워치독 | ✅ 7종 수정 / ⚠ **오발동 2건 신규** |
+
+---
+
+**결함 1 — `S(z)` 가 33~54% 틀려 있었다 (✅ 수정).**
+`alignment_scores` 반복 11–15 가 0.750–0.758 로 별도 무리인데 기각 임계 0.5 라
+`rejected_repeats: 0`. 결정적 증거는 **P−S 상대 τ** — 같은 DAC·같은 출력 스트림 인터리브라
+상수여야 하는데 반복 11 에서 **1.4 → 32 샘플 점프**(출력 버퍼 프레임 슬립). 게이트는 요약
+스칼라 `delay_spread 32` 를 허용치 48 과 비교해 **통과시켰다.**
+재발행 후 전대역 S 0.781 → **0.998**, 형상 오차 **P 17.0% / S 54.1%** 였음이 확인됐다.
+**출하 npz 로 설계한 필터를 클린 플랜트에 적용 = −0.54 dB**(올바른 설계 −6.53 dB).
+
+**결함 2 — 실측 녹음 80세션의 시간축 붕괴 (⚠ 재녹음 필요).**
+```
+coh²(source.wav → ERR mic) = 0.021 ~ 0.126   ← 학습이 배워야 할 관계
+coh²(REF mic  → ERR mic)   = 0.959 ~ 0.991   ← 음향 자체는 멀쩡 (같은 I²S 클록)
+source→ERR 지연 표준편차    = 248 ~ 4813 샘플
+```
+창별 최적정렬 후 coh²: 1.5s 0.430 / 0.5s 0.541 / **0.1s 0.745** / 25ms 0.518 —
+창을 줄여도 0.75 에서 멈춘다. **느린 드리프트가 아니라 빠른 위상 점프**이므로
+**일정 ppm 리샘플 dewarp 는 듣지 않는다.**
+원인: `record_duct.py` 가 `sd.Stream(device=(in_dev, out_dev))` 로 서로 다른 두 장치를
+duplex 로 묶고 콜백에서 출력커서와 입력커서를 **인덱스로만** 정렬 — "같은 물리 시각"이라고
+**단언**하고 측정하지 않았다.
+
+실제 기전: **`source.wav` 는 재생 배열이지 방출 시각이 아니다.** USB DAC 의 PLL 헌팅
+(주기 4~5초, 진폭 **259~407 샘플**)이 그 둘을 벌려 놓는다.
+
+**✅ 발생기는 고쳤다**: 정렬 수치를 신규 `src/deep_anc/data/timeline.py` 에서만 유도하고
+`record_duct` / `recorded_qa` / 재정렬 스크립트가 전부 그것을 호출한다. 저장 시점 게이트 신설.
+**✅ 47/80 은 오프라인 복구했다** (`ref_witness_warp_v1` — REF 마이크를 시간축 증인으로 써
+L(t) 를 추정하고 ERR 로만 검증). coh²(150–600) p50 0.078 → **0.947**, 선형 하한
+−0.23 → **−12.09 dB**, 잔여 지연 p50 **142.53 샘플**(기하 예측 139.9 와 일치).
+**⚠ 나머지 33세션은 재녹음해야 한다** — 47세션으로는 게이트(`≥80세션 그리고 ≥90분`) 미달.
+80세션은 `data/recorded_broken/` 에 **격리**돼 있다(되돌릴 수 있음).
+
+> **D7 판정 (전문가 충돌 해소).** 데이터 전문가의 "일정 ppm 리샘플 dewarp" 가설은
+> **기각**한다. 전역 기울기를 빼도 오차의 **99~102% 가 남고**, 잔차 파워의 83~98% 가
+> 0.1–0.5 Hz 대역에 있다(주기 3.95~5.33 s). **결정론적 주기 헌팅**이며 연속 시변 워프가
+> 이것을 처리한다.
+
+**결함 3 — 고역 증폭 (절대목표 1 정면 위반, ⚠ 부분 수정).**
+`results/session_20260804_0939/metrics.csv`: tone300 이 1k **−16.84** / 2k −15.42 /
+4k −18.03 / 8k **−21.56** dB (음수 = 증폭). 손실에 대역 밖 항이 **없고** 게이트에만 있었다.
+✅ 대역 밖 do-no-harm 힌지 추가(신뢰대역 여집합에서 자동 유도, 단측·위상 무관).
+⚠ **남은 것은 §0.5-3 참조** — λ 미교정(비 1333%), 힌지 마진과 게이트 임계 불일치(8~9 dB),
+출하 `alpha=0.7` 이 배분을 뒤집지 못함.
+
+**D1 — 코퍼스 누수 (⚠ 부분).** 실측 music 60트랙 **전부(100%)** 가 합성 풀 원본에 있고,
+결정적 split 재현 결과 **55개(92%)가 합성 train** 에 있다. speech/machine/environment 는 **0%**.
+같은 오디오에 **상충하는 정답**이 간다(합성 −18 dB 가능 / 실측 −0.4 dB 천장).
+✅ `corpus_disjoint` 게이트 + held-out 목록(691 클립) + `prepare_noise_pool.py --holdout`.
+⚠ manifest 격리로 실데이터 양성 확인 미완.
+
+**D2 — 실측 지연이 설정과 ~250 샘플 어긋난다.** 독립 세 방법 일치(포락선 1672 / 반송파 1663±73 /
+스윕 ~1670) vs 설정 유도 ~1950. 비용 계열별 **+0.71 ~ +2.39 dB**.
+✅ `measured_source_delay_agreement` / `invariant_measured_delay_agreement` 게이트 신설
+(실제 아티팩트에서 1672 vs 1849, 차이 177 > 허용 64 를 검출하는 것 확인).
+⚠ 재녹음 후 재판정 필요.
+
+**D3 — G4 판정 자체가 해상도 미달.** 계열 내 그룹 간 잔차 SD(pooled) **1.46 dB** →
+그룹 2개 계열의 평균 SE **1.03 dB** > 계열 간 폭 **0.92 dB**.
+music val 두 그룹이 자기들끼리 **2.96 dB** 벌어져 있고(−0.99 vs +1.97), machine val 은
+그룹 1개라 SE 추정 불가. **music val = 2세션 × 3클립 = 곡 6개.**
+**"music 이 최악" 은 통계적 근거가 없다.** ✅ G4 가 3값(PASS/FAIL/**INCONCLUSIVE**) 판정 +
+그룹 부트스트랩 CI 를 내도록 바뀜 — 판정 불가는 통과가 아니다.
+
+**D4 — music `group_id` 가 FMA 트랙 ID 버킷**이라 누수 방지 기능을 못 한다(아티스트/앨범 아님).
+실측: 세션/그룹 비율이 music **1.00**, speech **1.00**(감사 미언급), machine 2.50,
+environment 1.25 — **music 과 speech 는 그룹화 기능이 아예 없다.**
+`data/raw/music/fma_small` 에 README.txt 뿐이고 `fma_metadata`(tracks.csv, 342MB)가 없다.
+
+**D5 — 크레스트 제한 10 dB** (`build_recording_sources.py`) 가 네 계열을 **9.61–9.98 dB
+(폭 0.37 dB)** 로 균질화해 **music 을 측정 가능한 모든 축에서 가장 쉬운 신호로** 만들었다.
+현장 소음은 15–25 dB.
+⚠ **감사의 "3~5배 올려도 안전(22 dB 여유)" 은 틀렸다** — 클리핑하는 것은 소스가 아니라
+REF 마이크이고 실측 12세션 최악 peak 0.2123 = **13.4 dB** 여유다.
+```
+레벨 5배(+14dB) — 감사안   REF peak 1.064  여유 -0.6 dB ← 클리핑
+크레스트 15dB + 레벨 +3dB  REF peak 0.533  여유 +5.4 dB ← 권고
+```
+
+**D6 — machine 이 8그룹인 것은 물리 한계가 아니라 선택이다.** `ESC50_MACHINE` 이 ESC-50
+50개 중 24개만 쓰고 **26개를 버렸다**(siren, car_horn, clock_alarm, can_opening,
+keyboard_typing, mouse_click, door_wood_knock/creaks, glass_breaking 등 9종이 기계·도시음).
+게다가 **MIMII(팬/펌프/밸브/슬라이더)와 DEMAND 가 이미 합성 풀에 있는데 실측 machine
+수집에 전혀 쓰이지 않았다.** 재녹음 시 여기서 그룹 수를 늘릴 수 있다.
+
+**런타임 안전 (✅ 7종 수정 / ⚠ 오발동 2건 신규).**
+수정된 것: S1 클립 워치독이 DL 경로에서 죽은 코드였던 것(모델이 `0.2*tanh` 라 `|y|>0.2`
+불가능 → 포화율 + RMS 상한으로 교체) / S2 데드라인 워치독이 교대 미스를 영원히 못 잡던 것
+(스트릭 → 슬라이딩 윈도, 교대 미스 47블록에 mute) / S3 발산 워치독이 `baseline_power==0`
+이면 조용히 비활성이던 것(**fail-closed** 로 전환) / S6 NaN 을 조용히 삼키던 것 /
+S7 **출력 DC 보호 신설**(DCBlocker r=0.9995, 150 Hz −0.0006 dB) / 입력 백로그 8 hop(42.7 ms)
+→ 1 hop 대칭화 / `runtime*.yaml` 의 존재하지 않는 plan·onnx 경로.
+**⚠ 신규 오발동 2건은 §0.5-6 참조** — 실기 전에 반드시 처리할 것.
+
+## 0.7 파레토 — 결함은 같은 곳에서 반복된다 (사용자 지시)
+
+커밋 이력 + 이번 발견 **18건**을 분류한 결과:
+
+| 군집 | 건수 | **공통 발생기** |
+|---|---:|---|
+| **A. 두 도메인 간 시간 정렬 부기** | 9 | 같은 물리량(지연/lead/대역)을 **여러 곳에서 따로 유도**하고 대조 안 함 |
+| **B. 실패해본 적 없는 게이트** | 5 | 게이트가 "통과"를 주장하는데 그 주장이 **반증된 적이 없음** |
+| C. 측정 없는 성급한 결론 | 4 | TensorRT 기각 / 용량 부족 / 600Hz 한계 / 클록 드리프트 — 전부 정정됨 |
+
+**A+B = 14/18 (78%)**. 실측: 지연 산술을 독립 수행하는 파일이 **13개**
+(`eval/recorded.py` 35회, `train/finetune_readiness.py` 31, `bench/measure_duct_transfer_map.py` 20,
+`train/trainer.py` 17, …).
+
+**해야 할 것 (증상 수정보다 우선):**
+1. **지연·정렬 부기의 단일 출처** — 한 곳에서만 유도하고 나머지는 읽기만.
+   `Lead.derive(s_delay, handoff, p_delay)` 로만 만들 수 있게 해 손으로 못 쓰게 하라(pydantic).
+2. **교차 도메인 불변식 검사기** — P−S 상대 τ 상수성 / `coh²(재생→마이크)` / 플랜트 지문 일치 /
+   lead 유도값 일치. 측정·QA·게이트·런타임이 **같은 코드**를 호출해야 한다.
+3. **실패 증명 없는 게이트 금지** — 게이트를 열거해 **FAIL 시키는 fixture 가 없으면 실패하는
+   메타 테스트**. 게이트 9개가 전부 PASS 인데 전부 무용지물이었던 사고의 유일한 구조적 방어다.
+
+## 0.8 acoustic-reference 실배포 가능성 (2026-08-05 분석, 부분 완료)
+
+사용자 질문 *"예측지평 33 ms 때문에 상한이 0 dB 라는데 샘플을 늘리면 되지 않나?"* 에 대한 분석.
+
+**핵심 항등식**: `H = D_e − t(REF→CS)` — **ERR 마이크 위치는 H 에 영향이 0.**
+레버는 오직 **REF→CS 거리**와 **전기 지연 D_e** 다.
+
+```
+루프지연 L 대 광대역 상한 (150–600 Hz, 실측 Wiener)
+L=140:  −37.83 dB    L=256: −4.15    L=512: −0.21    L=757: −0.02    L=1718: −0.00
+        └── 절벽이 L=256~512 사이 ──┘
+```
+
+| 시나리오 | D_e (샘플) | 필요 REF→CS (H≤128) |
+|---|---:|---|
+| 현재 (USB 256/low, 3스레드) | 1714 | 11 m 이상 (비현실적) |
+| 핸드오프 0 만 | 1470 | 9.6 m |
+| **APE I²S 128 + 핸드오프 0** | **750** | **4.4 m** |
+
+- **코덱/앰프/마이크 고정분 = 479 샘플(9.98 ms)** — 버퍼를 24 ms 흔들어도 잔차 9.0~11.7 ms 로
+  일정하다(5개 설정 교차검증) = **소프트웨어로 접근 불가, 하드웨어 교체만**.
+- 실측 소스풀 80개(64–1600 Hz)에서 H=1581 일 때 중앙 −0.22 dB / **최악 −0.02 dB**.
+  H=140 이면 중앙 −4.75 / 최악 −1.41.
+- **대역폭이 결정한다**: H=1609 에서도 BW 1 Hz **−17.09 dB** / 5 Hz **−33.65** / 20 Hz −6.41 /
+  450 Hz −0.02. **팬·모터 같은 준주기 소음은 지금 지연으로도 된다. 음성·음악·광대역이 죽는다.**
+- **feedback ANC 는 답이 아니다** — 루프지연이 그대로 예측지평이 되어 feedforward 보다
+  음향선행 140 샘플만큼 **더 나쁘다**(실측 차이 0.01 dB). 게다가 Bode 적분이 대가를
+  보호대역 안쪽에 **+4.8~+18.8 dB** 로 되돌려 절대목표 2 와 구조적으로 양립 불가.
+- ⚠ **미완**: 신호예측가능성·비선형상한 두 각도와 적대적 검증이 중단됨.
+  스크립트 `.claude/.../workflows/scripts/acoustic-ref-feasibility-*.js`, run `wf_ff3b17f5-6b4`.
+  **`digital-ref lead 를 올려 얻은 수치는 acoustic-ref 로 전이되지 않는다**
+  (lead 는 digital-ref 전용 자유변수).
 
 ### base vs tiny 최종 비교 (2026-08-04 05:03, 동일 held-out 64 아이템)
 
@@ -37,6 +451,11 @@
 | held-out η=0.15 fullband | −12.97 | **−13.97** | **tiny (1.00dB)** |
 | **최악 아이템 fullband** | **+13.89 (증폭)** | **+4.06** | **tiny (9.83dB)** |
 | Jetson P99 (ORT CPU) | 6.8ms **게이트 미달** | **1.84ms** | **tiny** |
+
+> 이 절과 아래의 `1.84ms` / `6.8ms` 는 **2026-08-04 30W 시절 값**이다. 전원모드 표기가 없어
+> 대조가 안 되므로 인용하지 말 것 — **지연 수치의 단일 출처는
+> [docs/12 §4.6](docs/12_system_summary.md#46-추론-지연--30w-vs-maxn)** 이다
+> (MAXN: tiny ORT P99 **1.44ms**, base 6.40ms). 그리고 모든 GPU 수치는 **듀티 100%** 벤치다.
 
 소스별로는 **7종 중 7종 전부 tiny가 우세**하다.
 
@@ -202,7 +621,8 @@ $SSH 'cd ~/Deep-ANC && bash scripts/elice/run_job_queue.sh 1'   # 또는 0
 
 - 저장소 골격·문서·자동 테스트, GitHub `Roka-jsj/Deep-ANC` 공개 운영
 - 19-에이전트 리뷰(결함 15건) + 5-에이전트 구조 감사(이슈 35건) 반영
-- 물리 정합 학습 목표(digital-ref lead 109, P(z) resolver, trusted-band 150–600Hz NMSE)
+- 물리 정합 학습 목표(digital-ref lead — **현행 실측 116**, 사전학습 artifact 는 109 —,
+  P(z) resolver, trusted-band NMSE — **현행 150–1600Hz**, 사전학습 당시 150–600Hz)
 - 원샷 부트스트랩 `scripts/elice/bootstrap_all.sh` (환경+데이터 6종+RIR+QA+테스트+2GPU 학습)
 - 데이터: DNS 16,000 / speech 8,065 / music 7,997 / MIMII 3,600 / ESC-50 2,000 / DEMAND 96
   (약 154.9시간). 손상 FMA MP3 3개는 manifest에서 제외
@@ -229,7 +649,8 @@ $SSH 'cd ~/Deep-ANC && bash scripts/elice/run_job_queue.sh 1'   # 또는 0
 #### 2026-08-04 오후 세션에서 완료한 것
 
 - **G2 통과 — recorded 데이터셋 수집 완료**: **80세션 / 93.3분 / 4계열 각 20개 / 64그룹**,
-  분할 train 64 · val 9 · test 7, 전수 QA **80/80 PASS**.
+  분할 train 64 · val 9 · test 7, **형식** QA 80/80 PASS.
+  ⚠ **2026-08-06 정정: 정렬 QA 로는 0/80 PASS 이며 80세션 전량 격리됐다** (§0.6 결함 2).
   - `build_recording_sources.py` — 계열별 소스 WAV, tanh 소프트 클리핑으로 크레스트 10dB 제한
   - `record_session_batch.py` — 재개 가능 배치, 세션마다 즉시 QA, 일시적 xrun 1회 재시도
   - `record_duct.py` — settle 1초, **xrun 발생 세션은 저장 자체를 거부**
@@ -246,12 +667,21 @@ $SSH 'cd ~/Deep-ANC && bash scripts/elice/run_job_queue.sh 1'   # 또는 0
   `src/deep_anc/dsp/interleaved_probe.py`(자극 설계 + IR 복원 + warp 추적/역보정).
   게이트에 `interleaved_multitone` 방식을 추가하되 **ESS 보다 좁게** 검사한다
   (guard=1, 분석창 ≤2초, 톤 수, 톤 SNR, 그리고 두 파일의 `capture_id` 일치).
-- **전체 회귀 테스트 336개 통과** (세션 시작 기준선 273 → +63)
+- **전체 회귀 테스트 336개 통과** (당시. 2026-08-06 현재 **604개**)
 - **README 전면 정리 + 그림 4종** — 덕트 도면(SVG, `duct.yaml`에서 생성), 지연 예산,
   실기 ANC 시연 파형/스펙트럼, 데이터셋 구성. 전부
   `scripts/docs/render_readme_figures.py`가 **실측 산출물에서 재생성**한다.
 
 ### 대기 ⬜ (다음 세션이 할 일 순서)
+
+> ⚠ **이 절은 2026-08-04 기준이며 상당 부분이 낡았다. 실행 순서는 §0.5 를 따르라.**
+> G1 은 **해결됐다** (2026-08-05 플랜트 복구 — 단, 당시 '통과' 시킨 게이트가 오염된 S(z) 를
+> 통과시켰다는 것이 §0.6 결함 1 이다). 실질 블로커는 이제 **결함 2(실측 녹음 시간축 붕괴)** 다.
+> 아래 G1 서술의 "클록 도메인 드리프트" 진단도 틀렸다 — 실측 상대 드리프트는 +0.4 ppm 이고
+> 실제 원인은 USB 큐 위상 점프다(§0 표).
+
+<details>
+<summary>2026-08-04 시점의 기록 (역사적 참고용)</summary>
 
 **파인튜닝 준비 상태: NOT READY. 블로커는 G1 하나뿐이다.**
 
@@ -288,6 +718,8 @@ $SSH 'cd ~/Deep-ANC && bash scripts/elice/run_job_queue.sh 1'   # 또는 0
    - `trainer.py`의 `freeze_encoder`를 DDP 래핑 **앞**으로 이동
    - `recorded_qa.py`의 최소 RMS(−80dBFS)가 실제 바닥(−67.4dBFS)보다 낮다 → SNR 여유로 전환
    - `make_recorded_manifest.py`가 `batch_progress.csv`의 판정을 무시한다
+
+</details>
 
 ### 승자 연장 작업의 규약 (감독자가 자동 적용 — 참고용)
 
@@ -449,8 +881,9 @@ exit code 표와 산출물 경로는 README §6.6 참조.
   `control_filter_last.npy`를 CWD에 저장하므로 원본에서 기본값 실행 금지.
 - `~/FxLMS/realtime_fxlms` — C++ 단일 blocking `snd_pcm_readi`→계산→`writei`, block512,
   S 2048tap, W 512tap, 내부 230+370Hz digital tone reference. FxLMS 부호는 Deep_ANC의
-  `e=d+S·y`와 일치하지만 REF ch1은 실제 제어에 쓰지 않는다. APE 입력/USB 출력이 독립 clock인데
-  timestamp가 없고 partial write/xrun 뒤에도 계속하므로 **절대 지연·위상 근거로 쓸 수 없다.**
+  `e=d+S·y`와 일치하지만 REF ch1은 실제 제어에 쓰지 않는다. timestamp가 없고 partial write/
+  xrun 뒤에도 계속하므로 **절대 지연·위상 근거로 쓸 수 없다.** (두 클록이 독립이라서가
+  아니다 — APE 입력과 USB 출력은 같은 Tegra 발진기를 공유하며 상대 드리프트는 +0.4 ppm 이다.)
   `run_experiment.sh`는 PCM 100%로 바꾸므로 볼륨 최저 규칙과 충돌해 **실행 금지**다.
   기존 `fxlms_run_log.csv`의 ANC control RMS는 거의 0.299로 ±0.3 hard-limit에 포화됐고
   표시 감쇠는 −1.80~+5.69dB로 요동해 **2dB 성공 증거가 아니다.**

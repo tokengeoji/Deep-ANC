@@ -23,34 +23,54 @@ ctypes 로 preload 한다. venv 를 새로 만들면 이 두 파일을 함께 �
 | 엔진 | 상태 | hop 256 스텝 지연 (Jetson 실측) | 용도 |
 |---|---|---|---|
 | `torch` | 동작 | tiny ~10ms (P99 11.6ms) | 개발/디버깅 — 실시간 불가 |
-| `ort` (CPU) | 동작 | **tiny P99 1.50ms ✓ / base P99 6.8ms ✗** | **현행 배포 기본** (tiny) |
-| `trt` (FP16) | 코드 준비됨, 현재 환경 실행 도구 없음 | 미실측 | 별도 사전 구성 환경의 base 목표 경로 |
+| `ort` (CPU) | 동작 | **tiny P99 1.44ms ✓ (MAXN) / 1.54ms (30W) · base 6.40ms ✗** | **현행 배포 기본** (tiny) |
+| `trt` (FP16) | **동작** — `import tensorrt` 10.3.0, plan 빌드·실측 완료 | tiny P50 0.29ms / P99 3.12ms (MAXN, **듀티 100% 벤치**) | GPU 경로 후보 |
 | `fxlms` | 동작 | ~0.2ms | 베이스라인/폴백 |
+
+지연 수치의 **단일 출처는 [docs/12 §4.6](12_system_summary.md#46-추론-지연--30w-vs-maxn)** 이다.
+**전원모드(30W/MAXN)를 함께 적지 않은 수치는 인용하지 않는다** — 예전 문서의 1.50 / 1.84ms
+는 전원모드 표기가 없어 대조 불가하므로 위 표를 기준으로 삼는다.
 
 게이트: block 256(5.33ms)에서 **P99 < 3.0ms**. 실행:
 
 ```bash
-.venv/bin/python scripts/bench/measure_inference_latency.py --config configs/runtime.yaml \
-    --set engine.type=ort --set engine.onnx=runs/export/model.onnx
+.venv/bin/python scripts/bench/measure_inference_latency.py --config configs/runtime_tiny.yaml \
+    --set engine.type=ort --set engine.onnx=runs/export/tiny_corrected.onnx
 ```
+
+> [!WARNING]
+> **이 벤치는 듀티 100%(sleep 없는 back-to-back 루프)다.** 실제 ANC 는 5.33 ms 주기에
+> 추론 ~0.3 ms 로 듀티 약 6% 이고, 그 조건에서 거버너가 GPU 를 306 MHz 로 고정해
+> TRT P50 이 0.30 → 1.10 ms 로 **3.7배** 나빠진다. 또 `chrt -f 80` 을 붙이면 커널 RT
+> 스로틀링(`sched_rt_runtime_us=950000`)으로 **1초마다 50 ms 스파이크**가 섞인다.
+> **GPU 실시간 판정은 주기 호출 벤치(미구현) 전까지 잠정이다.**
 
 표의 FxLMS `동작`은 알고리즘/실시간 처리 경로를 뜻한다. 2026-08-03 pin17 복구 뒤 ERR/REF
 I²S 입력은 −46dBFS대, clip 0%로 두 채널 probe를 통과했다. 실제 덕트 상쇄는 출력 직전
 probe 재통과와 사용자 입회·앰프 볼륨 최저를 모두 만족할 때만 실행한다.
 
-### TensorRT 경로 (현재 Jetson에서는 사용 불가)
+### TensorRT 경로 (동작 확인됨 — 2026-08-06 갱신)
 
-TRT 10.3 런타임 라이브러리는 있으나 **python 바인딩·trtexec 이 미설치**다. 이 프로젝트는
-apt/sudo를 포함한 Jetson 시스템 변경을 금지하므로 현재 장비에 설치하지 않는다. 따라서 현행
-배포는 tiny+ORT를 사용한다. `trtexec`이 사전에 제공된 별도 환경에서만 다음 경로를 검증한다.
+> 이전 판은 *"TRT python 바인딩·trtexec 미설치로 사용 불가"* 라고 적었다. **그 서술은 낡았다.**
+> `.venv/bin/python -c "import tensorrt; print(tensorrt.__version__)"` → **10.3.0**,
+> FP16 엔진 `runs/export/tiny_corrected_fp16.plan` (3.7 MB, 2026-08-04 22:37)이 실제로
+> 빌드돼 있고 지연도 실측했다(README §2.6, docs/12 §4.6).
+> **`trtexec` 바이너리만 PATH 에 없다** — 엔진 빌드는 `scripts/export/build_trt.sh` 의
+> python API 경로를 쓴다. 이 프로젝트는 apt/sudo 를 포함한 Jetson 시스템 변경을 금지하므로
+> `trtexec` 을 설치하지 않는다.
 
 ```bash
-bash scripts/export/build_trt.sh runs/export/model.onnx      # FP16 엔진 빌드
-.venv/bin/python scripts/bench/measure_inference_latency.py --config configs/runtime.yaml \
-    --set engine.type=trt --set engine.plan=runs/export/model_fp16.plan
+bash scripts/export/build_trt.sh runs/export/tiny_corrected.onnx   # FP16 엔진 빌드
+.venv/bin/python scripts/bench/measure_inference_latency.py --config configs/runtime_tiny.yaml \
+    --set engine.type=trt --set engine.plan=runs/export/tiny_corrected_fp16.plan
 ```
 
-TRT 없이도 **tiny + ORT CPU 로 실시간 게이트를 통과**하므로 1차 데모는 가능하다.
+**배포 기본은 여전히 tiny + ORT CPU 다.** GPU 실측치가 듀티 100% 조건에서 나온 값이라
+실제 ANC 듀티(약 6%)에서의 실시간 성립이 아직 확인되지 않았기 때문이다.
+`runs/export/` 에 실재하는 artifact 는 `tiny_corrected.onnx`,
+`tiny_corrected_fp16.plan`, `tiny_long.onnx` 세 개뿐이다(`ls -l runs/export/` 로 확인).
+예전 문서가 가리키던 `model.onnx` / `model_fp16.plan` 은 **존재하지 않으며 어떤 스크립트도
+만들지 않는다.**
 
 ### 체크포인트와 배포 자격
 
@@ -80,10 +100,14 @@ ONNX·지연 파이프라인을 검증하는 데는 쓸 수 있지만, 실제 no
 - 파이프라인 핸드오프 = 정확히 1 hop → 학습 플랜트의 `handoff_extra_samples: 256` 와 정합.
   실효 지연 검증: `.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --calibrate`
   (실측과 다르면 원인을 확인하고 P/S 지연·lead를 함께 재산출한 뒤 파인튜닝).
-- `digital_reference_lead_samples: 109`는 자기생성 소음의 실제 재생을 109샘플
-  (2.27ms) FIFO로 늦춰 모델에 확정된 선행 신호를 제공한다. 소음 게이트도
-  같은 FIFO를 통과하므로 ON/OFF 전환 중에도 `ref[t]=source[t+109]` 정렬을
-  유지한다. 현재 corrected Stage-1 학습 설정은 109를 사용한다.
+- `digital_reference_lead_samples` 는 자기생성 소음의 실제 재생을 그만큼 FIFO로 늦춰
+  모델에 확정된 선행 신호를 제공한다. 소음 게이트도 같은 FIFO를 통과하므로 ON/OFF 전환
+  중에도 `ref[t]=source[t+lead]` 정렬을 유지한다.
+  **배포 중인 ONNX 는 `lead=109` 로 사전학습됐고 `configs/runtime_tiny.yaml` 도 109 다.**
+  그러나 **2026-08-05 플랜트 복구 후 실측 lead 는 116** 이다
+  (`S 1462 + handoff 256 − P 1602`). 7샘플(146 µs) 어긋난 상태이며, 새 파인튜닝이 116으로
+  끝나면 런타임 설정도 116으로 올린다. 런타임은 checkpoint/ONNX 메타와 설정이 다르면
+  **오디오를 열기 전에 거부**하므로 두 값이 조용히 섞이지는 않는다.
 - 배포 템플릿 `configs/runtime.yaml`은 legacy artifact의 자동 오실행을 피하려고 0을
   유지한다. **artifact의 학습 lead와 런타임 lead를 반드시 같게** 맞춘다.
   `reference: mic`은 0 이외의 값을 거부한다.
@@ -99,13 +123,14 @@ ONNX·지연 파이프라인을 검증하는 데는 쓸 수 있지만, 실제 no
 .venv/bin/python scripts/bench/check_audio_input.py
 # acoustic-reference/recorded 수집은 두 채널 모두 필요
 .venv/bin/python scripts/bench/check_audio_input.py --require-both
-# lead=0 artifact의 DL(ORT) — 항상 ANC OFF 시작, A 키로 ON
-.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml \
-    --set engine.type=ort --set engine.onnx=runs/export/model.onnx
-# +109 artifact 정렬 스모크; surrogate Stage-1은 물리 데모에 사용 금지
-.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml \
+# 배포 후보 (tiny + ORT) — 항상 ANC OFF 시작, A 키로 ON
+# runtime_tiny.yaml 이 lead=109 와 tiny_corrected.onnx 를 이미 가리킨다
+.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml
+# 다른 artifact 를 쓰려면 lead 를 그 artifact 메타와 반드시 같게 준다 (다르면 시작 전 거부)
+.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml \
     --set digital_reference_lead_samples=109 \
-    --set engine.type=ort --set engine.onnx=runs/export/model_lead109.onnx
+    --set engine.type=ort --set engine.onnx=runs/export/tiny_corrected.onnx
+# 실재하는 artifact: runs/export/{tiny_corrected.onnx, tiny_corrected_fp16.plan, tiny_long.onnx}
 # FxLMS 회귀 기준선 (기존 시스템과 동일 동작 확인용)
 .venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --set controller=fxlms
 # 세션 기록 (npz)

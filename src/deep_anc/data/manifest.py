@@ -198,6 +198,7 @@ def assign_splits(
     seed: int = 20260802,
     group_key: str | None = "group_id",
     stratify_key: str | None = None,
+    min_units_per_split: dict[str, int] | None = None,
 ) -> list[dict]:
     """재현 가능한 분할을 배정한다.
 
@@ -205,6 +206,20 @@ def assign_splits(
     키가 있으면 누수 가능성이 있으므로 거부한다. 키가 전혀 없으면 legacy 파일
     단위 분할을 유지한다. ``stratify_key``가 있으면 각 계층 안에서 그룹을 따로
     배정하며, 그룹 수가 양수 비율 split 수 이상이면 모든 split을 최소 1회 덮는다.
+
+    ``min_units_per_split`` — 계층마다 split 이 가져야 할 **단위(그룹) 하한**
+    ------------------------------------------------------------------------
+    비율 분할만으로는 이 하한을 만족시킬 수 없다. 2026-08-06 실측: 실측 80세션/
+    64그룹을 8:1:1 로 나누면 val·test 가 계열당 **1~2 그룹**이 되는데
+    ``recorded_statistical_power`` 게이트는 **4 그룹**을 요구한다. 비율로 4를 얻으려면
+    계열당 40그룹(=160세션)이 필요하고, 그건 스피커 시간 2배다.
+
+    그래서 하한을 **먼저 확보하고 나머지를 비율로** 나눈다. 하한을 만족시킬 수 없으면
+    조용히 적게 주지 않고 **실패한다** — "게이트가 요구하는 것을 만족하지 못하는
+    manifest" 가 조용히 만들어지면, 그 사실은 학습이 끝난 뒤 G4 판정 불가로만 드러난다.
+
+    하한의 단일 출처는 ``eval.recorded.MIN_GROUPS_PER_FAMILY`` 이고, 이 함수는 그것을
+    **읽지 않는다** — 호출자가 넘긴다. 여기서 다시 유도하면 그것이 두 번째 정의가 된다.
     """
     import numpy as np
 
@@ -273,7 +288,22 @@ def assign_splits(
 
     split_ratios = (train_ratio, val_ratio, test_ratio)
 
-    def allocate_counts(n_units: int) -> list[int]:
+    floors = [0, 0, 0]
+    if min_units_per_split:
+        unknown = sorted(set(min_units_per_split) - set(VALID_SPLITS))
+        if unknown:
+            raise ValueError(f"알 수 없는 split 이름: {unknown}")
+        for position, name in enumerate(VALID_SPLITS):
+            value = int(min_units_per_split.get(name, 0))
+            if value < 0:
+                raise ValueError(f"{name} 단위 하한은 0 이상이어야 합니다: {value}")
+            if value > 0 and split_ratios[position] <= 0.0:
+                raise ValueError(
+                    f"{name} 비율이 0 인데 단위 하한 {value} 를 요구할 수 없습니다"
+                )
+            floors[position] = value
+
+    def allocate_counts(n_units: int, stratum: str = "__all__") -> list[int]:
         raw = [n_units * ratio for ratio in split_ratios]
         counts = [math.floor(value) for value in raw]
         remaining = n_units - sum(counts)
@@ -297,12 +327,49 @@ def assign_splits(
                 )
                 counts[donor] -= 1
                 counts[missing_index] += 1
+
+        if any(floors):
+            # 하한을 먼저 확보한다. 남는 것이 없으면 조용히 줄이지 않고 실패한다.
+            shortfall = [
+                f"{VALID_SPLITS[i]} {floors[i]}" for i in range(3) if floors[i] > 0
+            ]
+            # train 에도 최소 1 단위는 남겨야 학습이 성립한다.
+            train_floor = 1 if split_ratios[0] > 0.0 else 0
+            needed = sum(floors) + max(0, train_floor - floors[0])
+            if n_units < needed:
+                where = f"[{stratum}] " if stratum != "__all__" else ""
+                raise ValueError(
+                    f"{where}단위(그룹)가 {n_units} 개뿐이라 split 하한을 만족할 수 없습니다: "
+                    f"요구 {', '.join(shortfall)} + train 최소 {train_floor} = {needed}. "
+                    "비율을 바꿔도 해결되지 않습니다 — 서로 다른 그룹(원본)을 더 모아야 합니다."
+                )
+            for position in range(3):
+                if counts[position] >= floors[position]:
+                    continue
+                deficit = floors[position] - counts[position]
+                # 여유가 가장 많은 split 에서 가져온다. train 을 먼저 헐되 1 은 남긴다.
+                while deficit > 0:
+                    donors = [
+                        i
+                        for i in range(3)
+                        if counts[i] - floors[i] > (train_floor if i == 0 else 0)
+                    ]
+                    if not donors:
+                        donors = [i for i in range(3) if counts[i] > floors[i]]
+                    if not donors:  # 방어: 위 needed 검사가 이미 막는다.
+                        raise ValueError(
+                            f"[{stratum}] split 하한을 만족시킬 단위가 없습니다"
+                        )
+                    donor = max(donors, key=lambda i: (counts[i] - floors[i], -i))
+                    counts[donor] -= 1
+                    counts[position] += 1
+                    deficit -= 1
         return counts
 
     for stratum in sorted(strata):
         stratum_units = strata[stratum]
         order = rng.permutation(stratum_units)
-        n_train, n_val, _n_test = allocate_counts(len(stratum_units))
+        n_train, n_val, _n_test = allocate_counts(len(stratum_units), stratum)
         for rank, unit_index in enumerate(order):
             if rank < n_train:
                 assigned = "train"

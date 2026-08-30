@@ -20,6 +20,6 @@
   <circle cx="803.3" cy="226.0" r="5" fill="#1f2933"/>
   <text x="803.3" y="248.0" text-anchor="middle" dominant-baseline="hanging" font-size="13" fill="#1f2933" font-family="Noto Sans CJK KR, Noto Sans KR, Apple SD Gothic Neo, Malgun Gothic, sans-serif">ERR  에러 마이크</text>
   <text x="803.3" y="264.0" text-anchor="middle" dominant-baseline="hanging" font-size="11" fill="#8b949e" font-family="Noto Sans CJK KR, Noto Sans KR, Apple SD Gothic Neo, Malgun Gothic, sans-serif">x = 1.100 m</text>
-  <text x="70" y="300" font-size="12" fill="#1f2933" font-family="Noto Sans CJK KR, Noto Sans KR, Apple SD Gothic Neo, Malgun Gothic, sans-serif">단면 105×105 mm · 내부 길이 1.190 m · closed-open · 평면파 차단 1633 Hz · 목표 대역 80–800 Hz · 축방향 공진 70, 210, 350, 489, 629 Hz</text>
+  <text x="70" y="300" font-size="12" fill="#1f2933" font-family="Noto Sans CJK KR, Noto Sans KR, Apple SD Gothic Neo, Malgun Gothic, sans-serif">단면 105×105 mm · 내부 길이 1.190 m · closed-open · 평면파 차단 1633 Hz · 목표 대역 80–1600 Hz · 축방향 공진 70, 210, 350, 489, 629 Hz</text>
   <text x="70" y="46" font-size="16" font-weight="bold" fill="#1f2933" font-family="Noto Sans CJK KR, Noto Sans KR, Apple SD Gothic Neo, Malgun Gothic, sans-serif">아크릴 덕트 배치 (원점 = 좌측 폐단)</text>
 </svg>

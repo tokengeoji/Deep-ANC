@@ -85,6 +85,7 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
     if overrides:
         cfg = apply_overrides(cfg, overrides)
     validate_duct(cfg["duct"])
+    _propagate_d_noise_delay(cfg)
     return cfg
 
 
@@ -100,7 +101,45 @@ def load_runtime_config(path: str | Path, overrides: list[str] | None = None) ->
         # 이 두 번째 적용이 없으면 ``--set hardware.audio.block_size=512`` 같은
         # 런타임 조정은 위의 참조 파일 로드에서 조용히 사라진다.
         cfg = apply_overrides(cfg, overrides)
+    _propagate_d_noise_delay(cfg)
     return cfg
+
+
+def _propagate_d_noise_delay(cfg: dict) -> None:
+    """duct 의 ``d_noise_delay_samples`` 를 ``cfg["data"]`` 로 **통과시킨다** (유도 아님).
+
+    왜 필요한가
+    ----------
+    실측 브랜치의 lead 는 ``K' = (D_noise + K) − d_recorded`` 로 유도되어야 두 브랜치가
+    모델에게 주는 총 선행량이 같아진다. 그런데 ``RecordedANCDataset`` 은 ``data_cfg`` 만
+    받고, ``d_noise_delay_samples`` 는 ``duct.yaml`` 에 있어서 그 값이 도달하지 못했다.
+    그래서 ``recorded_lead_mode=timeline`` 을 켜면 "d_noise_delay_samples 가 필요합니다"
+    로 실패했고, 결국 ``constant`` 로 남아 있었다.
+
+    ``constant`` 의 대가 (2026-08-06 실측):
+
+        합성  x_ref 가 d 보다  1602 + 116 = 1718 샘플 앞선다
+        실측  x_ref 가 d 보다   142.5 + 116 =  258 샘플 앞선다
+        → 어긋남 1460 샘플 (30.4 ms). 같은 모델이 두 브랜치에서 다른 과제를 배운다.
+
+    여기서 하는 것은 **복사**이지 유도가 아니다. 값의 단일 출처는 여전히 duct.yaml 이고,
+    두 브랜치가 같은 숫자를 읽게 만드는 것이 목적이다.
+    """
+
+    data = cfg.get("data")
+    duct = cfg.get("duct")
+    if not isinstance(data, dict) or not isinstance(duct, dict):
+        return
+    value = (duct.get("digital_reference") or {}).get("d_noise_delay_samples")
+    if value is None:
+        return
+    declared = data.get("d_noise_delay_samples")
+    if declared is not None and int(declared) != int(value):
+        raise ValueError(
+            f"d_noise_delay_samples 가 두 곳에서 다릅니다: data_sim {declared} vs "
+            f"duct {value} — 같은 물리량을 두 곳에서 정하지 마세요 (duct.yaml 이 출처)"
+        )
+    data["d_noise_delay_samples"] = int(value)
 
 
 def validate_duct(duct: dict) -> list[str]:

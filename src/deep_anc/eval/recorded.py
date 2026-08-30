@@ -18,14 +18,26 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from ..config import DEFAULT_HANDOFF_SAMPLES, REPO_ROOT
+from ..config import REPO_ROOT
 from ..data.manifest import read_manifest
 from ..data.primary_path import resolve_digital_primary_path
 from ..data.synth_dataset import _delay_np
+from ..dsp.invariants import check_lead_agreement, check_plant_fingerprint_match
 from ..dsp.secondary_path import (
     DifferentiableSecondaryPath,
     SecondaryPathData,
     load_secondary_path,
+)
+# 대역 밖 예산의 단일 출처 — 손실 힌지가 이 임계에서 유도된다 (발생기 A).
+from ..dsp.do_no_harm import MAX_OUT_OF_BAND_AMPLIFICATION_DB
+
+# 지연·lead·대역 부기의 단일 출처 (발생기 A).
+from ..dsp.timing import (
+    BandPlan,
+    FrequencyBand,
+    PlantDelays,
+    PlantFingerprint,
+    handoff_samples_from_config,
 )
 from ..models import build_model
 from ..train.trainer import validate_training_physics
@@ -188,11 +200,7 @@ def load_recorded_eval_context(
         raise ValueError(
             f"S(z) sample_rate={secondary.sample_rate}Hz != checkpoint={fs}Hz"
         )
-    handoff = int(
-        secondary_cfg.get("handoff_extra_samples", DEFAULT_HANDOFF_SAMPLES)
-    )
-    if handoff < 0:
-        raise ValueError("secondary handoff 지연은 0 이상이어야 합니다")
+    handoff = handoff_samples_from_config(duct_cfg)
 
     primary_delay: int | None = None
     expected_lead = 0
@@ -200,22 +208,30 @@ def load_recorded_eval_context(
         _, primary_delay = resolve_digital_primary_path(
             data_cfg, duct_cfg, fs, secondary
         )
-        expected_lead = max(
-            0, int(secondary.delay_samples) + handoff - int(primary_delay)
+        # lead 는 여기서 다시 유도하지 않는다 — PlantDelays 가 유일한 발원지이고
+        # 게이트(finetune_readiness)도 **같은 함수**를 호출한다. 두 곳이 각자 유도해
+        # 109 와 113 으로 갈라졌던 것이 커밋 aaeef41 의 사고다.
+        delays = PlantDelays.from_config(
+            duct_cfg=duct_cfg,
+            secondary_delay_samples=int(secondary.delay_samples),
+            primary_delay_samples=int(primary_delay),
+            sample_rate=fs,
         )
-        if lead != expected_lead:
+        expected_lead = int(delays.lead().samples)
+        result = check_lead_agreement(int(lead), delays)
+        if not result.ok:
             raise ValueError(
                 "checkpoint digital-reference lead가 P/S 지연과 다릅니다: "
                 f"checkpoint={lead}, expected={expected_lead} "
                 f"(S={secondary.delay_samples}+handoff {handoff}, P={primary_delay})"
             )
 
-    target_band = duct_cfg.get("acoustics", {}).get(
-        "realistic_target_band_hz", [80.0, 1000.0]
+    band_plan = BandPlan.resolve(
+        plant_trusted_band_hz=secondary.trusted_band_hz(),
+        duct_cfg=duct_cfg,
+        sample_rate=fs,
     )
-    computed_trusted = intersect_frequency_bands(
-        secondary.trusted_band_hz(), target_band, fs / 2.0
-    )
+    computed_trusted = band_plan.optimize.as_tuple()
     saved_trusted_raw = cfg["trusted_band_hz"]
     saved_trusted = intersect_frequency_bands(
         saved_trusted_raw, saved_trusted_raw, fs / 2.0
@@ -385,12 +401,37 @@ def resolve_feedback_delay(data_cfg: dict, requested: int | None = None) -> int:
     return value
 
 
+def _plant_settle_samples(context: "RecordedEvalContext") -> int:
+    """평가 컨텍스트의 플랜트 정착 구간 (단일 출처 위임)."""
+
+    from ..dsp.timing import PlantSettle
+
+    return PlantSettle.derive(
+        secondary_delay_samples=int(context.secondary_path.delay_samples),
+        handoff_samples=int(context.secondary_handoff_samples),
+        fir_taps=int(context.secondary_path.fir.size),
+        sample_rate=int(context.sample_rate),
+    ).samples
+
+
 def resolve_warmup_samples(
     data_cfg: dict,
     sample_rate: int,
     requested_seconds: float | None = None,
+    min_samples: int = 0,
 ) -> int:
-    """평가 지표에서 제외할 플랜트 적용 후 warmup 길이를 반환."""
+    """평가 지표에서 제외할 플랜트 적용 후 warmup 길이를 반환.
+
+    ``min_samples`` 는 S(z) 총지연 + FIR 정착이다(단일 출처: ``dsp.timing.PlantSettle``).
+    이 구간은 y 가 무엇이든 ``e = d`` 라 상쇄량을 잴 수 없다. 학습이 버리는 구간
+    (``trainer.loss_start_sample``)과 **같은 양을 가리켜야** 두 숫자를 비교할 수 있다 —
+    예전에는 학습이 0, 평가가 ``closed_loop.warmup_seconds``(12000) 을 버렸고 아무도
+    두 숫자가 다른 것을 몰랐다 (발생기 A).
+
+    하한을 두는 방향은 게이트를 **강화**한다: warmup_seconds 가 나중에 0 으로 내려가도
+    구조적으로 상쇄 불가능한 구간(실측 recorded 하한 worst −4.8 dB)이 지표에 섞이지
+    않는다. 현재 값(12000 > 3769)에서는 동작이 변하지 않는다.
+    """
 
     seconds = (
         float(data_cfg.get("closed_loop", {}).get("warmup_seconds", 0.25))
@@ -399,7 +440,10 @@ def resolve_warmup_samples(
     )
     if not math.isfinite(seconds) or seconds < 0.0:
         raise ValueError("warmup_seconds는 유한한 0 이상 값이어야 합니다")
-    return int(round(seconds * int(sample_rate)))
+    floor = int(min_samples)
+    if floor < 0:
+        raise ValueError("min_samples는 0 이상이어야 합니다")
+    return max(floor, int(round(seconds * int(sample_rate))))
 
 
 def _read_session_metadata(session_dir: Path) -> dict:
@@ -745,6 +789,147 @@ def evaluate_recorded_segments(
     }
 
 
+# ``MAX_OUT_OF_BAND_AMPLIFICATION_DB`` 는 여기에 있었다. 손실 힌지 마진과 이 임계가
+# 서로를 모른 채 각자 적혀 있었고, 실측 결과 **힌지를 정확히 만족한 모델이 게이트를
+# 8.5 dB 차이로 FAIL** 했다. 이제 정의는 ``dsp/do_no_harm.py`` 한 곳이고 손실 마진은
+# 거기에서 유도된다. 이 이름은 기존 참조(테스트·스크립트)를 위해 위에서 import 된다.
+
+MIN_GROUPS_PER_FAMILY = 4
+"""cluster bootstrap 이 CI 를 정의할 수 있는 계열당 최소 **독립 그룹** 수.
+
+같은 그룹 안의 세그먼트는 독립이 아니다(같은 음원·같은 세션). 따라서 계열 평균의
+불확도는 세그먼트 수가 아니라 그룹 수가 정한다. 실측(2026-08-05): 계열 내 그룹 간
+잔차 SD 1.46 dB, 그룹 2개면 SE 1.03 dB 인데 계열 간 전체 폭이 0.92 dB 였다 — **폭이
+1 SE 보다 작아** "최악 계열" 선택이 동전 던지기였다. 그룹이 1개면(val machine,
+test environment, test machine) SE 추정 자체가 불가능하다.
+"""
+
+G4_PASS = "PASS"
+G4_FAIL = "FAIL"
+G4_INCONCLUSIVE = "INCONCLUSIVE"
+"""G4 는 2값이 아니라 **3값** 판정이다.
+
+"개선을 보이지 못했다"와 "악화를 보였다"는 다른 사실이고, 둘을 같은 FAIL 로 뭉치면
+원인 진단이 불가능해진다. 더 중요한 것은 반대 방향이다 — 표본이 부족해 아무 말도 할
+수 없는 상태를 PASS 로 흘려보내면 게이트가 있는 것이 없는 것보다 나쁘다. 실측
+파인튜닝 val trusted −0.07 dB 는 cluster bootstrap CI [−0.456, +0.481] 로 0 과 구별
+불가였는데 점추정만 보고 "개선"으로 읽혔다.
+
+``INCONCLUSIVE`` 는 결코 ``g4_pass=True`` 가 되지 않는다.
+"""
+
+
+def cluster_bootstrap_ci(
+    values: np.ndarray,
+    groups: np.ndarray,
+    *,
+    n_resamples: int = 10_000,
+    seed: int = 20260805,
+    alpha: float = 0.05,
+) -> tuple[float, float, int]:
+    """**그룹 단위**로 재표집한 평균의 신뢰구간. 반환은 ``(lo, hi, n_groups)``.
+
+    세그먼트 단위 부트스트랩은 같은 음원에서 잘라낸 조각들을 독립 표본으로 착각해
+    CI 를 실제보다 몇 배 좁게 만든다. 클러스터(=그룹)를 통째로 뽑아야 "다른 음원을
+    가져왔다면 어땠을까"라는 질문에 답이 된다 — G4 가 실제로 묻는 질문이 그것이다.
+
+    그룹 수가 :data:`MIN_GROUPS_PER_FAMILY` 미만이면 ``(nan, nan, n)`` 을 돌려준다.
+    클러스터가 1개면 CI 가 수학적으로 정의되지 않는데, 그때 좁은 CI 를 지어내는 것이
+    가장 위험한 실패다.
+    """
+
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    groups = np.asarray(groups).reshape(-1)
+    if values.size != groups.size:
+        raise ValueError(f"값과 그룹 길이가 다릅니다: {values.size} != {groups.size}")
+    unique = np.unique(groups)
+    if unique.size < MIN_GROUPS_PER_FAMILY:
+        return float("nan"), float("nan"), int(unique.size)
+    by_group = [values[groups == key] for key in unique]
+    rng = np.random.default_rng(int(seed))
+    picks = rng.integers(0, unique.size, size=(int(n_resamples), unique.size))
+    draws = np.empty(int(n_resamples), dtype=np.float64)
+    for index in range(int(n_resamples)):
+        draws[index] = float(
+            np.concatenate([by_group[choice] for choice in picks[index]]).mean()
+        )
+    lo = float(np.percentile(draws, 100.0 * alpha / 2.0))
+    hi = float(np.percentile(draws, 100.0 * (1.0 - alpha / 2.0)))
+    return lo, hi, int(unique.size)
+
+
+def _plant_fingerprint_for(context: "RecordedEvalContext") -> PlantFingerprint:
+    """평가 결과에 박아 넣을 플랜트 지문. **결함 5의 구조적 차단이다.**
+
+    2026-08-04 사고: 파인튜닝 전 기준선은 S 지연 1342 / lead 109 / surrogate 물리,
+    후는 1465 / 113 / measured 였다. **서로 다른 물리**인데 "1.30 dB 개선"이라고
+    적혔고 그것을 막는 장치가 아무 데도 없었다. metrics 가 지문을 들고 다니지 않으면
+    이 사고는 구조적으로 반복된다.
+    """
+
+    duct_cfg = context.cfg.get("duct", {}) or {}
+    secondary_value = str((duct_cfg.get("secondary_path", {}) or {}).get("npz", ""))
+    primary_value = str(
+        (duct_cfg.get("digital_reference", {}) or {}).get("primary_path_npz", "")
+    )
+    delays = PlantDelays(
+        # P 지연이 없는 실행(acoustic reference 등)은 0 으로 둔다. 그 사실 자체가
+        # 지문에 남아 measured 실행과 절대 같아 보이지 않는다.
+        primary_delay_samples=max(0, int(context.primary_delay_samples or 0)),
+        secondary_delay_samples=int(context.secondary_path.delay_samples),
+        handoff_samples=int(context.secondary_handoff_samples),
+        sample_rate=int(context.sample_rate),
+    )
+    bands = BandPlan(
+        plant_trusted=FrequencyBand.parse(context.trusted_band_hz, name="S 신뢰"),
+        target=FrequencyBand.parse(context.trusted_band_hz, name="목표"),
+        optimize=FrequencyBand.parse(context.trusted_band_hz, name="손실"),
+        measure=FrequencyBand.parse(context.trusted_band_hz, name="보고"),
+        nyquist_hz=float(context.sample_rate) / 2.0,
+    )
+    return PlantFingerprint.build(
+        delays=delays,
+        lead=delays.lead(),
+        physics_status=str(context.physics_status),
+        bands=bands,
+        secondary_sha256=_sha256_if_file(secondary_value) or None,
+        primary_sha256=_sha256_if_file(primary_value) or None,
+        configured_lead_samples=int(context.digital_reference_lead_samples),
+    )
+
+
+def plant_fingerprint_from_metrics(data) -> PlantFingerprint:
+    """``metrics.npz`` 에 저장된 지문을 되살린다 (비교 전용).
+
+    저장 형식이 아니라 **타입**으로 되살리는 이유: 필드를 손으로 골라 비교하면
+    언젠가 한 필드를 빠뜨리고, 그 빠뜨린 필드가 하필 달랐던 것이 사고가 된다.
+    """
+
+    if "plant_fingerprint_json" not in getattr(data, "files", []):
+        raise ValueError(
+            "metrics.npz 에 plant_fingerprint_json 이 없습니다 — 플랜트 지문을 남기지 "
+            "않던 구버전 평가기의 산출물이라 비교 가능성을 판정할 수 없습니다. "
+            "evaluate_recorded.py 로 재평가하세요."
+        )
+    payload = json.loads(str(np.asarray(data["plant_fingerprint_json"]).reshape(-1)[0]))
+    return PlantFingerprint(**payload)
+
+
+def assert_comparable_metrics(before, after, *, context: str = "전후 비교") -> None:
+    """두 ``metrics.npz`` 가 **같은 플랜트**에서 나왔을 때만 비교를 허용한다.
+
+    ``np.load`` 로 연 두 아카이브를 그대로 넘겨라. 다르면 :class:`ValueError` 다 —
+    "개선"을 적기 전에 멈추는 것이 이 함수의 목적이다.
+    """
+
+    result = check_plant_fingerprint_match(
+        plant_fingerprint_from_metrics(before),
+        plant_fingerprint_from_metrics(after),
+    )
+    if not result.ok:
+        raise ValueError(f"[{context}] {result.detail}")
+
+
 def write_recorded_metrics(
     result: dict,
     out_dir: str | Path,
@@ -799,7 +984,104 @@ def write_recorded_metrics(
         and worst_source_trusted_db < 0.0
         and worst_source_trusted_worst10_db < 0.0
     )
-    g4_pass = trusted_pass and fullband_pass and source_pass
+
+    # ---- (a) 대역 밖 do-no-harm (절대목표 1) ------------------------------------
+    octave_rows = result.get("octave_rows") or []
+    worst_octave = (
+        min(octave_rows, key=lambda row: float(row["attenuation_worst10_mean_db"]))
+        if octave_rows
+        else None
+    )
+    amplified = [
+        row
+        for row in octave_rows
+        if float(row["attenuation_worst10_mean_db"]) <= -MAX_OUT_OF_BAND_AMPLIFICATION_DB
+    ]
+    # 옥타브 행이 아예 없으면 "해치지 않았다"를 **측정하지 못한** 것이다. 측정하지
+    # 못한 것을 통과로 세지 않는다 — 그것이 이 저장소에서 반복된 실패 방식이다.
+    do_no_harm_pass = bool(octave_rows) and not amplified
+
+    # ---- (b) 통계적 검정력 (D3) ---------------------------------------------------
+    underpowered = [
+        (str(row["source_family"]), int(row["n_groups"]))
+        for row in source_rows
+        if int(row["n_groups"]) < MIN_GROUPS_PER_FAMILY
+    ]
+    power_pass = bool(source_rows) and not underpowered
+
+    # ---- (c) 계열별 cluster bootstrap CI (D3) -------------------------------------
+    # 점추정으로 "최악 계열"을 고르는 것은 계열 간 폭(0.92 dB)이 그룹 SE(1.03 dB)보다
+    # 작을 때 동전 던지기다. 개선을 주장하려면 CI **상단**이 0 아래여야 한다.
+    per_segment_trusted = np.asarray(result["per_segment_trusted_db"], dtype=np.float64)
+    segment_family = np.asarray(result["segment_source_family"])
+    segment_group = np.asarray(result["segment_group_id"])
+    source_ci: list[tuple[str, float, float, int]] = []
+    for row in source_rows:
+        family = str(row["source_family"])
+        mask = segment_family == family
+        lo, hi, n_groups = cluster_bootstrap_ci(
+            per_segment_trusted[mask], segment_group[mask]
+        )
+        source_ci.append((family, lo, hi, n_groups))
+    ci_defined = bool(source_ci) and all(
+        math.isfinite(hi) for _, _, hi, _ in source_ci
+    )
+    ci_pass = ci_defined and all(hi < 0.0 for _, _, hi, _ in source_ci)
+
+    # ---- 3값 판정 ------------------------------------------------------------------
+    # 순서가 중요하다: **증명된 악화(FAIL)** 가 **판정 불가(INCONCLUSIVE)** 보다 먼저다.
+    # 표본이 부족하더라도 이미 해를 끼친 것이 보인다면 그것은 결론이 난 사실이다.
+    hard_failures: list[str] = []
+    if not trusted_pass:
+        hard_failures.append(f"trusted 평균 {trusted['mean_db']:+.2f} dB ≥ 0")
+    if not fullband_pass:
+        hard_failures.append(f"fullband 평균 {fullband['mean_db']:+.2f} dB > 0")
+    if not source_pass:
+        hard_failures.append(
+            f"최악 계열 {worst_source_family or 'n/a'} {worst_source_trusted_db:+.2f} dB"
+        )
+    if not do_no_harm_pass:
+        if not octave_rows:
+            hard_failures.append("옥타브 감쇠를 측정하지 못했습니다")
+        else:
+            hard_failures.append(
+                "대역 밖 증폭: "
+                + ", ".join(
+                    f"{row['center_hz']:.0f}Hz {row['attenuation_worst10_mean_db']:+.2f} dB"
+                    for row in amplified
+                )
+            )
+
+    inconclusive_reasons: list[str] = []
+    if not power_pass:
+        inconclusive_reasons.append(
+            "계열당 그룹 부족 (최소 "
+            f"{MIN_GROUPS_PER_FAMILY}): "
+            + ", ".join(f"{family}={count}" for family, count in underpowered)
+            + " — 그룹이 1개면 오차 추정 자체가 불가능합니다"
+        )
+    elif not ci_pass:
+        inconclusive_reasons.append(
+            "계열별 cluster bootstrap CI 상단이 0 아래가 아닙니다: "
+            + ", ".join(
+                f"{family} [{lo:+.2f}, {hi:+.2f}]" for family, lo, hi, _ in source_ci
+            )
+            + " — 점추정이 음수라도 0 과 구별되지 않으면 개선을 주장할 수 없습니다"
+        )
+
+    if hard_failures:
+        verdict = G4_FAIL
+        verdict_reason = "; ".join(hard_failures)
+    elif inconclusive_reasons:
+        verdict = G4_INCONCLUSIVE
+        verdict_reason = "; ".join(inconclusive_reasons)
+    else:
+        verdict = G4_PASS
+        verdict_reason = "모든 조건을 통계적 근거와 함께 만족했습니다"
+    # INCONCLUSIVE 는 결코 통과가 아니다.
+    g4_pass = verdict == G4_PASS
+
+    fingerprint = _plant_fingerprint_for(context)
     checkpoint_sha256 = _sha256_if_file(checkpoint)
     manifest_sha256 = _sha256_if_file(manifest)
 
@@ -830,7 +1112,12 @@ def write_recorded_metrics(
         f"- 세션 양끝 제외: {edge_trim_samples} samples "
         f"({edge_trim_samples / context.sample_rate:.3f} s/edge)",
         f"- 지표 warmup 제외: {warmup_samples} samples "
-        f"({warmup_samples / context.sample_rate:.3f} s, S(z) 적용 후 절단)",
+        f"({warmup_samples / context.sample_rate:.3f} s, S(z) 적용 후 절단)"
+        + (
+            f" — 플랜트 정착 하한 {_plant_settle_samples(context)} samples 적용"
+            if warmup_samples <= _plant_settle_samples(context)
+            else f" (플랜트 정착 하한 {_plant_settle_samples(context)} samples 보다 김)"
+        ),
         "",
         "## 전체 결과",
         "",
@@ -861,12 +1148,58 @@ def write_recorded_metrics(
         f"| **최악 source family 최악 10%** (기능 2) | < 0 dB | "
         f"{worst_source_trusted_worst10_db:+.2f} dB | "
         f"{'PASS' if source_rows and worst_source_trusted_worst10_db < 0.0 else 'FAIL'} |",
+        f"| **대역 밖 do-no-harm** (기능 1) | > −{MAX_OUT_OF_BAND_AMPLIFICATION_DB:.1f} dB | "
+        + (
+            f"{worst_octave['center_hz']:.0f} Hz "
+            f"{worst_octave['attenuation_worst10_mean_db']:+.2f} dB"
+            if worst_octave
+            else "측정 없음"
+        )
+        + f" | {'PASS' if do_no_harm_pass else 'FAIL'} |",
+        f"| **계열당 그룹 수** (통계적 검정력) | ≥ {MIN_GROUPS_PER_FAMILY} | "
+        + (
+            ", ".join(f"{family}={count}" for family, count in underpowered)
+            if underpowered
+            else f"최소 {min((int(row['n_groups']) for row in source_rows), default=0)}"
+        )
+        + f" | {'PASS' if power_pass else '판정 불가'} |",
+        f"| **계열별 CI 상단** (그룹 부트스트랩) | < 0 dB | "
+        + (
+            ", ".join(f"{family} {hi:+.2f}" for family, _, hi, _ in source_ci)
+            if ci_defined
+            else "정의 불가"
+        )
+        + f" | {'PASS' if ci_pass else '판정 불가'} |",
         "",
-        f"**G4 종합: {'PASS' if g4_pass else 'FAIL'}**",
+        f"**G4 종합: {verdict}** — {verdict_reason}",
         "",
         "> 기능 2(모든 소리 제거)는 **평균이 아니라 최악값** 문제다. 여섯 소스 중 다섯이",
         "> −20 dB 이고 하나가 +6 dB 이면 평균은 좋아 보이지만, 그 하나가 들리는 순간",
         "> quiet zone 은 실패한 것이다. 그래서 평균 두 줄만으로는 G4 를 통과시키지 않는다.",
+        ">",
+        "> 기능 1(저·고역 모두 제거)의 게이트는 **대역 밖 do-no-harm** 이다. fullband 평균",
+        "> NMSE 는 `d` 에 에너지가 없는 대역의 증폭을 원리적으로 잡지 못한다 — 실측에서",
+        "> fullband +5.95 dB 와 8 kHz −21.56 dB 가 같은 실행에 공존했다.",
+        ">",
+        "> **판정 불가(INCONCLUSIVE)는 PASS 가 아니다.** 계열당 그룹이 1–2개면 cluster",
+        "> bootstrap 의 클러스터 수가 CI 를 정의하지 못한다. 그때 좁은 CI 를 지어내는 것이",
+        "> 가장 위험한 실패이므로, 판정할 수 없다는 사실을 그대로 남긴다.",
+        "",
+        "## 계열별 그룹 부트스트랩 신뢰구간",
+        "",
+        "| Source family | 그룹 | Trusted 평균 | 95% CI |",
+        "|---|---:|---:|---|",
+    ]
+    for (family, lo, hi, n_groups), row in zip(source_ci, source_rows):
+        interval = (
+            f"[{lo:+.2f}, {hi:+.2f}]"
+            if math.isfinite(hi)
+            else f"정의 불가 (그룹 {n_groups} < {MIN_GROUPS_PER_FAMILY})"
+        )
+        lines.append(
+            f"| {family} | {n_groups} | {row['trusted']['mean_db']:+.2f} dB | {interval} |"
+        )
+    lines += [
         "",
         "## Source family별 결과",
         "",
@@ -963,6 +1296,53 @@ def write_recorded_metrics(
                 worst_source_trusted_worst10_db, dtype=np.float64
             ),
             g4_worst_source_family=np.asarray(worst_source_family),
+            # ---- 3값 판정 (D3). INCONCLUSIVE 는 g4_pass=False 다 ----
+            g4_verdict=np.asarray(verdict, dtype=np.str_),
+            g4_verdict_reason=np.asarray(verdict_reason, dtype=np.str_),
+            # ---- 대역 밖 do-no-harm (결함 3, 절대목표 1) ----
+            g4_do_no_harm_pass=np.asarray(do_no_harm_pass, dtype=np.bool_),
+            g4_max_out_of_band_amplification_db=np.asarray(
+                MAX_OUT_OF_BAND_AMPLIFICATION_DB, dtype=np.float64
+            ),
+            g4_worst_octave_center_hz=np.asarray(
+                float(worst_octave["center_hz"]) if worst_octave else -1.0,
+                dtype=np.float64,
+            ),
+            g4_worst_octave_worst10_db=np.asarray(
+                float(worst_octave["attenuation_worst10_mean_db"])
+                if worst_octave
+                else float("nan"),
+                dtype=np.float64,
+            ),
+            # ---- 통계적 검정력 + 그룹 부트스트랩 CI (D3) ----
+            g4_power_pass=np.asarray(power_pass, dtype=np.bool_),
+            g4_ci_pass=np.asarray(ci_pass, dtype=np.bool_),
+            g4_min_groups_per_family=np.asarray(MIN_GROUPS_PER_FAMILY, dtype=np.int64),
+            g4_underpowered_families=np.asarray(
+                [family for family, _ in underpowered], dtype=np.str_
+            ),
+            source_trusted_ci_lo_db=np.asarray(
+                [lo for _, lo, _, _ in source_ci], dtype=np.float64
+            ),
+            source_trusted_ci_hi_db=np.asarray(
+                [hi for _, _, hi, _ in source_ci], dtype=np.float64
+            ),
+            # ---- 플랜트 지문 (결함 5) ----
+            # 지문을 **하나의 JSON 칸**으로 저장한다. 필드를 흩어 놓으면 비교할 때
+            # 하나를 빠뜨리게 되고, 하필 그 빠뜨린 필드가 달랐던 것이 2026-08-04 사고다.
+            plant_fingerprint_json=np.asarray(
+                json.dumps(fingerprint.model_dump(), sort_keys=True, ensure_ascii=False),
+                dtype=np.str_,
+            ),
+            plant_fingerprint_digest=np.asarray(fingerprint.digest(), dtype=np.str_),
+            secondary_path_npz=np.asarray(
+                str((context.cfg.get("duct", {}) or {}).get("secondary_path", {}).get("npz", "")),
+                dtype=np.str_,
+            ),
+            secondary_path_sha256=np.asarray(
+                fingerprint.secondary_sha256 or "", dtype=np.str_
+            ),
+            primary_path_sha256=np.asarray(fingerprint.primary_sha256 or "", dtype=np.str_),
             nmse_trusted_mean_db=np.asarray(trusted["mean_db"]),
             nmse_trusted_median_db=np.asarray(trusted["median_db"]),
             nmse_trusted_worst10_mean_db=np.asarray(
@@ -1038,9 +1418,17 @@ def write_recorded_metrics(
 
 
 __all__ = [
+    "G4_FAIL",
+    "G4_INCONCLUSIVE",
+    "G4_PASS",
+    "MAX_OUT_OF_BAND_AMPLIFICATION_DB",
+    "MIN_GROUPS_PER_FAMILY",
     "RecordedEvalContext",
     "RecordedSegment",
+    "assert_comparable_metrics",
+    "cluster_bootstrap_ci",
     "deterministic_segment_starts",
+    "plant_fingerprint_from_metrics",
     "evaluate_recorded_segments",
     "iter_recorded_segments",
     "load_and_audit_recorded_manifest",

@@ -1,1121 +1,412 @@
 <div align="center">
-  <img src="assets/images/gomduri.png" width="150" alt="Deep ANC 마스코트">
 
 # Deep ANC
 
-**덕트용 인과(causal) 딥러닝 능동소음제어 — Elice A100 학습, Jetson AGX Orin 실시간 추론**
+**Causal deep learning for active noise control in a duct**
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.5-EE4C2C?logo=pytorch&logoColor=white)](requirements-train.txt)
 [![Jetson](https://img.shields.io/badge/Jetson-AGX_Orin-76B900?logo=nvidia&logoColor=white)](docs/06_deployment_jetson.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
 
-> 1.2m 사각 아크릴 덕트 안에 quiet zone을 만든다. 48kHz 오디오를 256샘플 블록으로 받아
-> **상쇄 파형을 직접 예측**하고, 학습 중에는 측정된 2차경로 `S(z)`를 미분 가능한 플랜트로
-> 통과시켜 에러 마이크의 잔여 신호를 최소화한다.
+## Abstract
 
-진행 상황·실행 중인 학습·하드웨어 상태는 이 문서가 아니라 **[HANDOFF.md](HANDOFF.md)** 가
-단일 출처다. 이 README는 프로젝트가 무엇이고 어떻게 쓰는지만 다룬다.
+능동소음제어(ANC)는 소음과 반대 위상의 파형을 내보내 조용한 영역을 만든다. 고전적인
+FxLMS 는 적응 FIR 필터 하나로 이 문제를 풀지만, 광대역·비정상 신호에서는 수렴이 느리고
+비선형 왜곡을 다루지 못한다.
+
+이 저장소는 1.2 m 아크릴 덕트 안에 quiet zone 을 만드는 **인과(causal) 신경망 ANC** 를
+구현한다. 모델은 레퍼런스와 에러 마이크를 입력받아 상쇄 파형을 **직접 예측**하고, 학습
+중에는 실측된 2차경로 `S(z)` 를 미분 가능한 플랜트로 통과시켜 에러 마이크의 잔여 신호를
+최소화한다. 추론 시 `S(z)` 는 쓰이지 않으므로 런타임에 적응 필터가 없다.
+
+설계는 두 가지 절대 목표로 소급 판단한다: **(1) 저주파와 고주파를 모두 제거**하고,
+**(2) 소음뿐 아니라 음성·음악까지 제거**하되 평균이 아니라 **최악값**으로 판정한다.
+이 두 목표는 손실 함수와 진입 게이트 양쪽에 구조적으로 새겨져 있다.
+
+## Features
+
+- **End-to-end 파형 예측** — 스펙트럼 마스크나 런타임 적응 필터 없이 시간영역 상쇄 파형을 직접 낸다
+- **미분 가능한 2차경로** — 실측 `S(z)` FIR 을 학습 그래프에 넣어 `e = d + S·y` 를 직접 최소화한다
+- **최악값 목적함수** — dB 산술평균 대신 CVaR 집계를 써서 최악 아이템에 그래디언트를 배분한다
+- **대역 밖 악화 금지** — 신뢰대역 여집합에 단측 힌지를 걸고, 그 마진을 평가 게이트 임계에서 유도한다
+- **스트리밍 등가성** — 오프라인 `forward` 와 블록 단위 `streaming_step` 이 수치적으로 같다
+- **ONNX / TensorRT 배포** — Jetson AGX Orin 에서 256 샘플 블록(5.33 ms 마감) 실시간 추론
+- **실측 기반 검증** — 합성 시뮬레이션이 아니라 실제 덕트 녹음 82 세션으로 평가한다
+- **진입 게이트 14 종** — 물리·데이터·체크포인트가 정합하지 않으면 학습이 시작되지 않는다
+
+## Requirements
+
+- Python 3.10+
+- PyTorch 2.5 (학습 `2.5.1+cu121` / Jetson 추론은 NVIDIA JetPack 6 wheel)
+- NumPy 1.26.4, SciPy, soundfile, PyYAML, tqdm
+- ONNX 1.15+, ONNX Runtime **1.18.1 고정** (1.19+ 는 Tegra 에서 크래시)
+- sounddevice (실기 측정·녹음)
+- pytest
+
+```bash
+pip install -r requirements-train.txt     # 학습 (CUDA)
+pip install -r requirements-jetson.txt    # Jetson 추론
+```
+
+Jetson 은 `torch` 를 PyPI 가 아닌 NVIDIA wheel 로 설치해야 한다. 절차는
+[`scripts/jetson/setup_jetson.sh`](scripts/jetson/setup_jetson.sh) 참조.
 
 ---
 
-## 1. 프로젝트 개요
+## 1. Introduction
 
-### 1.1 절대 목표
+### 1.1 문제 정의
 
-모든 데이터·모델·평가 결정은 다음 두 가지로 소급 판단한다.
+덕트 ANC 는 인과성 문제다. 소음이 레퍼런스 마이크를 지나 에러 마이크에 닿기까지의 시간
+안에, 상쇄 스피커가 반대 파형을 만들어 같은 지점에 도착시켜야 한다. 이 여유가 음수면
+어떤 알고리즘도 상쇄할 수 없다.
+
+덕트 배치 (단위 m):
+
+```
+0.00  소음 스피커        ─┐
+0.10  레퍼런스 마이크     │  1.2 m 아크릴 사각 덕트
+1.05  상쇄 스피커         │  평면파 컷오프 1633 Hz
+1.10  에러 마이크         │  축방향 공진 70 / 210 / 350 / 489 / 629 Hz
+1.20  개구부             ─┘
+```
+
+### 1.2 두 가지 절대 목표
 
 | 목표 | 통과 기준 | 측정 축 |
 |---|---|---|
-| **기능 1 — 저주파와 고주파를 모두 제거** | 한쪽 대역만 좋으면 실패 | 옥타브밴드별 감쇠, 최악 10% 구간 |
-| **기능 2 — 모든 소리를 제거 (quiet zone)** | 소음뿐 아니라 대화·음악도 감쇠 | 소스 종류별 감쇠의 **최악값**(평균 아님) |
+| **G1 — 저주파와 고주파를 모두 제거** | 한쪽 대역만 좋으면 실패 | 옥타브밴드별 감쇠, 최악 10 % 구간 |
+| **G2 — 모든 소리를 제거** | 소음뿐 아니라 음성·음악도 감쇠 | 소스 종류별 감쇠의 **최악값** |
 
-기능 2가 평균이 아니라 최악값 문제인 이유: 여섯 소스 중 다섯이 −20dB이고 하나가 0dB이면
-평균은 좋아 보이지만, 그 하나가 들리는 순간 quiet zone은 실패한 것이다.
+G2 가 평균이 아니라 최악값인 이유: 여섯 소스 중 다섯이 −20 dB 이고 하나가 0 dB 이면
+평균은 좋아 보이지만, 그 하나가 들리는 순간 quiet zone 은 실패한 것이다.
 
-판정 기준의 단일 출처는
-[평가 프로토콜 §0](docs/07_evaluation_protocol.md#0-절대-목표-2가지와-측정-매핑)이다.
+### 1.3 기여
 
-### 1.2 3단계 로드맵
-
-| 단계 | 내용 | 재학습 |
-|---|---|:---:|
-| **Stage-1** | 합성 데이터 + surrogate 플랜트로 선형 역매핑 사전학습 | 진행 중 |
-| **Stage-2** | 실측 `P(z)`/`S(z)` + recorded 세션 70%로 open-loop 파인튜닝 | 필요 |
-| **Stage-3** | ERR 되먹임 closed-loop, 비선형 커리큘럼, THD/IMD 반영 | 필요 |
-
-Stage-1이 먼저 선형 역매핑만 확립하는 이유는 [3.3](#33-학습-목표와-trusted-band)에 있다.
-v1.1/v2 연구 항목은 [docs/11](docs/11_v2_roadmap.md)에 승인·기각 근거와 함께 있다.
-
-### 1.3 검증된 것과 아직 아닌 것
-
-| 항목 | 결과 | 상태 |
-|---|---|:---:|
-| 자동 회귀 테스트 | 352개 (인과성·등가성·DSP·데이터·복구 게이트) | 통과 |
-| 오프라인↔스트리밍 수치 등가성 | 최대 오차 약 `3e-8` | 통과 |
-| PyTorch↔ONNX Runtime 등가성 | 최대 오차 `8e-8` 이하 | 통과 |
-| tiny + ORT CPU P99 | **1.84ms** / 게이트 `<3ms` | 통과 |
-| tiny_long + ORT CPU P99 | **2.24ms** / 게이트 `<3ms` | 통과 |
-| base + ORT CPU P99 | 6.8ms / 게이트 미달 | 미달 |
-| TensorRT FP16 (tiny) | P50 **0.56ms** (CPU의 2.5배 빠름) / P99 3.27ms | 대안 |
-| 실시간 구동 (RT 우선순위 적용 후) | xrun 145 → **2** / 20초, step 1.8–2.5ms | 통과 |
-| **실기 ANC 저역** (150–600Hz, tiny) | tone300 **+6.26dB** · band **+5.14dB** · 음성+소음 **+4.39dB** | 동작 |
-| **실기 ANC 고역** (1150–1250Hz) | **+0.46dB** — 상쇄도 증폭도 하지 않음 | **미달** |
-| recorded 독립 세션 (G2) | **80세션 / 93.3분 / 4계열 / 64그룹**, 전수 QA 80/80 | 통과 |
-| **실측 `P/S` (G1)** | 150–600Hz 반복 일관성 **P 0.973 / S 0.956**, 상대 τ 32샘플 | 통과 |
-| **파인튜닝 진입 게이트** | **9개 검사 전부 PASS** | 통과 |
-| 실측 녹음 기준선 (파인튜닝 전) | trusted **+1.23 dB** — 아직 **증폭**한다 | **미달** |
-| 실제 덕트 감쇠 성능 | 파인튜닝 후 G4 로 판정한다 | **미주장** |
-
-실기 ANC 수치는 `secondary_surrogate` checkpoint를 실기에 걸었을 때의 **관측치**다.
-실측 `P/S`로 파인튜닝하기 전이므로 최종 성능이 아니다. 재현 절차와 원자료는
-[6.6.3](#663-자동-offonoff-평가)과 `results/session_*/{metrics.csv, wav/}`에 있다.
-
-고역 항목이 "미달"인 이유는 증폭해서가 아니라 **아무 일도 일어나지 않아서**다. 1200Hz는
-trusted band(150–600Hz) 밖이고 학습 손실이 그 대역을 보지 않는다. 예전 기록의
-"−1.50dB(증폭)"은 오독이었다 — 그 시나리오는 에너지의 0.5% 미만만 trusted band에 있어
-그 숫자가 잡음이었다. 실제 1150–1250Hz 감쇠는 `+0.46dB`다.
-
-> 추론 지연 통과는 실시간 실행 가능성을 뜻할 뿐 감쇠 성능을 뜻하지 않는다.
-> 학습 로그의 NMSE는 `secondary_surrogate` 플랜트에서 나온 **표현 사전학습 지표**이며
-> 물리 성능이 아니다. 이 구분은 checkpoint의 `physics_status` 필드가 강제한다.
-
-### 1.4 실기 동작 — 소음 10초 뒤 ANC ON
-
-<div align="center">
-  <img src="assets/images/anc_demo.png" width="900" alt="실기 ANC 시연: ANC OFF/ON 에러 마이크 레벨과 스펙트럼">
-</div>
-
-음성과 80–800Hz 덕트 소음을 섞어 재생하고 10초 뒤 ANC를 켠 실측이다. 에러 마이크 레벨이
-`−14.5 → −18.7 dBFS`로 내려가고, 스펙트럼에서 150–600Hz 공진 봉우리가 눌린다. 1kHz 위는
-변하지 않는다 — 손실이 그 대역을 최적화하지 않기 때문이며, **증폭하지 않는 것**이 현재의
-성공 기준이다.
-
-> 이 그림은 `results/session_*/`의 실제 WAV와 `metrics.csv`에서
-> [render_readme_figures.py](scripts/docs/render_readme_figures.py)가 다시 만든다.
-> 손으로 그린 그림이 아니라서 수치가 바뀌면 그림도 바뀐다.
-
+1. 실측 1차·2차 경로를 미분 가능한 플랜트로 학습 그래프에 넣고, 그 위에서 최악값 집계와
+   대역 밖 do-no-harm 제약을 함께 최적화하는 손실을 설계했다.
+2. 평가 게이트의 임계에서 손실 항의 마진을 **유도**해, 손실을 만족한 모델이 게이트를
+   통과하는 것이 우연이 아니라 정리가 되게 했다.
+3. 학습 데이터의 재생–캡처 시간축 정합성을 측정으로 판정하고, 그 임계를 제어 대역
+   상단에서 유도하는 파이프라인을 만들었다.
 
 ---
 
-## 2. 아키텍처
+## 2. Method
 
-### 2.1 신호 흐름
+### 2.1 신호 모델과 지연 물리
 
-<div align="center">
-  <img src="assets/diagrams/fig1_system.svg" width="960" alt="ANC 신호 흐름">
-</div>
+레퍼런스 모드는 두 가지다.
 
-<p align="center"><b>Figure 1.</b> 학습과 실기가 같은 방정식을 쓴다. 모델은 마스크가 아니라
-<b>상쇄 파형 <code>y(t)</code> 를 직접 회귀</b>하고, 학습에서는 실측 <code>S(z)</code> 를
-미분 가능한 플랜트로 통과시켜 에러 마이크의 <code>e(t)</code> 를 최소화한다.
-숫자는 실측값(48kHz 샘플)이며 <code>configs/duct.yaml</code> 이 단일 출처다.</p>
+**digital reference** (기본) — 소음원을 런타임이 직접 생성하므로 파형을 미리 안다.
 
 ```
-e(t) = d(t) + S · y(t)          d(t) = P · n(t)
+x_ref(t) = n(t + K)            K = digital reference lead
+d(t)     = P(z) · n(t − D)     P(z) = 소음 스피커 → 에러 마이크 실측 FIR
+e(t)     = d(t) + S(z) · y(t)
 ```
 
-측정 FIR에 극성이 이미 들어 있으므로 어디에서도 추가 부호 반전을 하지 않는다.
-
-**지연 예산이 이 설계의 모든 것을 결정한다.** 상쇄 경로는 `S 1465 + handoff 256 = 1721`
-샘플이고 1차 경로는 `P 1608` 샘플이다. 즉 **상쇄음이 소음보다 113샘플 늦게 도착한다.**
-소음을 Jetson이 직접 생성하기 때문에 레퍼런스를 그만큼 미리 줄 수 있고
-(`digital_reference_lead_samples = 113`), 그래서 이 시스템이 성립한다.
-이 여유가 **2.4 ms 뿐**이라는 사실이 아래 §2.3의 모든 설계 결정을 강제한다.
-
-### 2.2 HybridANCNet
-
-<div align="center">
-  <img src="assets/diagrams/fig2_architecture.svg" width="520" alt="HybridANCNet 전체 스택">
-</div>
-
-<p align="center"><b>Figure 2.</b> 전체 스택 (tiny 기준). 오른쪽은 텐서 shape.
-점선 블록(MHSA)은 <code>base</code> 전용이며 배포 모델에는 없다 —
-구조 탐색에서 <b>측정으로 실격</b>했다(§2.8).</p>
-
-| 하이퍼파라미터 | `base` | `tiny` |
-|---|---:|---:|
-| 파라미터 | 5,994,512 | **1,164,809** |
-| encoder channels `C` | 256 | 128 |
-| TCN repeats × dilations | 3 × (1,2,4,8,16) | 2 × (1,2,4,8) |
-| TCN blocks | 15 | 8 |
-| TCN hidden | 512 | 256 |
-| GLSTM `G × H` | 2 × 256 | 1 × 192 |
-| MHSA | 4 heads, w=64 | 없음 |
-| 수용영역 | 504 ms | 168 ms |
-| **Jetson P99 (ORT CPU)** | 6.8 ms ✗ | **1.84 ms** ✓ |
-| Jetson P99 (TRT FP16) | 10.14 ms ✗ | 7.66 ms ✗ |
-
-`hop=128`인데 런타임 블록이 256인 것은 실수가 아니다. 엔진은 한 스텝에 **2프레임을 그래프
-내부에서 언롤**한다 — 콜백 주기를 늘려 xrun 여유를 얻으면서 알고리즘 룩어헤드는 0으로 유지한다.
-
-### 2.3 왜 원논문 구조를 그대로 쓰지 않는가
-
-이 아키텍처는 세 논문에서 부품을 가져왔지만 **어느 것도 그대로 쓸 수 없었다.** 원논문들은
-전부 오프라인·비인과 또는 자기회귀 설정이고, ANC는 그 반대편 극단에 있기 때문이다.
-
-| 제약 | 값 | 이 제약이 배제하는 것 |
-|---|---|---|
-| 알고리즘 룩어헤드 | **0 프레임** | 양방향 RNN, global LN, STFT 분석창 |
-| 실시간 예산 | Jetson CPU P99 **< 3 ms** / 5.33 ms 블록 | 자기회귀 샘플 생성, 5.99M 파라미터 |
-| 스트리밍 = 오프라인 등가 | 최대 오차 `3e-8` | 그래프에 숨은 전역 상태 |
-| 출력 | 마스크가 아니라 **파형** | 마스킹 기반 분리 formulation |
-
-#### Conv-TasNet — encoder/decoder와 1-D 블록
-
-**가져온 것:** 파형영역 학습형 encoder/decoder, depthwise dilated conv 블록, skip+residual 분기.
-
-**바꾼 것과 이유:**
-
-1. **global LN → ChannelLN.** Conv-TasNet의 gLN은 발화 **전체**의 통계로 정규화한다. 스트리밍에서
-   그 통계는 미래를 포함하므로 인과성이 깨진다. 채널 축만 정규화해야 프레임 단위 추론과
-   오프라인 결과가 수치로 같아진다 — 이 등가성을 테스트가 강제한다.
-2. **마스크 → 파형 회귀.** Conv-TasNet은 혼합 신호의 encoding에 마스크를 곱해 화자를 분리한다.
-   ANC에는 **분리할 혼합 신호가 없다.** 레퍼런스에 마스크를 곱해서는 1차경로 응답의
-   *음의 신호*를 만들 수 없다. 그래서 디코더가 상쇄 파형을 직접 합성한다.
-3. **좌측 패딩 전용.** 원구조는 기본이 비인과다.
-
-> 그대로 썼다면: 실시간에서 소음이 도착하기 **전에** 출력을 낼 수 없어 ANC 자체가 불가능하다.
-
-#### WaveNet — dilated causal convolution
-
-**가져온 것:** dilation을 지수적으로 키워 수용영역을 넓히는 스택, skip 연결.
-
-<div align="center">
-  <img src="assets/diagrams/fig4_receptive_field.svg" width="900" alt="dilated causal convolution 수용영역">
-</div>
-
-<p align="center"><b>Figure 3.</b> tiny의 한 repeat (d = 1, 2, 4, 8). 층을 쌓을 때마다 수용영역이
-지수적으로 커지지만 현재 프레임 <code>t</code> 오른쪽 탭은 하나도 없다.
-전체 2 repeat = 61 프레임 = <b>168 ms</b>.</p>
-
-**바꾼 것과 이유:**
-
-1. **자기회귀 제거.** WaveNet은 샘플 하나를 낼 때마다 스택 전체를 다시 통과한다. 48 kHz에서
-   5.33 ms 블록당 **256회 forward**가 필요하다. Jetson CPU 예산은 블록당 **1회 3 ms**다.
-   여기서는 레퍼런스로부터 프레임 전체를 한 번에 예측한다(비자기회귀).
-2. **μ-law softmax → 연속 출력.** 상쇄 파형은 8-bit 양자화 격자 위에 있지 않다.
-3. **샘플이 아니라 encoder 프레임 위에서 dilation.** hop 128 덕분에 같은 dilation 예산
-   (1,2,4,8)이 몇 ms가 아니라 **168 ms**를 덮는다. 덕트의 최저 축방향 공진 70 Hz의
-   주기가 14 ms이므로 이 길이가 필요하다.
-
-> 그대로 썼다면: 실시간 추론이 100배 이상 예산을 초과한다.
-
-#### GCRN — Grouped LSTM
-
-**가져온 것:** 채널을 G그룹으로 나눠 순환 비용을 1/G로 줄이고, 그룹 간 셔플로 정보를 다시 섞는 전략.
-
-<div align="center">
-  <img src="assets/diagrams/fig5_glstm.svg" width="820" alt="Grouped LSTM">
-</div>
-
-<p align="center"><b>Figure 4.</b> Grouped LSTM (G = 2 예시). <code>h, c</code> 가 프레임 간에
-넘어가는 순환 상태이며, 이것이 곧 스트리밍 상태의 실체다(Figure 6).</p>
-
-**바꾼 것과 이유:**
-
-- **STFT 도메인 → 파형 도메인.** GCRN은 복소 스펙트럼 매핑 모델이라 LSTM이 STFT 병목에 있다.
-  STFT는 **분석창을 다 채워야** 변환할 수 있으므로 창 길이만큼 룩어헤드가 생긴다.
-  1024샘플 창이면 **21 ms**인데, 이 시스템의 전체 여유는 **2.4 ms**다.
-  **STFT 기반 구조는 지연 예산만으로 배제된다.** 그래서 그룹 LSTM만 떼어내 TCN 스택
-  중간(repeat 2 뒤)에 넣었다.
-
-#### Transformer — Multi-Head Self-Attention
-
-**가져온 것:** 회전기계처럼 반복되는 패턴을 되돌아보는 조회 메커니즘.
-
-**바꾼 것:** 양방향 full attention → **windowed causal** (과거 64프레임 = 170 ms).
-양방향은 비인과라 즉시 탈락이고, `O(T²)` full attention은 스트리밍에서 무한히 커진다.
-
-**그리고 측정 결과 도움이 되지 않았다.** 20k step 동일 조건 구조 탐색에서 attention 계열은
-대조군 대비 **fullband +2.15 dB / held-out +2.12 dB 악화**로 do-no-harm 실격이었다.
-배포 모델 `tiny`에서 MHSA를 **제거**한 근거가 이 측정이다. 논문에 있는 부품이라고 넣지 않았다.
-
-#### 정리
-
-| 논문 | 가져온 것 | 그대로 쓰면 | 이 프로젝트 |
-|---|---|---|---|
-| Conv-TasNet | 파형 encoder/decoder, 1-D 블록 | 비인과(gLN), 마스크 formulation | cLN, 파형 직접 회귀, 좌측 패딩 |
-| WaveNet | dilated causal 스택 | 자기회귀 → 예산 100배 초과 | 비자기회귀, 연속출력, 프레임 단위 dilation |
-| GCRN | grouped LSTM + shuffle | STFT 창 21 ms 룩어헤드 | 파형영역 TCN 스택 안에 배치 |
-| Transformer | 반복 패턴 조회 | 양방향·`O(T²)` | windowed causal — **측정 후 제거** |
-
-### 2.4 TCN 잔차 블록
-
-<div align="center">
-  <img src="assets/diagrams/fig3_tcn_block.svg" width="760" alt="TCN 잔차 블록">
-</div>
-
-<p align="center"><b>Figure 5.</b> 1×1로 채널을 넓히고 depthwise dilated conv로 시간을 본 뒤
-skip과 residual로 나눠 내보낸다. depthwise를 쓰면 채널마다 독립 시간 필터를 두면서도
-파라미터가 <code>H·k</code> 로 끝나고, 채널 혼합은 앞뒤 1×1이 맡는다.</p>
-
-### 2.5 스트리밍 상태
-
-<div align="center">
-  <img src="assets/diagrams/fig6_streaming.svg" width="880" alt="스트리밍 상태 I/O">
-</div>
-
-<p align="center"><b>Figure 6.</b> 모든 상태를 그래프 입출력으로 드러낸다.
-숨은 전역 상태를 두면 오프라인 결과와 프레임 단위 결과가 같은지 <b>검증할 방법이 없다.</b>
-tiny의 상태는 12개다.</p>
-
-- 오프라인 일괄 추론 ↔ 프레임 단위 스트리밍: 최대 오차 **3e-8**
-- PyTorch ↔ ONNX Runtime: 최대 오차 **8e-8**
-- ONNX opset 17, 정적 shape, 상태 명시 I/O
-
-### 2.6 성능
-
-**모든 수치는 `secondary_surrogate` 플랜트에서 나온 표현 사전학습 지표이거나 실기 관측치다.**
-실측 `P/S` 파인튜닝 전이므로 최종 성능이 아니다. 이 구분은 checkpoint의 `physics_status`
-필드가 강제한다.
-
-**base vs tiny** — 동일 조건(100k step, 같은 seed·데이터, held-out 64 아이템):
-
-| 지표 (NMSE dB, 낮을수록 좋음) | base 5.99M | tiny 1.16M | 우세 |
-|---|---:|---:|---|
-| trusted 150–600 Hz | **−18.99** | −18.66 | base 0.33 |
-| fullband | −15.88 | **−17.14** | **tiny 1.26** |
-| held-out η=0.15 trusted | **−14.78** | −14.74 | base 0.04 |
-| held-out η=0.15 fullband | −12.97 | **−13.97** | **tiny 1.00** |
-| **최악 아이템 fullband** | **+13.89 (증폭)** | **+4.06** | **tiny 9.83** |
-| Jetson P99 | 6.8 ms ✗ | **1.84 ms** ✓ | **tiny** |
-
-소스별로는 **7종 중 7종 전부 tiny가 우세**하며, 최악 소스 `demand`가 base −4.36 / tiny −9.24 dB다.
-**파라미터가 5배 많다고 안전하지 않다** — 최악 아이템에서 base는 fullband를 13.89 dB 증폭한다
-(do-no-harm 위반). 배포 후보를 tiny로 확정한 근거다.
-
-**구조 탐색** — 20k step 동일 예산, `last.pt` 기준, paired bootstrap 95% CI:
-
-| 후보 | trusted NMSE | Δ vs 대조군 | 95% CI | 판정 |
-|---|---:|---:|---|---|
-| `tiny_control` | −14.59 | — | — | **승자** |
-| `tiny_long` | −14.81 | −0.22 | [−0.71, **+0.26**] | 유의하지 않음 |
-| `tiny_long_attn` | −12.42 | +2.17 | [+1.47, +2.94] | 실격 (do-no-harm) |
-| `tiny_attn` | −12.06 | +2.53 | [+1.59, +3.53] | 실격 (do-no-harm) |
-
-seed를 바꾸면 `tiny_long`의 Δ가 −0.22 ↔ +0.46으로 **0.68 dB 요동**한다. 판정 마진 0.30 dB보다
-크므로 이득이 있더라도 run 간 잡음에 묻힌다. **구조 탐색은 종결이고 tiny를 유지한다.**
-
-**GPU(TensorRT)는 typical latency 에서 2.5배 빠르고, CPU 는 꼬리가 더 촘촘하다.**
-배포는 CPU 지만 GPU 가 못 하는 것이 아니다 — 둘의 성격이 다르다.
-
-| 모델 | 엔진 | P50 | P90 | P99 | max |
-|---|---|---:|---:|---:|---:|
-| **tiny** | **ORT CPU** | 1.38 | 1.44 | **1.54** | 46.1 |
-| tiny | TRT FP16 | **0.56** | **1.27** | 3.27 | 47.1 |
-| base | ORT CPU | 6.00 | 6.18 | 6.40 | 54.2 |
-| base | TRT FP16 | **1.33** | 4.00 | 6.00 | 49.2 |
-
-(RT 우선순위 `chrt -f 80`, 코어 4–7 고정, warmup 500, 5000 스텝. max 46–54 ms 는 데스크톱
-세션이 떠 있는 측정 환경의 잡음이며 **모든 조합에 공통**이라 엔진 비교에는 쓰지 않는다.)
-
-읽는 법:
-
-* **GPU 가 P50 에서 2.5배, P90 에서도 빠르다.** 뒤집히는 것은 P99 뿐이다.
-* **base 는 GPU 에서만 돌아간다.** CPU 로는 중앙값 6.00 ms 로 5.33 ms 예산을 이미 넘어
-  아예 따라가지 못한다. TRT 가 base 를 4.5배 빠르게 한다.
-* 배포 모델 `tiny` 는 **CPU 를 쓴다.** 하드 마감에서 글리치를 만드는 것은 평균이 아니라
-  꼬리이고, P99 1.54 vs 3.27 ms 로 CPU 가 2배 촘촘하다. 둘 다 5.33 ms 예산 안이지만
-  안전 여유(게이트 P99 < 3 ms)를 넘는 쪽은 GPU 다.
-* **모델을 키운다면 GPU 가 유일한 길이다.** 절대 목표 1 의 고역(현재 미달)을 위해 용량을
-  늘려야 한다면 이 경로를 다시 연다.
-
-이 수치는 엔진 구현을 고친 뒤의 것이다. 처음 측정에서는 GPU 가 P99 7.66 ms 로 CPU 보다
-4배 나빴는데, **원인이 GPU 가 아니라 구현이었다.**
-
-| 결함 | 고친 방식 | 효과 |
-|---|---|---|
-| CUDA Graph 미사용 | parity 별 그래프 캡처(H2D→추론→D2H 한 번에) | P50 1.32 → 0.56 ms |
-| pageable 호스트 메모리 | `cudaHostAlloc` 고정 버퍼 | 비동기 복사가 실제로 비동기가 됨 |
-| 매 스텝 `set_tensor_address` 26회 | A/B 두 경우를 그래프에 굳힘 | 파이썬 호출 제거 |
-| 매 스텝 numpy 할당 | 고정 버퍼에 직접 기록 | 핫패스 할당 제거 |
-| 동기 대기 정책 | `cudaDeviceScheduleSpin` | 스레드 재우기 방지 |
-
-그래프 경로는 비그래프 경로와 **비트 단위로 동일**하다(최대오차 `0.000e+00`).
-
-**GPU 는 폭(width)에는 거의 공짜지만 깊이(depth)에는 비싸다.** 지금까지의 구조 탐색은
-깊이·수용영역·attention 만 바꿨고 **폭만 키운 변형은 시험하지 않았다.** 그런데 GPU 가
-원하는 것은 정확히 폭이다 — 레이어당 병렬 작업이 늘어야 놀던 코어가 채워진다.
-tiny 는 레이어당 병렬 작업이 약 512 개인데 Orin 은 CUDA 코어가 2048 개다.
-
-| 모델 | 파라미터 | 블록 | GPU P50 | GPU P99 | CPU P50 |
-|---|---:|---:|---:|---:|---:|
-| `tiny` | 1.16M | 8 | 0.56 | 3.27 | 1.38 |
-| `base` | 5.99M | **15** | 1.33 | 6.00 | 6.00 |
-| `tiny_wide` | **12.8M** | 8 | **1.13** | **4.63** | 9.51 |
-
-`tiny_wide` 는 `tiny` 보다 **11배 큰데 GPU 에서 2배만 느리고**, 파라미터가 2.1배 많은
-`base` 보다도 **빠르다** — 블록이 8 대 15 이기 때문이다. 비용을 내는 것은 순차 커널
-런치이지 연산량이 아니다.
-
-그리고 `tiny_wide` 는 **GPU 에서만 실시간이 된다**: P99 4.63 ms 로 5.33 ms 예산 안에
-들어가는 반면, CPU 는 중앙값 9.51 ms 로 예산을 2배 넘긴다.
-
-> **단, 용량이 병목이라는 증거는 아직 없다.** `base` 는 `tiny` 보다 크지만 7종 소스
-> 전부에서 졌고, 구조 탐색의 어떤 후보도 `tiny` 를 이기지 못했다. `tiny_wide` 는
-> **지연 측정용 무작위 초기화**이며 상쇄 성능은 학습해 봐야 안다. 파인튜닝의 학습
-> 손실이 정체하면 용량 부족이고, 그때 이 형상과 GPU 경로를 쓴다.
-
-**실기 ANC** (tiny + ONNX Runtime, 실제 덕트/마이크/스피커):
-
-<div align="center">
-  <img src="assets/images/anc_demo.png" width="900" alt="실기 ANC OFF/ON">
-</div>
-
-<p align="center"><b>Figure 7.</b> 음성 + 80–800 Hz 덕트 소음을 재생하고 10초 뒤 ANC를 켠 실측.
-에러 마이크 레벨 <code>−14.5 → −18.7 dBFS</code>, 150–600 Hz 공진 봉우리가 눌린다.</p>
-
-| 시나리오 | 감쇠 |
-|---|---:|
-| tone 300 Hz | **+6.26 dB** |
-| band (trusted) | **+5.14 dB** |
-| 음성 + 소음 (80–800 Hz) | **+4.39 dB** |
-| 1150–1250 Hz | +0.46 dB — 상쇄도 증폭도 하지 않음 |
-
-고역이 0 dB인 것은 손실이 trusted band(150–600 Hz)만 최적화하기 때문이다. 현 단계에서
-**증폭하지 않는 것**이 성공 기준이며, 절대 목표 1의 고역은 **아직 미달**이다(§7.4).
+`K` 는 손으로 정하는 값이 아니라 실측에서 유도된다.
+
+```
+K = S 벌크지연 + 스레드 핸드오프(256) − P 벌크지연
+```
+
+**acoustic reference** — 레퍼런스 마이크가 소음을 듣는다. `S(z)` 의 실측 지연이 그대로
+예측 부담이 되므로 주기성·협대역 성분에 한정된다.
+
+### 2.2 아키텍처 — HybridANCNet
+
+```
+입력 [B, 2, T]  (ch0 = reference, ch1 = error)
+  │
+  ├─ Encoder      Conv1d(win=384, stride=hop=128) → GLU → ChannelLayerNorm → 1×1
+  ├─ TCN blocks   dilated causal conv, dilations 1·2·4·8(·16), repeats 2(tiny)/3(base)
+  ├─ GLSTM        grouped LSTM (긴 시간 상관)
+  ├─ MHSA         windowed causal multi-head self-attention (선택)
+  ├─ Head         1×1 → PReLU
+  └─ Decoder      ConvTranspose1d → soft limiter  y = L·tanh(u/L)
+출력 [B, 1, T]
+```
+
+| 변형 | 파라미터 | 채널 | TCN repeats | dilations |
+|---|---:|---:|---:|---|
+| `hybrid_anc_tiny` | 1.16 M | 128 | 2 | 1·2·4·8 |
+| `hybrid_anc_base` | 5.99 M | 256 | 3 | 1·2·4·8·16 |
+
+모든 연산은 인과적이다. 스트리밍 상태(`enc_hist`, 블록별 상태, `dec_tail`)를 명시적으로
+들고 다니며, 오프라인 `forward` 와 블록 단위 `streaming_step` 의 수치 등가성을 테스트가
+강제한다.
+
+### 2.3 손실 함수
+
+```
+L = A[NMSE_trusted(dB)]
+  + λ_dnh   · Σ_b w_b · A[relu(대역밖 증폭_b − margin_b)]
+  + λ_frame · A[프레임별 NMSE_trusted(dB)]
+  + λ_mrstft· A[아이템별 multi-resolution STFT]
+  + λ_sat   · 리미터 이전 활성 포화 벌점
+```
+
+`A[·]` 는 평균이 아니라 **(평균, CVaR) 혼합** 집계다. dB 산술평균의 아이템별 그래디언트는
+잔차 RMS 에 반비례하므로, 이미 잘 되는 아이템이 그래디언트를 독식하고 증폭 중인 아이템이
+가장 덜 배운다 — G2 와 정확히 반대 방향이다.
+
+**신뢰대역 안과 밖이 비대칭이다.**
+
+- **안** — 양측 목표. "줄여라". `S(z)` 의 크기와 위상을 둘 다 믿는다.
+- **밖** — 단측 힌지. "키우지 마라". 판정량이 `bandpower(S·y)` 라 `∠S` 와 무관하고,
+  `relu` 라 "상쇄하라"는 그래디언트를 만들지 않는다.
+
+do-no-harm 마진은 평가 게이트의 옥타브 임계 `G` 에서 유도된다.
+
+```
+margin = 20·log10(10^(G/20) − 1)          G = 1.0 dB  →  margin = −18.27 dB
+```
+
+이 유도가 있으면 "손실을 만족한 모델은 게이트를 통과한다"가 정리가 된다. 힌지 대역은
+게이트의 옥타브 경계에 정렬되어, 대역 전체 비율을 만족한 채 한 옥타브에 에너지를 몰아넣는
+자유도가 없다.
+
+### 2.4 실시간 파이프라인
+
+```
+캡처 스레드 ──► SPSC 링버퍼 ──► 추론 스레드 ──► SPSC 링버퍼 ──► 재생 스레드
+              (write_pos만)              (read_pos만)
+
+블록 256 샘플 @ 48 kHz = 5.33 ms 마감
+안전장치: 출력 DC 차단기 + 워치독 7 종 (발산·포화·클록 이탈 등)
+```
 
 ---
 
-## 3. 덕트 구조와 동작 원리
+## 3. Experimental Setup
 
-### 3.0 덕트 물리
+### 3.1 하드웨어
 
-<div align="center">
-  <img src="assets/diagrams/fig0_duct_3d.svg" width="960" alt="아크릴 덕트 3D 배치">
-</div>
-
-<p align="center"><b>Figure 8.</b> 상쇄 스피커(CS)는 <b>상면 side-branch</b> 라 상쇄음이
-축방향이 아니라 위에서 들어온다. 단면 105 mm 가 평면파 차단 1633 Hz 를 결정한다.
-좌표·치수는 <code>configs/duct.yaml</code> 에서 읽어 그린다.</p>
-
-<div align="center">
-  <img src="assets/diagrams/duct_layout.svg" width="900" alt="아크릴 덕트 측면 배치도">
-</div>
-
-| 항목 | 값 | 의미 |
-|---|---|---|
-| 내부 길이 | 1.190 m (외형 1.200 m) | 좌측 폐단 내측면 ~ 개구 |
-| 단면 | 105 × 105 mm 사각 (PMMA, 두께 10 mm) | — |
-| 경계 | closed–open | 폐단 반사 0.80, 개방단 −0.45(위상 반전) |
-| **평면파 차단** | **1,633 Hz** = `c / (2·0.105)` | 이 위는 단일 스피커·단일 마이크로 제어 불가 |
-| 축방향 공진 | 70 / 210 / 350 / 489 / 629 Hz | `L_eff ≈ 1.226 m` (개방단 보정 `0.61·r_eq`) |
-| 현실적 목표 대역 | 80–800 Hz | 차단 주파수와 스피커 저역 한계의 교집합 |
-| **trusted band** | **150–600 Hz** | 실측 `S(z)` 유효대역 ∩ 목표 대역 — 손실이 보는 유일한 대역 |
-
-배치(원점 = 좌측 폐단): 소음 스피커 `x=0.0`(축방향 방사) · 기준 마이크 `x=0.100`(벽면) ·
-상쇄 스피커 `x=1.050`(상면 side-branch, Ø40) · 에러 마이크 `x=1.100` · 개구 `x=1.200`.
-
-> 에러 마이크의 `x=1.100`은 **잠정값**이다. 상쇄 스피커 마운트 구간(0.990–1.110)과 겹치는
-> 문제가 미해결이라 확정 시 [duct.yaml](configs/duct.yaml)과 RIR 뱅크를 함께 갱신해야 한다.
-> 도면과 위 표는 모두 `duct.yaml`에서 자동 생성된다 — 설정과 문서가 어긋날 수 없다.
-
-### 3.1 지연 물리와 두 레퍼런스 모드
-
-이 프로젝트의 심장은 지연 예산이다. 상쇄 신호는 소음보다 **먼저** 에러 마이크에 도달해야 한다.
-
-<div align="center">
-  <img src="assets/images/timing_budget.png" width="820" alt="digital reference 선행량 계산">
-</div>
-
-| 모드 | 레퍼런스 | 예측 부담 | 운용 범위 |
-|---|---|---|---|
-| **digital-ref** | Jetson이 소음원을 직접 생성 | 출력버퍼 지연이 양 경로에 공통 | 광대역 비정상 신호까지 상쇄 가능 |
-| **acoustic-ref** | 외부 소음을 REF 마이크로 수음 | `P ≈ 30ms` 예측 필요 | 톤·회전기계·공진 등 주기/협대역 |
-
-현재 기본은 digital-ref다. 자기 생성 소음을 실제 출력보다 앞서 공급하는 선행량이
-`digital_reference_lead_samples`이며 실측 P/S에서 나온다.
-
-```
-lead = (S 순수지연 1465 + 스레드 핸드오프 256) − P 순수지연 1608 = 113
-```
-
-**학습 113 / 배포 109 로 지금은 다르다.** 배포 중인 ONNX는 실측 전에 `lead=109`(추정 P/S
-기준)로 사전학습한 것이고, 런타임은 checkpoint·ONNX 메타와 설정이 **다르면 시작 전에
-거부**하므로 그 모델에는 109가 맞다. 파인튜닝이 113으로 끝나면 `runtime_tiny.yaml`도 113으로
-올린다. 두 값이 섞이지 않게 막는 것이 이 거부 규칙이다.
-
-acoustic 모드에서는 반드시 0으로 덮어써야 한다.
-
-덕트 평면파 컷오프는 약 1,633Hz다. 그 이상은 단일 상쇄 스피커와 에러 마이크로 제어하기 어렵다.
-acoustic-ref에서 예측 불가능한 광대역 성분은 제거가 아니라 **증폭하지 않는 0dB**가 성공 기준이다.
-자세한 지연 회계는 [docs/01](docs/01_physics_limits.md)을 따른다.
-
-### 3.2 극성과 플랜트 규약
-
-```
-e = d + S·y        (측정 FIR에 극성이 이미 포함 — 어디에서도 추가 부호 반전 금지)
-```
-
-학습 플랜트의 총지연 = `S(z)` npz의 delay(1465) + 스레드 핸드오프(256). digital-ref의
-`d` 경로에는 핸드오프가 없다. RIR에는 음향 온셋이 이미 포함돼 있어서 `D_noise` 결합 시
-`t_ac(NS→ERR)`를 빼야 한다([synth_dataset.py](src/deep_anc/data/synth_dataset.py) 주석 참조).
-
-### 3.3 학습 목표와 trusted band
-
-손실은 **trusted band에서만** 최적화한다. trusted band는 `S(z)` 실측 유효대역과 덕트
-목표대역의 교집합이며 현재 **150–600Hz**다.
-
-대역이 넓을수록 좋은 것이 아니다. `S(z)`를 신뢰할 수 없는 대역까지 fullband로 최적화하면
-그 대역의 잘못된 위상 정보가 gradient를 지배해 **신뢰 구간의 성능까지 잃는다**. 실제로 초기
-학습은 fullband 목표에서 loss 2.0에 수렴했는데, 그것은 "출력 0"이 정확한 해였기 때문이다.
-fullband NMSE도 함께 기록하되 최적화 대상으로 삼지 않는다.
-
-같은 이유로 Stage-1은 공칭 플랜트를 고정한다. 모델 입력에 조건으로 주어지지 않는 랜덤
-delay/all-pass 섭동은 위상 gradient를 상쇄해 다시 영출력 해로 몰고 간다.
-기능 1의 고역 목표를 정직하게 평가하려면 먼저 80–1600Hz 광대역 재보정을 통과해야 한다.
-
-손실 구성: FP32 trusted NMSE + MR-STFT(256/512/1024/2048) + power + clip 정규화.
-손실을 FP32로 고정하는 이유는 bf16이 FFT를 지원하지 않기 때문이다.
-
-### 3.4 스트리밍과 ONNX 규약
-
-- 모델은 미래 입력을 참조하지 않는다. **스트리밍 = 오프라인 수치 등가**를 테스트가 강제한다.
-- 세그먼트 길이는 256의 배수. ONNX는 opset 17, 정적 shape, **상태 명시 I/O**.
-- closed-loop 워밍업 절단은 플랜트 적용 **후**에 한다.
-
-스트리밍 상태는 그래프 밖으로 드러난다 — 숨은 전역 상태를 두면 오프라인/스트리밍 등가를
-검증할 수 없기 때문이다. `tiny`의 상태는 12개다.
-
-```
-st_enc                     인코더 룩백 창 (win−hop = 256 샘플)
-st_0_tcn … st_7_tcn        TCN 8블록(repeats 2 × dilations 4)의 depthwise 지연선
-st_8_lstm_h, st_8_lstm_c   GLSTM 은닉·셀 상태
-st_dec                     디코더 overlap-add 꼬리
-```
-
-export는 이 메타(`model_name`, `digital_reference_lead_samples`, `block_samples`, `hop`,
-`win`, `state_names`, 원본 `ckpt`, `ort_max_err`)를 `.json`으로 함께 쓴다. 런타임은 이 메타와
-설정이 어긋나면 **오디오를 열기 전에 거부**한다.
-
-### 3.5 실시간 3-스레드 구조
-
-캡처 / 추론 / 재생을 SPSC 링버퍼로 잇는다. 링버퍼 소유권 규칙은 절대적이다 —
-**생산자는 `write_pos`만, 소비자는 `read_pos`만** 만진다. 런타임은 항상 ANC OFF로 시작하며
-`start_on=true`는 코드가 거부한다.
-
-추론이 예산 안에 들어와도(`step` 약 1.8ms) **오디오 콜백 스레드가 일반 우선순위면 쓸 수 없다.**
-그 상태에서는 20초에 xrun 145회가 났고, RT 우선순위를 준 뒤 같은 하드웨어에서 2회로 떨어졌다.
-설정 방법은 [6.6.1](#661-선결-조건-오디오-스레드-실시간-우선순위)에 있다.
-
-안전장치는 4겹이다 — 출력 소프트 리미터, 연속 클립 mute, 발산 워치독(에러파워가 베이스라인
-×4로 0.5초), 추론 데드라인 워치독. **리미터 한계(`safety.control_limit`)를 모델의 실제 출력보다
-낮게 잡으면 매 블록이 클립돼 ANC가 켜지자마자 mute된다.** 이것은 오작동이 아니라 설계된 동작이며,
-증상은 [6.7 문제 해결](#67-문제-해결)에 있다.
-
-### 3.6 GPU 작업 큐
-
-학습이 끝나면 GPU가 노는 구조적 문제가 있었다. 어떤 스크립트도 "작업 완료 → 다음 작업 투입"
-체인을 갖지 않았고, 한 작업이 실패하면 남은 작업이 전부 취소됐다. Elice는 인스턴스 가동
-시간으로 과금되므로 이 유휴가 곧 비용이다.
-
-[`src/deep_anc/ops/job_queue.py`](src/deep_anc/ops/job_queue.py)의 감독자가 이를 대체한다.
-
-- **기존 프로세스 불가침** — 진입은 4중 AND다. ① 자기 중복 방지 flock ② 점유 PID의
-  cmdline과 `/proc/<pid>/stat` starttime을 매 폴링마다 확인(PID 재사용 함정 제거)
-  ③ 기존 watcher의 lock 획득(커널이 종료 시 해제하므로 race-free 증거) ④ GPU 실제 유휴
-  3회 연속. 신호는 자신이 만든 프로세스 그룹에만 보낼 수 있다.
-- **실패 격리** — 어떤 작업이 실패해도 종료하지 않고 다음 작업으로 넘어간다. 종료하는 순간
-  GPU가 놀기 때문이다. OOM만 **동일 하이퍼파라미터로** 1회 재시도한다(batch 자동 하향은
-  실험 비교 가능성을 파괴하므로 금지). 실패 산출물은 `runs/failed/`로 옮겨 보존한다.
-- **큐 재로드** — 작업 사이마다 큐 YAML을 다시 읽는다. 감독자를 재시작하지 않고 작업을 덧붙일 수 있다.
-
----
-
-## 4. 기술 스택
-
-| 영역 | 구성 |
+| 구성 | 사양 |
 |---|---|
-| 학습 | Elice Cloud 2×A100 80GB, PyTorch 2.5.1+cu121, bf16 AMP, AdamW + warmup→cosine |
-| 추론 | Jetson AGX Orin (JetPack 6 / R36.4.4), PyTorch 2.5.0a0, **onnxruntime 1.18.1 고정** |
-| 오디오 | 48kHz, 블록 256샘플, I²S 입력(APE) 2ch + USB 출력(AB13X) 2ch |
-| 데이터 | DNS-Challenge, FMA-small, DEMAND, MIMII, ESC-50 + 합성 신호 (약 154.9시간) |
-| 평가 | trusted/fullband NMSE, 옥타브밴드, 소스별, held-out 비선형(η=0.15) |
+| 덕트 | 1.2 m 사각 아크릴, 평면파 컷오프 1633 Hz |
+| 마이크 | INMP441 ×2 (I²S), 레퍼런스 X=0.10 m / 에러 X=1.10 m |
+| 스피커 | 4 인치 풀레인지 ×2, PCM5102A DAC + TPA3116D2 앰프 |
+| 추론 | Jetson AGX Orin (JetPack 6, CUDA 12.6) |
+| 학습 | NVIDIA A100 |
 
-> `onnxruntime`은 **1.18.1로 고정**한다. 1.19 이상은 Tegra 환경에서 크래시가 확인됐다.
+### 3.2 경로 측정
 
-### 4.1 데이터 구성
+1차·2차 경로는 **동시 인터리브 톤 프로브**로 잰다. 두 스피커를 같은 출력 스트림에서
+교대 톤 빈으로 동시에 구동하므로, 타임베이스 워프가 두 채널에 공통으로 걸려 상대량에서
+상쇄된다.
 
-| 소스 | 유효 파일 | 비율 | 담당 분포 |
-|---|---:|---:|---|
-| 합성 신호 | on-the-fly | 25% | 톤, 고조파, AM/FM, 협대역, chirp |
-| DNS noise | 16,000 | 30% | 광범위한 실환경 소음 |
-| DNS speech | 8,065 | 15% | 대화·음성 — **기능 2** |
-| FMA-small | 7,997 | 10% | 음악 — **기능 2** |
-| DEMAND | 96 | 8% | 주방·세탁기·사무실·지하철·차량 |
-| MIMII fan | 3,600 | 7% | 저역 회전기계음 |
-| ESC-50 | 2,000 | 5% | 비정상 환경·이벤트음 |
+```
+P(z) 소음 → 에러      순수지연 1580 샘플     150–1600 Hz 일관성 0.9992
+S(z) 상쇄 → 에러      순수지연 1440 샘플     150–1600 Hz 일관성 0.9987
+P − S = 140 샘플                            유지 반복 32/32
+```
 
-음성·음악이 분포에 포함된 것은 우연이 아니라 기능 2의 요구다. digital-ref 모드는 광대역
-비정상 신호도 인과적으로 상쇄할 수 있기 때문에 가능하다.
+**절대 지연은 재현되지 않지만 `P − S` 는 재현된다.** 독립 캡처에서 `P−S = 139~141`,
+그로부터 유도되는 lead 는 115~116 이다. 그래서 `P` 와 `S` 는 반드시 **같은 캡처**의
+값끼리만 함께 쓴다.
 
-이 규모는 **범용 사전학습을 시작하기에는 충분하지만 최종 모델의 완성 조건은 아니다.**
-실측 `P(z)`, 80–1600Hz `S(z)` 재보정, 소스·대역별 검증에 따른 혼합비 조정,
-digital/acoustic 모드별 별도 학습이 추가로 필요하다.
+### 3.3 데이터셋
 
-내장 val은 고정 16개라 최종 판정용이 아니다. 공개 데이터의 파일 단위 split에는 동일 화자·책·
-환경·기계 조건의 상관 누수 가능성이 남아 있어 `best.pt`만 신뢰하지 않고 `last.pt`도 함께 본다.
+**합성** — 온더플라이 생성. 실측 P/S 를 지나온 `d` 를 만들고 RIR 뱅크로 도메인 랜덤화한다.
+소스 혼합비는 `configs/data_sim.yaml` 이 선언하며, 선언한 태그의 manifest 가 없으면
+데이터셋 생성이 **실패한다**(조용한 대체 금지).
 
-### 4.2 실측 덕트 녹음 데이터셋 (파인튜닝용)
+**실측** — 덕트에서 직접 녹음한 82 세션 / 95.7 분.
 
-합성 데이터만으로는 실제 덕트의 공진·비선형·마이크 특성을 배울 수 없다. Stage-2 파인튜닝은
-**실제 덕트에서 스피커를 울려 녹음한 세션**을 70% 비율로 섞는다.
+| 계열 | 세션 | 그룹 |
+|---|---:|---:|
+| machine | 30 | 25 |
+| environment | 18 | 17 |
+| music | 18 | 18 |
+| speech | 16 | 15 |
 
-<div align="center">
-  <img src="assets/images/dataset_composition.png" width="900" alt="실측 덕트 녹음 데이터셋 구성">
-</div>
+각 세션은 저장 시점에 시간축 정합성 검사를 통과해야 한다 — 재생–캡처 지연 궤적의
+robust-std, 유효창 비율, 저역·고역 코히런스. 통과하지 못한 세션은 저장되지 않는다.
+
+---
+
+## 4. Evaluation Protocol
+
+평가는 4 개 게이트로 이루어지며 **G4 는 3 값 판정**이다 (PASS / FAIL / INCONCLUSIVE).
+표본이 부족해 아무 말도 할 수 없는 상태를 PASS 로 흘려보내면 게이트가 없느니만 못하다.
+
+| 게이트 | 판정 |
+|---|---|
+| G1 | 신뢰대역 NMSE 개선 (cluster bootstrap CI 로 0 과 구별) |
+| G2 | 소스 계열별 감쇠의 **최악값** |
+| G3 | 통계적 검정력 — 계열당 독립 그룹 ≥ 4 |
+| G4 | **대역 밖 do-no-harm** — 옥타브 감쇠가 −1.0 dB 보다 나쁘면 실패 |
+
+G4 를 fullband 평균으로 대신할 수 없는 이유: NMSE 는 `d` 의 에너지로 정규화되므로 `d` 에
+에너지가 거의 없는 대역에서는 `e` 가 수십 dB 커져도 전체 비율이 거의 안 변한다. 실측
+반증으로 8 kHz 를 21 dB 증폭하면서 fullband 기준을 통과한 사례가 있다.
+
+### 4.1 이론 상한
+
+실측 P/S 에서 최적 인과 FIR (M = 2048) 을 직접 풀어 얻은 달성 가능 상한:
+
+```
+150–1600 Hz   +4.83 dB
+150– 600 Hz   +5.20 dB
+```
+
+이 값은 아티팩트 sha256 을 키로 캐시되며, P/S 를 다시 측정하면 자동으로 재계산된다.
+설정에 적어 둔 숫자를 게이트가 그대로 믿지 않는다.
+
+---
+
+## 5. Results
+
+> **현재 상태** — 물리 계층과 데이터 파이프라인은 검증됐고, 정정된 플랜트에서의 학습은
+> 아직 수행되지 않았다. 검증된 것과 미검증인 것을 구분해 적는다.
+
+**검증된 것**
 
 | 항목 | 값 |
 |---|---|
-| 세션 / 분량 | **80세션 · 93.3분** (게이트 요구: `≥80` **그리고** `≥90분`) |
-| 소스 계열 | speech / music / environment / machine — 각 20세션 · 23.3분 |
-| 그룹 | 64그룹 — 같은 원본(화자·앨범·기계 등)이 두 분할에 걸치지 않게 묶는다 |
-| 분할 | train 64 / val 9 / test 7 (**그룹 단위**) |
-| 채널 | ERR(ch0) + REF(ch1) 2채널 `mics.wav` + 재생한 `source.wav` |
-| 재생 레벨 | peak 0.06 · 크레스트 10 dB로 제한 |
-| QA | 전수 80/80 PASS — 클리핑 0%, ERR RMS 하한, xrun 발생 세션은 **저장 자체를 거부** |
+| 경로 측정 재현성 | 독립 캡처 2 회의 최적 필터 `−P/S` 일치 0.9976 (상대오차 7.7 %) |
+| `P − S` 불변량 | 140 / 141 샘플 (독립 캡처 9 건에서 139~141) |
+| 신뢰대역 일관성 | 150–1600 Hz 에서 P 0.9992 / S 0.9987 |
+| 실측 데이터 정합성 | 82 세션 전량이 저장 시점 시간축 게이트 통과 |
+| 테스트 | 51 개 파일 / 744 케이스 통과 |
 
-수집 과정에서 실제로 걸러낸 것들이 이 설계의 이유다.
+**미검증**
 
-- **크레스트 제한이 없으면 세션이 통째로 무의미해진다.** ESC-50 클립을 피크 정규화만 하면
-  크레스트가 27 dB까지 올라가 RMS가 0.0026이 되고, 마이크에는 소음 바닥과 구분되지 않는
-  신호가 들어온다(구동/무구동 차이 `+0.3 dB`). tanh 소프트 클리핑으로 10 dB로 맞춘 뒤
-  SNR이 `+19.4 dB`가 됐다.
-- **그룹 깊이를 자동으로 고르지 않으면 분할이 무너진다.** LibriSpeech를 그대로 쓰면 20개
-  speech 세션이 전부 `group=dev-clean` 하나가 되어 speech 전체가 한 분할로 몰린다.
-- **xrun이 난 세션은 재시도한다.** 배치의 첫 세션은 full-duplex 스트림을 처음 여는 순간이라
-  거의 항상 한 번 걸린다. 한 번 재시도하고, 두 번 연속 실패하면 결함으로 기록한다.
-
-```bash
-.venv/bin/python scripts/data/build_recording_sources.py     # 계열별 소스 WAV 생성
-.venv/bin/python scripts/data/record_session_batch.py --confirm-speaker   # 연속 녹음(스피커)
-.venv/bin/python scripts/data/make_recorded_manifest.py      # 그룹 단위 분할
-.venv/bin/python scripts/data/validate_recorded_sessions.py  # 전수 QA
-```
+- 정정된 플랜트(`[150, 1600]` 대역)로 사전학습된 체크포인트가 아직 없다. 기존 체크포인트는
+  모두 `[150, 600]` 대역·폐기된 2차경로에서 학습된 것이라 파인튜닝 진입 게이트를 통과하지
+  못한다.
+- 합성 코퍼스 중 선언 비중 0.45 에 해당하는 원본(`dns_fullband`, `demand`, `machine`)이
+  아직 확보되지 않았다.
+- 따라서 **실기 상쇄 성능 수치는 아직 주장하지 않는다.**
 
 ---
 
-## 5. 프로젝트 구조
+## 6. Limitations
 
-```
-Deep_ANC/
-├── configs/              # 모델·데이터·덕트·학습·런타임 설정 (단일 출처)
-│   ├── duct.yaml         #   실측 P/S 경로·handoff·목표대역 — 여기서만 정의한다
-│   ├── model_*.yaml      #   base, tiny, tiny_long, tiny_attn, tiny_long_attn, tiny_wide
-│   ├── train_finetune.yaml  #  Stage-2 진입 게이트 기준 (readiness 블록)
-│   ├── runtime_tiny.yaml #   배포 후보 실기 설정 (tiny + ORT)
-│   └── elice/            #   GPU 작업 큐 정의
-├── src/deep_anc/
-│   ├── models/           # HybridANCNet (TCN / GLSTM / MHSA) + 스트리밍 export
-│   ├── data/             # 합성·recorded 데이터셋, manifest, 전수 QA, P(z) resolver
-│   ├── dsp/              # S(z) 플랜트, 동시 인터리브 자극, warp 추적, 비선형
-│   ├── losses/           # trusted-band NMSE + MR-STFT + power/clip 정규화
-│   ├── train/            # Trainer, checkpoint, 파인튜닝 readiness 게이트, lock
-│   ├── eval/             # 지표, 플롯, recorded 독립 평가, 측정 산출물 규약
-│   ├── realtime/         # 3-스레드 런타임, 엔진 4종(torch/ort/trt/fxlms), SPSC 링버퍼
-│   └── ops/              # GPU 작업 큐 감독자 (학습 경로와 분리)
-├── scripts/
-│   ├── elice/            # 부트스트랩(--no-train), 병렬 학습, 구조 탐색, 작업 큐
-│   ├── train/            # 학습, ONNX export, 파인튜닝 진입 감사·파이프라인
-│   ├── eval/             # 오프라인 평가, recorded 독립 평가
-│   ├── bench/            # 입력 preflight, 추론 지연, 클록 드리프트, 레벨·주기 스윕
-│   ├── data/             # 노이즈풀, RIR 뱅크, P/S 측정(ESS·동시 인터리브), 덕트 녹음
-│   ├── demo/             # 세션 평가(OFF→ON→OFF), 청취용 데모 렌더링
-│   ├── docs/             # README 그림 생성 (실측 산출물·설정에서 재생성)
-│   └── jetson/, export/  # Jetson 유저공간 셋업, TensorRT 엔진 빌드
-├── assets/
-│   ├── measured/         # 실측 P/S NPZ (primary_path_il, secondary_path_il)
-│   ├── diagrams/         # 아키텍처 그림 6종 + 덕트 3D/측면도
-│   └── images/           # 실기 시연·데이터셋·지연 예산 그림
-├── tests/                # 회귀 테스트 352개
-└── docs/                 # 00~12 + FxLMS 부록
-```
-
-실행 중 생성되는 `data/`, `runs/`, `results/`, `transfer/`는 `.gitignore`의
-**루트 앵커(`/`)** 로 차단된다. 앵커를 빼면 `src/deep_anc/data/`와 `scripts/data/`까지
-무시되는 사고가 난다(실제 이력).
-
-### 5.1 문서 지도
-
-| 범주 | 문서 |
-|---|---|
-| 시작·현황 | [HANDOFF](HANDOFF.md) · [전체 개요](docs/00_overview.md) · [작업 규칙](AGENTS.md) |
-| 물리·실물 | [지연 물리](docs/01_physics_limits.md) · [하드웨어](docs/02_hardware_setup.md) · [덕트 구조](docs/09_duct_structure.md) |
-| 데이터·모델 | [데이터 파이프라인](docs/03_data_pipeline.md) · [모델 아키텍처](docs/04_model_architecture.md) · [구조 지도](docs/10_structure_map.md) |
-| 학습·배포 | [Elice 학습](docs/05_training_elice.md) · [Jetson 배포](docs/06_deployment_jetson.md) · [개발 절차](docs/08_dev_workflow.md) |
-| **총정리** | **[시스템 총정리](docs/12_system_summary.md)** — 하드웨어·데이터·아키텍처·결과·개선방안 |
-| 평가·연구 | [평가 프로토콜](docs/07_evaluation_protocol.md) · [v2 로드맵](docs/11_v2_roadmap.md) · [FxLMS 부록](docs/appendix_legacy_fxlms.md) |
+- **레퍼런스 모드** — 현재 학습·평가는 digital reference(소음원을 미리 아는 구성)를 쓴다.
+  실배포에는 acoustic reference 가 필요하고, 그 모드에서는 `S(z)` 의 실측 지연이 그대로
+  예측 부담이 되어 주기성·협대역 성분으로 범위가 좁아진다.
+- **저역 하한** — 80–150 Hz 는 경로 일관성이 0.59~0.82 로 낮다. 목표 대역은 [80, 1600] 이지만
+  검증된 신뢰대역은 [150, 1600] 이다.
+- **2차경로 적응 없음** — `S(z)` 는 오프라인 측정값이고 런타임에 갱신되지 않는다. 온라인
+  2차경로 추정은 보조잡음을 계속 주입해야 하므로 G2 와 충돌한다. 현재는 학습 시 플랜트
+  섭동(지연 지터·이득·틸트)으로 강건성을 확보한다.
+- **비선형** — 앰프·스피커 비선형은 학습 시 랜덤 비선형으로 근사하며, 실측 THD/IMD 기반
+  모델은 아직 적용하지 않았다.
 
 ---
 
-## 6. 설치 및 실행
+## 7. Usage
 
-모든 Python 실행은 `.venv/bin/python`을 쓴다. 시스템 `python3`에는 torch가 없다.
-
-### 6.1 Jetson 환경 구축 (소리 출력 없음)
+### 7.1 설치
 
 ```bash
 git clone https://github.com/Roka-jsj/Deep-ANC.git
 cd Deep-ANC
-
-bash scripts/jetson/setup_jetson.sh    # .venv 재생성이 필요할 때만. lib preload 훅 포함 — 필수
-.venv/bin/python -m pytest -q          # 268개 전부 통과해야 정상
-.venv/bin/python scripts/data/build_rir_bank.py --n 300
-.venv/bin/python scripts/bench/check_audio_input.py
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-train.txt      # 또는 requirements-jetson.txt
 ```
 
-### 6.2 Elice에서 사전학습 (원샷)
+### 7.2 데이터 준비
 
 ```bash
-SSH="ssh -i ~/.ssh/elice.pem -p <포트> elicer@<호스트>"
-$SSH 'git clone -q https://github.com/Roka-jsj/Deep-ANC.git; \
-  setsid nohup bash Deep-ANC/scripts/elice/bootstrap_all.sh > ~/bootstrap.log 2>&1 < /dev/null &'
-$SSH 'tail -n 20 ~/bootstrap.log'
+# 합성 소음 풀 manifest (선언한 태그의 원본이 없으면 실패한다)
+python scripts/data/prepare_noise_pool.py
+
+# 실측 세션 → held-out → manifest → 전수 QA
+python scripts/data/make_recorded_holdout.py
+python scripts/data/make_recorded_manifest.py
+python scripts/data/validate_recorded_sessions.py
 ```
 
-환경 검증 → 공개 데이터 6종 다운로드 → 압축·파일목록 검증 → manifest/RIR/QA → pytest →
-GPU0=base·GPU1=tiny 병렬 학습까지 자동이다. 대용량 다운로드는 `pget.py`의 병렬 Range 요청을
-쓴다(Azure는 단일 연결 417KB/s로 제한되며 pget으로 약 7MB/s가 나온다).
-
-`setsid nohup … < /dev/null &` 패턴은 선택이 아니다. 터널이 끊겨도 원격 작업은 대부분
-살아 있으므로, 재실행 전에 반드시 상태를 먼저 확인한다(중복 실행 = 로그 겹쳐쓰기).
-
-### 6.3 GPU 작업 큐
+### 7.3 경로 측정 (스피커 출력 있음)
 
 ```bash
-.venv/bin/python scripts/elice/job_queue.py verify --queue configs/elice/queue_gpu1.yaml
-.venv/bin/python scripts/elice/job_queue.py plan   --queue configs/elice/queue_gpu1.yaml
-bash scripts/elice/run_job_queue.sh 1     # 감독자 기동 (SSH 끊겨도 계속)
-python3 scripts/elice/queue_status.py     # 표준 라이브러리만 사용 — 학습 CPU를 뺏지 않는다
+python scripts/data/measure_paths_interleaved.py --confirm-volume-minimum \
+    --primary-out assets/measured/primary_path_il.npz \
+    --secondary-out assets/measured/secondary_path_il.npz
 ```
 
-`plan`과 `--dry-run`은 GPU와 기존 프로세스를 전혀 건드리지 않는다.
-
-### 6.4 배포와 오프라인 평가
+### 7.4 학습
 
 ```bash
-.venv/bin/python scripts/train/export_onnx.py \
-  --ckpt runs/pretrain_tiny_corrected/ckpt/best.pt --out runs/export/tiny.onnx
+# 사전학습
+python scripts/train/train.py --config configs/train_pretrain.yaml
 
-.venv/bin/python scripts/bench/measure_inference_latency.py \
-  --config configs/runtime.yaml --set engine.type=ort --set engine.onnx=runs/export/tiny.onnx
-
-.venv/bin/python scripts/eval/evaluate_offline.py \
-  --ckpt runs/pretrain_tiny_corrected/ckpt/best.pt --n-items 64
+# 파인튜닝 — 진입 게이트를 통과해야 시작된다
+python scripts/train/check_finetune.py --config configs/train_finetune.yaml \
+    --set data.digital_primary_path_mode=measured
+python scripts/train/run_finetune_pipeline.py --config configs/train_finetune.yaml
 ```
 
-> DL 성능 평가는 `evaluate_offline.py`가 단일 출처다 — checkpoint의 resolved `P/S/lead`를
-> 그대로 쓴다. `compare_fxlms.py`는 그 규약을 반영하지 않아 학습된 checkpoint에서 DL 감쇠를
-> 약 43dB 낮게 보고하므로(실측 `+42.86 → −0.91dB`), 그런 checkpoint를 받으면 실행을 거부한다.
-> FxLMS와의 실기 비교가 필요하면 [`evaluate_fxlms_direct.py`](scripts/demo/evaluate_fxlms_direct.py)를 쓴다.
-
-ONNX 내보내기는 연속 블록 수치 등가성을 함께 검사한다.
-
-> 오프라인 평가는 `data/manifests/`와 RIR 뱅크가 있어야 의미가 있다. 둘이 없으면 소스별
-> 표에 `synthetic`만 남고 RIR이 즉석 32개로 대체되어 **기능 2를 측정할 수 없다.**
-
-### 6.5 청취용 데모 렌더링 (소리 출력 없음)
-
-오디오 장치를 열지 않고 상쇄 결과를 WAV로 만든다. 하드웨어 게이트와 무관하게 언제든 실행된다.
+### 7.5 평가와 배포
 
 ```bash
-.venv/bin/python scripts/demo/render_anc_demo.py \
-  --ckpt runs/pretrain_tiny_corrected/ckpt/best.pt --seconds 6
+python scripts/eval/evaluate_offline.py --ckpt runs/<run>/ckpt/best.pt --n-items 64
+python scripts/train/export_onnx.py --ckpt runs/<run>/ckpt/best.pt --out runs/export/model.onnx
+python scripts/bench/measure_inference_latency.py --config configs/runtime.yaml
 ```
 
-시나리오마다 `*_off.wav`(ANC 끔) / `*_on.wav`(ANC 켬) / `*_ab.wav`(앞 절반 OFF → 뒤 절반 ON)가
-나온다. **OFF와 ON은 같은 스케일로 쓴다.** 파일별로 정규화하면 소리 크기 차이가 사라져 상쇄가
-귀에서 없어진다. 물리 규약은 checkpoint에 저장된 resolved 설정을 그대로 쓴다 — 여기서 규약을
-다시 구현하면 학습과 어긋난 그럴듯한 소리를 만들게 된다.
-
-`configs/eval_demo.yaml`은 실제 음성 WAV에 덕트 소음을 섞은 시나리오다(기능 2의 청취 확인용).
-
-> 이 소리는 **실제 덕트 성능이 아니다.** surrogate 플랜트 시뮬레이션이며, 실측 `P/S`와
-> recorded 세션을 통과하기 전에는 "이만큼 조용해진다"의 근거가 될 수 없다.
-
-### 6.6 실시간 ANC 실행 (실기 — 스피커가 울린다)
-
-#### 6.6.1 선결 조건: 오디오 스레드 실시간 우선순위
-
-이것이 없으면 런타임은 열리지만 **쓸 수 없다.** PortAudio 콜백 스레드가 일반 우선순위로 돌면
-20초 구동에서 xrun이 145회 발생했고, 같은 하드웨어에서 RT 우선순위를 준 뒤 2회로 떨어졌다.
+### 7.6 테스트
 
 ```bash
-sudo tee /etc/security/limits.d/95-audio-rt.conf >/dev/null <<'EOF'
-@audio   -  rtprio     95
-@audio   -  memlock    unlimited
-@audio   -  nice      -19
-EOF
-sudo usermod -aG audio "$USER"
-sudo reboot                      # limits.conf 는 로그인 세션 시작 시에만 적용된다
+python -m pytest -q
 ```
 
-재부팅 뒤 확인한다. `ulimit -r`이 `0`이면 아직 적용되지 않은 것이다.
+---
 
-```bash
-ulimit -r                        # 95 여야 한다
-chrt -f 80 true && echo "SCHED_FIFO 가능"
+## 8. Repository Structure
+
+```
+src/deep_anc/
+  data/          합성·실측 데이터셋, manifest, 시간축 정합, QA
+  dsp/           지연·대역 단일 출처, 2차경로, 덕트 시뮬, 불변식, 설계 상한
+  losses/        ANC 손실과 경계 검증 (pydantic)
+  models/        HybridANCNet, TCN·GLSTM·MHSA, 스트리밍
+  eval/          지표, 실측 평가, FxLMS 베이스라인
+  realtime/      링버퍼, 추론 엔진(Torch/ORT/TRT), 안전 워치독
+  train/         트레이너, 파인튜닝 진입 게이트
+  ops/           게이트 레지스트리, 작업 큐
+
+configs/         덕트·데이터·모델·학습·런타임·평가 설정
+scripts/         data · train · eval · bench · export · jetson
+tests/           51 개 파일 / 744 케이스
+docs/            00 개요 · 01 지연 물리 · 02 하드웨어 · … · 12 시스템 요약
 ```
 
-| 항목 | RT 우선순위 없음 | 있음 |
-|---|---:|---:|
-| xrun (20초 구동) | 145 | **2** |
-| deadline miss | 77 | **4** |
-| 추론 step | 2.6–3.2 ms | **1.8–2.5 ms** |
+핵심 규약은 단일 출처를 갖는다.
 
-이것은 프로젝트 저장소 밖의 시스템 설정이므로 사용자가 직접 적용한다. Jetson의 다른 시스템
-구성(RT 커널, 전원모드, pinmux)은 [8.2의 불변식](#82-불변식)대로 건드리지 않는다.
-
-#### 6.6.2 실행
-
-스피커를 열기 전에 입력 게이트가 먼저 통과해야 한다. 런타임이 이 검사를 내장하고 있고,
-실패하면 exit 2로 스피커를 열지 않고 멈춘다.
-
-```bash
-.venv/bin/python scripts/bench/check_audio_input.py --require-both   # 사전 확인
-.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml
-```
-
-`configs/runtime_tiny.yaml`이 배포 후보 설정이다 — `tiny` + ONNX Runtime, `lead=109`.
-설정 파일 없이 덮어써서 쓸 수도 있다.
-
-```bash
-.venv/bin/python -m deep_anc.realtime.run_realtime \
-  --set engine.type=ort \
-  --set engine.onnx=runs/export/tiny_corrected.onnx \
-  --set digital_reference_lead_samples=109 \
-  --set noise.type=band --set noise.band='[80, 1000]' --set noise.amplitude=0.03 \
-  --run-seconds 60 --record results/session_$(date +%m%d_%H%M).npz
-```
-
-> **`safety.control_limit`을 0.2보다 낮추지 말 것.** 0.2는 임의의 안전값이 아니라 모델 자체의
-> 소프트 리미터(`0.2·tanh(y/0.2)`)와 같은 값이다. 더 낮추면 런타임 리미터가 모델을 자기
-> 자신에게 클립시키고, 연속 클립 mute(20블록 = 106ms)가 ANC를 켜자마자 꺼버린다.
-> 과출력 보호는 이 값이 아니라 **발산 워치독**(에러파워가 베이스라인 ×4로 0.5초 지속)이 한다.
-
-런타임은 **항상 ANC OFF로 시작**한다. `start_on: true`는 코드가 거부한다 — 사람이 켜는 순간을
-기준으로 OFF/ON을 비교할 수 있어야 하기 때문이다. 켜는 것은 키보드다.
-
-| 키 | 동작 |
+| 물리량 | 단일 출처 |
 |---|---|
-| `A` 또는 `Space` | **ANC ON/OFF 토글** |
-| `N` | 소음 스피커 ON/OFF |
-| `R` | 엔진 상태 리셋 |
-| `H` | 도움말 |
-| `Q` | 종료 |
+| 지연·lead·대역 | `dsp/timing.py` — lead 는 `PlantDelays.lead()` 로만 생성 가능 |
+| 대역 밖 예산 | `dsp/do_no_harm.py` — 손실 마진이 게이트 임계에서 유도 |
+| 스트림 정합 임계 | `dsp/invariants.py` — 지터 상한이 제어 대역 상단에서 유도 |
+| 게이트 목록 | `ops/gate_registry.py` — 모든 게이트가 음성·양성 fixture 를 갖는다 |
 
-`--record`는 `--run-seconds`가 있어야 한다(녹음 버퍼 크기를 미리 잡아야 하므로).
-`--calibrate`는 소음을 상쇄 없이 흘려 실효 지연만 측정하는 모드다.
-`--list-devices`는 오디오를 전혀 열지 않고 장치 목록만 출력한다.
+## 9. Safety
 
-#### 6.6.3 자동 OFF→ON→OFF 평가
+- 스피커 출력 스크립트는 **사용자 입회 + 볼륨 최소** 상태에서만 실행한다.
+- 런타임은 항상 ANC OFF 로 시작하고, 워치독이 발산·포화·클록 이탈을 감지하면 상쇄 출력을
+  0 으로 페이드한다.
+- 출력에는 소프트 리미터 `y = L·tanh(u/L)` 가 항상 걸려 있다.
 
-사람이 키를 누르는 대신 프로토콜대로 진행하고 감쇠를 계산해 리포트를 쓴다.
+## Documentation
 
-```bash
-.venv/bin/python scripts/demo/evaluate_session.py \
-  --config configs/runtime_tiny.yaml --controllers dl fxlms \
-  --scenarios tone300 band --out results/live_rt
-```
-
-구간은 OFF 10초 → ON 30초 → OFF 5초(`configs/eval.yaml`의 `protocol`)이며, 게이트 램프를
-피하려고 경계 1–2초를 잘라내고 비교한다. `--controllers dl fxlms`로 같은 세션에서 딥러닝
-컨트롤러와 FxLMS를 나란히 볼 수 있다.
-
-#### 6.6.4 임의의 소리(음악·영상 등)를 소음원으로 쓰기
-
-`noise.type=file`은 WAV를 소음 스피커로 재생한다. 유튜브 영상 소리로 시험하려면 먼저 WAV로
-받아 두고 지정한다.
-
-```bash
-.venv/bin/python -m deep_anc.realtime.run_realtime \
-  --config configs/runtime_tiny.yaml \
-  --set noise.type=file --set noise.file=results/demo_source/clip.wav
-```
-
-> **재생 중인 앱 소리를 실시간으로 받아 상쇄하는 경로(`noise.type=live`)는 아직 없다.**
-> digital-ref 모드는 소음원을 런타임이 직접 만든다는 전제 위에 `lead=109`를 쓰기 때문에,
-> 외부 앱 출력을 받으려면 acoustic-ref(`reference: mic`, `lead=0`)로 가거나 루프백 소스를
-> 새로 구현해야 한다. 현재 상태는 [HANDOFF.md](HANDOFF.md)를 따른다.
-
-#### 6.6.5 시간축 진단
-
-전달맵·`P/S` 측정이 INVALID로 나올 때 원인이 레벨인지 배선인지 **시간축**인지 가른다.
-
-```bash
-.venv/bin/python scripts/bench/measure_io_jitter.py --confirm-volume-minimum --seconds 30
-.venv/bin/python scripts/bench/measure_duct_transfer_map.py \
-  --confirm-volume-minimum --amplitude 0.02 --repeats 7 --excitation-seconds 6
-```
-
-`measure_io_jitter.py`는 연속 스트림에서 DAC→ADC 지연이 **얼마나 흔들리는지**를 본다.
-ANC는 고정 위상을 전제하므로 평균 지연보다 지터가 성능을 먼저 결정한다. 두 가지가 핵심이다.
-
-- **ERR−REF 자기검증** — 두 마이크는 같은 ADC 클록이라 상대 지연이 물리적으로 고정이다.
-  따라서 ERR−REF가 흔들리면 하드웨어가 아니라 **추정기가 틀린 것**이다.
-- **대역제한 PHAT** — 전대역 PHAT는 자극이 없는 대역의 잡음까지 백색화해 증폭한다.
-  실제로 `−5408 샘플` 같은 값이 나왔다. 가중을 자극 대역으로 한정해야 한다.
-
-> 이 도구의 PASS는 **유효로 인정된 주기에 대한** 판정이다. 유효 주기 수(`valid/total`)를 함께
-> 보지 않으면 걸러낸 주기에 나쁜 소식이 숨는다. 전달맵이 같은 조건에서 큰 spread를 보고하면
-> 지터 도구의 PASS보다 전달맵을 믿어야 한다.
-
-### 6.7 문제 해결
-
-| 증상 | 원인 | 대응 |
-|---|---|---|
-| exit 2, 스피커가 열리지 않음 | 입력 사전점검 실패 | `check_audio_input.py --require-both`. raw가 `-1`/`0` 고착이면 배선 문제이며 `--force`로 우회하지 않는다 |
-| 시작 전 lead 불일치 거부 | 런타임 `digital_reference_lead_samples` ≠ checkpoint/ONNX 메타 | 설정을 메타에 맞춘다. acoustic-ref는 반드시 `0` |
-| xrun·deadline miss 폭증 | 오디오 스레드 RT 우선순위 없음 | [6.6.1](#661-선결-조건-오디오-스레드-실시간-우선순위) |
-| ANC를 켜도 유효구간 0% / 켜자마자 꺼짐 | `safety.control_limit` < 0.2 → 모델을 자기 리미터에 클립 | **0.2로 되돌린다** ([6.6.2](#662-실행)) |
-| ANC를 켰는데 고역이 오히려 시끄러움 | surrogate 물리로 학습한 모델이 신뢰대역 밖에 잡음을 주입 | 실측 `P/S` 파인튜닝 전에는 예상된 결과다 ([7.6](#76-파인튜닝-전-기준선--아직-증폭한다)) |
-| 자동 mute (divergence) | 에러파워가 베이스라인 ×4를 0.5초 지속 | 설계된 보호 동작. `safety.divergence_ratio` 참조 |
-| `onnxruntime` 크래시 | 1.19 이상 | **1.18.1로 고정** |
-
-### 6.8 실측 데이터 QA와 독립 평가 (소리 출력 없음)
-
-```bash
-.venv/bin/python scripts/data/make_recorded_manifest.py
-.venv/bin/python scripts/data/validate_recorded_sessions.py
-.venv/bin/python scripts/eval/evaluate_recorded.py \
-  --ckpt runs/finetune_tiny/ckpt/best.pt --split test
-```
-
-manifest는 같은 `group_id`를 split 밖으로 내보내지 않고 source family별 8:1:1로 나눈다.
-`evaluate_recorded.py`는 checkpoint의 resolved `P/S/lead`를 그대로 써서 G4를 판정한다 —
-학습 코드 경로를 재사용하면 같은 버그를 두 번 통과시키기 때문이다.
-
-### 6.9 실측 P(z)/S(z) 측정 (실기 — 스피커가 울린다)
-
-두 경로를 **한 번의 재생으로 동시에** 잰다. 재생(USB)과 녹음(I²S)이 다른 클록 도메인이라
-두 측정이 떨어져 있으면 그 사이의 warp가 **P와 S의 상대 지연**에 그대로 실리는데,
-ANC가 실제로 요구하는 값이 바로 그 상대 지연(`lead`)이다.
-
-```bash
-.venv/bin/python scripts/data/measure_paths_interleaved.py \
-  --confirm-volume-minimum --dewarp        # 약 11초 재생, peak 0.02
-
-.venv/bin/python scripts/data/calibrate_wideband.py \
-  --confirm-volume-minimum --output-channel cancel   # 경로별 순차 ESS (구방식)
-```
-
-두 출력 채널에 **인접 FFT 빈을 번갈아** 실어 한 번의 FFT로 누화 없이 분리한다. 게이트가
-`guard=1`을 강제하는 이유는 두 경로를 가능한 한 같은 주파수에서 보기 위해서다. 게이트를
-통과한 두 NPZ는 같은 `capture_id`를 갖고, 파인튜닝 감사가 그 일치를 확인한다 — "같은 조건"을
-진폭·블록·latency 값의 우연한 일치가 아니라 **같은 캡처였다는 사실**로 확인하기 위해서다.
-
-현재 이 측정은 통과하지 못한다. 원인과 시도한 대응은 [7.4](#74-g1은-어떻게-풀렸는가--분석-창이-결정적-파라미터였다)에 있다.
-
-### 6.10 파인튜닝 (Stage-2)
-
-파인튜닝은 실측 `P(z)`/`S(z)`, 완료된 사전학습 checkpoint, recorded manifest가 **모두**
-있어야 시작된다. 하나라도 없으면 GPU를 초기화하기 전에 거부한다.
-
-배포 후보는 `tiny`이므로 진입점도 `tiny`를 가리킨다
-(`model_tiny.yaml` / `runs/pretrain_tiny_corrected` / `runs/finetune_tiny`).
-base와 동일 조건(100k step·같은 seed·같은 데이터)으로 비교했을 때 held-out trusted NMSE가
-tiny 쪽이 낫고 Jetson 지연 여유도 크다.
-
-```bash
-.venv/bin/python scripts/train/run_finetune_pipeline.py \
-  --config configs/train_finetune.yaml --set data.digital_primary_path_mode=measured
-
-.venv/bin/python scripts/train/run_finetune_pipeline.py --check-only ...   # 준비 감사만
-.venv/bin/python scripts/train/run_finetune_pipeline.py --status ...       # lock 없이 상태 확인
-.venv/bin/python scripts/train/check_finetune.py ...                       # lock 없는 독립 감사
-```
-
-산출물은 `results/finetune_autostart/<run-key>/{status.json, audit/}`에 쌓인다.
-`status.json`은 **advisory**이며 재개 판단은 항상 디스크 사실(`last.pt` 존재)로만 한다.
-
-> **불변식:** NOT READY이면 `runs/` 아래에 아무것도 만들지 않는다. 학습 디렉터리의 존재는
-> "학습이 실제로 시작됐다"는 뜻이어야 한다.
-
-| exit | 의미 | 대응 |
-|---:|---|---|
-| 0 | READY 또는 전체 게이트 PASS | — |
-| 1 | **NOT READY** (설계된 fail-closed) | 실측 P/S·recorded 확보 |
-| 2 | config 오류, `best.pt`만 있는 모호한 재개 | 설정/체크포인트 확인 |
-| 3 | 다른 경로로 이미 같은 run을 학습 중 | **조사 대상** |
-| 4 | pipeline 중복 실행 | 무시 가능 (`--status`로 확인) |
-| 5 | 학습/평가/완료 단계 실패 | `status.json`의 `failed_step` 확인 |
-
-`train.py`를 직접 실행해도 같은 readiness 검사가 GPU 초기화 전에 강제된다.
-
----
-
-## 7. 평가 프로토콜
-
-성능 주장은 전체 NMSE 하나로 하지 않는다. 소스별, 저·고역별, 중앙값과 최악 10%,
-실시간 P99/xrun을 함께 통과해야 한다.
-
-### 7.1 물리 게이트 G1–G4
-
-| 게이트 | 내용 | 현재 |
-|---|---|:---:|
-| **G1** | 같은 capture 의 실측 `S(z)`/`P(z)`. `repeats≥3`, **검증 대역 150–600Hz** 일관성 `≥0.9`, `amplitude≤0.02`, xrun/clip 0, **상대** 지연 spread `≤1ms` | 통과 |
-| **G2** | recorded 독립 세션 `≥80`개 / `≥90`분 / 4개 source family, 전수 QA 통과 | 통과 |
-| **G3** | 파인튜닝 설정 정합 — measured 모드, recorded 비율, lead 일치 | 통과 |
-| **G4** | recorded val/test 독립 평가. **checkpoint SHA와 manifest SHA에 결박**, 소스별 **최악값**이 기준 | 파인튜닝 후 |
-
-G1을 통과하지 못한 상태에서 나온 어떤 감쇠 수치도 **진단값**이지 성능이 아니다.
-성공한 반복만 골라 고정 `P/S`로 저장하는 방식으로 게이트를 우회하지 않는다.
-G1이 어떻게 풀렸는지는 [7.4](#74-g1은-어떻게-풀렸는가--분석-창이-결정적-파라미터였다), 대역을 좁힌
-결정과 그 대가는 [7.5](#75-게이트-대역을-801600--150600-으로-좁힌-결정)에 있다.
-
-G4가 소스별 **평균이 아니라 최악값**을 보는 이유는 기능 2의 정의 그 자체다. 평균 게이트는
-"음성을 6dB 증폭하지만 나머지를 잘 잡는" 모델을 통과시킨다 — quiet zone은 그 순간 실패다.
-
-### 7.2 오프라인 평가 산출물
-
-`evaluate_offline.py`는 절대 목표 2가지를 분리 측정한다.
-
-- **기능 1** — 옥타브밴드별 감쇠 (trusted 대역 표시 포함)
-- **기능 2** — 소스 종류별 NMSE (synthetic / dns / speech / music / demand / machine / esc50)
-- trusted−fullband 간극, held-out 비선형(η=0.15) 일반화, 아이템 분포(중앙값·최악)
-
-`metrics.npz`의 `per_item_trusted_db`는 후보 간 **paired 비교**의 근거다. 모든 후보가 같은
-평가 seed로 동일한 아이템을 보기 때문에 아이템 난이도 분산이 상쇄된다.
-
-### 7.3 구조 후보 선정 규칙 (사전 등록)
-
-결과를 보기 **전에** 큐 정의에 확정한다. 결과를 본 뒤 기준을 바꾸는 것을 구조적으로 막는다.
-
-1. **1차 지표** — `last.pt`의 held-out trusted NMSE. `best.pt`는 고정 16개 val 배치에서
-   뽑혀 선택 편향이 있고, `last.pt`는 모든 후보가 같은 step 예산이라 편향이 없다.
-2. **유의성** — 대조군 대비 paired 차이의 bootstrap 95% CI 상한 `< −0.30dB`.
-   유의한 후보가 없으면 **승자는 대조군**(가장 싸고 P99 위험이 낮다).
-3. **실격** — fullband 또는 held-out이 대조군 대비 `1.0dB` 초과 악화(do-no-harm),
-   `config_snapshot.yaml` 지문 불일치, step 예산 불일치.
-4. **동점(0.30dB 이내)** — ① 최악 소스가 가장 좋은 후보(기능 2) ② trusted 밴드 중 감쇠 `≤0`인
-   밴드가 적은 후보(기능 1) ③ 비용 순.
-5. `best.pt`로 확인했을 때 승자가 다르면 `winner_ambiguous` — 자동 승격하지 않는다.
-
-> 이 신뢰구간은 평가 아이템 간 분산만 덮고 **run 간(seed) 분산은 덮지 않는다.**
-> seed 반복 결과가 나오기 전에는 확정적 우열 주장으로 쓰지 않는다.
-
----
-
-### 7.4 G1은 어떻게 풀렸는가 — 분석 창이 결정적 파라미터였다
-
-재생은 USB DAC(AB13X), 녹음은 Tegra APE I²S다. **서로 다른 클록 도메인**이라 "출력 샘플 번호
-↔ 녹음 샘플 번호" 대응이 시간에 따라 흔들린다(warp). 이 때문에 P/S 실측이 오래 막혀 있었고,
-후보를 하나씩 실험으로 배제한 끝에 원인이 확정됐다.
-
-| 후보 | 검증 방법 | 결과 |
-|---|---|---|
-| ADC·마이크 | ERR–REF 지연을 13주기 추적 | 편차 **0.5샘플** — 정상 |
-| USB 드라이버 | `dmesg` URB 오류·언더런 | **0건** — 정상 |
-| PortAudio 교차 카드 정렬 | `aplay`/`arecord` 직접 경로와 비교 | **동일 증상** — 무관 |
-| 레벨·비선형 | SNR 13.8 → 35.0 dB (21 dB↑) | 일관성 **−0.14** — 무관 |
-| **분석 창 길이** | 주기 1.0 → 0.125 s | **0.535 → 0.955** ← 원인 |
-
-warp 의 위상오차는 `2πfτ/fs` 로 **주파수에 비례**한다. 창을 줄이면 창 안의 warp 가 줄어
-고역이 살아난다. 창 길이만 바꾼 실측(진폭 0.06 고정, 반복 16):
-
-| 분석 주기 | P(z) | S(z) | 1000–1600 Hz |
-|---:|---:|---:|---:|
-| 1.000 s | 0.535 | 0.535 | 0.368 |
-| 0.250 s | 0.793 | 0.726 | 0.668 |
-| **0.125 s** | **0.955** | **0.925** | 0.887 |
-
-이에 맞춰 측정 도구를 고쳤다 — 기본 주기 0.125 s, 시간영역 온셋 검출 대신 위상 기울기로
-순수지연 추출, 지연 탐색을 IR 복원 주기 안으로 제한(제한이 없어 S 가 1339 대신 4339 로
-나왔고 값이 그럴듯해 조용히 틀릴 뻔했다), 게이트가 판정하는 지연 안정도를 **두 경로의
-상대값**으로 전환(절대 warp 는 두 채널에 공통이라 lead 에서 상쇄된다).
-
-**교차검증 3건이 맞는다.**
-
-| 양 | 실측 | 독립 근거 |
-|---|---:|---|
-| `P − S` | 143 샘플 | 기하 `(1.100−0.050)/343` = **147** |
-| `d_noise` | 1608 | 기하 예측 **1612** |
-| `lead` | 113 | 이전 추정 **109** (다른 방법) |
-
-### 7.5 게이트 대역을 [80,1600] → [150,600] 으로 좁힌 결정
-
-전대역에서 P 는 0.86~0.96 을 내지만 S 는 0.77~0.94 로 0.90 을 오간다. 약점이 **80–150 Hz 와
-1000–1600 Hz** 에 몰리는데, 상쇄 스피커가 Ø40 사이드브랜치 드라이버라 그 두 끝에서 덕트
-결합이 약한 물리적 한계다. 신뢰 대역 150–600 Hz 에서는 P/S 모두 0.95~0.99 이고, 학습 손실이
-최적화하는 대역도 바로 여기다 — 즉 [80,1600] 요구는 학습이 실제로 쓰는 것보다 넓었다.
-
-> **대가: 절대 목표 1(저·고역 모두 제거)의 고역은 이 단계에서 미달로 고정된다.**
-> 이 설정으로 만든 어떤 모델도 600 Hz 위를 주장하지 않는다. 고역은 상쇄 경로 개선
-> (스피커·장착)이 선행되어야 하는 Stage-3 과제다.
-
-축소하면서 동시에 **조였다.** 측정 아티팩트에 `consistency_band_hz` 를 저장하고, 게이트가
-"일관성을 잰 대역이 요구 대역을 덮는가"를 검사한다. 예전에는 `coherence_median` 이 어느
-대역에서 잰 값인지 파일 어디에도 없었다 — 좁은 대역에서 잰 0.95 로 넓은 대역을 주장할 수
-있었다는 뜻이다.
-
-같은 구분이 학습에도 들어간다. `excitation_band_hz`(구동 64–1648 Hz)와
-`consistency_band_hz`(검증 150–600 Hz)는 다른 값이고, 손실·평가는 **검증 대역**을 쓴다
-([secondary_path.py](src/deep_anc/dsp/secondary_path.py) `trusted_band_hz()`).
-
-### 7.6 파인튜닝 전 기준선 — 아직 증폭한다
-
-실측 P/S 를 확보한 뒤 사전학습 `tiny` 를 **실제 덕트 녹음** val 분할에 걸었다.
-
-| Source family | 세션/그룹 | trusted 평균 | 최악 10% |
-|---|---|---:|---:|
-| machine | 3 / **1** | **+1.86** | +3.91 |
-| environment | 2 / 2 | +1.72 | +3.45 |
-| speech | 2 / 2 | +0.51 | +4.05 |
-| music | 2 / 2 | +0.49 | +2.89 |
-| **전체** | 9 / 7 | **+1.23** | +3.79 |
-
-NMSE 는 낮을수록 좋다 — **양수는 증폭**이다. 합성 데이터에서 −18.66 dB 를 내던 모델이
-실측에서 +1.23 dB 다. 이것이 sim-to-real 격차의 크기이며, 파인튜닝이 정확히 이 격차를
-메우는 단계다. 사전학습은 `P(z)=S(z)` surrogate 로 했고 실측 P 와 S 는 다르다.
-
-> `machine` 은 성능이 가장 나쁜데 val/test 가 각각 **그룹 하나**로 판정된다. 원본이
-> ESC-50 이고 기계 카테고리가 8종뿐이라 생긴 구조적 한계다(다른 계열은 20그룹).
-> 파인튜닝 후 G4 가 최악 계열을 지목하면 그 계열을 겨냥해 보강한다.
-
-## 8. 안전 및 정책
-
-### 8.1 스피커를 여는 스크립트
-
-`record_duct`, `record_session_batch`, `calibrate_wideband`, `measure_paths_interleaved`,
-`measure_duct_transfer_map`, `measure_channel_paths`, `measure_io_jitter`, `measure_io_latency`,
-`playback_duct_probe`, `evaluate_session`, `evaluate_fxlms_direct`, `run_realtime`은 실제 소리를 낸다.
-**사용자가 현장에 있고 앰프 볼륨이 최저인 상태에서만** 실행한다.
-
-측정 스크립트는 `--confirm-volume-minimum` 없이는 실행되지 않고 진폭 상한(`0.02`)이 코드에 있다.
-소리를 내지 않는 대안은 [6.5의 WAV 렌더링](#65-청취용-데모-렌더링-소리-출력-없음)이다.
-
-실행 전에 스피커를 전혀 열지 않는 입력 게이트가 먼저 통과해야 한다.
-
-```bash
-.venv/bin/python scripts/bench/check_audio_input.py                 # ERR ch0 (FxLMS/digital-ref)
-.venv/bin/python scripts/bench/check_audio_input.py --require-both  # ERR+REF (recorded/acoustic-ref)
-```
-
-장치가 열려도 raw가 `-1`/`0`으로 고착되면 유효 오디오가 아니다. 이 실패를 `--force`로
-우회하거나 스피커 출력으로 진단하지 않는다. 배선은
-[J30 핀 표](docs/02_hardware_setup.md#j30-40핀-헤더-물리-배선-2026-08-03-사용자-확정)를 따르되,
-이 문제를 해결하려고 pinmux/I²S·RT 커널·전원모드·오디오 데몬을 바꾸거나 `sudo`를 실행하지 않는다.
-
-### 8.2 불변식
-
-| 규칙 | 이유 |
+| 문서 | 내용 |
 |---|---|
-| `~/anc_project`, `~/FxLMS`는 **읽기 전용** | 기존 FxLMS 실험 환경. python import도 금지(`python3 -B`) |
-| Jetson **sudo·시스템 변경 금지** | 현재 구성(RT 커널, 30W, pinmux)은 의도된 것이다 |
-| `S(z)`/핸드오프/목표대역은 `duct.yaml` 단일 출처 | 값이 두 곳에 있으면 반드시 갈라진다 |
-| `.gitignore`의 루트 앵커 유지 | 비앵커 패턴은 소스 디렉터리까지 무시한다 |
-| 비밀정보(`*.pem`, `id_rsa*`, `.env`) 커밋 금지 | 공개 저장소다 |
-| TensorRT는 사전 구성된 환경에서만 | 이 프로젝트를 위해 `apt`/`sudo` 설치를 하지 않는다 |
-| 지연·극성·인과성·SPSC 소유권·FP32 손실·정적 ONNX 상태 I/O | 테스트가 강제하는 불변식 |
-| 파인튜닝 게이트를 낮추지 않는다 | 물리가 안 맞는데 통과시키면 그 뒤 숫자가 전부 무의미해진다 |
-| README 그림은 **실측 산출물에서 재생성** | 손으로 그린 그림은 시간이 지나면 조용히 거짓말이 된다 |
+| [docs/01](docs/01_physics_limits.md) | 지연 물리 — 두 레퍼런스 모드의 인과성 |
+| [docs/02](docs/02_hardware_setup.md) | 하드웨어 배선과 점검 절차 |
+| [docs/04](docs/04_model_architecture.md) | 모델·스트리밍·ONNX 규약 |
+| [docs/07](docs/07_evaluation_protocol.md) | 평가 프로토콜과 게이트 |
+| [AGENTS.md](AGENTS.md) | 작업 규칙 |
+| [HANDOFF.md](HANDOFF.md) | 현재 진행 상태 (이 README 는 상태를 담지 않는다) |
 
-전체 규칙은 [AGENTS.md](AGENTS.md)가 단일 출처다.
-
----
-
-## 라이선스
+## License
 
 [MIT License](LICENSE)

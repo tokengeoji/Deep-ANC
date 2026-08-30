@@ -3,7 +3,7 @@
 작성: 2026-08-03. 원 설계서(4개 전문 조사 종합)를 3개 독립 검증 렌즈(①물리·수치 검증, ②배포 제약 적대 검증, ③학습 실현성 검증)로 교차검증한 결과의 종합.
 **채택 규칙: 3개 렌즈 중 하나라도 기각한 항목은 로드맵에서 제외**하고 말미의 "검토 후 제외" 절에 사유와 함께 기록한다(다음 세션 재검토 방지). 조건부 기각(시점·사양 수정으로 해소되는 것)은 수정판을 해당 단계에 조건 명시 후 편입했다.
 
-불변 전제: 블록 256샘플=5.33ms, hop 128=2.67ms, 상쇄 경로 지연 1598샘플(S 1342 + 핸드오프 256), digital-ref 예측 요구 −109샘플, acoustic-ref 예측 요구 ≈1458샘플(≈30ms), 평면파 컷오프 1633Hz, Jetson P99<3ms, ONNX opset17 정적그래프·상태 명시 텐서·TRT 화이트리스트(DFT/Loop/Gather 금지), 시스템 변경 불가.
+불변 전제(**2026-08-05 플랜트 복구 반영**): 블록 256샘플=5.33ms, hop 128=2.67ms, 상쇄 경로 지연 **1718샘플(S 실측 1462 + 핸드오프 256)**, digital-ref 예측 요구 **−116샘플**, acoustic-ref 예측 요구 **≈1578샘플(≈32.9ms)**, 평면파 컷오프 1633Hz, Jetson P99<3ms, ONNX opset17 정적그래프·상태 명시 텐서·TRT 화이트리스트(DFT/Loop/Gather 금지), 시스템 변경 불가.
 
 ## 0. corrected Stage-1 현재 기준선
 
@@ -13,7 +13,8 @@
 - `secondary_surrogate`: `P(z)=S(z)`로 gain/FIR 스케일을 맞춘 표현 사전학습
 - `digital_reference_lead_samples: 109`: 학습 연속 source와 런타임 playback FIFO 모두 구현
 - 공칭 선형 plant: η=10, drive=1, hardclip=0, delay/gain/tilt/all-pass 섭동 OFF
-- trusted 150–600Hz NMSE로 최적화/체크포인트 선택, fullband NMSE를 do-no-harm 지표로 동시 로깅
+- trusted NMSE로 최적화/체크포인트 선택, fullband NMSE를 do-no-harm 지표로 동시 로깅
+  (**2026-08-05 플랜트 복구로 trusted 대역이 150–600Hz → 150–1600Hz 로 확대**)
 - checkpoint의 resolved config·`physics_status`·lead, ONNX JSON lead 메타, 런타임 mismatch fail-fast(legacy=0)
 
 이 단계의 체크포인트는 **representation-only**다. 고정-batch overfit 성공은
@@ -47,7 +48,7 @@ THD/IMD 실측을 통과한 뒤 Stage-2 커리큘럼으로 점진 투입한다. 
   `/home/capston/anc_project/calibrate_s_path.py`는 읽기 전용 참고로만 사용하고 필요한 코드는
   이 저장소로 복사해 출처를 남긴다. THD 수% 미만이면 신경 플랜트 등 고비용 G_nl 작업을
   회피한다 — C단계 G_nl 투자 규모 결정 게이트.
-- ② **광대역 S(z) 재보정 150–600Hz → 80–1600Hz**: 현 coherence 0.40(`calibration_4s.log` 경고) + 유효대역 밖 고조파(300Hz의 2·3차=600/900Hz) 통과로 학습 신호 오염 — 모든 비선형 고도화의 선결 조건. 반복 일관성 ≥0.9 후에만 신뢰대역을 늘린다.
+- ② ~~**광대역 S(z) 재보정 150–600Hz → 80–1600Hz**~~ → **2026-08-05 해소.** 동시 인터리브 측정 + 오염 반복 기각으로 `consistency_band_hz` 가 **150–1600Hz** 가 됐다(150–1600Hz 일관성 P 0.9993 / S 0.9990). 남은 한계는 **80–150Hz** 뿐이다(클린 후에도 S 0.706~0.758 — 진짜 물리 한계). docs/02 §4.
 - ③ **digital-ref P(z) 실측**: 동일 앰프·볼륨·I/O 조건에서
   `calibrate_wideband.py --output-channel noise`로 noise→ERR compact FIR+순수지연을
   측정한다. `duct.digital_reference.primary_path_npz`와 `d_noise_delay_samples`를 함께
@@ -79,7 +80,7 @@ revised-OLA 감사는 **불필요 확인 완료**: docs/04 기준 디코더 OLA�
    manifest는 Elice에서 재생성하거나 휴대 가능 규약으로 교체한다.
 3. `digital_primary_path_mode: measured`와 실측 `primary_path_npz`/`d_noise_delay_samples`를
    선택한다. corrected Stage-1의 `secondary_surrogate` 상태로 파인튜닝하지 않는다.
-4. 독립 val/test에서 trusted 150–600Hz NMSE와 fullband NMSE를 항상 동시
+4. 독립 val/test에서 trusted NMSE(현 150–1600Hz)와 fullband NMSE를 항상 동시
    제시한다. 합성 offline·실기 session 평가는 S(z) 실측대역∩덕트 목표대역에서
    trusted/fullband/간극을 Markdown+NPZ에 자동 저장하며 기존 소스별·옥타브 지표도
    유지한다. 다만 Trainer val은 합성 최대 16개뿐이며 recorded val/test evaluator까지
@@ -139,7 +140,7 @@ fail-fast하며, 키가 없는 legacy artifact는 0으로 해석한다. 0 no-op�
 
 ### C0. 선결 조건 (모든 렌즈 공통 지적)
 1. **파라미터·연산 예산 전면 재산정**: 원 설계 §2.3 표는 산술 오류로 기각됨(제외 절 참조). 인코더는 10ch 풀레이트 직결 금지 — **밴드 채널 별도 소형 투영(1×1 프리믹스 10→2ch) 또는 밴드 decimation으로 재사양** 후 재산정. 룩백 24ms 확장은 in=2ch 기준 규모(≈1.18M)로만 한정 승인.
-2. **v1-base TRT FP16 실측 선행**: 현행 배포 스택(ORT CPU)에서 v1-base P99 6.8ms로 게이트 탈락 상태(tiny 1.50ms만 통과, docs/06). TRT python 바인딩·trtexec 미설치이며 Jetson 시스템 설치는 금지되어 있으므로, 사전 구성된 별도 환경이 생기기 전에는 실측할 수 없다. 실측 통과 전 v2-base 채널 규모 확정 불가.
+2. **v1-base TRT FP16 실측 선행**: 현행 배포 스택(ORT CPU)에서 v1-base P99 6.8ms로 게이트 탈락 상태(tiny 1.44ms@MAXN 만 통과, docs/06). **(2026-08-06 정정)** TRT python 바인딩 10.3.0 은 venv 에 있고 FP16 plan 실측도 끝났다 — **이 사유는 해소됐다**(docs/06). 남은 제약은 GPU 지연 실측이 **듀티 100% 연속 실행** 조건에서 나온 값이라는 것이며, 듀티 6% 주기 호출 벤치 전에는 v2-base 채널 규모를 확정할 수 없다.
 
 ### C1. 승인된 그래프 요소 (전부 화이트리스트 op 조합·정적 shape·상태 명시 텐서·알고리즘 지연 0)
 - **4밴드 분석 필터뱅크**: 실계수 인과 Conv1d(전대역+0–400+400–900+900–1633Hz), DFT 불사용, 상태 st_fb. 컷오프 이하 용량 집중 — 물리 정합. (C0-1 사양 조건)
@@ -151,7 +152,7 @@ fail-fast하며, 키가 없는 legacy artifact는 0으로 해석한다. 0 no-op�
 
 ### C2. acoustic-ref 주기성 전략 (§3 — 성분 분해 원칙 유지)
 - **① 자기상관 주기 특징**: ref 과거 히스토리 버퍼 + 지연 행렬 MatMul, 후보 L∈[2ms,40ms] 로그 간격 ~64개, Gather 불사용 — 인과, 승인.
-- **① 소프트 comb 예측 탭 — 수정판만**: 원 명세는 인과성 위반으로 기각(제외 절). 수정판: **softmax 지연 후보를 유효 지연 mT̂≥1458샘플(=P)로 제한 + ref 버퍼 ≥ P+40ms(≈3378샘플 이상, 렌즈 ② 권고 ~2×P≈2916 이상)로 확장** — 정적 shape 유지. 이 형태로만 구현.
+- **① 소프트 comb 예측 탭 — 수정판만**: 원 명세는 인과성 위반으로 기각(제외 절). 수정판: **softmax 지연 후보를 유효 지연 mT̂≥1578샘플(=실측 P)로 제한 + ref 버퍼 ≥ P+40ms(≈3378샘플 이상, 렌즈 ② 권고 ~2×P≈2916 이상)로 확장** — 정적 shape 유지. 이 형태로만 구현.
 - **② 필터계수 예측 헤드**: 사전학습 서브필터 뱅크(M≈16) + 프레임율 α 결합(MatMul) — 공진 협대역·준정상 한정, 오차 피드백 비의존이라 발산 위험 없음. [GFANC arXiv:2303.05788; GFANC-Kalman SPL 2024]
 - **③ 학습·안전장치**: 30ms 타겟 시프트 커리큘럼(순주기→변조→공진→혼합), 증폭 페널티(e>d 구간 가중 벌점) 게이팅 학습, **성분별 분리 평가(주기/공진/색잡음/백색 — 백색은 0dB 무해가 성공 기준)**.
 
@@ -176,9 +177,9 @@ acoustic-ref 광대역 랜덤(상관시간 ≪ 30ms)은 본 로드맵의 어떤 
 |---|---|---|---|---|
 | R1 | §2.3 파라미터 예산표 (v2-base ≈8.4M / v2-tiny ≈1.8M) | 3/3 | **산술 오류 확정**: Conv1d(10→512, k=1152)=10×512×1152=5.90M인데 표는 1.18M(in=2ch 값)으로 기재 — 입력 채널 ×5 누락. 실제 v2-base ≈12–13M. tiny도 인코더 단독 2.95M이라 1.8M 불가능 | 인코더 재사양(C0-1) 후 전면 재산정 |
 | R2 | §2.2 인코더 10ch 풀레이트 직결 사양 (10ch × k=1152 × 512out) | 2/3 (①②는 예산표 기각에 포함, ③ 명시 기각) | 다이어그램과 예산표가 상호 모순, 인코더 GMAC만 +2.1~2.2 GMAC/s로 예산 붕괴의 원인 | 1×1 프리믹스(10→2ch) 또는 밴드 decimation 재설계 |
-| R3 | §2.4 지연 예산 수치 (v2-base 3.4 GMAC/s → TRT FP16 ≤2.4ms) | 3/3 | R1에서 파생된 과소 추정(실제 ≈4.5–4.6 GMAC/s = v1의 2배). TRT 미설치(설치=금지된 시스템 변경)로 실측 불가능한 수치이며, 현행 ORT CPU에서 v1-base조차 P99 6.8ms로 게이트 탈락 중 | 사전 구성된 별도 TRT 환경 + v1-base FP16 P99 실측 통과 |
+| R3 | §2.4 지연 예산 수치 (v2-base 3.4 GMAC/s → TRT FP16 ≤2.4ms) | 3/3 | R1에서 파생된 과소 추정(실제 ≈4.5–4.6 GMAC/s = v1의 2배). **(2026-08-06 정정)** TRT 는 설치돼 있어 실측 가능하다 — 다만 현재 수치는 전부 듀티 100% 조건이다. 현행 ORT CPU 에서 v1-base 는 여전히 P99 6.40ms 로 게이트 탈락 중 | 사전 구성된 별도 TRT 환경 + v1-base FP16 P99 실측 통과 |
 | R4 | v2-tiny ≈1.8M 폴백 "안전망" 주장 | 2/3 | R1과 동일 산술 오류. 명시 사양대로면 ORT CPU 추정 P99 ≈5ms로 게이트 탈락 가능성 높음 — 안전망으로 불성립 | 인코더 재사양 시 ≈0.6 GMAC/s로 통과 가능 — 재산정·실측 후 |
-| R5 | 측정-e 기반 test-time training + TRT refit | 3/3 | TRT python API 미설치(설치 금지)로 원천 불가 + 공유 Orin GPU에서 배경 학습이 P99<3ms 게이트와 자원 경합 — "지연 불변" 주장 검증 불가 + 30ms 지연 플랜트 경유 온라인 가중치 갱신은 발산 시 실제 소음 증폭 사고 직결. 승인된 저위험 대체재: FiLM 임베딩 갱신(C4) | 오프라인 검증 + 경합 격리 + 사전 구성된 별도 TRT 환경 |
+| R5 | 측정-e 기반 test-time training + TRT refit | 3/3 | **(2026-08-06 정정)** TRT python API 는 설치돼 있어 이 사유는 해소됐다. 남은 기각 사유는 다음 둘이다: 공유 Orin GPU에서 배경 학습이 P99<3ms 게이트와 자원 경합 — "지연 불변" 주장 검증 불가 + 30ms 지연 플랜트 경유 온라인 가중치 갱신은 발산 시 실제 소음 증폭 사고 직결. 승인된 저위험 대체재: FiLM 임베딩 갱신(C4) | 오프라인 검증 + 경합 격리 + 사전 구성된 별도 TRT 환경 |
 | R6 | Meta-AF식 학습 옵티마이저로 FxLMS 갱신 교체 | 1/3 (③) | 미분가능 폐루프 시뮬 + 메타학습 인프라가 필요한 별도 연구 과제 — 2×A100 공유·캡스톤 일정에서 비용 대비 이득 불확실. B6의 고전 FxNLMS가 같은 역할을 검증된 비용으로 수행 | (사실상 종결 — 일정 여유 생길 경우만) |
 | R7 | Mamba 오프라인 티처 증류 | 1/3 (③) | 티처 사전학습에 v1급 A100 시간 추가 소요, 설계 자신이 인용한 실증(Wu & Braun — 초저지연에서 Mamba 열세)상 티처 우위 근거 약함 | (사실상 종결) |
 | R8 | MAML 파인튜닝 | 1/3 (③) | 이중 최적화 비용·불안정 + few-step 적응 실행 경로가 정적 TRT 그래프에 없음(온디바이스 갱신=R5 전제와 연동). 섭동 지식은 B5·FiLM 레시피로 흡수 가능 | (사실상 종결) |

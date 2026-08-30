@@ -1,0 +1,56 @@
+{
+ "89ba6cd3d97e7d706ab42974cb29622f00bed683c512b215bd64b4583d2ead86|a84040b9c00820088687e57a2c18942f9a0e21c09240007cd1475be0ace120f8|116|150.000-1600.000|2048|48000.0": {
+  "ceiling_db": 4.826704564549887,
+  "regularisation": 1e-06,
+  "condition_number": 19846925.33791882,
+  "max_tap": 2.9606820801340676,
+  "stable": true,
+  "primary": "/home/capston/Deep_ANC/assets/measured/primary_path_il.npz",
+  "secondary": "/home/capston/Deep_ANC/assets/measured/secondary_path_il.npz"
+ },
+ "89ba6cd3d97e7d706ab42974cb29622f00bed683c512b215bd64b4583d2ead86|a84040b9c00820088687e57a2c18942f9a0e21c09240007cd1475be0ace120f8|116|150.000-176.777|2048|48000.0": {
+  "ceiling_db": 19.89104239339967,
+  "regularisation": 1e-06,
+  "condition_number": 6205575.289657343,
+  "max_tap": 0.8128493786781961,
+  "stable": true,
+  "primary": "assets/measured/primary_path_il.npz",
+  "secondary": "assets/measured/secondary_path_il.npz"
+ },
+ "89ba6cd3d97e7d706ab42974cb29622f00bed683c512b215bd64b4583d2ead86|a84040b9c00820088687e57a2c18942f9a0e21c09240007cd1475be0ace120f8|116|176.777-353.553|2048|48000.0": {
+  "ceiling_db": 19.648111269502394,
+  "regularisation": 1e-06,
+  "condition_number": 30075680.419304933,
+  "max_tap": 2.9448675561240654,
+  "stable": true,
+  "primary": "assets/measured/primary_path_il.npz",
+  "secondary": "assets/measured/secondary_path_il.npz"
+ },
+ "89ba6cd3d97e7d706ab42974cb29622f00bed683c512b215bd64b4583d2ead86|a84040b9c00820088687e57a2c18942f9a0e21c09240007cd1475be0ace120f8|116|353.553-707.107|2048|48000.0": {
+  "ceiling_db": 2.1588116563813773,
+  "regularisation": 1e-06,
+  "condition_number": 125583027.71364282,
+  "max_tap": 36.47639064321087,
+  "stable": true,
+  "primary": "assets/measured/primary_path_il.npz",
+  "secondary": "assets/measured/secondary_path_il.npz"
+ },
+ "89ba6cd3d97e7d706ab42974cb29622f00bed683c512b215bd64b4583d2ead86|a84040b9c00820088687e57a2c18942f9a0e21c09240007cd1475be0ace120f8|116|707.107-1414.214|2048|48000.0": {
+  "ceiling_db": 5.22342676461961,
+  "regularisation": 1e-06,
+  "condition_number": 42208296.29448667,
+  "max_tap": 4.3642850684405285,
+  "stable": true,
+  "primary": "assets/measured/primary_path_il.npz",
+  "secondary": "assets/measured/secondary_path_il.npz"
+ },
+ "89ba6cd3d97e7d706ab42974cb29622f00bed683c512b215bd64b4583d2ead86|a84040b9c00820088687e57a2c18942f9a0e21c09240007cd1475be0ace120f8|116|1414.214-1600.000|2048|48000.0": {
+  "ceiling_db": 7.3840303310442685,
+  "regularisation": 1e-06,
+  "condition_number": 240134920.10031945,
+  "max_tap": 2.6079744771946958,
+  "stable": true,
+  "primary": "assets/measured/primary_path_il.npz",
+  "secondary": "assets/measured/secondary_path_il.npz"
+ }
+}

@@ -20,18 +20,34 @@ controller: dl
 
 # (S 순수지연 1342 + 스레드 핸드오프 256) − D_noise 1489 = 109.
 # checkpoint/ONNX 메타와 불일치하면 오디오를 열기 전에 거부된다.
-# 109 는 **현재 배포 중인 ONNX 기준**이다. 이 모델은 실측 P/S 확보 전에 추정값
-# (S 1342 + handoff 256 − D_noise 1489)으로 사전학습했다. 2026-08-05 실측은 113 이며
-# (S 1465 + 256 − P 1608) configs/data_sim.yaml 이 그 값을 쓴다. 런타임은 checkpoint/
-# ONNX 메타와 다르면 시작 전에 거부하므로 두 값이 섞이지 않는다.
-# 파인튜닝이 113 으로 끝나면 새 ONNX 를 내보내고 이 값을 113 으로 올린다.
+#
+# ⚠ 109 는 **현재 배포 중인 ONNX 기준**이고 실측 플랜트와 다르다.
+# 이 모델은 실측 P/S 확보 전에 추정값(S 1342 + handoff 256 − D_noise 1489)으로
+# 사전학습했다. 2026-08-05 플랜트 복구 결과 실측 lead 는 **116** 이다
+# (S 1462 + handoff 256 − P 1602; 독립 캡처 9건에서 115~117, 중앙 116).
+# configs/data_sim.yaml 이 116 을 쓴다.
+#
+# 즉 109 는 checkpoint/ONNX/plan 메타와 **자기들끼리만** 일관되고 실제 덕트와는
+# 7 샘플(146 µs) 어긋난다. 런타임 자체검사(validate_digital_reference_lead)는
+# runtime↔checkpoint 만 보므로 이 불일치를 잡지 못한다 — "일관성 검사"가
+# "정확성 검사"를 대신하고 있는 상태다. 정확성은 파인튜닝 진입 게이트
+# path_delay_and_lead 가 지킨다(설정 lead == 실측 S+handoff−P 를 정확히 요구).
+#
+# 실측 lead 스캔(150-600Hz, 정규방정식): 0 → −5.54 / 116 → −6.53 dB.
+# lead 오차는 조용한 성능 손실이지 오류가 아니므로 로그에 남지 않는다.
+# 파인튜닝이 116 으로 끝나면 새 ONNX 를 내보내고 이 값을 116 으로 올린다.
 digital_reference_lead_samples: 109
 
 engine:
   type: ort
   ckpt: runs/pretrain_tiny_corrected/ckpt/best.pt
   onnx: runs/export/tiny_corrected.onnx
-  plan: runs/export/tiny_fp16.plan
+  # 2026-08-05 수정: 이전 값 `runs/export/tiny_fp16.plan` 은 **존재하지 않는 파일**이었다.
+  # engine.type=ort 라 이 키가 한 번도 읽히지 않아 조용히 썩어 있었고, trt 로 바꾸는
+  # 순간(대개 실기 직전) 터졌을 것이다. 이제 run_realtime 의
+  # engine_artifact_preflight 가 **선언된 모든 아티팩트**의 존재를 시작 전에 검사한다
+  # — "지금 안 쓰니까 괜찮다"가 이 결함이 살아남은 이유였다.
+  plan: runs/export/tiny_corrected_fp16.plan
   cpu_affinity: [4, 5, 6, 7]
 
 fxlms:
@@ -43,16 +59,52 @@ fxlms:
 safety:
   # 0.2 는 임의의 값이 아니라 **모델 자체의 소프트 리미터와 같은 값**이다
   # (model_*.yaml limiter.limit=0.2 → 출력은 항상 0.2·tanh(y/0.2), 즉 |y|<0.2).
-  # 이보다 낮추면 런타임 리미터가 모델을 자기 자신에게 클립시키고, clip_streak_mute
-  # (연속 20블록=106ms)가 ANC 를 켜자마자 꺼버린다. 실제로 그렇게 됐다 —
+  # 이보다 낮추면 런타임 리미터가 모델을 자기 자신에게 클립시킨다. 예전에는 그 상태를
+  # clip_streak_mute(연속 20블록=106ms)가 잡아 ANC 를 켜자마자 꺼버렸다 —
   # 0.05 에서는 유효구간 0.0%, 0.15 에서도 band 시나리오가 93.3% 로 게이트 미달이었다.
-  # 과출력 보호는 이 값이 아니라 발산 워치독(에러파워 ×4가 0.5초 지속 → 자동 mute)이 한다.
+  # 그 키는 폐기됐고(리미터와 같은 값을 재 DL 경로에서 항상 0 이었다) 포화 워치독
+  # (|y| > 0.95×limit)이 대체한다. 과출력 보호는 output_rms_ratio 와 발산 워치독이 한다.
+  #
+  # 여기 값은 configs/runtime.yaml 과 같은 규약이다. 각 키의 근거는 그 파일의 주석과
+  # src/deep_anc/realtime/safety.py 의 SafetyLimits docstring 을 보라.
   control_limit: 0.2
   fade_ms: 20
-  clip_streak_mute: 20
+
+  saturation_ratio: 0.95
+  saturation_fraction: 0.5
+  saturation_window_s: 1.0
+  saturation_rate_mute: 0.5
+
+  output_rms_ratio: 0.6
+  rms_window_s: 1.0
+  rms_rate_mute: 0.5
+
+  deadline_window_s: 1.0
+  deadline_miss_rate_mute: 0.2
+
   divergence_ratio: 4.0
   divergence_hold_s: 0.5
-  deadline_miss_mute: 3
+  divergence_rate_mute: 0.5
+  baseline_floor_power: 1.0e-8
+  baseline_tau_s: 1.0
+  baseline_grace_s: 3.0
+  divergence_probe_s: 1.0
+  divergence_probe_confirm_ratio: 2.0
+  divergence_probe_limit: 3
+  divergence_probe_clear_s: 10.0
+
+  output_dc_limit_ratio: 0.05
+  output_dc_window_s: 0.2
+  output_dc_rate_mute: 0.5
+  output_dc_blocker_r: 0.9995
+  # noise.band 하단이 80 Hz 다 — 이동평균 DC 판정은 그 대역의 정상 상쇄음을 DC 로
+  # 오인한다. 저역통과 + AC 우세도로 판정한다.
+  output_dc_lowpass_hz: 2.0
+  output_dc_ac_dominance: 0.3
+  output_dc_hard_ratio: 0.5
+
+  handoff_window_s: 1.0
+  handoff_drop_rate_mute: 0.2
 
 noise:
   type: band

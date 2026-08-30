@@ -63,7 +63,7 @@ legacy `main_realtime_anc.py`는 정상 종료 때도 기본 `control_filter_las
 ### 5.1 corrected Stage-1 — 표현 사전학습
 
 - [x] `P(z)=S(z)` scale-matched surrogate, +109 lead FIFO, 공칭 선형 plant로 영출력 해의 원인 제거
-- [x] trusted 150–600Hz NMSE를 학습/체크포인트 선택에 쓰고 fullband NMSE를 동시 로깅
+- [x] trusted NMSE(현 **150–1600Hz**)를 학습/체크포인트 선택에 쓰고 fullband NMSE를 동시 로깅
 - [x] +109 학습↔실시간 FIFO 정렬, artifact 메타, mismatch fail-fast 자동 테스트
 - [ ] base/tiny 완주 후 `best.pt`·`last.pt`·resolved config·로그 회수
 
@@ -77,9 +77,13 @@ legacy `main_realtime_anc.py`는 정상 종료 때도 기본 `control_filter_las
 - [x] `--require-both`로 ERR/REF 모두 PASS(pin17 REF L/R 복구)
 - [x] ERR/REF 과클리핑 원인이던 빠진 pin17을 재연결; Jetson pinmux/I²S는 변경하지 않음
 - [ ] 동일 앰프·볼륨·오디오 설정에서 `P(z)`(noise→ERR)와 `S(z)`(cancel→ERR) 반복 실측
-- [ ] 각 ESS 반복 일관성 ≥0.9, `S(z)` 80–1600Hz 신뢰대역, 스피커 THD/IMD 확인
-- [ ] 실측 순수지연으로 `K=(S delay+256)-P delay`를 재계산; 109가 바뀌면
-  학습 설정·런타임·artifact 메타를 함께 바꿈
+- [x] 각 반복 일관성 확인 — **요구 대역(150–1600Hz) 모든 부대역 ≥0.9406**, 유지 반복 ≥8,
+  **P−S 상대 τ 궤적 상수성**(총계만 보면 오염을 놓친다 — 실제로 놓쳤다). 스피커 THD/IMD 는 미확인
+- [x] 실측 순수지연으로 `K=(S delay+256)-P delay`를 재계산 → **K=116** (S 1462 / P 1602).
+  학습 설정(`configs/duct.yaml`, `data_sim.yaml`)은 갱신됨. **배포 artifact 는 아직 109**
+  (그 ONNX 가 109 로 학습됐기 때문 — 런타임이 불일치를 시작 전에 거부한다)
+- [ ] **recorded 80세션 재녹음** — 현 데이터는 재생↔녹음 시간축이 붕괴해 전량 격리됨
+  (`data/recorded_broken/`). coh²(source→ERR) 0.021~0.126 vs coh²(REF→ERR) 0.959~0.991
 - [ ] 소음·음성·음악·환경·기계음을 source family×대역으로 나눈 독립 세션 수집
 - [ ] 화자·곡·환경·기계 조건 그룹을 가로지 않는 8:1:1 train/val/test 생성
 

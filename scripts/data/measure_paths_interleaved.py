@@ -57,10 +57,12 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import calibrate_wideband as cw  # noqa: E402
 
 from deep_anc.audio_io import (  # noqa: E402
+    assert_measurement_preconditions,
     pcm_int32_to_float32,
     resolve_alsa_portaudio_device,
 )
-from deep_anc.config import REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.config import DEFAULT_HANDOFF_SAMPLES, REPO_ROOT, load_yaml  # noqa: E402
+from deep_anc.dsp.timing import PlantDelays  # noqa: E402 — lead 유도의 단일 출처
 from deep_anc.dsp.interleaved_probe import (  # noqa: E402
     DEFAULT_TRACK_WINDOW,
     align_repeats,
@@ -69,6 +71,8 @@ from deep_anc.dsp.interleaved_probe import (  # noqa: E402
     complex_consistency,
     dewarp_recording,
     estimate_transfer,
+    relative_tau_outliers,
+    timebase_drift,
     tone_snr_db,
     track_warp,
 )
@@ -93,25 +97,73 @@ DEFAULT_TONE_SPACING_HZ = None
 # 레벨은 원인이 아니다 — 같은 스윕에서 SNR 을 13.8→35.0dB 로 21dB 올려도 일관성은
 # 개선되지 않았다(오히려 -0.14). PortAudio 도 아니다(ALSA 직접 경로 동일 증상).
 DEFAULT_PERIOD_SECONDS = 0.125
-DEFAULT_WARMUP_PERIODS = 4      # 순환 정상상태 도달 전 주기는 버린다
-DEFAULT_REPEATS = 16
+# 워밍업 4주기(0.5s)로는 스트림이 정상상태에 못 든다 — 2026-08-05 실측에서 저장된
+# 캡처 9건 **전부** 반복 0(대개 반복 1도)의 국소 타임베이스 드리프트가 정상상태의
+# 2~5배였다. 16주기(2.0s)로 늘린다.
+DEFAULT_WARMUP_PERIODS = 16
+# 게이트가 반복을 버리므로 여유를 둔다. 저장된 캡처에서 유지율은 33~75% 였고
+# min_kept_repeats 8 을 확보하려면 32 가 필요하다(16 이면 8/16 로 아슬아슬했다).
+# 재생 길이는 0.125s×(16+32) = 6.0초 — 앞선 (4+16)×0.125 = 2.5초보다 길다.
+DEFAULT_REPEATS = 32
 # τ 는 재현되는 대역에서만 적합한다. 재현 안 되는 대역을 넣으면 그 잡음이 τ 를 끌고 간다.
 DEFAULT_FIT_BAND_HZ = (150.0, 1200.0)
 # 일관성을 **어느 대역에서 쟀는지**가 곧 이 모델을 어느 대역에서 믿을 수 있는가다.
 # 그래서 숫자만 저장하지 않고 대역도 함께 저장하고, 게이트가 그 대역이 요구 대역을
 # 덮는지 검사한다. 대역이 안 적혀 있으면 0.95 라는 숫자가 무엇에 대한 0.95 인지 모른다.
-DEFAULT_CONSISTENCY_BAND_HZ = (150.0, 600.0)
+#
+# 2026-08-05 정정: [150,600] 은 "600Hz 위는 덕트 물리 한계" 라는 **틀린 전제** 위에
+# 있었다. 아래 게이트를 켜고 재분석하면 1000-1600Hz 일관성이 P 0.999 / S 0.999 다.
+DEFAULT_CONSISTENCY_BAND_HZ = (150.0, 1600.0)
 
 MIN_TONE_SNR_DB = 12.0          # 톤 중앙값 SNR 하한
 MIN_TONE_SNR_FRACTION = 0.9     # 이 비율 이상의 톤이 하한을 넘어야 한다
 MAX_CREST_DB = 14.0
+
+# --- 2-pass 공동 판정 상수 -------------------------------------------------
+#
+# 아래 네 값은 저장된 캡처 10건(총 236 반복)을 직접 재분석해 정한 것이다.
+# 임의로 완화하면 2026-08-05 결함 1(프레임 슬립 5반복 + 정상상태 미도달 1반복이
+# 그대로 official 이 된 사건)이 그대로 재현된다.
+DEFAULT_MIN_ALIGNMENT_SCORE = 0.95
+"""중앙 앵커 2-pass 규약 기준. 단일 pass(앵커 0) 규약이라면 0.80 이 맞는 값이다.
+
+앵커 0 규약에서는 정상군 최저 0.838 과 오염군 최고 0.836 이 겹쳐 점수만으로는
+어떤 임계로도 분리되지 않는다. 2-pass 후에는 유지 반복 0.9845~0.9995 / 오염
+반복 최고 0.966 으로 완전히 갈린다.
+"""
+
+DEFAULT_MAX_RELATIVE_TAU_SAMPLES = 3.0
+"""|rel − median(rel)| 허용치(샘플). 정상 최대 1.987 / 오염 최소 4.316.
+
+두 값 사이가 비어 있어 3.0 이 양쪽에 각각 1.5x / 1.44x 여유를 준다.
+MAD 스케일 임계는 쓰지 않는다 — 오염이 과반인 캡처에서 MAD 가 부풀어
+(실측 1.346 → 허용 11.98) 슬립 블록을 통째로 통과시킨다.
+"""
+
+DEFAULT_MAX_DRIFT_DEVIATION_SAMPLES = 2.0
+"""|국소 드리프트 − 중앙| 허용치(샘플/주기). 정상 ≤0.83 / 이상 ≥2.63."""
+
+MAX_KEPT_RELATIVE_TAU_ABS_SAMPLES = 1.0
+"""최종 아티팩트 게이트. 2-pass 후 실측 |rel|max 는 0.128~0.417 이다."""
+
+MIN_BAND_CONSISTENCY = 0.90
+"""필수 대역 안 **모든** 부대역이 넘어야 한다 — 총계는 에너지 가중이라 약한
+대역을 숨긴다(실측: S 전대역 총계 0.9987 인데 80-150Hz 부대역만 보면 0.706)."""
+
+CONSISTENCY_SUB_BANDS_HZ = (
+    (80.0, 150.0),
+    (150.0, 300.0),
+    (300.0, 600.0),
+    (600.0, 1000.0),
+    (1000.0, 1600.0),
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hardware", default="configs/hardware_jetson.yaml")
     parser.add_argument("--band", type=float, nargs=2, default=list(DEFAULT_BAND_HZ))
-    parser.add_argument("--required-band", type=float, nargs=2, default=[80.0, 1600.0])
+    parser.add_argument("--required-band", type=float, nargs=2, default=[150.0, 1600.0])
     parser.add_argument(
         "--tone-spacing-hz",
         type=float,
@@ -132,13 +184,31 @@ def build_parser() -> argparse.ArgumentParser:
                         default=list(DEFAULT_CONSISTENCY_BAND_HZ),
                         help="official coherence_median 을 계산할 대역(아티팩트에 함께 기록)")
     parser.add_argument(
-        "--min-alignment-score", type=float, default=0.5,
-        help="이 신뢰도 미만인 반복은 τ 탐색 실패로 보고 버린다(개수는 산출물에 기록)",
+        "--min-alignment-score", type=float, default=DEFAULT_MIN_ALIGNMENT_SCORE,
+        help=(
+            "이 신뢰도 미만인 반복은 τ 탐색 실패로 보고 버린다(개수는 산출물에 기록). "
+            "중앙 앵커 2-pass 규약에서 유지 반복은 0.9845~0.9995, 오염 반복은 최고 0.966"
+        ),
+    )
+    parser.add_argument(
+        "--max-relative-tau-samples", type=float,
+        default=DEFAULT_MAX_RELATIVE_TAU_SAMPLES,
+        help="P−S 상대 τ 의 중앙값 편차 허용(샘플). 정상 최대 1.99 / 오염 최소 4.32",
+    )
+    parser.add_argument(
+        "--max-drift-deviation-samples", type=float,
+        default=DEFAULT_MAX_DRIFT_DEVIATION_SAMPLES,
+        help="국소 타임베이스 드리프트의 중앙값 편차 허용(샘플/주기). 정상 ≤0.83",
     )
     parser.add_argument("--min-kept-repeats", type=int, default=8)
-    parser.add_argument("--max-delay-jitter-ms", type=float, default=1.0)
+    parser.add_argument("--max-delay-jitter-ms", type=float, default=0.0625)
     parser.add_argument("--block-size", type=int, default=None)
-    parser.add_argument("--latency", choices=["low", "high"], default="high")
+    # 런타임(run_realtime / record_duct)은 'low' 로 **고정**돼 있다
+    # (configs/hardware_jetson.yaml: "코드는 'low' 고정"). 기본값이 'high' 였던 탓에
+    # 측정하는 플랜트와 실제로 도는 플랜트의 버퍼 구성이 달랐다 — 실측 절대지연이
+    # low 1565~1659 / high 2858~2888 로 갈린다. 출하 npz(calibration_latency=low)도
+    # low 에서 나왔다. 배포와 다른 모드로 잰 플랜트는 그 자체로 fail-open 이다.
+    parser.add_argument("--latency", choices=["low", "high"], default="low")
     parser.add_argument("--input-probe-seconds", type=float, default=3.0)
     parser.add_argument("--primary-out", default="assets/measured/primary_path_il.npz")
     parser.add_argument("--secondary-out", default="assets/measured/secondary_path_il.npz")
@@ -148,7 +218,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "주기 분석 전에 warp 궤적을 추적해 녹음을 재생 타임베이스로 되돌린다. "
-            "실측에서 반복 일관성 0.05 → 0.85 (게이트 0.90 에는 아직 미달)"
+            "**쓰지 마라** — 2026-08-05 오프라인 재검증에서 전대역 일관성이 "
+            "window 1024/2048/4096 에서 0.834/0.879/0.762 로 **떨어졌다**(무보정 0.979). "
+            "앞선 '0.05 → 0.85' 개선 주장은 반복 0 오염이 지배하던 시절의 값이다. "
+            "진단용으로만 남긴다."
         ),
     )
     parser.add_argument("--track-window", type=int, default=DEFAULT_TRACK_WINDOW)
@@ -194,6 +267,98 @@ def bulk_delay_samples(
     return float(taus[index] + fraction * 0.25)
 
 
+def channel_stack(
+    *,
+    err: np.ndarray,
+    probe,
+    drive: str,
+    period_starts: list[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """주기별 전달함수를 쌓아 ``(주파수, [반복, 톤] 복소 스택)`` 을 준다."""
+
+    rows = [
+        estimate_transfer(err[s : s + probe.period_samples], probe, drive=drive)
+        for s in period_starts
+    ]
+    return rows[0][0], np.stack([H for _, H in rows])
+
+
+def select_repeats(
+    *,
+    frequencies: dict[str, np.ndarray],
+    stacks: dict[str, np.ndarray],
+    sample_rate: int,
+    fit_band_hz: tuple[float, float],
+    max_relative_tau_samples: float,
+    max_drift_deviation_samples: float,
+    min_kept_repeats: int = 3,
+) -> tuple[np.ndarray, int, dict[str, Any]]:
+    """두 채널을 **함께** 보고 쓸 반복과 앵커를 정한다.
+
+    반환 ``(keep, anchor, report)``. 판정 근거는 전부 타임베이스 관측이다 —
+    "결과가 좋아지는가"로 고르지 않는다. 어떤 반복을 왜 버렸는지 report 에 남는다.
+
+    채널별 독립 판정이면 P 에서만 버린 반복이 S 에 남아 두 경로가 서로 다른 반복
+    집합에서 만들어질 수 있다. 그러면 lead 가 물리량이 아니게 된다.
+    """
+
+    taus: dict[str, np.ndarray] = {}
+    scores: dict[str, np.ndarray] = {}
+    for drive in ("noise", "cancel"):
+        _, tau, score = align_repeats(
+            frequencies[drive], stacks[drive], sample_rate=sample_rate,
+            fit_band_hz=fit_band_hz, anchor=0,
+        )
+        taus[drive], scores[drive] = tau, score
+
+    # (a) 타임베이스가 정상상태였는가. 워밍업 4주기로는 부족하다는 것이 실측이다.
+    common = 0.5 * (taus["noise"] + taus["cancel"])
+    drift, drift_median = timebase_drift(common)
+    drift_dev = np.abs(drift - drift_median)
+    keep = drift_dev <= float(max_drift_deviation_samples)
+
+    # (b) P−S 상대 τ 연속성. 이 측정 방식의 유일한 물리 불변량이다.
+    bad_rel, rel_dev, rel_centre = relative_tau_outliers(
+        taus["noise"], taus["cancel"],
+        tolerance_samples=float(max_relative_tau_samples),
+    )
+    keep = keep & ~bad_rel
+
+    # (c) 살아남은 무리가 **스트림의 첫 분석 주기와 같은 프레임 정렬**인가.
+    #     pass1 앵커(반복 0)에서는 상대 τ 가 구조적으로 0 이다. 중앙값이 0 에서
+    #     크게 벗어났다는 것은 살아남은 쪽이 슬립 **이후** 무리라는 뜻이고, 한 캡처
+    #     안의 정보만으로는 어느 쪽이 옳은지 가릴 수 없다 — 실패 폐쇄한다.
+    #     실측 9건의 |centre| 는 0.07~1.81 로 임계 3.0 안에 넉넉히 들어온다.
+    if abs(rel_centre) > float(max_relative_tau_samples):
+        raise ValueError(
+            f"유지 무리의 P−S 상대 τ 중앙값이 {rel_centre:+.2f} 샘플로 첫 분석 주기와 "
+            f"다릅니다 (허용 ±{float(max_relative_tau_samples)}) — 프레임 슬립이 "
+            "과반이라 어느 무리가 옳은지 이 캡처만으로는 가릴 수 없습니다"
+        )
+
+    kept = np.flatnonzero(keep)
+    if kept.size < int(min_kept_repeats):
+        raise ValueError(
+            f"타임베이스가 안정한 반복이 {kept.size}개뿐입니다 "
+            f"(최소 {int(min_kept_repeats)}, 드리프트 중앙 {drift_median:.2f} 샘플/주기)"
+        )
+    anchor = int(kept[kept.size // 2])   # 중앙 반복 — 드리프트 외삽을 최소화한다
+    report = {
+        "drift_samples_per_period": float(drift_median),
+        "drift_deviation": drift_dev,
+        "relative_tau": taus["noise"] - taus["cancel"],
+        "relative_tau_centre": rel_centre,
+        "relative_tau_deviation": rel_dev,
+        "pass1_taus": taus,
+        "pass1_scores": scores,
+        "drift_rejected": np.flatnonzero(
+            drift_dev > float(max_drift_deviation_samples)
+        ),
+        "relative_tau_rejected": np.flatnonzero(bad_rel),
+    }
+    return keep, anchor, report
+
+
 def analyse_channel(
     *,
     err: np.ndarray,
@@ -207,28 +372,44 @@ def analyse_channel(
     consistency_band_hz: tuple[float, float],
     min_alignment_score: float,
     min_kept_repeats: int,
+    keep: np.ndarray,
+    anchor: int,
+    stack: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """주기별 전달함수를 주파수영역에서 정렬·평균한 뒤 순수지연 + compact FIR 로 나눈다.
+
+    ``keep`` 과 ``anchor`` 는 **받는다** — 스스로 정하지 않는다. 두 채널의 τ 를
+    함께 봐야만 판정할 수 있는 P−S 상대 τ 연속성이 판정 근거에 들어 있고
+    (``select_repeats``), 채널마다 다른 반복 집합을 쓰면 lead 가 물리량이 아니게 된다.
+    기본값을 주지 않는 것도 의도적이다 — 빠뜨리면 조용히 통과하는 대신 즉시 실패한다.
 
     반환에 ``taus`` 가 들어 있는 것이 핵심이다. 두 채널은 같은 스트림을 지나므로
     warp 가 공통으로 실린다 — 따라서 **τ 의 차이**(P − S)가 lead 가 의존하는 유일한
     양이고, 절대 τ 의 흔들림은 lead 에서 상쇄된다. 게이트가 판정해야 하는 것도 그 차이다.
     """
 
-    rows = []
-    for start in period_starts:
-        segment = err[start : start + probe.period_samples]
-        rows.append(estimate_transfer(segment, probe, drive=drive))
-    frequencies = rows[0][0]
-    stack = np.stack([H for _, H in rows])
+    if stack is None:
+        frequencies, stack = channel_stack(
+            err=err, probe=probe, drive=drive, period_starts=period_starts
+        )
+    else:
+        stack = np.asarray(stack, dtype=np.complex128)
+        frequencies = (
+            probe.bins_for(drive) * probe.sample_rate / probe.period_samples
+        ).astype(np.float64)
     aligned, taus, scores = align_repeats(
-        frequencies, stack, sample_rate=probe.sample_rate, fit_band_hz=fit_band_hz
+        frequencies, stack, sample_rate=probe.sample_rate,
+        fit_band_hz=fit_band_hz, anchor=int(anchor),
     )
-    # τ 탐색이 봉우리를 못 찾은 반복은 시간축 정보가 아니라 잡음이다. 기준(첫 반복)은
-    # 자기 자신과의 상관이 1 이므로 항상 살아남는다. 판정 근거는 **정렬 신뢰도 하나**이며,
-    # "결과가 좋아지는가"로 고르지 않는다 — 그건 게이트 우회다. 몇 개를 왜 버렸는지
-    # 산출물에 남겨 검토자가 확인할 수 있게 한다.
-    keep = scores >= float(min_alignment_score)
+    # τ 탐색이 봉우리를 못 찾은 반복은 시간축 정보가 아니라 잡음이다. 판정 근거는
+    # **타임베이스 관측(select_repeats)과 정렬 신뢰도** 둘뿐이며, "결과가 좋아지는가"로
+    # 고르지 않는다 — 그건 게이트 우회다. 몇 개를 왜 버렸는지 산출물에 남긴다.
+    keep = np.asarray(keep, dtype=bool).reshape(-1) & (
+        scores >= float(min_alignment_score)
+    )
+    if keep.size != stack.shape[0]:
+        raise ValueError(f"keep 길이가 반복 수와 다릅니다: {keep.size} != {stack.shape[0]}")
+    keep[int(anchor)] = True     # 앵커는 자기상관 1 이라 항상 살아남는다
     if int(keep.sum()) < int(min_kept_repeats):
         raise ValueError(
             f"정렬에 성공한 반복이 {int(keep.sum())}개뿐입니다 "
@@ -268,6 +449,16 @@ def analyse_channel(
         )
     fir = ir[:fir_length].astype(np.float32)
 
+    band_consistency = np.asarray(
+        [
+            complex_consistency(aligned[:, (frequencies >= lo) & (frequencies <= hi)])
+            if int(((frequencies >= lo) & (frequencies <= hi)).sum()) >= 4
+            else np.nan
+            for lo, hi in CONSISTENCY_SUB_BANDS_HZ
+        ],
+        dtype=np.float64,
+    )
+
     return {
         "frequencies_hz": frequencies,
         "repeat_transfers": stack,
@@ -277,6 +468,10 @@ def analyse_channel(
         "all_taus": taus,
         "alignment_scores": scores,
         "kept_mask": keep,
+        "anchor_repeat": int(anchor),
+        "kept_repeat_indices": np.flatnonzero(keep).astype(np.int64),
+        "band_consistency": band_consistency,
+        "band_consistency_hz": np.asarray(CONSISTENCY_SUB_BANDS_HZ, dtype=np.float64),
         "rejected_repeats": int(taus.size - taus_kept.size),
         "consistency": consistency,
         "fullband_consistency": fullband_consistency,
@@ -312,6 +507,130 @@ def channel_quality(
     return reasons
 
 
+def analyse_capture(
+    *,
+    err: np.ndarray,
+    probe,
+    period_starts: list[int],
+    snr_spectra: tuple[np.ndarray, np.ndarray],
+    fir_length: int,
+    pre_roll: int,
+    max_delay_samples: int,
+    fit_band_hz: tuple[float, float],
+    consistency_band_hz: tuple[float, float],
+    required_band_hz: tuple[float, float],
+    min_alignment_score: float,
+    min_kept_repeats: int,
+    max_relative_tau_samples: float,
+    max_drift_deviation_samples: float,
+    max_delay_jitter_samples: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """캡처 한 건을 2-pass 공동 분석한다 — **온라인·오프라인이 공유하는 유일한 경로**.
+
+    pass1 은 두 채널의 τ 궤적만 얻어 (a) 타임베이스 드리프트 이상치와 (b) P−S 상대 τ
+    연속성 위반을 **함께** 판정한다. pass2 는 살아남은 반복의 중앙을 앵커로 재정렬한다.
+    측정 스크립트와 재분석 스크립트가 서로 다른 코드로 갈라지면 재현성이 깨지므로
+    두 경로 모두 이 함수만 호출한다.
+    """
+
+    signal_spectrum, noise_spectrum = snr_spectra
+    need_lo, need_hi = float(required_band_hz[0]), float(required_band_hz[1])
+
+    frequencies: dict[str, np.ndarray] = {}
+    stacks: dict[str, np.ndarray] = {}
+    for drive in ("noise", "cancel"):
+        frequencies[drive], stacks[drive] = channel_stack(
+            err=err, probe=probe, drive=drive, period_starts=period_starts
+        )
+
+    keep, anchor, report = select_repeats(
+        frequencies=frequencies, stacks=stacks, sample_rate=probe.sample_rate,
+        fit_band_hz=fit_band_hz,
+        max_relative_tau_samples=max_relative_tau_samples,
+        max_drift_deviation_samples=max_drift_deviation_samples,
+        min_kept_repeats=min_kept_repeats,
+    )
+    report["drift_ppm"] = (
+        1e6 * report["drift_samples_per_period"] / float(probe.period_samples)
+    )
+
+    results: dict[str, dict[str, Any]] = {}
+    for drive in ("noise", "cancel"):
+        model = analyse_channel(
+            err=err, probe=probe, drive=drive, period_starts=period_starts,
+            fir_length=fir_length, pre_roll=pre_roll,
+            max_delay_samples=max_delay_samples, fit_band_hz=fit_band_hz,
+            consistency_band_hz=consistency_band_hz,
+            min_alignment_score=min_alignment_score,
+            min_kept_repeats=min_kept_repeats,
+            keep=keep, anchor=anchor, stack=stacks[drive],
+        )
+        snr = tone_snr_db(signal_spectrum, noise_spectrum, probe.bins_for(drive))
+        results[drive] = {
+            "model": model,
+            "snr_db": snr,
+            "output_channel": drive,
+            "reasons": channel_quality(
+                consistency=model["consistency"], snr_db=snr,
+                min_consistency=cw.MIN_CONSISTENCY,
+            ),
+        }
+
+    # 두 채널의 점수 게이트가 서로 다른 반복을 떨어뜨릴 수 있다. official 은 **두 채널이
+    # 같은 반복 집합**에서 나와야 lead 가 물리량이므로 교집합을 최종 유지 집합으로 삼는다.
+    final_keep = (
+        results["noise"]["model"]["kept_mask"] & results["cancel"]["model"]["kept_mask"]
+    )
+    if int(final_keep.sum()) < int(min_kept_repeats):
+        raise ValueError(
+            f"두 채널 모두 통과한 반복이 {int(final_keep.sum())}개뿐입니다 "
+            f"(최소 {int(min_kept_repeats)})"
+        )
+
+    # lead 가 의존하는 유일한 양 — 두 경로의 **상대** 시간이동. 절대 warp 는 두 채널에
+    # 공통이므로 여기서 상쇄된다. 이것이 커지면 lead 를 믿을 수 없다.
+    relative_tau = (
+        results["noise"]["model"]["all_taus"][final_keep]
+        - results["cancel"]["model"]["all_taus"][final_keep]
+    )
+    relative_spread = int(
+        np.ceil(float(np.max(relative_tau) - np.min(relative_tau)) - 1e-9)
+    )
+    if relative_spread > int(max_delay_jitter_samples):
+        for item in results.values():
+            item["reasons"].append(f"relative_delay_spread_{relative_spread}")
+
+    # 최종 아티팩트 게이트 — 2-pass 후 상대 τ 는 진짜 0 근처로 수렴해야 한다.
+    # 실측 |rel|max 는 캡처 8건에서 0.128~0.417 이다.
+    relative_max_abs = float(np.max(np.abs(relative_tau - np.median(relative_tau))))
+    if relative_max_abs > MAX_KEPT_RELATIVE_TAU_ABS_SAMPLES:
+        for item in results.values():
+            item["reasons"].append(f"kept_relative_tau_{relative_max_abs:.2f}")
+
+    # 최악 부대역 게이트 — 총계는 에너지 가중이라 약한 대역을 숨긴다.
+    for item in results.values():
+        bands = item["model"]["band_consistency"]
+        edges = item["model"]["band_consistency_hz"]
+        for (lo, hi), value in zip(edges, bands):
+            if lo < need_lo or hi > need_hi:
+                continue     # 필수 대역 밖은 판정하지 않는다
+            if not np.isfinite(value) or value < MIN_BAND_CONSISTENCY:
+                item["reasons"].append(
+                    f"band_consistency_{lo:.0f}_{hi:.0f}_{value:.3f}"
+                )
+
+    report.update(
+        {
+            "keep": final_keep,
+            "anchor": int(anchor),
+            "relative_tau_kept": relative_tau,
+            "relative_delay_spread_samples": relative_spread,
+            "relative_tau_max_abs": relative_max_abs,
+        }
+    )
+    return results, report
+
+
 def _official_arrays(
     *,
     model: dict[str, Any],
@@ -331,6 +650,8 @@ def _official_arrays(
     drive: str,
     snr_db: np.ndarray,
     period_seconds: float,
+    drift_samples_per_period: float,
+    relative_tau_max_abs: float,
 ) -> dict[str, Any]:
     return {
         "fir": np.asarray(model["fir"], dtype=np.float32),
@@ -369,6 +690,19 @@ def _official_arrays(
         "tone_frequencies_hz": (
             probe.bins_for(drive) * probe.sample_rate / probe.period_samples
         ).astype(np.float64),
+        # --- 최악 부대역 게이트용. 총계는 에너지 가중이라 약한 대역을 숨긴다. ---
+        "band_consistency": np.asarray(model["band_consistency"], dtype=np.float64),
+        "band_consistency_hz": np.asarray(
+            model["band_consistency_hz"], dtype=np.float64
+        ),
+        # 절대 지연은 앵커 규약에 의존한다 — 어느 반복을 기준으로 잡았는지 없이는
+        # delay_samples 를 재현할 수 없다. 반드시 함께 저장한다.
+        "anchor_repeat": np.int64(model["anchor_repeat"]),
+        "kept_repeat_indices": np.asarray(
+            model["kept_repeat_indices"], dtype=np.int64
+        ),
+        "drift_samples_per_period": np.float64(drift_samples_per_period),
+        "relative_tau_max_abs_samples": np.float64(relative_tau_max_abs),
     }
 
 
@@ -445,6 +779,8 @@ def main(argv: list[str] | None = None) -> int:
 
     capture_id = uuid.uuid4().hex
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 이른 저장본과 최종 저장본이 **같은 값**을 써야 metadata.json 대조가 통과한다.
+    started_at_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     session_dir = diagnostics_root / f"{stamp}_{capture_id[:8]}"
     session_dir.mkdir(parents=True, exist_ok=False)
 
@@ -462,6 +798,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import sounddevice as sd
 
+        # 캡처 클록 교란 방지 — PulseAudio 가 같은 APE 카드를 44.1kHz 로 잡으면
+        # PLL_A 가 재조정되어 우리 48kHz 캡처의 BCLK 가 세션 중에 이동한다.
+        # XRUN 이 아니라서 기존 게이트가 못 잡는다(2026-08-06 I2S 설계 검증에서 발견).
+        assert_measurement_preconditions(sd, hardware)
         print("출력 없는 ERR/REF raw preflight 중...")
         preflight_raw, preflight_report = cw._capture_preflight(
             sd, hardware, args.input_probe_seconds
@@ -506,6 +846,67 @@ def main(argv: list[str] | None = None) -> int:
     err = recorded[:, 0].astype(np.float64)
     measurement_report = cw.analyze_int32_input_probe(recorded_raw)
 
+    def _capture_metadata(extra: dict[str, Any] | None = None) -> dict:
+        """재분석에 필요한 **캡처 시점** 메타데이터. 분석 결과에 의존하지 않는다.
+
+        ``reanalyse_paths_interleaved.py`` 가 요구하는 필드가 전부 여기 있어야
+        분석이 실패해도 오프라인에서 되살릴 수 있다.
+        """
+
+        base = {
+            "capture_id": capture_id,
+            "method": METHOD,
+            "started_at_utc": started_at_utc,
+            "sample_rate": fs,
+            "block_size": block_size,
+            "latency": args.latency,
+            "amplitude": float(args.amplitude),
+            "design_band_hz": [float(args.band[0]), float(args.band[1])],
+            "required_band_hz": [need_lo, need_hi],
+            "channel_band_hz": {k: list(v) for k, v in channel_band.items()},
+            "tone_spacing_hz": float(probe.bin_step("noise") * resolution),
+            "period_seconds": float(args.period_seconds),
+            "warmup_periods": int(args.warmup_periods),
+            "repeats": int(args.repeats),
+            "lead_in_samples": int(lead_in),
+            "guard_bins": probe.guard_bins(),
+            "crest_db": {"noise": crest_noise, "cancel": crest_cancel},
+            "warp": warp_report,
+            "telemetry": telemetry,
+            "preflight": preflight_report,
+            "measurement": measurement_report,
+            "invalid_reasons": invalid,
+        }
+        if extra:
+            base.update(extra)
+        return base
+
+    def _write_capture(meta: dict, *, mode: str, **arrays) -> None:
+        raw_path = session_dir / "raw_measurement.npz"
+        with raw_path.open(mode + "b") as handle:
+            np.savez_compressed(
+                handle,
+                output=playback.astype(np.float32),
+                err=recorded[:, 0].astype(np.float32),
+                ref=recorded[:, 1].astype(np.float32),
+                input_raw_int32=recorded_raw.astype(np.int32),
+                preflight_raw_int32=preflight_raw.astype(np.int32),
+                metadata_json=np.asarray(
+                    json.dumps(cw._json_safe(meta), ensure_ascii=False, sort_keys=True)
+                ),
+                **arrays,
+            )
+        with (session_dir / "metadata.json").open(mode, encoding="utf-8") as handle:
+            json.dump(cw._json_safe(meta), handle, ensure_ascii=False, indent=2, sort_keys=True)
+
+    # ── 원시 캡처를 **분석보다 먼저** 저장한다 ──────────────────────────────
+    # 스피커를 울린 시간은 되돌릴 수 없다(사용자 지시: 스피커 구동 하드웨어 수명).
+    # 분석 게이트는 정당하게 실패할 수 있고 실제로 실패한다 —
+    # 2026-08-06: 드리프트 중앙 3.95 / −4.03 샘플/주기로 두 번 연속 전량 기각됐는데,
+    # 저장이 분석 뒤에 있어서 **6초씩 두 번을 그냥 버렸다.**
+    # reanalyse_paths_interleaved.py 가 저장된 캡처만으로 오프라인 재분석을 하므로
+    # (실제로 그렇게 플랜트를 복구했다), 먼저 저장해 두면 실패해도 살릴 수 있다.
+
     invalid: list[str] = []
     if int(telemetry.get("xrun_count", 0)) != 0:
         invalid.append(f"xrun_{telemetry['xrun_count']}")
@@ -538,6 +939,12 @@ def main(argv: list[str] | None = None) -> int:
             f"{warp_report['peak_median']:.3f} · 채택 {warp_report['kept_fraction']:.1%}"
         )
 
+    _write_capture(_capture_metadata(), mode="x")
+    print(
+        f"원시 캡처 저장: {(session_dir / 'raw_measurement.npz').relative_to(REPO_ROOT)}"
+        " — 분석이 실패해도 reanalyse_paths_interleaved.py 로 되살릴 수 있다"
+    )
+
     period_starts = [
         lead_in + (int(args.warmup_periods) + k) * probe.period_samples
         for k in range(int(args.repeats))
@@ -561,45 +968,36 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    results: dict[str, dict[str, Any]] = {}
-    for drive, output_channel in (("noise", "noise"), ("cancel", "cancel")):
-        try:
-            model = analyse_channel(
-                err=err, probe=probe, drive=drive, period_starts=period_starts,
-                fir_length=int(args.fir_length), pre_roll=int(args.pre_roll),
-                max_delay_samples=max_delay, fit_band_hz=fit_band,
-                consistency_band_hz=consistency_band,
-                min_alignment_score=float(args.min_alignment_score),
-                min_kept_repeats=int(args.min_kept_repeats),
-            )
-        except ValueError as exc:
-            print(f"[실패] {drive} 분석: {exc}", file=sys.stderr)
-            return 1
-        snr = tone_snr_db(signal_spectrum, noise_spectrum, probe.bins_for(drive))
-        results[drive] = {
-            "model": model,
-            "snr_db": snr,
-            "output_channel": output_channel,
-            "reasons": channel_quality(
-                consistency=model["consistency"], snr_db=snr,
-                min_consistency=cw.MIN_CONSISTENCY,
-            ),
-        }
-
-    # lead 가 의존하는 유일한 양 — 두 경로의 **상대** 시간이동. 절대 warp 는 두 채널에
-    # 공통이므로 여기서 상쇄된다. 이것이 커지면 lead 를 믿을 수 없다.
-    both = results["noise"]["model"]["kept_mask"] & results["cancel"]["model"]["kept_mask"]
-    if int(both.sum()) < 2:
-        print("[실패] 두 채널 모두 정렬에 성공한 반복이 2개 미만입니다", file=sys.stderr)
+    try:
+        results, report = analyse_capture(
+            err=err, probe=probe, period_starts=period_starts,
+            snr_spectra=(signal_spectrum, noise_spectrum),
+            fir_length=int(args.fir_length), pre_roll=int(args.pre_roll),
+            max_delay_samples=max_delay, fit_band_hz=fit_band,
+            consistency_band_hz=consistency_band,
+            required_band_hz=(need_lo, need_hi),
+            min_alignment_score=float(args.min_alignment_score),
+            min_kept_repeats=int(args.min_kept_repeats),
+            max_relative_tau_samples=float(args.max_relative_tau_samples),
+            max_drift_deviation_samples=float(args.max_drift_deviation_samples),
+            max_delay_jitter_samples=max_jitter,
+        )
+    except ValueError as exc:
+        print(f"[실패] 분석: {exc}", file=sys.stderr)
         return 1
-    relative_tau = (
-        results["noise"]["model"]["all_taus"][both]
-        - results["cancel"]["model"]["all_taus"][both]
+    relative_tau = report["relative_tau_kept"]
+    relative_spread = int(report["relative_delay_spread_samples"])
+    keep, anchor = report["keep"], int(report["anchor"])
+
+    print(
+        f"\n반복 선별: {int(keep.sum())}/{keep.size} 유지 · 앵커 {anchor}\n"
+        f"  드리프트 중앙 {report['drift_samples_per_period']:.2f} 샘플/주기 "
+        f"({report['drift_ppm']:.0f} ppm) · "
+        f"드리프트 기각 {list(map(int, report['drift_rejected']))}\n"
+        f"  상대 τ 중앙 {report['relative_tau_centre']:.2f} · "
+        f"기각 {list(map(int, report['relative_tau_rejected']))} · "
+        f"유지 |rel| 최대 {report['relative_tau_max_abs']:.3f}"
     )
-    relative_spread = int(round(float(np.max(relative_tau) - np.min(relative_tau))))
-    if relative_spread > max_jitter:
-        for item in results.values():
-            item["reasons"].append(f"relative_delay_spread_{relative_spread}")
 
     for drive, label in (("noise", "P(z) 소음→ERR"), ("cancel", "S(z) 상쇄→ERR")):
         item = results[drive]
@@ -628,36 +1026,37 @@ def main(argv: list[str] | None = None) -> int:
 
     valid = not invalid and not results["noise"]["reasons"] and not results["cancel"]["reasons"]
 
-    metadata = {
-        "capture_id": capture_id,
-        "method": METHOD,
-        "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "sample_rate": fs,
-        "block_size": block_size,
-        "latency": args.latency,
-        "amplitude": float(args.amplitude),
-        "design_band_hz": [float(args.band[0]), float(args.band[1])],
-        "required_band_hz": [need_lo, need_hi],
-        "channel_band_hz": {k: list(v) for k, v in channel_band.items()},
-        "tone_spacing_hz": float(probe.bin_step("noise") * resolution),
-        "period_seconds": float(args.period_seconds),
-        "warmup_periods": int(args.warmup_periods),
-        "repeats": int(args.repeats),
-        "guard_bins": probe.guard_bins(),
-        "crest_db": {"noise": crest_noise, "cancel": crest_cancel},
-        "warp": warp_report,
-        "telemetry": telemetry,
-        "preflight": preflight_report,
-        "measurement": measurement_report,
-        "invalid_reasons": invalid,
+    # 캡처 시점 필드는 _capture_metadata() 가 단일 출처다 — 여기서 다시 적으면
+    # 이른 저장본과 최종 저장본이 갈라지고, 재분석기의 metadata.json 대조가 깨진다.
+    metadata = _capture_metadata({
         "valid": valid,
         "fit_band_hz": list(fit_band),
         "consistency_band_hz": list(consistency_band),
         "relative_delay_spread_samples": relative_spread,
         "max_delay_jitter_samples": max_jitter,
+        "anchor_repeat": anchor,
+        "kept_repeat_indices": [int(v) for v in np.flatnonzero(keep)],
+        "drift_samples_per_period": float(report["drift_samples_per_period"]),
+        "drift_ppm": float(report["drift_ppm"]),
+        "relative_tau_centre_samples": float(report["relative_tau_centre"]),
+        "relative_tau_max_abs_samples": float(report["relative_tau_max_abs"]),
+        "drift_rejected_repeats": [int(v) for v in report["drift_rejected"]],
+        "relative_tau_rejected_repeats": [
+            int(v) for v in report["relative_tau_rejected"]
+        ],
+        "max_relative_tau_samples": float(args.max_relative_tau_samples),
+        "max_drift_deviation_samples": float(args.max_drift_deviation_samples),
+        "min_alignment_score": float(args.min_alignment_score),
         "channels": {
             drive: {
                 "output_channel": item["output_channel"],
+                "band_consistency": [
+                    float(v) for v in item["model"]["band_consistency"]
+                ],
+                "band_consistency_hz": [
+                    [float(lo), float(hi)]
+                    for lo, hi in item["model"]["band_consistency_hz"]
+                ],
                 "consistency": item["model"]["consistency"],
                 "fullband_consistency": item["model"]["fullband_consistency"],
                 "consistency_band_hz": list(item["model"]["consistency_band_hz"]),
@@ -674,32 +1073,21 @@ def main(argv: list[str] | None = None) -> int:
             }
             for drive, item in results.items()
         },
-    }
+    })
 
-    npz_path = session_dir / "raw_measurement.npz"
-    with npz_path.open("xb") as handle:
-        np.savez_compressed(
-            handle,
-            output=playback.astype(np.float32),
-            err=recorded[:, 0].astype(np.float32),
-            ref=recorded[:, 1].astype(np.float32),
-            input_raw_int32=recorded_raw.astype(np.int32),
-            preflight_raw_int32=preflight_raw.astype(np.int32),
-            noise_transfers=results["noise"]["model"]["repeat_transfers"],
-            cancel_transfers=results["cancel"]["model"]["repeat_transfers"],
-            noise_ir=results["noise"]["model"]["ir"].astype(np.float64),
-            cancel_ir=results["cancel"]["model"]["ir"].astype(np.float64),
-            frequencies_hz=results["noise"]["model"]["frequencies_hz"],
-            relative_tau_samples=relative_tau,
-            noise_snr_db=results["noise"]["snr_db"].astype(np.float64),
-            cancel_snr_db=results["cancel"]["snr_db"].astype(np.float64),
-            metadata_json=np.asarray(
-                json.dumps(cw._json_safe(metadata), ensure_ascii=False, sort_keys=True)
-            ),
-        )
-    with (session_dir / "metadata.json").open("x", encoding="utf-8") as handle:
-        json.dump(cw._json_safe(metadata), handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
+    # 이른 저장본을 분석 결과까지 담은 최종본으로 **덮어쓴다**.
+    _write_capture(
+        metadata,
+        mode="w",
+        noise_transfers=results["noise"]["model"]["repeat_transfers"],
+        cancel_transfers=results["cancel"]["model"]["repeat_transfers"],
+        noise_ir=results["noise"]["model"]["ir"].astype(np.float64),
+        cancel_ir=results["cancel"]["model"]["ir"].astype(np.float64),
+        frequencies_hz=results["noise"]["model"]["frequencies_hz"],
+        relative_tau_samples=relative_tau,
+        noise_snr_db=results["noise"]["snr_db"].astype(np.float64),
+        cancel_snr_db=results["cancel"]["snr_db"].astype(np.float64),
+    )
 
     if not valid:
         print(f"\n[실패] 정식 모델을 저장하지 않았습니다. 진단: {session_dir}", file=sys.stderr)
@@ -723,20 +1111,34 @@ def main(argv: list[str] | None = None) -> int:
                 block_size=block_size,
                 latency=str(args.latency),
                 output_channel=item["output_channel"],
-                repeats=int(args.repeats),
+                # 재생한 주기 수가 아니라 **실제로 평균에 들어간** 반복 수를 신고한다.
+                repeats=int(keep.sum()),
                 xrun_count=int(telemetry.get("xrun_count", 0)),
                 capture_id=capture_id,
                 probe=probe,
                 drive=drive,
                 snr_db=item["snr_db"],
                 period_seconds=float(args.period_seconds),
+                drift_samples_per_period=float(report["drift_samples_per_period"]),
+                relative_tau_max_abs=float(report["relative_tau_max_abs"]),
             ),
         )
 
     p_delay = int(results["noise"]["model"]["delay_samples"])
     s_delay = int(results["cancel"]["model"]["delay_samples"])
-    handoff = 256
-    lead = max(0, s_delay + handoff - p_delay)
+    # handoff 도 lead 도 여기서 다시 쓰지 않는다. 예전에는 이 자리에 ``handoff = 256``
+    # 이라는 **세 번째 사본**과 lead 관계식이 손으로 적혀 있었다 (발생기 A).
+    handoff = DEFAULT_HANDOFF_SAMPLES
+    lead = int(
+        PlantDelays(
+            primary_delay_samples=p_delay,
+            secondary_delay_samples=s_delay,
+            handoff_samples=handoff,
+            sample_rate=int(fs),
+        )
+        .lead()
+        .samples
+    )
     print(
         f"\n[성공] P {primary_out.relative_to(REPO_ROOT)}\n"
         f"       S {secondary_out.relative_to(REPO_ROOT)}\n"

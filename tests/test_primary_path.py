@@ -176,9 +176,14 @@ def test_secondary_surrogate_prefers_measured_d_noise_over_geometry(configs):
 def test_configured_d_noise_agrees_with_duct_geometry(configs):
     """실측 d_noise 와 기하 예측이 크게 어긋나면 배선/좌표 어느 쪽이 틀린 것이다.
 
-    2026-08-05 실측 1608 vs 기하 1612 — 4샘플(83µs) 차. 이 정도는 마이크 좌표
-    불확실성(에러마이크 x=1.100 은 아직 잠정값)으로 충분히 설명된다. 이 검사가
-    깨지면 duct.yaml 좌표나 P/S 측정 중 하나를 다시 봐야 한다.
+    2026-08-05 재분석 실측 1602 vs 기하 1609 — 7샘플(146µs) 차. 이 정도는 마이크
+    좌표 불확실성(에러마이크 x=1.100 은 아직 잠정값)과 상쇄 스피커 사이드브랜치
+    관로(≈7샘플)로 충분히 설명된다. 이 검사가 깨지면 duct.yaml 좌표나 P/S 측정
+    중 하나를 다시 봐야 한다.
+
+    주의: 절대 지연 자체는 캡처 간에 재현되지 않는다(스트림 기동 오프셋 + 앵커
+    규약 의존, 실측 범위 1565~1659). 이 검사가 실제로 보는 것은 **P−S** 이며,
+    ``default_d_noise_delay`` 가 S 의 delay 를 받아 기하로 P 를 예측하기 때문이다.
     """
 
     _, duct = configs
@@ -381,6 +386,8 @@ def test_dataset_rir_surrogate_keeps_legacy_rir_and_added_delay(configs):
 def test_dataset_acoustic_mode_ignores_digital_primary_policy(configs):
     data, duct = deepcopy(configs)
     data = _dataset_config(data, "measured", reference_mode="acoustic")
+    # 소스 분포가 아니라 P(z) 정책을 보는 테스트다 — 진단 탈출구를 명시적으로 켠다.
+    data["allow_missing_source_manifests"] = True
     duct["digital_reference"]["primary_path_npz"] = None
     p_ref = np.array([0.5, 0.25], dtype=np.float32)
     p_err = np.array([-0.75, 0.125], dtype=np.float32)

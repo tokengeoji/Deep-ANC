@@ -58,7 +58,7 @@ def main() -> int:
     parser.add_argument("--out", default="results/compare_fxlms.md")
     args = parser.parse_args()
 
-    from deep_anc.config import DEFAULT_HANDOFF_SAMPLES
+    from deep_anc.dsp.timing import handoff_samples_from_config
 
     duct_cfg = load_yaml(args.duct_config)
     eval_cfg = load_yaml(args.eval_config)
@@ -68,9 +68,7 @@ def main() -> int:
     fb_delay = (int(fb_range[0]) + int(fb_range[1])) // 2
 
     sp = load_secondary_path(REPO_ROOT / duct_cfg["secondary_path"]["npz"])
-    handoff = int(
-        duct_cfg["secondary_path"].get("handoff_extra_samples", DEFAULT_HANDOFF_SAMPLES)
-    )
+    handoff = handoff_samples_from_config(duct_cfg)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     plant = DifferentiableSecondaryPath(sp, handoff_extra_samples=handoff).to(device)
 

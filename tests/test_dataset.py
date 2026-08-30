@@ -52,6 +52,11 @@ def test_dataset_items(cfgs, rir_bank, mode):
     data["reference_mode"] = mode
     if mode == "acoustic":
         data["digital_reference_lead_samples"] = 0
+        # acoustic 혼합비는 demand/dns_fullband/machine 을 선언하는데 이 저장소에는
+        # 그 원본이 없다. 이 테스트가 보는 것은 데이터셋 기계장치(모양·지연·시드)이지
+        # 소스 분포가 아니므로 진단 탈출구를 **명시적으로** 켠다.
+        # 학습 설정에 이 키를 넣으면 절대목표 2의 소스 게이트가 사라진다.
+        data["allow_missing_source_manifests"] = True
     ds = SynthANCDataset(data, duct, split="train", seed=1, rir_bank=rir_bank)
     assert ds.segment % 256 == 0                  # 런타임 블록 배수 요건
     it = iter(ds)

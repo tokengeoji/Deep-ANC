@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from deep_anc.dsp.timing import PlantSettle  # noqa: E402
 from deep_anc.eval.recorded import (  # noqa: E402
     evaluate_recorded_segments,
     iter_recorded_segments,
@@ -101,8 +102,19 @@ def main(argv: list[str] | None = None) -> int:
         feedback_delay = resolve_feedback_delay(
             context.cfg["data"], args.feedback_delay_samples
         )
+        # 학습이 버리는 정착 구간과 **같은 출처**에서 하한을 받는다. 두 숫자를 각자
+        # 유도하면 갈라진다 — 실제로 학습 0 / 평가 12000 으로 갈라져 있었다.
+        plant_settle = PlantSettle.derive(
+            secondary_delay_samples=int(context.secondary_path.delay_samples),
+            handoff_samples=int(context.secondary_handoff_samples),
+            fir_taps=int(context.secondary_path.fir.size),
+            sample_rate=int(context.sample_rate),
+        )
         warmup_samples = resolve_warmup_samples(
-            context.cfg["data"], context.sample_rate, args.warmup_seconds
+            context.cfg["data"],
+            context.sample_rate,
+            args.warmup_seconds,
+            min_samples=plant_settle.samples,
         )
         edge_trim_samples = int(
             round(float(args.edge_trim_seconds) * context.sample_rate)

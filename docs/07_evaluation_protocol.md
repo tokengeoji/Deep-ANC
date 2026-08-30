@@ -17,7 +17,7 @@
 
 | 지표 | 정의 | 좋은 방향 |
 |---|---|---|
-| trusted-band NMSE(dB) | 150–600Hz에서 10·log₁₀(Σ|E|²/Σ|D|²) | 음수 ↓ |
+| trusted-band NMSE(dB) | **150–1600Hz**에서 10·log₁₀(Σ|E|²/Σ|D|²) | 음수 ↓ |
 | fullband NMSE(dB) | 전 주파수에서 10·log₁₀(Σe²/Σd²) | 음수 ↓ |
 | NMSE gap(dB) | trusted − fullband; 대역 집중 이득/대역 밖 행동 차이 | 0과 함께 해석 |
 | 감쇠(attenuation, dB) | −NMSE = 10·log₁₀(P_d/P_e) | 양수 ↑ |
@@ -25,13 +25,19 @@
 | 세그먼트 분포 | 1s 세그먼트 감쇠의 중앙값 / 최악 10% | — |
 | 실시간 건전성 | step P99(ms), deadline miss, xrun | ↓ |
 
-**신뢰 표기**: S(z) 보정 유효대역(현재 150–600Hz) 밖의 밴드 수치는 `trusted=False`(*)로
+**신뢰 표기**: S(z) 보정 유효대역(현재 **150–1600Hz**, `consistency_band_hz`) 밖의 밴드 수치는 `trusted=False`(*)로
 표기한다 — 광대역 재보정(docs/02 §4) 후 유효대역을 갱신할 것 (설계 L2).
 
 **이중 판정 규칙**: corrected Trainer는 trusted NMSE와 fullband NMSE를 매 train/val
 평가에서 동시에 남긴다. `best.pt`는 trusted NMSE로 선택하되, fullband NMSE가
 0dB보다 나빠지면 대역 밖 소음을 증폭한 것이므로 배포 후보에서 탈락시킨다.
-trusted 수치만 제시하거나 fullband 평균으로 150–600Hz 개선을 숨기지 않는다.
+trusted 수치만 제시하거나 fullband 평균으로 trusted 대역 개선을 숨기지 않는다.
+
+> [!CAUTION]
+> **이 규칙이 실제로 깨진 적이 있다.** 2026-08-04 판 README/docs12 는 실기 ANC 절에
+> trusted 대역 4줄만 싣고, 같은 `metrics.csv` 에 기록된 **2–8 kHz 15–22 dB 증폭**을
+> 한 줄도 싣지 않았다. 6개 시나리오 중 유일하게 무해한 `voice_in_noise` 만 그림으로
+> 대표해 실었다. **대역 밖 옥타브를 함께 싣지 않은 감쇠 주장은 이 프로토콜 위반이다.**
 
 ## 2. 시나리오 (configs/eval.yaml — 오프라인/실기 공통)
 
@@ -206,17 +212,29 @@ ANC ON duty 0%였고, 무음 3-thread 진단도 256/low에서 miss 261·xrun 311
 
 | 게이트 | 통과 조건 | 미통과 시 의미 |
 |---|---|---|
-| G0 표현 학습 | 고정 batch overfit에서 trusted NMSE < −6dB, lead=109 메타 정합 | 모델/경사/정렬 파이프라인 결함 |
-| G1 경로 실측 | 동일 하드웨어 게인에서 `P(z)`와 `S(z)` ESS 반복 일관성 ≥0.9; S 목표 80–1600Hz | surrogate 이외 물리 주장 불가 |
-| G2 데이터 | 소스 family×대역 커버리지, 그룹 단위 8:1:1, 독립 recorded val/test | 누수·환경 암기 가능성 |
+| G0 표현 학습 | 고정 batch overfit에서 trusted NMSE < −6dB, **lead 메타 정합**(설정 lead == 실측 `S+handoff−P`) | 모델/경사/정렬 파이프라인 결함 |
+| G1 경로 실측 | 동일 캡처의 `P(z)`/`S(z)` **동시 인터리브** 측정. 요구 대역(150–1600Hz) **모든 부대역** 일관성 ≥0.9406, 유지 반복 ≥8, **P−S 상대 τ 궤적이 상수**(편차 ≤3샘플), 타임베이스 드리프트 ≤2샘플/주기, 정렬 신뢰도 ≥0.95 | surrogate 이외 물리 주장 불가 |
+| G2 데이터 | 소스 family×대역 커버리지, 그룹 단위 8:1:1, 독립 recorded val/test, **재생→캡처 결맞음 coh²(source→ERR) ≥0.6 (150–600Hz)**, **합성 매니페스트 ∩ 실측 소스 = ∅** | 누수·환경 암기·**시간축 붕괴** 가능성 |
 | G3 파인튜닝 | `digital_primary_path_mode: measured`, measured 70% + synth 30%, P/S/lead 스냅샷 보존 | 표현 사전학습 상태 |
-| G4 독립 평가 | trusted 150–600Hz < 0dB와 fullband ≤0dB를 동시 통과, 소스·대역·최악 10% 병기 | 국소 개선 또는 대역 밖 증폭 |
+| G4 독립 평가 | trusted **150–1600Hz** < 0dB와 fullband ≤0dB를 동시 통과, 소스별 **최악값** < 0dB, **대역 밖 do-no-harm**, 검정력·그룹 부트스트랩 CI. 판정은 **3값**(PASS/FAIL/**INCONCLUSIVE**) | 국소 개선 또는 대역 밖 증폭 |
 | G5 Jetson/실기 | artifact lead fail-fast 통과, P99 <3ms, watchdog/xrun 기록, FxLMS와 동일 세션 비교 | 배포 성능 주장 불가 |
 
 G0의 고정-batch 수치는 의도적 과적합 진단이지 일반화 성능이 아니다.
 `make_recorded_manifest.py`는 group 원자성+source-family 층화 8:1:1을 제공하고,
 `validate_recorded_sessions.py`는 family×split 커버리지와 파일 QA를 기본 치명 게이트로 검사한다.
 도구 구현은 완료됐지만 실제 독립 세션을 수집해 PASS하기 전에는 G2/G4가 통과한 것이 아니다.
+
+> [!CAUTION]
+> **2026-08-04 에는 이 표의 G1–G3 가 전부 PASS 였고, 전부 무의미했다.** 당시 게이트는
+> ① `S(z)` 형상이 54% 틀린 아티팩트를 통과시켰고(요약 스칼라만 보고 궤적을 안 봤다),
+> ② 재생↔녹음 시간축이 붕괴한 데이터셋을 "전수 QA 80/80 PASS" 로 통과시켰다(정렬을
+> 검사하지 않았다). **게이트가 초록불이라는 사실은 검증이 아니라 게이트의 시야에 대한
+> 진술이다.** 위 G1/G2 조건이 길어진 것은 그 사고의 결과이며, 새 게이트는 전부
+> **실패 fixture 와 짝**으로 선언돼 있다(`src/deep_anc/ops/gate_registry.py`, 메타 테스트가
+> 1:1 대응을 강제). 자세한 근본 원인은 [docs/12 §5.0](12_system_summary.md#50-근본-원인--게이트-9개가-pass-인데-전부-무의미했다).
+>
+> **아직 남은 구멍**: 메타 테스트는 "발동시킬 수 있는가" 만 강제하고 "정상 데이터에서
+> 발동하지 않는가"(위양성)는 강제하지 못한다.
 
 ## 7. 리포트 양식
 

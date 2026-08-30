@@ -54,12 +54,28 @@ def build_recorded_entries(
     *,
     seed: int = 20260803,
     ratios: dict[str, float] | None = None,
+    min_groups_per_split: int | None = None,
 ) -> list[dict]:
     """세션을 스캔하고 group 단위 split을 붙인 매니페스트 항목을 만든다.
 
     구형 세션은 ``group_id=<세션 디렉터리명>``과
     ``source_family=<program.type 또는 legacy>``로 승격한다.
+
+    ``min_groups_per_split`` 은 계열마다 val·test 가 가져야 할 **독립 그룹 하한**이고,
+    기본값은 ``eval.recorded.MIN_GROUPS_PER_FAMILY`` 다 — G4 평가기가 쓰는 값과
+    **같은 상수**를 읽는다. 여기서 따로 4 를 적으면 그것이 세 번째 정의가 되고,
+    언젠가 한쪽만 바뀐다(이 저장소에서 반복된 발생기 A).
     """
+    from deep_anc.eval.recorded import MIN_GROUPS_PER_FAMILY
+
+    floor = int(MIN_GROUPS_PER_FAMILY if min_groups_per_split is None else min_groups_per_split)
+    if floor < MIN_GROUPS_PER_FAMILY:
+        raise ValueError(
+            f"min_groups_per_split 는 G4 하한 {MIN_GROUPS_PER_FAMILY} 아래로 내릴 수 없습니다: "
+            f"{floor}. 강화 방향(더 큰 값)만 허용합니다 — 게이트가 요구하는 그룹 수를 "
+            "manifest 쪽에서 낮추면 학습이 끝난 뒤 G4 판정 불가로만 드러납니다."
+        )
+    min_groups_per_split = floor
     root = Path(root)
     manifest_path = Path(manifest_path)
     split_ratios = ratios or {"train": 0.8, "val": 0.1, "test": 0.1}
@@ -115,6 +131,14 @@ def build_recorded_entries(
         seed=seed,
         group_key="group_id",
         stratify_key="source_family",
+        # 비율이 0 인 split 에는 하한을 걸지 않는다. 우회로가 아니다 —
+        # val_ratio=0 으로 하한을 피하면 val 그룹이 0 이 되고, 그러면
+        # recorded_statistical_power 게이트가 그 자리에서 FAIL 한다.
+        min_units_per_split={
+            split: min_groups_per_split
+            for split in ("val", "test")
+            if split_ratios.get(split, 0.0) > 0.0
+        },
     )
 
 
@@ -126,6 +150,15 @@ def main() -> int:
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--min-groups-per-split",
+        type=int,
+        default=None,
+        help=(
+            "계열마다 val·test 가 가져야 할 독립 그룹 하한. 기본값은 G4 평가기의 "
+            "MIN_GROUPS_PER_FAMILY 를 그대로 읽는다. 강화(더 큰 값)만 허용한다."
+        ),
+    )
     args = parser.parse_args()
 
     root_arg = Path(args.root)
@@ -138,7 +171,13 @@ def main() -> int:
         "test": args.test_ratio,
     }
     try:
-        entries = build_recorded_entries(root, out, seed=args.seed, ratios=ratios)
+        entries = build_recorded_entries(
+            root,
+            out,
+            seed=args.seed,
+            ratios=ratios,
+            min_groups_per_split=args.min_groups_per_split,
+        )
     except ValueError as exc:
         print(f"[오류] {exc}", file=sys.stderr)
         return 2
@@ -159,6 +198,22 @@ def main() -> int:
         f"train/val/test={counts['train']}/{counts['val']}/{counts['test']} → {out}"
     )
     print(f"source_family: {', '.join(families)}")
+    # 계열×split 의 **그룹 수**를 그대로 보여준다 — 게이트가 보는 축이 세션 수가 아니라
+    # 그룹 수이므로, 세션 수만 출력하면 통과 여부를 화면에서 판단할 수 없다.
+    from deep_anc.eval.recorded import MIN_GROUPS_PER_FAMILY
+
+    print(f"{'계열':<14}{'train':>7}{'val':>6}{'test':>6}   (그룹 수, val·test 하한 {MIN_GROUPS_PER_FAMILY})")
+    for family in families:
+        cells = []
+        for split in ("train", "val", "test"):
+            cells.append(
+                len({
+                    entry["group_id"]
+                    for entry in entries
+                    if entry["source_family"] == family and entry["split"] == split
+                })
+            )
+        print(f"{family:<14}{cells[0]:>7}{cells[1]:>6}{cells[2]:>6}")
     inferred = [entry for entry in entries if entry["metadata_inferred"]]
     if inferred:
         print(
