@@ -1,4 +1,4 @@
-# Recorded 82+17 세대 승격 계약
+# Recorded Stage-1 82+19 세대 승격 계약
 
 > [!CAUTION]
 > 이 문서의 역사적 `highband-coverage-v1`은 **Stage-1의 600--1600 Hz 부족분**을
@@ -7,16 +7,23 @@
 > 증거로 승격할 수 없다. 최종 광대역 데이터 계약은
 > [docs/18](18_broadband_anc_guardrails.md)과
 > `src/deep_anc/data/broadband_coverage_receipt.py`를 따른다.
+>
+> 현행 수집 세대는 `stage1-coverage-v2`다. v1 첫 environment 원본의 두 실제
+> capture는 하드웨어/xrun/clip 문제가 없었지만 source→ERR 150--600 Hz coherence²가
+> `0.872375`, `0.836006`으로 canonical `0.90`에 미달했다. 임계값을 낮추거나 같은
+> church-bells 원본을 반복하지 않고, 안정적인 DEMAND DKITCHEN immutable 원본으로
+> 교체한다. v1 raw와 progress는 diagnostic evidence로 보존하고 v2가 resume하지 않는다.
 
 ## 1. 목적과 현재 상태
 
 기존 `data/recorded` 82세션은 이미 holdout·원본 계보·tree SHA에 묶인 parent다.
 추가 녹음을 위해 이 디렉터리나 기존 manifest를 수정하지 않는다. 추가 세션은 별도
-root에 수집하고, 검증을 모두 통과한 뒤에만 parent 82 + additions 17 = 99행의 새
+root에 수집하고, 검증을 모두 통과한 뒤에만 parent 82 + additions 19 = 101행의 새
 generation manifest를 발행한다.
 
-현재 82세션만 존재하는 상태는 계속 유효한 transfer schema v1이다. 17세션이 실제로
-녹음되기 전에는 99세션 generation을 만들었다고 간주하지 않으며 readiness도 기존
+현재 82세션만 존재하는 schema v1은 기존 bytes를 재검증하는 forensic/readiness 계약으로만
+유효하다. 현행 `stage1-coverage-v2` 신규 학습 입력으로는 사용할 수 없다. 19세션이 실제로
+녹음되기 전에는 101세션 generation을 만들었다고 간주하지 않으며 readiness도 기존
 82세션 증거를 사용한다.
 
 ## 2. 권위 경로
@@ -26,9 +33,9 @@ generation manifest를 발행한다.
 | parent raw | `data/recorded/` | 기존 82세션 tree bytes 불변 |
 | parent manifest | `data/manifests/recorded_regrouped.jsonl` | holdout SHA와 exact 일치 |
 | parent holdout | `data/manifests/recorded_holdout.json` | lineage/tree/provenance 외부 anchor |
-| addition source plan | `data/source_plans/recorded_additions/<generation-id>.csv` | exact 17행·exact header |
-| addition raw | `data/recorded_additions/<generation-id>/` | 별도 root, session 17개 + progress 1개 |
-| combined manifest | `data/manifests/recorded_generations/<generation-id>/recorded.jsonl` | parent 82행을 의미 변경 없이 복사 + addition 17행 |
+| addition source plan | `data/source_plans/recorded_additions/<generation-id>.csv` | exact 19행·exact header |
+| addition raw | `data/recorded_additions/<generation-id>/` | 별도 root, session 19개 + progress 1개 |
+| combined manifest | `data/manifests/recorded_generations/<generation-id>/recorded.jsonl` | parent 82행을 의미 변경 없이 복사 + addition 19행 |
 | generation report | `data/manifests/recorded_generations/<generation-id>/generation.json` | 위 모든 현재 bytes에서 재유도 |
 
 구현 authority는 `src/deep_anc/data/recorded_generation.py`다. transfer schema v1/v2
@@ -38,25 +45,29 @@ generation manifest를 발행한다.
 
 ## 3. source plan 계약
 
-CSV는 `SOURCE_PLAN_FIELDS`와 열 순서까지 같아야 하며, 정확히 17행이어야 한다.
-family 구성은 Stage-1 600--1600 Hz coverage 보충 목적에 맞춰 speech 5, music 4, environment 4,
+CSV는 `SOURCE_PLAN_FIELDS`와 열 순서까지 같아야 하며, 정확히 19행이어야 한다.
+family 구성은 Stage-1 coverage 보충과 current-plant train anchor를 함께 만족하도록
+speech 5, music 5, environment 5,
 machine 4로 고정한다. 모든 행은 녹음 전에 split을 지정하고, lineage component와 원본
 SHA가 서로 독립적이어야 한다.
 
-현행 generation-id는 `highband-coverage-v1`이다. canonical 구성은 environment/music
-source-pool 8행, external DNS speech 5행, external ESC machine 4행이다. DNS selection
-receipt가 없거나 외부 전달 receipt SHA가 없으면 source plan은 명시적으로 BLOCKED된다.
+현행 generation-id는 `stage1-coverage-v2`다. canonical 구성은 environment/music
+source-pool 9행, immutable DEMAND environment 1행, external DNS speech 5행, external
+ESC machine 4행이다. DNS와 DEMAND selection receipt가 없거나 두 외부 전달 receipt
+SHA 중 하나라도 없으면 source plan은 명시적으로 BLOCKED된다.
 
 | family | path | start | split |
 |---|---|---:|---|
-| environment | `data/source_pool/environment/environment_008.wav` | 54.1 | test |
+| environment | `data/source_pool/environment/environment_006.wav` | 25.75 | train |
 | environment | `data/source_pool_v2/environment/environment_012.wav` | 3.0 | test |
 | environment | `data/source_pool_v2/environment/environment_004.wav` | 5.9 | test |
 | environment | `data/source_pool_v2/environment/environment_017.wav` | 26.2 | val |
+| environment | immutable origin `.../origin-environment-demand-dkitchen-ch01-f7e2a2868219.wav` 185.6--200.6 s → exact peak-normalized composite `.../environment-demand-dkitchen-ch01-f7e2a2868219-185600ms-peaknorm.wav` | composite 0.0 | test |
 | music | `data/source_pool/music/music_007.wav` | 54.8 | test |
 | music | `data/source_pool_v2/music/music_007.wav` | 12.8 | test |
 | music | `data/source_pool_v2/music/music_012.wav` | 17.1 | val |
 | music | `data/source_pool_v2/music/music_017.wav` | 20.1 | val |
+| music | `data/source_pool_v2/music/music_008.wav` | 31.5 | train |
 
 CSV의 `group_id`나 `lineage_key` 문자열은 권위 정보가 아니다. validator는 기존 두
 source pool 160행과 FMA `tracks.csv`, LibriSpeech `CHAPTERS.TXT`, ESC-50
@@ -68,6 +79,7 @@ source pool 160행과 FMA `tracks.csv`, LibriSpeech `CHAPTERS.TXT`, ESC-50
 | `source_kind` | 용도 | 재검증 |
 |---|---|---|
 | `source_pool_row` | metadata DSU상 parent와 분리된 기존 pool row | family/group/component, source SHA, identity transform |
+| `external_demand_environment_file` | 안정적인 지속성 환경음으로 실패한 v1 church-bells 행을 대체 | exclusion 전 96행 DEMAND manifest, exact clean commit/bootstrap/freeze/holdout, DKITCHEN 16채널 public group, full 300초 원본 SHA, origin 185.6--200.6 s→15초 peak-normalized composite bytes 재유도, strict-P 네 부대역, rendered level/SNR |
 | `external_exact_composite` | source pool에 free machine component가 없을 때 쓰는 untouched ESC-50 5초 raw | ESC `src_file`, raw SHA, metadata SHA, 48 kHz Kaiser-5 resample, PCM16, 3회 반복한 15초 output SHA |
 | `external_dns_speech_composite` | Elice schema-v4 speech에서 선택한 DNS component | immutable manifest/bootstrap receipt, source/raw/composite SHA, public group/reader/book alias, strict-P 네 부대역, 10.333초 PCM16 raw→15초 repeat-trim |
 | `external_librispeech_file` | 향후 후보 감사용 지원 타입이며 현행 exact plan에는 0행 | raw path/SHA, CHAPTERS SHA, duration, reader↔book 전체 그래프의 transitive component |
@@ -120,12 +132,38 @@ public manifest의 기존 split은 provenance로만 보존하고, recorded split
 독립적으로 `train, train, val, test, test`를 결정론적으로 배정한다. 선택 group 전체는
 이후 synthetic 모든 split에서 제외한다.
 
-selector 발행 직전에는 bootstrap receipt의 commit과 현재 HEAD뿐 아니라 HEAD tree,
+DEMAND DKITCHEN의 public manifest split은 `train`이지만 recorded split은 coverage가
+부족한 `test`다. 이는 split 문자열을 바꿔 누수를 숨기는 것이 아니다. 선택 당시의 exclusion
+전 96행 manifest와 `manifest_generation.json`, bootstrap receipt, environment freeze,
+parent82 holdout, full 300초 source와 실제 재생할 15초 composite를 별도 no-replace bundle에
+복사한다. full origin→composite transform은
+`mono_48000_pcm16_window_peak_normalize_720000/v1`로 고정하고, validator가 origin
+185.6--200.6초 PCM에서 composite bytes를 다시 만들어 exact 일치를 검사한다.
+source path는 일반 basename `ch01.wav`를 쓰지 않고 content-addressed 고유 basename을 쓴다. 이후 public
+producer가 DKITCHEN public group의 16채널만 제거해 DEMAND 96→80행, 나머지 5개 환경은
+보존하고 교집합 0임을 확인하기 전에는 pilot/pretrain도 fail-closed한다.
+
+원본 300초 WAV를 그대로 `NoiseProgram(file)`에 넣으면 150.652초의 full-file
+global peak가 amplitude 정규화 기준이 되어, 선택한 창의 실제 재생은 RMS
+`-63.85 dBFS`, 150--1600 Hz `-78.39 dBFS`까지 내려간다. 이는 strict
+capture gate를 통과시킬 실효 excitation이 아니다. composite를 amplitude `0.06`으로
+렌더한 canonical 수치는 peak `0.059999999` (`-24.437 dBFS`), RMS
+`-43.490 dBFS`, 150--1600 Hz Hann band RMS `-56.665 dBFS`다. 공식 level-meter
+playback `-56.487 dBFS`보다 `0.177 dB` 낮고, meter 하한 `-52.1 dBFS`와
+보수적 ERR quiet ceiling `-64.0 dBFS`를 결합한 predicted signal-to-quiet은
+`11.723 dB`로 coherence² `0.90`의 이론적 SNR `9.542 dB`를 넘는다. 이 수치와
+안전 peak/RMS 범위를 receipt에 결속하며, 이 게이트는 물리 level meter를 대체하지
+않는다. DEMAND bundle은 receipt+bootstrap+freeze+generation+manifest+holdout+full
+origin+composite의 exact 8파일이다.
+
+두 selector는 격리된 `-I -S -B` import path에서 exact commit, bootstrap/freeze,
+pre-exclusion manifest generation을 검증하고 시작·종료 clean-source evidence가 같을 때만
+발행한다. 그중 DNS selector는 발행 직전 bootstrap receipt의 commit과 현재 HEAD뿐 아니라 HEAD tree,
 index stage/mode/blob, 실제 tracked worktree bytes, assume-unchanged/skip-worktree flag,
 replace/graft, non-ignored untracked 파일을 모두 검사한다. `src/`, `scripts/`, `configs/`
 아래 ignored untracked injection도 거부한다. `data/`, `results/`, `runs/`처럼 Git ignore
 정책 밖의 artifact 출력은 허용하며 이 clean-source evidence 자체를 selection receipt에
-봉인한다. issuer는 import 전부터 `-I -S -B` 및
+봉인한다. DNS issuer는 import 전부터 `-I -S -B` 및
 `-X pycache_prefix=/dev/null/deep-anc-selector`를 강제해 `PYTHONPATH`, user-site,
 `.pth`, adjacent/venv `__pycache__` 재사용을 거부한다. live interpreter/sys.path,
 source/native loader origin, `__cached__`, 실제 로드된 NumPy FFT/native-extension bytes,
@@ -136,10 +174,16 @@ NumPy power-of-two FFT 구현으로 고정한다. Jetson validator/readiness도 
 untracked injection을 다시 계산한다. 기존 Elice checkout의 protected root에 남은
 regular `__pycache__/*.pyc`는 삭제하지 않고 import 전에 repository 밖
 `.deep_anc_source_cache_quarantine/`으로 no-overwrite 원자 이동한다. symlink,
-special file, `.pyc` 외 member는 격리하지 않고 즉시 차단한다. manifest는 원래
+special file, `.pyc` 외 member는 격리하지 않고 즉시 차단한다. DNS manifest는 원래
 경로/size/SHA/mode/source commit을 봉인하고 중단 transaction을 재실행에서 복구한다.
 
-selector는 전체 raw를 스캔하지만 Jetson에는 선택되지 않은 DNS raw를 복제하지 않는다.
+DEMAND selector는 현재 DNS의 pre-import cache quarantine과 NumPy/SoundFile/SciPy native
+loader inventory 전체를 복제하지 않는다. 대신 canonical isolated sys.path, exact clean
+commit, bootstrap/freeze, immutable 96행 manifest·generation·parent82·strict P·full source를
+발행과 소비 시점에 재검산한다. 따라서 DNS 전용 runtime provenance를 DEMAND receipt가
+제공한다고 주장하지 않는다.
+
+DNS selector는 전체 raw를 스캔하지만 Jetson에는 선택되지 않은 DNS raw를 복제하지 않는다.
 Jetson validator는 immutable manifest 전체 lineage와 선택 raw/composite/strict-P 점수를
 재계산한다. full-scan ranking은 bootstrap-bound receipt와 외부 receipt 파일 SHA로
 검증하며, 최종 권위 coverage는 실제 덕트 additions를 포함해 다시 생성한 recorded
@@ -162,7 +206,7 @@ for spec in \
   '5-222524-A-41.wav machine-222524-repeat3.wav'; do
   set -- $spec
   .venv/bin/python scripts/data/build_recorded_external_composite.py \
-    --generation-id highband-coverage-v1 \
+    --generation-id stage1-coverage-v2 \
     --raw-member "data/raw/noise/esc50/ESC-50-master/audio/$1" \
     --family machine --out-name "$2" || exit 1
 done
@@ -181,6 +225,36 @@ Elice에서 먼저 selector를 실행한다. 이 명령은 저장된 파일만 �
   --write
 ```
 
+같은 clean exact checkout에서 DEMAND DKITCHEN bundle도 exclusion 전
+`canonical_v4` generation에 결속해 발행한다. 이 selector는 full 300초 source와
+96행 parent manifest를 immutable bundle에 복사할 뿐 오디오 장치를 열지 않는다.
+`<manifest_generation_SHA256>`는 발행 직전
+`data/manifests/canonical_v4/manifest_generation.json`의 외부 전달 SHA다.
+
+```bash
+.venv/bin/python -I -S -B \
+  -X pycache_prefix=/dev/null/deep-anc-selector \
+  scripts/data/select_recorded_demand_environment.py \
+  --expected-commit <40자리_SHA> \
+  --bootstrap-receipt-sha256 <Elice_bootstrap_receipt_SHA256> \
+  --expected-manifest-generation-sha256 <manifest_generation_SHA256> \
+  --write
+```
+
+DEMAND bundle의 receipt SHA도 stdout와 다른 전달 채널에서 고정한다. Jetson 전송 뒤에는
+그 외부 SHA를 다시 제공하지 않으면 기존 bundle을 검증할 수 없다.
+
+```bash
+.venv/bin/python -I -S -B \
+  -X pycache_prefix=/dev/null/deep-anc-selector \
+  scripts/data/select_recorded_demand_environment.py \
+  --expected-commit <40자리_SHA> \
+  --bootstrap-receipt-sha256 <Elice_bootstrap_receipt_SHA256> \
+  --expected-manifest-generation-sha256 <manifest_generation_SHA256> \
+  --expected-receipt-sha256 <Elice_DEMAND_receipt_SHA256> \
+  --verify-existing
+```
+
 retained cache를 명시적으로 돌려놓아야 할 때만 selector가 출력한 absolute
 transaction path를 사용한다. 복구는 기존 cache를 overwrite하지 않으며,
 같은 transaction을 두 번 복구하면 실패한다.
@@ -193,7 +267,7 @@ transaction path를 사용한다. 복구는 기존 cache를 overwrite하지 않�
   --restore-source-cache-quarantine </absolute/transaction/path>
 ```
 
-출력한 selection receipt 파일 SHA를 별도 채널로 Jetson에 전달한다. exact 17행 plan은
+출력한 selection receipt 파일 SHA를 별도 채널로 Jetson에 전달한다. exact 19행 plan은
 그 외부 anchor를 필수 인자로 받아 receipt와 plan의 동시 재봉인을 막는다.
 기존 bundle 검증도 commit/bootstrap/selection receipt 외부 anchor 세 개를 모두
 다시 제공해야 한다.
@@ -215,8 +289,9 @@ canonical 경로는 비워져 원인 수정 후 새 no-replace 실행이 가능�
 
 ```bash
 .venv/bin/python scripts/data/build_recorded_additions_plan.py \
-  --generation-id highband-coverage-v1 \
+  --generation-id stage1-coverage-v2 \
   --dns-selection-receipt-sha256 <Elice_selection_receipt_SHA256> \
+  --demand-selection-receipt-sha256 <Elice_DEMAND_receipt_SHA256> \
   --check-only
 ```
 
@@ -227,20 +302,45 @@ source plan은 다음 무음 dry-run으로 검사한다. 이 명령은 파일을
 
 ```bash
 .venv/bin/python scripts/data/record_session_batch.py \
-  --sources data/source_plans/recorded_additions/highband-coverage-v1.csv \
-  --out-root data/recorded_additions/highband-coverage-v1 \
-  --canonical-additions-generation highband-coverage-v1 \
+  --sources data/source_plans/recorded_additions/stage1-coverage-v2.csv \
+  --out-root data/recorded_additions/stage1-coverage-v2 \
+  --canonical-additions-generation stage1-coverage-v2 \
   --amplitude 0.06 \
   --dry-run
 ```
 
-17행이 모두 15초라면 audible 합계는 255초(4분 15초)다. 실제 연결 시간은 dry-run이
+이 pre-campaign dry-run은 source/lineage/plan/기존 session을 전부 읽되 오디오 장치와 fresh
+campaign만 열지 않는다. 실제 실행은 아래처럼 방금 발행한 campaign의 외부 SHA를 반드시 함께
+지정해야 하며, dry-run 성공만으로 live admission이 열리지 않는다.
+
+20초 official meter가 PASS하고 출력 stream이 닫힌 직후 그 raw와 canonical sibling receipt를
+다음처럼 묶는다. 첫 명령은 무출력 check-only이며, 같은 bytes가 PASS한 뒤에만 `--write`를
+붙여 no-replace 발행한다. stdout의 `receipt_path`와 `receipt_sha256`을 live 명령에 그대로 쓴다.
+
+```bash
+.venv/bin/python scripts/data/issue_recording_level_campaign.py \
+  --meter-raw results/calibration_interleaved/level_bootstrap/<capture>/meter_raw.npz \
+  --meter-receipt results/calibration_interleaved/level_bootstrap/<capture>/meter_raw.receipt.json
+
+.venv/bin/python scripts/data/issue_recording_level_campaign.py \
+  --meter-raw results/calibration_interleaved/level_bootstrap/<capture>/meter_raw.npz \
+  --meter-receipt results/calibration_interleaved/level_bootstrap/<capture>/meter_raw.receipt.json \
+  --write
+```
+
+19행이 모두 15초라면 audible 합계는 285초(4분 45초)다. 실제 연결 시간은 dry-run이
 출력한 input-only preflight·settle 포함 상한을 따른다. 실제 실행은 사용자 입회,
 볼륨 최소, 배선/덕트 geometry 확인, 오디오 장치 무점유 확인 뒤 별도 승인된 연결
 창에서만 한다. 실패 세션은 자동 재시도하지 않고 failure evidence를 먼저 분석한다.
-canonical additions의 file playback amplitude는 기존 82세션과 동일한 **exact 0.06**이며,
-CLI 기본값뿐 아니라 최종 generation validator도 이 값을 강제한다. 0.15는 안전 상한일 뿐
-canonical 수집 레벨이 아니다.
+canonical additions의 file playback **digital amplitude**는 **exact 0.06**이며, CLI
+기본값뿐 아니라 최종 generation validator도 이 값을 강제한다.
+이 숫자는 같은 physical SPL이나 과거 82세션과 같은 amplifier gain을 증명하지 않는다.
+canonical batch/session/generation은 fresh meter raw·receipt를 recording-level campaign
+path/SHA로 결속한다. 각 session 시작 시 meter 완료 후 최대 600초 이내인지, 같은 hardware
+config/fingerprint와 amplifier setting 확인이 유지되는지 다시 검사한다. 시간이 만료되면 임계값을
+늘리지 않고 새 meter/campaign을 발행해 resume한다. 이 결속은 아날로그 노브를 자동 판독하는
+것은 아니므로 다른 amplifier setting을 같은 물리 레벨이라고 주장할 수는 없다.
+0.15는 안전 상한일 뿐 canonical 수집 레벨이 아니다.
 
 신규 세션은 publish 전에 다음 일곱 조건을 하나의 공용 capture-gate 계약으로 모두
 통과해야 한다. 저역 코히런스 하나만으로 성공 처리하지 않는다.
@@ -254,17 +354,20 @@ canonical 수집 레벨이 아니다.
 7. 잔여 지연 p95−p5 `<= 48 samples`
 
 실패 조건은 durable `failure.json`에 실제 측정값과 함께 저장되고 active additions에는
-발행되지 않는다. batch resume과 최종 99세션 generation도 저장된 `TimelineReport`에서
+발행되지 않는다. batch resume과 최종 101세션 generation도 저장된 `TimelineReport`에서
 같은 공용 계약을 다시 계산하여, 수집 시점과 최종 승격 시점의 판정식이 갈라지지 않게 한다.
 
 승인된 연결 창의 실제 실행도 dry-run과 같은 amplitude를 명시한다.
 
 ```bash
 .venv/bin/python scripts/data/record_session_batch.py \
-  --sources data/source_plans/recorded_additions/highband-coverage-v1.csv \
-  --out-root data/recorded_additions/highband-coverage-v1 \
-  --canonical-additions-generation highband-coverage-v1 \
+  --sources data/source_plans/recorded_additions/stage1-coverage-v2.csv \
+  --out-root data/recorded_additions/stage1-coverage-v2 \
+  --canonical-additions-generation stage1-coverage-v2 \
   --amplitude 0.06 \
+  --recording-level-campaign results/recording_level_campaigns/<campaign-id>/campaign.json \
+  --recording-level-campaign-sha256 <외부_SHA256> \
+  --confirm-same-amplifier-setting \
   --confirm-user-present \
   --confirm-volume-minimum \
   --confirm-routing-and-geometry
@@ -292,24 +395,30 @@ record_duct 내부 검증과 batch QA/exact artifact 검증을 모두 통과한 
 root에 남은 경우 자동 삭제하지 않고 명시적으로 quarantine하거나 새 generation-id를
 사용해야 한다.
 
-17세션과 `batch_progress.csv`가 exact 일치한 뒤 generation을 no-replace 발행한다.
+19세션과 `batch_progress.csv`가 exact 일치한 뒤 generation을 no-replace 발행한다.
 `--allow-missing-source-files` 같은 publish 우회는 제공하지 않는다.
 
 ```bash
 .venv/bin/python scripts/data/build_recorded_generation.py \
-  --generation-id highband-coverage-v1 \
+  --generation-id stage1-coverage-v2 \
   --expected-holdout-sha256 <recorded_holdout_sha256>
 ```
 
+generation 뒤에는 clean exact commit에서 old82 train split로 발행한
+`data/manifests/recorded_level_calibration/<commit>.json`도 필요하다. 이 receipt는 WAV를
+수정하지 않고 historical ERR만 current strict-P 단위로 보정하며, val/test는 fit이 아니라
+사전 고정 품질 gate 진단에만 쓴다.
+
 그 다음 Jetson에서 source raw가 아직 존재할 때 transfer schema v2를 발행한다.
 schema v2는 parent manifest, generation report, source plan, combined manifest, parent와
-addition raw exact 집합을 모두 포함한다. Elice의 validator는 외부 전달된 transfer SHA와
+addition raw, recording-level campaign/meter, historical level calibration receipt exact 집합을
+모두 포함한다. Elice의 validator는 외부 전달된 transfer SHA와
 bootstrap receipt를 anchor로 삼고, config의 `data.recorded_generation` 경로와
 `data.recorded_generation_sha256`도 exact 비교한다.
 
 schema v2 bootstrap은 검증된 generation report의 path/SHA를
 `prepare_noise_pool.py --recorded-generation ...
---expected-recorded-generation-sha256 ...`로 전달한다. prepare는 source plan의 17행에서
+--expected-recorded-generation-sha256 ...`로 전달한다. prepare는 source plan의 19행에서
 source/output SHA, external raw-member SHA, raw lineage와 authority component를 재유도해
 `manifest_generation.json.recorded_generation_exclusion`에 결속한다. public 6종은
 basename뿐 아니라 content SHA와 lineage component 단위로 제외하며, readiness의
@@ -317,18 +426,29 @@ basename뿐 아니라 content SHA와 lineage component 단위로 제외하며, r
 계산한다. 따라서 parent82 holdout 밖 external raw를 sidecar에서 생략하거나 다른
 generation의 exclusion으로 바꾸면 학습 전에 실패한다.
 
+기존 canonical transfer가 82세션 schema v1이면 파일을 지우거나 덮어쓰지 않는다.
+검증된 기존 SHA를 명시하여 content-addressed history를 먼저 만들고, 완성된 101세션
+schema v2만 원자 교체한다. 전체 인자는 `docs/05_training_elice.md`의 canonical 명령을
+byte 그대로 사용한다. 그 완전한 명령에서 `--recorded-generation`은
+`data/manifests/recorded_generations/stage1-coverage-v2/generation.json`,
+`--rotate-existing-transfer-sha256`은 검증 직전 canonical schema v1의 실제 SHA-256이어야 한다.
+설명용 placeholder를 bash에 복사해 실행하지 않는다.
+
+builder는 기존 v1 전체와 임시 v2 전체를 각각 검증한 뒤 `os.replace`한다. 어느 검증이든
+실패하면 canonical v1은 그대로 남고 v2를 학습 입력으로 주장할 수 없다.
+
 ## 5. 실패 조건과 lifecycle
 
 다음 중 하나라도 발생하면 generation/transfer/readiness는 FAIL이다.
 
 - parent 82 파일·manifest·holdout·provenance의 1 byte 변경
-- addition 17 중 누락·교체·중복 source row 또는 session
+- addition 19 중 누락·교체·중복 source row 또는 session
 - source plan header/count/family composition 변경
 - preassigned split, start, source SHA, session metadata 불일치
 - pool metadata DSU 또는 external metadata component가 parent active component와 겹침
 - external transform output/authority metadata SHA 불일치
 - session WAV format/frame/channel 또는 session artifact SHA 불일치
-- combined manifest에서 parent 의미 변경 또는 99행 exact 집합 불일치
+- combined manifest에서 parent 의미 변경 또는 101행 exact 집합 불일치
 - generation report/transfer/config SHA trust-chain 불일치
 - schema v2 generation exclusion sidecar 누락 또는 public 6종과 source/raw SHA·lineage 교집합
 

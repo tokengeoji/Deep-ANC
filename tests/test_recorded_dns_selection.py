@@ -1468,6 +1468,7 @@ def test_source_plan_requires_and_preserves_external_receipt_sha(monkeypatch):
         builder._parser().parse_args(["--check-only"])
 
     receipt_sha = "d" * 64
+    demand_receipt_sha = "4" * 64
     observed = {}
     monkeypatch.setattr(builder, "CANONICAL_SOURCE_POOL_ADDITIONS", {})
     monkeypatch.setattr(builder, "CANONICAL_EXTERNAL_ESC_MACHINE_FILES", {})
@@ -1501,12 +1502,62 @@ def test_source_plan_requires_and_preserves_external_receipt_sha(monkeypatch):
         }
 
     monkeypatch.setattr(builder, "validate_dns_selection_receipt", fake_receipt)
+    def fake_demand_receipt(**kwargs):
+        observed["demand_expected"] = kwargs["expected_receipt_sha256"]
+        return {
+            "receipt_path": builder.DEMAND_SELECTION_RECEIPT,
+            "receipt_sha256": demand_receipt_sha,
+            "public_manifest_sha256": "5" * 64,
+            "selected": {
+                "bundle_source": {"sha256": "6" * 64},
+                "origin_bundle_source": {"sha256": "7" * 64},
+            },
+        }
+
+    monkeypatch.setattr(
+        builder,
+        "validate_demand_selection_receipt",
+        fake_demand_receipt,
+    )
     rows = builder.build_rows(
         builder.CANONICAL_GENERATION_ID,
         dns_selection_receipt_sha256=receipt_sha,
+        demand_selection_receipt_sha256=demand_receipt_sha,
     )
     assert observed["expected"] == receipt_sha
-    assert rows[0]["inventory_sha256"] == receipt_sha
+    assert observed["demand_expected"] == demand_receipt_sha
+    dns_row = next(
+        row
+        for row in rows
+        if row["source_kind"] == builder.SOURCE_KIND_EXTERNAL_DNS_SPEECH
+    )
+    assert dns_row["inventory_sha256"] == receipt_sha
+    demand_row = next(
+        row
+        for row in rows
+        if row["source_kind"]
+        == builder.SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT
+    )
+    assert demand_row == {
+        **{field: "" for field in builder.SOURCE_PLAN_FIELDS},
+        "source_kind": builder.SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT,
+        "path": builder.DEMAND_SELECTION_SOURCE,
+        "seconds": str(builder.DEMAND_WINDOW_SECONDS),
+        "start_seconds": str(builder.DEMAND_WINDOW_START_SECONDS),
+        "source_family": "environment",
+        "group_id": builder.DEMAND_PUBLIC_GROUP_ID,
+        "lineage_key": builder.DEMAND_LINEAGE_KEY,
+        "split": builder.DEMAND_RECORDED_SPLIT,
+        "source_file_sha256": "6" * 64,
+        "raw_member_path": builder.DEMAND_SELECTION_ORIGIN_SOURCE,
+        "raw_member_sha256": "7" * 64,
+        "raw_member_lineage_key": builder.DEMAND_PUBLIC_GROUP_ID,
+        "authority_metadata_sha256": "5" * 64,
+        "inventory_path": builder.DEMAND_SELECTION_RECEIPT,
+        "inventory_sha256": demand_receipt_sha,
+        "transform": builder.DEMAND_TRANSFORM,
+        "transform_repeat_count": "1",
+    }
 
 
 def test_selector_requires_five_distinct_full_coverage_groups():

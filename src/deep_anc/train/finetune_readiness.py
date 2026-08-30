@@ -467,24 +467,24 @@ def _canonical_recorded_lineage_snapshot(
             not isinstance(combined, dict)
             or not isinstance(combined.get("manifest"), dict)
             or combined["manifest"].get("sha256") != recorded_snapshot.sha256
-            or combined.get("session_count") != 99
+            or combined.get("session_count") != 101
             or not isinstance(additions, dict)
-            or additions.get("expected_session_count") != 17
+            or additions.get("expected_session_count") != 19
         ):
-            raise ValueError("recorded generation combined/additions summary가 exact 82+17이 아닙니다")
+            raise ValueError("recorded generation combined/additions summary가 exact 82+19가 아닙니다")
         assert recorded_snapshot.data is not None
         entries = read_manifest_bytes(
             recorded_snapshot.data, manifest_path=actual_path
         )
-        if len(entries) != 99:
-            raise ValueError(f"recorded generation combined manifest row가 99가 아닙니다: {len(entries)}")
+        if len(entries) != 101:
+            raise ValueError(f"recorded generation combined manifest row가 101이 아닙니다: {len(entries)}")
         generation_lineage = dict(lineage)
         generation_lineage.update(
             {
                 "regrouped_manifest": combined["manifest"].get("path"),
                 "regrouped_manifest_sha256": recorded_snapshot.sha256,
                 "regrouped_row_count": len(entries),
-                "component_count": int(lineage.get("component_count", 0)) + 17,
+                "component_count": int(lineage.get("component_count", 0)) + 19,
                 "component_membership_sha256": hashlib.sha256(
                     (
                         str(lineage.get("component_membership_sha256", ""))
@@ -3644,12 +3644,40 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
             transfer = validate_recorded_training_snapshot(
                 data_cfg, repo_root=REPO_ROOT
             )
+            calibration = getattr(transfer, "recorded_level_calibration", None)
+            calibration_path = getattr(calibration, "path", None)
+            calibration_sha = getattr(calibration, "sha256", None)
+            if calibration_path is None or not isinstance(calibration_sha, str):
+                raise ValueError(
+                    "recorded trust role에는 schema-v2 transfer가 검증한 "
+                    "recorded_level_calibration snapshot이 필요합니다"
+                )
+            try:
+                calibration_relative = Path(
+                    os.path.abspath(os.fspath(calibration_path))
+                ).relative_to(REPO_ROOT).as_posix()
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "recorded_level_calibration snapshot이 현재 저장소 밖입니다"
+                ) from exc
+            if (
+                data_cfg.get("recorded_level_calibration") != calibration_relative
+                or data_cfg.get("recorded_level_calibration_sha256")
+                != calibration_sha
+            ):
+                raise ValueError(
+                    "resolved data.recorded_level_calibration path/SHA가 "
+                    "transfer-검증 snapshot과 다릅니다"
+                )
             recorded_transfer_snapshot = transfer
             audit.pass_(
                 "recorded_transfer_snapshot",
-                "bootstrap receipt→transfer manifest→recorded bytes snapshot이 정합합니다",
+                "bootstrap receipt→transfer manifest→recorded bytes→level calibration "
+                "snapshot이 정합합니다",
                 transfer_manifest_sha256=transfer.transfer_manifest.sha256,
                 recorded_aggregate_sha256=transfer.recorded_aggregate_sha256,
+                recorded_level_calibration_path=calibration_relative,
+                recorded_level_calibration_sha256=calibration_sha,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             audit.fail("recorded_transfer_snapshot", str(exc))
@@ -4088,9 +4116,10 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
             manifest_path = manifest_path.resolve()
             entries = read_manifest(manifest_path)
             manifest_sha256 = sha256_file(manifest_path)
-        if str(data_cfg.get("recorded_sampling", "uniform_session")) == (
-            "family_lineage_session_balanced"
-        ):
+        if str(data_cfg.get("recorded_sampling", "uniform_session")) in {
+            "family_lineage_session_balanced",
+            "family_plant_domain_component_session_balanced",
+        }:
             invalid_lineage = [
                 str(entry.get("session_id") or entry.get("path") or index)
                 for index, entry in enumerate(entries)

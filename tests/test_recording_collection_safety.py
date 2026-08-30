@@ -31,6 +31,32 @@ BATCH = _load("scripts/data/record_session_batch.py", "record_session_batch_safe
 RECORD = _load("scripts/data/record_duct.py", "record_duct_safety_test")
 
 
+def _fake_campaign_args(module, monkeypatch, *, root: Path) -> list[str]:
+    receipt = "results/recording_level_campaigns/recording-level-" + "a" * 64 + "/campaign.json"
+    digest = "b" * 64
+    hardware = "configs/hardware_jetson.yaml"
+    monkeypatch.setattr(
+        module,
+        "validate_recording_level_campaign",
+        lambda **_kwargs: {
+            "campaign_id": "recording-level-" + "a" * 64,
+            "receipt_path": receipt,
+            "receipt_size": 123,
+            "receipt_sha256": digest,
+            "payload": {"hardware": {"config": {"path": hardware}}},
+        },
+    )
+    return [
+        "--hardware",
+        str(root / hardware),
+        "--recording-level-campaign",
+        receipt,
+        "--recording-level-campaign-sha256",
+        digest,
+        "--confirm-same-amplifier-setting",
+    ]
+
+
 def _source_plan(tmp_path: Path, *, split: str | None = "train", seconds: float = 15.0):
     source = tmp_path / "source.wav"
     sf.write(source, np.zeros(2_000, dtype=np.float32), 100, subtype="FLOAT")
@@ -207,6 +233,45 @@ def test_exact_collection_plan_is_bound_in_dry_run(tmp_path, capsys):
     assert "collection provenance: exact" in capsys.readouterr().out
 
 
+def test_record_duct_canonical_dry_run_allows_campaign_to_be_issued_afterward(
+    tmp_path, capsys
+):
+    source, plan = _source_plan(tmp_path)
+    digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+    assert RECORD.main(
+        [
+            "--program", "file", "--file", str(source), "--seconds", "15",
+            "--amplitude", "0.06", "--source-family", "speech",
+            "--group-id", "speaker-book-001", "--source-list", str(plan),
+            "--source-list-sha256", digest, "--source-row-number", "2",
+            "--lineage-key", "speaker-book-001", "--preassigned-split", "train",
+            "--require-recording-level-campaign", "--dry-run",
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    assert "live canonical 실행에는 fresh recording-level" in output
+    assert "[DRY-RUN PASS]" in output
+
+
+def test_record_duct_canonical_live_refuses_missing_campaign_before_audio(
+    tmp_path,
+):
+    source, plan = _source_plan(tmp_path)
+    digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+    with pytest.raises(SystemExit) as excinfo:
+        RECORD.main(
+            [
+                "--program", "file", "--file", str(source), "--seconds", "15",
+                "--amplitude", "0.06", "--source-family", "speech",
+                "--group-id", "speaker-book-001", "--source-list", str(plan),
+                "--source-list-sha256", digest, "--source-row-number", "2",
+                "--lineage-key", "speaker-book-001", "--preassigned-split", "train",
+                "--require-recording-level-campaign",
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
 def test_collection_plan_rejects_wrong_sha(tmp_path):
     source, plan = _source_plan(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
@@ -304,10 +369,26 @@ def test_canonical_additions_mode_requires_exact_generation_paths_and_header(
 
     monkeypatch.setattr(BATCH, "_read_source_plan", validate_authoritative_plan)
     out_root = tmp_path / BATCH.ADDITIONS_ROOT / generation_id
-    common = [
+    canonical_dry_run = [
         "--sources", str(plan),
         "--out-root", str(out_root),
         "--canonical-additions-generation", generation_id,
+        "--dry-run",
+    ]
+    assert BATCH.main(canonical_dry_run) == 0
+    with pytest.raises(SystemExit) as excinfo:
+        BATCH.main(
+            [
+                *canonical_dry_run[:-1],
+                "--confirm-user-present",
+                "--confirm-volume-minimum",
+                "--confirm-routing-and-geometry",
+            ]
+        )
+    assert excinfo.value.code == 2
+    common = [
+        *canonical_dry_run[:-1],
+        *_fake_campaign_args(BATCH, monkeypatch, root=tmp_path),
         "--dry-run",
     ]
     assert BATCH.main(common) == 0
@@ -317,7 +398,7 @@ def test_canonical_additions_mode_requires_exact_generation_paths_and_header(
             f"{BATCH.SOURCE_PLAN_ROOT}/{generation_id}.csv",
             True,
         )
-    ]
+    ] * 3
 
     with pytest.raises(SystemExit) as excinfo:
         BATCH.main([*common, "--amplitude", "0.15"])
@@ -346,7 +427,7 @@ def test_canonical_additions_mode_requires_exact_generation_paths_and_header(
         BATCH.main([*common, "--out-root", str(tmp_path / "wrong")])
     assert excinfo.value.code == 2
 
-    # 같은 17행이어도 exact header에서 authority 열 하나를 빼면 canonical 수집을
+    # 같은 19행이어도 exact header에서 authority 열 하나를 빼면 canonical 수집을
     # 시작하지 않는다. 일반 diagnostic CSV의 유연성은 유지한다.
     wrong_fields = [
         field for field in BATCH.SOURCE_PLAN_FIELDS
@@ -449,6 +530,7 @@ def test_canonical_batch_qa_failure_is_quarantined_and_exits_nonzero(
             "--confirm-user-present",
             "--confirm-volume-minimum",
             "--confirm-routing-and-geometry",
+            *_fake_campaign_args(BATCH, monkeypatch, root=tmp_path),
         ]
     )
     assert result == 1

@@ -17,6 +17,7 @@ from deep_anc.data.recorded_generation_exclusion import (
     RecordedGenerationExclusionError,
     derive_recorded_generation_exclusion,
     find_recorded_generation_overlaps,
+    generation_excluded_basenames,
     generation_excluded_public_groups,
     validate_recorded_generation_exclusion,
 )
@@ -233,3 +234,43 @@ def test_dns_public_group_authority_excludes_every_component_member(tmp_path: Pa
     )
     assert len(overlaps) == 1
     assert overlaps[0]["dimensions"] == ["authority_component"]
+
+
+def test_demand_unique_basename_excludes_only_one_public_group_of_16(tmp_path: Path):
+    summary, _fixture = _summary_fixture(tmp_path)
+    evidence = derive_recorded_generation_exclusion(summary, repo_root=tmp_path)
+    public_group = "public-lineage-" + "d" * 64
+    unique = "environment-demand-dkitchen-ch01-deadbeef0000.wav"
+    identity = evidence["identities"][0]
+    identity["source_path"] = f"data/immutable/{unique}"
+    identity["raw_member_path"] = f"data/immutable/{unique}"
+    identity["authority_components"] = [
+        "public_lineage_key:demand_environment:DKITCHEN",
+        f"public_group:{public_group}",
+    ]
+    assert generation_excluded_basenames(evidence) == {
+        unique.casefold(),
+        *{
+            Path(row["source_path"]).name.casefold()
+            for row in evidence["identities"][1:]
+        },
+    }
+    assert "ch01.wav" not in generation_excluded_basenames(evidence)
+    assert generation_excluded_public_groups(evidence) == {public_group}
+    public_rows = [
+        {
+            "path": f"/public/DKITCHEN/ch{index:02d}.wav",
+            "content_sha256": _sha(f"demand-{index}"),
+            "lineage_keys": ["demand_environment:DKITCHEN"],
+            "group_id": public_group,
+            "split": "train",
+        }
+        for index in range(1, 17)
+    ]
+    overlaps = find_recorded_generation_overlaps(
+        evidence, {"demand": public_rows}, repo_root=tmp_path
+    )
+    assert len(overlaps) == 16
+    assert {tuple(item["dimensions"]) for item in overlaps} == {
+        ("authority_component",)
+    }

@@ -3065,6 +3065,62 @@ def test_recorded_trust_roles_require_transfer_and_canonical_lineage(
     assert not manifest_gate["ok"] and "lineage sentinel" in manifest_gate["message"]
 
 
+@pytest.mark.parametrize("bind_resolved_config", [True, False])
+def test_readiness_cross_binds_and_reports_transfer_level_calibration(
+    tmp_path, monkeypatch, bind_resolved_config
+):
+    cfg = _ready_config(tmp_path)
+    cfg["experiment_role"] = "measured_probe"
+    calibration_path = (
+        tmp_path / "data/manifests/recorded_level_calibration/fixture.json"
+    )
+    calibration_path.parent.mkdir(parents=True)
+    calibration_path.write_text("{}\n", encoding="utf-8")
+    calibration_sha = hashlib.sha256(calibration_path.read_bytes()).hexdigest()
+    transfer = SimpleNamespace(
+        transfer_manifest=SimpleNamespace(sha256="1" * 64),
+        recorded_aggregate_sha256="2" * 64,
+        recorded_level_calibration=SimpleNamespace(
+            path=calibration_path,
+            sha256=calibration_sha,
+        ),
+        recorded_generation=None,
+        recorded_subband_coverage_receipt=None,
+        recorded_subband_coverage_report=None,
+    )
+
+    def validate_transfer(data_cfg, *, repo_root):
+        assert repo_root == tmp_path
+        if bind_resolved_config:
+            data_cfg["recorded_level_calibration"] = (
+                calibration_path.relative_to(tmp_path).as_posix()
+            )
+            data_cfg["recorded_level_calibration_sha256"] = calibration_sha
+        return transfer
+
+    monkeypatch.setattr(readiness, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        readiness, "validate_recorded_training_snapshot", validate_transfer
+    )
+    monkeypatch.setattr(
+        readiness,
+        "_canonical_recorded_lineage_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("fixture lineage")),
+    )
+
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+    gate = _gate(report, "recorded_transfer_snapshot")
+
+    assert gate["ok"] is bind_resolved_config
+    if bind_resolved_config:
+        assert gate["details"]["recorded_level_calibration_path"] == (
+            calibration_path.relative_to(tmp_path).as_posix()
+        )
+        assert gate["details"]["recorded_level_calibration_sha256"] == calibration_sha
+    else:
+        assert "transfer-검증 snapshot과 다릅니다" in gate["message"]
+
+
 # ---- D1 코퍼스 누수 -------------------------------------------------------------------
 def test_readiness_rejects_corpus_leak_between_synthetic_and_recorded(tmp_path):
     """합성 학습 스트림과 실측이 같은 원본 오디오를 쓰면 FAIL 한다.

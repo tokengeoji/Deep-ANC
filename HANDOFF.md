@@ -399,6 +399,82 @@ bootstrap/selector/train process는 0이다. 다음 순서는 최종 milestone t
 pytest 0 FAIL → `dev` force-with-lease → Elice exact preflight/full bootstrap → 새 DNS selector
 receipt → Jetson 무음 dry-run → amplitude `0.06` 첫 15초 세션이다.
 
+### 0.15 2026-08-30 병목 완화 경계와 현행 82+19 수집 계약
+
+이 절은 위 0.6--0.14에 남은 `17 addition / 99 combined` 실행 수치를 대체한다. 역사적
+`highband-coverage-v1` 17행과 그 실패 raw는 그대로 보존하지만 현행
+`stage1-coverage-v2` 입력으로 재사용하지 않는다.
+
+Git history 정리는 이미 완료됐다. 실제 `main..dev`는 7개 milestone commit과 main 통합 merge
+1개이고 local/remote branch도 `main`, `dev`만 존재하며 worktree는 이 디렉터리 하나다. 따라서
+위 0.13의 “155개를 앞으로 재구성” 설명은 과거 예약 기록이며 다시 rebase/force-push하지
+않는다. 이 통합 복구는 별도의 의미 있는 한 commit으로 추가한 뒤 exact SHA를 새 artifact의
+단일 출처로 사용한다.
+
+사용자 지시에 따라 기술적으로 본질적이지 않은 병목은 다음처럼 완화했다. 최종 2/4/8 kHz
+다채널 hardware authority가 없어도 150--1600 Hz Stage-1의 처리량 smoke와 정식 준비는
+진행할 수 있다. coverage가 아직 완성되기 전의 A100 200--500 step 실행도
+`init_eligible=false`인 finite/VRAM/ETA/resume 진단으로만 허용한다. 반면 lead·극성·인과성,
+deadline/xrun/clip, P/S와 raw SHA, 동기·coherence, split lineage 누수, trusted 대역 악화와
+대역 밖 고주파 증폭은 결과에 맞춰 완화하지 않는다. 전체 표는
+`docs/16_canonical_finetune_guardrails.md` §1.1이 권위다.
+
+실제 old82 `source_aligned→ERR`와 current strict P를 Welch/H1으로 전수 대조한 결과,
+2026-08-04 cohort는 train 중앙값 `-25.441966 dB`, 2026-08-06 cohort는
+`-20.333239 dB`로 같은 digital reference 단위가 아니었다. 이 차이를 무시한 70:30 학습은
+성능이 아니라 서로 다른 plant gain을 동시에 가르치므로 차단한다. 새
+`recorded_primary_level_calibration_v1`은 WAV와 source/REF를 바꾸지 않고 historical ERR만
+train-only cohort scalar로 current strict-P 단위에 맞춘다. val/test 중앙 잔차 최대
+`0.384963 dB`, 전체 session 최악 잔차 `1.679043 dB`, train complex agreement
+`0.986107`, scalar+delay 뒤 relative error `0.166113`, 보정 뒤 ERR peak 약 `0.669`로
+사전 고정 gate를 통과했다. 실제 receipt는 dirty tree에서 발행하지 않으며 새 clean exact
+commit에 결속한다.
+
+또한 네 family 모두에서 `historical_calibrated`와 `current_strict`를 train에 노출하지 않으면
+plant-domain 차이를 검증할 수 없다는 새 병목을 발견했다. 종전 17행에는 current music/train과
+environment/train이 0개였으므로, lineage가 독립인
+`environment/environment_006.wav@25.75s`와
+`source_pool_v2/music/music_008.wav@31.5s`를 각각 train 1개씩 추가했다. 현행 exact 구성은
+speech 5, music 5, environment 5, machine 4의 **19세션**, parent 포함 **101세션**이다.
+family→plant-domain→component→session sampler는 각 family에서 current/historical을 정확히
+50:50으로 노출하고 worker/resume global index에도 결정적이다. 서로 다른 plant-domain session
+mix는 허용하지 않는다.
+
+신규 19세션은 amplitude `0.06`, 48 kHz, 15초이고 audible 합계는 **285초(4분 45초)**다.
+canonical live는 fresh `measurement_level_meter_raw_v1`과 그 receipt를 no-replace
+`recording_level_campaign_v1`으로 묶은 뒤에만 열린다. 각 session은 campaign path/SHA,
+hardware identity/fingerprint, 같은 amplifier setting 확인, 실제 callback에 줄 float32 source
+sample SHA와 peak/RMS/trusted RMS를 저장한다. meter 완료 후 600초가 지나면 임계값을 늘리지
+않고 중단해 새 meter/campaign으로 resume한다. campaign 없는 canonical live는 audio import/open
+전에 실패하지만, pre-campaign `--dry-run`은 source/lineage/plan/기존 artifact를 무출력으로
+끝까지 검사할 수 있다. session 시작은 meter 완료 뒤이면서 campaign 발행 시각 이후여야 하므로
+과거 raw를 사후 campaign으로 승격할 수 없다.
+
+Red-team에서는 level calibration receipt의 164개 `source_aligned/mics` 참조를 가짜 SHA/size로
+재봉인해도 `verify_bound_audio=False` 경로가 통과하던 결함을 재현했다. schema-v2 transfer
+validator는 이제 추가 WAV 재읽기 없이 이미 검증한 `role=recorded` entry map과 164개
+path/size/SHA를 exact 대조하고, builder/validator 모두 receipt source commit과 현재 checkout
+HEAD의 exact 일치를 요구한다. stale audio ref와 stale commit negative fixture가 각각 이 경계를
+강제한다.
+
+학습 전 남은 실제 순서는 다음과 같다.
+
+1. 통합 변경의 focused/전체 pytest, static reference, shell syntax, secret, diff 검사를 0 FAIL로
+   끝내고 `dev` clean exact commit을 push한다.
+2. 같은 Elice A100의 검증된 raw/venv cache를 새 exact commit으로 fast-forward한 뒤
+   `bootstrap_all.sh --no-update`와 DNS/DEMAND selector를 재발행한다.
+3. Jetson에서 exact 19행 plan의 pre-campaign dry-run과 audio occupancy를 확인한다.
+4. fresh meter 20초 뒤 19×15초를 campaign freshness 안에서 수집하고 각 session의 일곱 capture
+   gate를 즉시 판정한다. 실패 행은 자동 재생·임계 완화 없이 raw-first 분석한다.
+5. 101세션 generation, old82 level-calibration receipt, transfer schema v2를 발행·전송하고
+   Elice readiness를 init만 FAIL인 16/17까지 올린다.
+6. G0/loss pilot/measured probe와 200--500 step A100 smoke를 통과한 뒤에만 selected 100k
+   pretrain과 50k fine-tune을 실행한다.
+
+현재 canonical checkpoint와 실제 OFF/ON raw는 아직 없으므로 감쇠 dB나 broadband 성공을
+주장하지 않는다. Stage-1 성공 뒤에도 2/4/8 kHz와 8 kHz octave 상단 11.314 kHz 최종 목표는
+동기 다채널 P/S·matched FxLMS·Level-5 actual G4가 별도로 필요하다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.

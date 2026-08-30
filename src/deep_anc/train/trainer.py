@@ -28,7 +28,15 @@ from ..config import (
     validate_canonical_training_policy,
 )
 from ..data.recorded_dataset import RecordedANCDataset, make_recorded_eval_batch
+from ..data.recorded_level_calibration import (
+    require_recorded_level_calibration_config,
+)
 from ..data.transfer_contract import bind_recorded_transfer_config
+from ..data.manifest_contract import validate_manifest_generation
+from ..data.recorded_demand_selection import (
+    DEMAND_SELECTION_RECEIPT,
+    require_demand_selection_excluded_from_manifest_generation,
+)
 from ..data.resumable_stream import indexed_rng
 from ..data.synth_dataset import (
     BROADBAND_SYNTH_PRIMARY_GENERATOR_SCHEMA,
@@ -206,6 +214,32 @@ def validate_canonical_run_entry(
             "canonical 학습은 외부 SHA로 고정한 Elice bootstrap receipt가 필요합니다"
         )
     bind_recorded_transfer_config(data_cfg, repo_root=REPO_ROOT)
+    # old82와 strict P의 약 20--25 dB 물리 단위 차이를 묵인한 채 70:30 stream을
+    # 시작하면 run directory가 생긴 뒤에야 오염을 발견한다. 외부 SHA가 결속된
+    # train-only receipt를 여기서 먼저 검증한다.
+    require_recorded_level_calibration_config(cfg, repo_root=REPO_ROOT)
+    # DKITCHEN이 recorded source로 선택된 뒤 exclusion sidecar/live manifest
+    # 재발행 전의 짧은 중간 상태에서 GPU pretrain을 시작하지 못하게 한다.
+    # 이 검사는 run directory 생성보다 먼저 실행된다.
+    mix = data_cfg.get("source_mix_ratio")
+    if (REPO_ROOT / DEMAND_SELECTION_RECEIPT).is_file() and isinstance(mix, dict):
+        required_tags = {
+            str(tag)
+            for tag, ratio in mix.items()
+            if str(tag) != "synthetic" and float(ratio) > 0.0
+        }
+        manifest_dir = Path(str(data_cfg.get("noise_manifest_dir", "data/manifests")))
+        if not manifest_dir.is_absolute():
+            manifest_dir = REPO_ROOT / manifest_dir
+        manifest_generation = validate_manifest_generation(
+            manifest_dir,
+            required_tags=required_tags,
+            repo_root=REPO_ROOT,
+        )
+        require_demand_selection_excluded_from_manifest_generation(
+            manifest_generation,
+            repo_root=REPO_ROOT,
+        )
     # binder가 resolved 값을 주입했다면 이미 stamp된 계약과 정확히 같아야 한다.
     # stamp 뒤 조용히 cfg를 바꾸는 경로는 전부 거부한다.
     validate_embedded_experiment_contract(cfg)

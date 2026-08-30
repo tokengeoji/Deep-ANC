@@ -1,6 +1,6 @@
 # Canonical 파인튜닝 강제 가드레일
 
-> 상태 기준일: 2026-08-28. 이 문서는 통과를 선언하는 새로운 증거가 아니라, 실제 코드
+> 상태 기준일: 2026-08-30. 이 문서는 통과를 선언하는 새로운 증거가 아니라, 실제 코드
 > authority와 artifact를 한곳에 연결하는 규범적 인덱스다. 문서와 코드가 충돌하면 raw
 > artifact와 아래에 명시한 코드 authority가 우선한다.
 
@@ -14,6 +14,26 @@
 
 `INCONCLUSIVE`는 G4의 분석 결과이며 운영 상태로는 **BLOCKED**다. 숫자가 없거나 raw를
 검증할 수 없는 경우도 BLOCKED다. FAIL과 BLOCKED를 임계값 완화로 PASS로 바꾸지 않는다.
+
+### 1.1 병목 완화와 pilot-only 경계
+
+2026-08-30 사용자 지시에 따라 기술적으로 본질적이지 않은 운영 병목은 완화할 수 있다.
+다만 완화는 **실험을 더 일찍 실행하는 권한**이지, 미달 evidence를 canonical PASS로 바꾸는
+권한이 아니다.
+
+| 분류 | 완화 가능 여부 | 적용 |
+|---|---|---|
+| 예상 감쇠량·초기 수렴 속도·ETA·GPU 사용률 | 가능 | 양의 감쇠와 무증폭을 향하는지 진단하고, 짧은 `a100_pretrain_smoke`를 먼저 실행할 수 있다. |
+| coverage·통계력이 아직 부족한 상태의 처리량/finite/resume 확인 | diagnostic-only로 가능 | 200--500 step 상한, `init_eligible=false`, loss winner 선택·weight 전이·test 금지 |
+| 2/4/8 kHz 최종 hardware authority가 없는 상태의 Stage-1 개발 | 가능 | 150--1600 Hz Stage-1만 진행하되 광대역 성공·배포 주장은 계속 차단 |
+| latency/deadline/xrun/clip, lead·극성·인과성 | 불가 | 한 번이라도 위반하면 해당 runtime/측정은 무효 |
+| P/S·coherence·동기 witness·raw SHA, train/val/test lineage 누수 | 불가 | 임계값을 결과에 맞춰 낮추거나 stale artifact를 승격하지 않음 |
+| trusted 대역 악화 또는 대역 밖 고주파 증폭 | 불가 | 성능이 작더라도 감소 방향은 요구하며, 증폭을 성능 절충으로 허용하지 않음 |
+
+따라서 녹음 한 행이 coherence 기준에 미달하면 그 행을 억지로 학습 자료로 넣지 않고 더
+안정적인 독립 source로 교체한다. 반대로 full-octave 장비 blocker는 Stage-1 smoke 자체를
+막지 않으며, 최종 광대역 G4와 배포만 계속 막는다. 이 분리는 GPU를 일찍 검증하면서도
+실패 데이터·잘못된 timing이 canonical checkpoint에 섞이지 않게 한다.
 
 ## 2. 절대 목표와 주파수 범위
 

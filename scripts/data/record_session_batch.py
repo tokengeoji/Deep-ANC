@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import datetime
 import errno
 import hashlib
 import json
@@ -53,6 +54,10 @@ from deep_anc.data.recorded_generation import (  # noqa: E402
     _read_session_metadata,
     _validate_session_artifacts,
     validate_generation_id,
+)
+from deep_anc.data.recording_level_campaign import (  # noqa: E402
+    RecordingLevelCampaignError,
+    validate_recording_level_campaign,
 )
 from deep_anc.audio_io import MAX_RECORDING_OUTPUT_PEAK  # noqa: E402
 from deep_anc.eval.artifacts import write_csv  # noqa: E402
@@ -95,6 +100,52 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_batch_recording_level_campaign(
+    args: argparse.Namespace, *, required: bool
+) -> dict | None:
+    """Batch가 child를 만들기 전에 external-SHA campaign을 fail-closed한다."""
+
+    receipt = args.recording_level_campaign
+    expected_sha = args.recording_level_campaign_sha256
+    if receipt is None and expected_sha is None:
+        if required:
+            raise RecordingLevelCampaignError(
+                "canonical additions에는 recording-level campaign path/SHA가 필요합니다"
+            )
+        if args.confirm_same_amplifier_setting:
+            raise RecordingLevelCampaignError(
+                "campaign 없이 same-amplifier 확인만 지정할 수 없습니다"
+            )
+        return None
+    if receipt is None or expected_sha is None:
+        raise RecordingLevelCampaignError(
+            "--recording-level-campaign과 --recording-level-campaign-sha256은 함께 필요합니다"
+        )
+    if args.confirm_same_amplifier_setting is not True:
+        raise RecordingLevelCampaignError(
+            "campaign 사용에는 --confirm-same-amplifier-setting이 필요합니다"
+        )
+    summary = validate_recording_level_campaign(
+        repo_root=REPO_ROOT,
+        campaign_receipt=str(receipt),
+        expected_sha256=str(expected_sha).lower(),
+        now_utc=datetime.datetime.now(datetime.timezone.utc),
+        require_fresh=True,
+    )
+    payload = summary.get("payload")
+    hardware = payload.get("hardware") if isinstance(payload, dict) else None
+    config_ref = hardware.get("config") if isinstance(hardware, dict) else None
+    config_path = config_ref.get("path") if isinstance(config_ref, dict) else None
+    if (
+        not isinstance(config_path, str)
+        or _lexical_repo_path(config_path) != _lexical_repo_path(args.hardware)
+    ):
+        raise RecordingLevelCampaignError(
+            "batch --hardware가 recording-level campaign config와 다릅니다"
+        )
+    return summary
 
 
 def analyse_session(session_dir: Path) -> dict:
@@ -693,6 +744,7 @@ def _confirm_reconnect(reason: str) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sources", default="data/source_pool_v2/sources.csv")
+    parser.add_argument("--hardware", default="configs/hardware_jetson.yaml")
     parser.add_argument("--out-root", default="data/recorded")
     parser.add_argument("--failed-root", default="results/recording_failures/record_duct")
     parser.add_argument("--log-root", default="results/recording_logs/record_session_batch")
@@ -701,8 +753,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=CANONICAL_RECORDING_AMPLITUDE,
         help=(
-            "file 재생 진폭. 기본 0.06은 기존 82세션 단일 레벨 계약이며, "
-            "canonical additions에서도 exact 0.06을 강제합니다"
+            "file 재생 digital 진폭. canonical additions에서 exact 0.06을 "
+            "강제하지만 같은 physical SPL/amplifier gain을 의미하지 않습니다"
         ),
     )
     parser.add_argument("--limit", type=int, default=None, help="이번 실행에서 녹음할 최대 세션 수")
@@ -726,7 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--canonical-additions-generation",
         default=None,
         help=(
-            "추가 17세션 canonical 수집 모드. source plan/out-root를 generation-id별 "
+            "추가 19세션 canonical 수집 모드. source plan/out-root를 generation-id별 "
             "별도 경로에 고정하고 exact CSV를 강제합니다"
         ),
     )
@@ -735,6 +787,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-user-present", action="store_true")
     parser.add_argument("--confirm-volume-minimum", action="store_true")
     parser.add_argument("--confirm-routing-and-geometry", action="store_true")
+    parser.add_argument(
+        "--recording-level-campaign",
+        default=None,
+        help="fresh recording-level campaign.json 저장소 상대경로",
+    )
+    parser.add_argument(
+        "--recording-level-campaign-sha256",
+        default=None,
+        help="campaign.json의 외부 SHA-256 anchor",
+    )
+    parser.add_argument("--confirm-same-amplifier-setting", action="store_true")
     return parser
 
 
@@ -808,7 +871,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.families is not None or args.preassigned_split is not None:
             parser.error(
-                "canonical additions는 CSV 17행 전체의 family/split을 사용하며 "
+                "canonical additions는 CSV 19행 전체의 family/split을 사용하며 "
                 "--families/--preassigned-split override를 허용하지 않습니다"
             )
         if len(entries) != ADDITION_SESSION_COUNT:
@@ -817,7 +880,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.amplitude != CANONICAL_RECORDING_AMPLITUDE:
             parser.error(
-                "canonical additions 재생 진폭은 기존 82세션과 같은 exact "
+                "canonical additions 재생 digital 진폭은 exact "
                 f"{CANONICAL_RECORDING_AMPLITUDE:.2f}이어야 합니다"
             )
         with sources_path.open(encoding="utf-8", newline="") as handle:
@@ -861,6 +924,13 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"canonical additions 기존 상태 검증 실패: {exc}")
     else:
         done = already_recorded(out_root)
+
+    try:
+        level_campaign = _validate_batch_recording_level_campaign(
+            args, required=canonical_rows is not None and not args.dry_run
+        )
+    except (OSError, RecordingLevelCampaignError, ValueError) as exc:
+        parser.error(f"recording level campaign 검증 실패: {exc}")
     pending = [entry for entry in entries if _plan_key(entry, source_list_sha256) not in done]
     if args.limit is not None:
         pending = pending[: args.limit]
@@ -884,7 +954,9 @@ def main(argv: list[str] | None = None) -> int:
         f"재생 amplitude: {args.amplitude:.2f} "
         f"(공용 peak 안전 상한 {MAX_RECORDING_OUTPUT_PEAK:.2f})\n"
         f"세션 hard timeout: 각 seconds + settle + {args.session_timeout_overhead_seconds:.1f}초\n"
-        f"자동 재시도: {'실패당 1회(opt-in)' if args.retry_once else '없음'}"
+        f"자동 재시도: {'실패당 1회(opt-in)' if args.retry_once else '없음'}\n"
+        f"recording-level campaign: "
+        f"{level_campaign['campaign_id'] if level_campaign is not None else 'diagnostic-unbound'}"
     )
     for index, entry in enumerate(pending, start=1):
         print(
@@ -894,6 +966,11 @@ def main(argv: list[str] | None = None) -> int:
             f"source={entry['path']} sha256={entry['source_file_sha256']}"
         )
     if args.dry_run:
+        if canonical_rows is not None and level_campaign is None:
+            print(
+                "[DRY-RUN 안내] live canonical batch에는 fresh recording-level "
+                "campaign path/SHA와 same-amplifier 확인이 필수입니다"
+            )
         print("[DRY-RUN PASS] 파일 생성/수정 및 오디오 장치 open 없음")
         return 0
 
@@ -911,6 +988,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.executable,
             str(REPO_ROOT / "scripts/data/record_duct.py"),
             "--program", "file", "--file", entry["path"],
+            "--hardware", str(args.hardware),
             "--file-start-seconds", str(entry["start_seconds"]),
             "--seconds", str(entry["seconds"]), "--amplitude", str(args.amplitude),
             "--settle-seconds", str(args.settle_seconds),
@@ -920,6 +998,18 @@ def main(argv: list[str] | None = None) -> int:
             "--lineage-key", entry["lineage_key"], "--preassigned-split", entry["split"],
             "--confirm-user-present", "--confirm-volume-minimum", "--confirm-routing-and-geometry",
         ]
+        if level_campaign is not None:
+            command_prefix.extend(
+                [
+                    "--recording-level-campaign",
+                    str(args.recording_level_campaign),
+                    "--recording-level-campaign-sha256",
+                    str(args.recording_level_campaign_sha256).lower(),
+                    "--confirm-same-amplifier-setting",
+                ]
+            )
+        if canonical_rows is not None:
+            command_prefix.append("--require-recording-level-campaign")
         timeout_seconds = (
             float(entry["seconds"]) + float(args.settle_seconds)
             + float(args.session_timeout_overhead_seconds)

@@ -148,7 +148,7 @@ CANONICAL_DATA_DISTRIBUTION = {
     "segment_seconds": 1.5,
     "reference_mode": "digital",
     "recorded_lead_mode": "timeline",
-    "recorded_sampling": "family_lineage_session_balanced",
+    "recorded_sampling": "family_plant_domain_component_session_balanced",
     "source_mix_ratio": CANONICAL_SOURCE_MIX_RATIO,
     "recorded_augment": CANONICAL_RECORDED_AUGMENT,
     "noise_manifest_dir": "data/manifests/canonical_v4",
@@ -287,7 +287,7 @@ def canonical_recorded_manifest_for_data(data: dict) -> str:
 
 
 def _canonical_recorded_manifest_binding(cfg: dict) -> bool:
-    """Legacy 82 또는 transfer-결속된 generation 99 manifest 선언만 허용한다."""
+    """Legacy 82 또는 transfer-결속된 generation 101 manifest 선언만 허용한다."""
 
     try:
         expected = canonical_recorded_manifest_for_data(cfg.get("data") or {})
@@ -1179,7 +1179,7 @@ def _validate_resolved_training_contract(cfg: dict) -> None:
         expected_sampling = (
             "family_lineage_session_subband_qualified"
             if broadband_role
-            else "family_lineage_session_balanced"
+            else "family_plant_domain_component_session_balanced"
         )
         if str(data.get("recorded_sampling", "")) != expected_sampling:
             raise ValueError(

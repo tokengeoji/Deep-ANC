@@ -38,6 +38,12 @@ from deep_anc.data.recorded_qa import (
     DEFAULT_RECORDED_CAPTURE_GATE,
     evaluate_recorded_capture_gate,
 )
+from deep_anc.data.recording_level_campaign import (
+    RecordingLevelCampaignError,
+    rendered_source_level_evidence,
+    validate_recording_level_campaign,
+    validate_recording_level_session_binding,
+)
 from deep_anc.data.timeline import TIMELINE_METHOD, TimelineReport
 from deep_anc.dsp.invariants import REQUIRED_SOURCE_FAMILIES
 from deep_anc.data import public_lineage
@@ -50,26 +56,42 @@ from deep_anc.data.recorded_dns_selection import (
     DNSSelectionError,
     validate_dns_selection_receipt,
 )
+from deep_anc.data.recorded_demand_selection import (
+    DEMAND_LINEAGE_KEY,
+    DEMAND_PUBLIC_GROUP_ID,
+    DEMAND_PUBLIC_GROUP_MEMBER_COUNT,
+    DEMAND_PUBLIC_LINEAGE_KEY,
+    DEMAND_RECORDED_SPLIT,
+    DEMAND_SELECTION_ORIGIN_SOURCE,
+    DEMAND_SELECTION_RECEIPT,
+    DEMAND_SELECTION_SOURCE,
+    DEMAND_SOURCE_KIND,
+    DEMAND_TRANSFORM,
+    DEMAND_WINDOW_SECONDS,
+    DEMAND_WINDOW_START_SECONDS,
+    DemandSelectionError,
+    validate_demand_selection_receipt,
+)
 
 
 RECORDED_GENERATION_SCHEMA_VERSION = 1
 PARENT_SESSION_COUNT = 82
-ADDITION_SESSION_COUNT = 17
+ADDITION_SESSION_COUNT = 19
 COMBINED_SESSION_COUNT = PARENT_SESSION_COUNT + ADDITION_SESSION_COUNT
 EXPECTED_ADDITION_FAMILY_COUNTS = {
     "speech": 5,
-    "music": 4,
-    "environment": 4,
+    "music": 5,
+    "environment": 5,
     "machine": 4,
 }
 EXPECTED_ADDITION_FAMILY_SPLIT_COUNTS = {
     ("speech", "train"): 2,
     ("speech", "val"): 1,
     ("speech", "test"): 2,
-    ("music", "train"): 0,
+    ("music", "train"): 1,
     ("music", "val"): 2,
     ("music", "test"): 2,
-    ("environment", "train"): 0,
+    ("environment", "train"): 1,
     ("environment", "val"): 1,
     ("environment", "test"): 3,
     ("machine", "train"): 1,
@@ -78,8 +100,9 @@ EXPECTED_ADDITION_FAMILY_SPLIT_COUNTS = {
 }
 EXPECTED_ADDITION_FAMILY_KIND_COUNTS = {
     ("speech", "external_dns_speech_composite"): 5,
-    ("music", "source_pool_row"): 4,
+    ("music", "source_pool_row"): 5,
     ("environment", "source_pool_row"): 4,
+    ("environment", DEMAND_SOURCE_KIND): 1,
     ("machine", "external_exact_composite"): 4,
 }
 PARENT_ROOT = "data/recorded"
@@ -111,6 +134,7 @@ SOURCE_KIND_POOL = "source_pool_row"
 SOURCE_KIND_EXTERNAL = "external_exact_composite"
 SOURCE_KIND_EXTERNAL_LIBRISPEECH = "external_librispeech_file"
 SOURCE_KIND_EXTERNAL_DNS_SPEECH = DNS_SOURCE_KIND
+SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT = DEMAND_SOURCE_KIND
 EXTERNAL_TRANSFORM = "mono_polyphase_kaiser5_resample_48000_pcm16_repeat/v1"
 EXTERNAL_REPEAT_COUNT = 3
 EXTERNAL_RAW_SECONDS = 5.0
@@ -124,9 +148,14 @@ CANONICAL_ADDITION_SECONDS_BY_KIND = {
     SOURCE_KIND_EXTERNAL: CANONICAL_ADDITION_SECONDS,
     SOURCE_KIND_EXTERNAL_LIBRISPEECH: CANONICAL_ADDITION_SECONDS,
     SOURCE_KIND_EXTERNAL_DNS_SPEECH: CANONICAL_ADDITION_SECONDS,
+    SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT: CANONICAL_ADDITION_SECONDS,
 }
 CANONICAL_SOURCE_POOL_ADDITIONS = {
-    "data/source_pool/environment/environment_008.wav": ("environment", 54.1, "test"),
+    "data/source_pool/environment/environment_006.wav": (
+        "environment",
+        25.75,
+        "train",
+    ),
     "data/source_pool_v2/environment/environment_012.wav": ("environment", 3.0, "test"),
     "data/source_pool_v2/environment/environment_004.wav": ("environment", 5.9, "test"),
     "data/source_pool_v2/environment/environment_017.wav": ("environment", 26.2, "val"),
@@ -134,7 +163,9 @@ CANONICAL_SOURCE_POOL_ADDITIONS = {
     "data/source_pool_v2/music/music_007.wav": ("music", 12.8, "test"),
     "data/source_pool_v2/music/music_012.wav": ("music", 17.1, "val"),
     "data/source_pool_v2/music/music_017.wav": ("music", 20.1, "val"),
+    "data/source_pool_v2/music/music_008.wav": ("music", 31.5, "train"),
 }
+
 # 이 다섯 source-pool speech는 PSD 진단에서 고역 후보였지만 full CHAPTERS
 # authority closure에서 parent82와 겹친다. canonical plan에는 넣지 않고 receipt의
 # rejected evidence로만 유지한다.
@@ -745,7 +776,7 @@ def _canonical_source_lineage(repo_root: Path) -> dict[str, Any]:
 def _canonical_source_selection_evidence(
     repo_root: Path, source_lineage: dict[str, Any]
 ) -> dict[str, Any]:
-    """현행 17행 선택의 물리/계보/외부 DNS receipt를 exact 결속한다."""
+    """현행 19행 선택의 물리/계보/외부 DNS receipt를 exact 결속한다."""
 
     primary = _snapshot(
         repo_root,
@@ -917,9 +948,34 @@ def _canonical_source_selection_evidence(
             "composite5 exact 14개여야 합니다"
         )
 
+    try:
+        demand_selection = validate_demand_selection_receipt(
+            repo_root=repo_root,
+            receipt_path=DEMAND_SELECTION_RECEIPT,
+            require_source_files=True,
+        )
+    except DemandSelectionError as exc:
+        raise RecordedGenerationError(
+            "BLOCKED: immutable pre-exclusion DEMAND selection bundle이 "
+            f"없거나 유효하지 않습니다: {exc}"
+        ) from exc
+    demand_selected = demand_selection["selected"]
+    demand_bundle_files = list(demand_selection["bundle_files"])
+    if (
+        len(demand_bundle_files) != 8
+        or demand_bundle_files
+        != sorted(demand_bundle_files, key=lambda item: str(item["path"]))
+        or len({str(item["path"]) for item in demand_bundle_files}) != 8
+        or any(set(item) != {"path", "sha256", "size"} for item in demand_bundle_files)
+    ):
+        raise RecordedGenerationError(
+            "external DEMAND selection bundle은 receipt+bootstrap+freeze+generation+"
+            "manifest+holdout+origin+composite exact 8개여야 합니다"
+        )
+
     payload = {
         "schema": SOURCE_SELECTION_CONTRACT_SCHEMA,
-        "generation_id": "highband-coverage-v1",
+        "generation_id": "stage1-coverage-v2",
         "strict_primary": _file_ref(primary, repo_root=repo_root),
         "algorithm": {
             "source_population": "full_source_pool_160_authority_DSU",
@@ -946,6 +1002,31 @@ def _canonical_source_selection_evidence(
             "strict_primary_sha256": dns_selection["strict_primary_sha256"],
             "selected_group_ids": dns_selection["selected_group_ids"],
             "bundle_files": dns_bundle_files,
+        },
+        "external_demand_environment_selection": {
+            "receipt_path": demand_selection["receipt_path"],
+            "receipt_sha256": demand_selection["receipt_sha256"],
+            "evidence_sha256": demand_selection["evidence_sha256"],
+            "public_manifest_sha256": demand_selection[
+                "public_manifest_sha256"
+            ],
+            "strict_primary_sha256": demand_selection[
+                "strict_primary_sha256"
+            ],
+            "public_group_id": demand_selected["public_group_id"],
+            "public_group_member_count": demand_selected[
+                "public_group_member_count"
+            ],
+            "recorded_split": demand_selected["recorded_split"],
+            "window_start_seconds": demand_selected["window_start_seconds"],
+            "origin_window_start_seconds": demand_selected[
+                "origin_window_start_seconds"
+            ],
+            "window_seconds": demand_selected["window_seconds"],
+            "strict_p_coverage": demand_selected["strict_p_coverage"],
+            "stationarity": demand_selected["stationarity"],
+            "rendered_level": demand_selected["rendered_level"],
+            "bundle_files": demand_bundle_files,
         },
         "external_machine_policy": "exact_ESC50_raw_identity_and_repeat3_composite",
     }
@@ -1020,7 +1101,7 @@ def _validate_addition_population(rows: list[dict[str, Any]]) -> None:
     }
     if observed_family_counts != EXPECTED_ADDITION_FAMILY_COUNTS:
         raise RecordedGenerationError(
-            "recorded additions family 구성은 speech 5 + music/environment/machine 각 4로 "
+            "recorded additions family 구성은 speech/music/environment 각 5 + machine 4로 "
             f"고정됩니다: actual={observed_family_counts}"
         )
     observed_family_split_counts = {
@@ -1052,8 +1133,8 @@ def _validate_addition_population(rows: list[dict[str, Any]]) -> None:
         != set(EXPECTED_ADDITION_FAMILY_KIND_COUNTS)
     ):
         raise RecordedGenerationError(
-            "recorded additions source_kind 구성은 source-pool 8 + external DNS speech5 "
-            "+ external ESC4로 "
+            "recorded additions source_kind 구성은 source-pool 9 + immutable DEMAND1 "
+            "+ external DNS speech5 + external ESC4로 "
             f"고정됩니다: actual={observed_family_kind_counts}"
         )
 
@@ -1103,6 +1184,22 @@ def _read_source_plan(
             str(item["composite_output"]["path"]): item
             for item in dns_selection["selected"]
         }
+    demand_selection: dict[str, Any] | None = None
+    if any(
+        str(row.get("source_kind")) == SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT
+        for row in raw_rows
+    ):
+        try:
+            demand_selection = validate_demand_selection_receipt(
+                repo_root=repo_root,
+                receipt_path=DEMAND_SELECTION_RECEIPT,
+                require_source_files=require_source_files,
+            )
+        except DemandSelectionError as exc:
+            raise RecordedGenerationError(
+                "BLOCKED: immutable pre-exclusion DEMAND selection bundle 검증 실패: "
+                f"{exc}"
+            ) from exc
     canonical_rows = source_lineage["rows"]
     component_by_path = source_lineage["component_by_path"]
     active_components = source_lineage["active_components"]
@@ -1319,6 +1416,59 @@ def _read_source_plan(
                 if _sha256_bytes(expected_output) != digest:
                     raise RecordedGenerationError(
                         f"external row {offset} canonical transform output SHA 불일치"
+                    )
+        elif source_kind == SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT:
+            assert demand_selection is not None
+            selected = demand_selection["selected"]
+            bundle_ref = selected["bundle_source"]
+            origin_ref = selected["origin_bundle_source"]
+            derived_group = str(selected["public_group_id"])
+            row_authority_tokens = {
+                f"public_lineage_key:{DEMAND_PUBLIC_LINEAGE_KEY}",
+                f"public_group:{derived_group}",
+                f"content_sha256:{bundle_ref['sha256']}",
+                f"raw_content_sha256:{origin_ref['sha256']}",
+            }
+            if (
+                family != "environment"
+                or path != DEMAND_SELECTION_SOURCE
+                or raw_member_path != DEMAND_SELECTION_ORIGIN_SOURCE
+                or group != DEMAND_PUBLIC_GROUP_ID
+                or lineage != DEMAND_LINEAGE_KEY
+                or split != DEMAND_RECORDED_SPLIT
+                or not math.isclose(
+                    start,
+                    DEMAND_WINDOW_START_SECONDS,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                or not math.isclose(
+                    seconds,
+                    DEMAND_WINDOW_SECONDS,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                or digest != bundle_ref["sha256"]
+                or raw_member_sha256 != origin_ref["sha256"]
+                or raw_member_lineage_key != DEMAND_PUBLIC_GROUP_ID
+                or authority_metadata_sha256
+                != demand_selection["public_manifest_sha256"]
+                or inventory_path != demand_selection["receipt_path"]
+                or inventory_sha256 != demand_selection["receipt_sha256"]
+                or transform != DEMAND_TRANSFORM
+                or repeat_text != "1"
+                or selected["public_group_member_count"]
+                != DEMAND_PUBLIC_GROUP_MEMBER_COUNT
+            ):
+                raise RecordedGenerationError(
+                    f"DEMAND environment row {offset}가 immutable bundle의 "
+                    "source/raw/SHA/start/duration/group/split과 다릅니다"
+                )
+            if require_source_files:
+                source_snapshot = demand_selection.get("source_snapshot")
+                if source_snapshot is None or source_snapshot.sha256 != digest:
+                    raise RecordedGenerationError(
+                        f"DEMAND environment row {offset} source snapshot이 없습니다"
                     )
         elif source_kind == SOURCE_KIND_EXTERNAL_DNS_SPEECH:
             assert dns_selection is not None
@@ -1702,6 +1852,111 @@ def _validate_canonical_capture_timeline(
     return report
 
 
+def _validate_recording_level_binding(
+    *,
+    metadata: dict[str, Any],
+    rendered_source: Any,
+    session_dir: Path,
+    repo_root: Path,
+) -> dict[str, Any]:
+    """Session binding을 historical start와 실제 source sample bytes에서 재검증한다."""
+
+    binding = metadata.get("recording_level_binding")
+    if not isinstance(binding, dict):
+        raise RecordedGenerationError(
+            f"추가 session recording_level_binding이 없습니다: {session_dir}"
+        )
+    receipt_ref = binding.get("campaign_receipt")
+    if (
+        not isinstance(receipt_ref, dict)
+        or set(receipt_ref) != {"path", "size", "sha256"}
+        or not isinstance(receipt_ref.get("path"), str)
+        or not isinstance(receipt_ref.get("sha256"), str)
+    ):
+        raise RecordedGenerationError(
+            f"추가 session campaign receipt 외부 anchor가 불완전합니다: {session_dir}"
+        )
+    # generation은 며칠 뒤에도 검증되어야 한다. 현재 wall-clock freshness가 아니라
+    # stored meter→duplex-stream age를 binding validator가 다시 계산한다.
+    try:
+        campaign = validate_recording_level_campaign(
+            repo_root=repo_root,
+            campaign_receipt=str(receipt_ref["path"]),
+            expected_sha256=str(receipt_ref["sha256"]),
+            now_utc=binding.get("session_started_at_utc"),
+            require_fresh=False,
+        )
+        validated_binding = validate_recording_level_session_binding(
+            campaign, binding
+        )
+        actual_rendered = rendered_source_level_evidence(
+            rendered_source
+        )
+    except (OSError, RecordingLevelCampaignError, ValueError) as exc:
+        raise RecordedGenerationError(
+            f"추가 session recording-level campaign/source 검증 실패: {session_dir}: {exc}"
+        ) from exc
+    stored_rendered = validated_binding.get("rendered_source")
+    if not isinstance(stored_rendered, dict):
+        raise RecordedGenerationError(
+            f"추가 session rendered source evidence가 없습니다: {session_dir}"
+        )
+    if actual_rendered.get("sample_sha256") != stored_rendered.get("sample_sha256"):
+        raise RecordedGenerationError(
+            f"추가 session source.wav sample SHA가 pre-live binding과 다릅니다: {session_dir}"
+        )
+    # FFT/RMS scalar의 저장/재검산도 유지하되, 파형 exact identity의 권위는 위 SHA다.
+    scalar_fields = (
+        "peak_linear",
+        "peak_dbfs",
+        "rms_dbfs",
+        "trusted_band_rms_dbfs",
+    )
+    for field in scalar_fields:
+        if not math.isclose(
+            float(actual_rendered[field]),
+            float(stored_rendered[field]),
+            rel_tol=1e-10,
+            abs_tol=1e-9,
+        ):
+            raise RecordedGenerationError(
+                f"추가 session rendered source {field} 재검산 불일치: {session_dir}"
+            )
+    for field in set(actual_rendered) - set(scalar_fields):
+        if actual_rendered[field] != stored_rendered.get(field):
+            raise RecordedGenerationError(
+                f"추가 session rendered source {field} 계약 불일치: {session_dir}"
+            )
+
+    payload = campaign.get("payload")
+    meter = payload.get("meter") if isinstance(payload, dict) else None
+    hardware = payload.get("hardware") if isinstance(payload, dict) else None
+    campaign_ref = {
+        "path": campaign.get("receipt_path"),
+        "size": campaign.get("receipt_size"),
+        "sha256": campaign.get("receipt_sha256"),
+    }
+    meter_raw = meter.get("raw") if isinstance(meter, dict) else None
+    meter_receipt = meter.get("receipt") if isinstance(meter, dict) else None
+    hardware_config = hardware.get("config") if isinstance(hardware, dict) else None
+    refs = (campaign_ref, meter_raw, meter_receipt, hardware_config)
+    if any(
+        not isinstance(ref, dict)
+        or set(ref) != {"path", "size", "sha256"}
+        for ref in refs
+    ):
+        raise RecordedGenerationError(
+            f"추가 session campaign transfer refs가 불완전합니다: {session_dir}"
+        )
+    return {
+        "campaign_id": campaign["campaign_id"],
+        "campaign": campaign_ref,
+        "meter_raw": dict(meter_raw),
+        "meter_receipt": dict(meter_receipt),
+        "hardware_config": dict(hardware_config),
+    }
+
+
 def _validate_session_artifacts(
     *,
     session_dir: Path,
@@ -1709,7 +1964,7 @@ def _validate_session_artifacts(
     row: dict[str, Any],
     expected_seconds: float,
     repo_root: Path,
-) -> None:
+) -> dict[str, Any]:
     """record_duct가 발행한 exact 3 WAV + session.json과 self evidence를 검증한다."""
 
     import numpy as np
@@ -1724,7 +1979,7 @@ def _validate_session_artifacts(
         or float(amplitude) != CANONICAL_RECORDING_AMPLITUDE
     ):
         raise RecordedGenerationError(
-            "추가 session amplitude가 기존 82세션과 같은 exact "
+            "추가 session digital amplitude가 exact "
             f"{CANONICAL_RECORDING_AMPLITUDE:.2f}가 아닙니다: {session_dir}"
         )
     _validate_canonical_capture_timeline(metadata, session_dir=session_dir)
@@ -1851,6 +2106,13 @@ def _validate_session_artifacts(
                 "추가 session source.wav가 source plan bytes/start/amplitude에서 재유도한 "
                 f"playback과 다릅니다: {session_dir}; max_abs_error={max_error}"
             )
+    observed_source = np.asarray(decoded["source.wav"][:, 0], dtype=np.float32)
+    return _validate_recording_level_binding(
+        metadata=metadata,
+        rendered_source=observed_source,
+        session_dir=session_dir,
+        repo_root=repo_root,
+    )
 
 
 def _read_session_metadata(session_dir: Path, *, repo_root: Path) -> dict[str, Any]:
@@ -1909,6 +2171,7 @@ def _expected_addition_entry(
         "source_pool_group_id": row["group_id"],
         "lineage_schema": ADDITION_LINEAGE_SCHEMA,
         "split": row["split"],
+        "plant_domain": "current_strict",
     }
 
 
@@ -1964,6 +2227,7 @@ def _validate_additions(
     observed_rows: set[int] = set()
     sessions: list[dict[str, Any]] = []
     manifest_entries: list[dict[str, Any]] = []
+    recording_level_campaigns: dict[str, dict[str, Any]] = {}
     for session_dir in session_dirs:
         metadata = _read_session_metadata(session_dir, repo_root=repo_root)
         if metadata.get("session_id") != session_dir.name:
@@ -2049,6 +2313,7 @@ def _validate_additions(
             or metadata.get("source_family") != row["source_family"]
             or metadata.get("group_id") != row["group_id"]
             or metadata.get("preassigned_split") != row["split"]
+            or metadata.get("plant_domain") != "current_strict"
         ):
             raise RecordedGenerationError(f"추가 session top-level metadata/CSV 불일치: {session_dir}")
         channels = metadata.get("channels")
@@ -2073,13 +2338,22 @@ def _validate_additions(
                 f"추가 session block/channel/safety/timeline provenance가 canonical이 아닙니다: "
                 f"{session_dir}"
             )
-        _validate_session_artifacts(
+        recording_level_campaign = _validate_session_artifacts(
             session_dir=session_dir,
             metadata=metadata,
             row=row,
             expected_seconds=float(row["seconds"]),
             repo_root=repo_root,
         )
+        campaign_id = str(recording_level_campaign.get("campaign_id") or "")
+        previous_campaign = recording_level_campaigns.setdefault(
+            campaign_id, recording_level_campaign
+        )
+        if not campaign_id or previous_campaign != recording_level_campaign:
+            raise RecordedGenerationError(
+                "추가 session들이 같은 campaign_id에 서로 다른 raw/receipt/config를 "
+                f"결속합니다: {session_dir}"
+            )
         evidence = _session_file_evidence(session_dir, repo_root=repo_root)
         sessions.append(
             {
@@ -2100,6 +2374,10 @@ def _validate_additions(
                 "group_id": row["group_id"],
                 "lineage_key": row["lineage_key"],
                 "split": row["split"],
+                "recording_level_campaign_id": campaign_id,
+                "recording_level_binding_sha256": metadata[
+                    "recording_level_binding"
+                ]["binding_sha256"],
                 **evidence,
             }
         )
@@ -2166,6 +2444,10 @@ def _validate_additions(
         "source_plan": _file_ref(plan_snapshot, repo_root=repo_root),
         "source_lineage_evidence_sha256": source_lineage_sha256,
         "source_selection": source_selection_evidence,
+        "recording_level_campaigns": [
+            recording_level_campaigns[key]
+            for key in sorted(recording_level_campaigns)
+        ],
         "tree": _tree_summary(additions_tree),
         "sessions": sessions,
         "session_aggregate_sha256": _canonical_json_sha256(sessions),
@@ -2309,7 +2591,7 @@ def build_recorded_generation_payload(
             if actual_by_id[key] != expected_by_id[key]
         )[:5]
         raise RecordedGenerationError(
-            "combined manifest가 parent 82 + exact additions 17과 다릅니다: "
+            "combined manifest가 parent 82 + exact additions 19와 다릅니다: "
             f"missing={missing}, extra={extra}, changed={changed}"
         )
     for entry in actual_entries:
@@ -2368,7 +2650,7 @@ def build_combined_manifest_bytes(
         raise RecordedGenerationError("추가 lineage가 parent component와 겹칩니다")
     entries = sorted([*parent_entries, *addition_entries], key=lambda item: str(item["session_id"]))
     if len(entries) != COMBINED_SESSION_COUNT:
-        raise RecordedGenerationError("combined manifest session 수가 99가 아닙니다")
+        raise RecordedGenerationError("combined manifest session 수가 101이 아닙니다")
     return b"".join(
         (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         for entry in entries

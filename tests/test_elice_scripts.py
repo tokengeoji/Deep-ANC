@@ -29,12 +29,15 @@ from deep_anc.data.source_trust import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+ELICE_TRAINING_DOCUMENT = REPO_ROOT / "docs/05_training_elice.md"
+ELICE_STAGING_DOCUMENT = REPO_ROOT / "docs/14_elice_external_data_staging.md"
 ELICE_SCRIPTS = (
     REPO_ROOT / "scripts/elice/bootstrap_all.sh",
     REPO_ROOT / "scripts/elice/setup_env.sh",
     REPO_ROOT / "scripts/elice/run_parallel_models.sh",
     REPO_ROOT / "scripts/elice/run_pretrain.sh",
     REPO_ROOT / "scripts/elice/run_structure_search.sh",
+    REPO_ROOT / "scripts/elice/bootstrap.sh",
 )
 STATIC_REFERENCE_CHECKER = (
     REPO_ROOT / "scripts/ci/check_static_contract_references.py"
@@ -52,6 +55,85 @@ def test_elice_shell_scripts_parse(script: Path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_legacy_bootstrap_is_permanently_fail_closed():
+    script = REPO_ROOT / "scripts/elice/bootstrap.sh"
+    for arguments in ([], ["--train"], ["--anything"]):
+        result = subprocess.run(
+            ["bash", str(script), *arguments],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert "폐기된 legacy 진입점" in result.stderr
+        assert "bootstrap_all.sh" in result.stderr
+        assert "train.py" not in result.stderr
+
+
+def test_elice_docs_preserve_single_cold_start_authority_and_raw_only_restore():
+    training = ELICE_TRAINING_DOCUMENT.read_text(encoding="utf-8")
+    staging = ELICE_STAGING_DOCUMENT.read_text(encoding="utf-8")
+
+    for text in (training, staging):
+        for token in (
+            "유일한 권위 진입점",
+            "scripts/elice/bootstrap_all.sh",
+            "--expected-commit",
+            "--expected-holdout-sha256",
+            "--expected-transfer-manifest-sha256",
+            "--no-update",
+            "scripts/elice/bootstrap.sh",
+            "--train",
+            "exit 2",
+        ):
+            assert token in text, f"Elice cold-start 문서의 필수 경계가 빠졌습니다: {token}"
+        assert "bash scripts/elice/bootstrap.sh" not in text
+
+    for token in (
+        "--recorded-generation",
+        "schema v2",
+        "combined 101",
+        "--rotate-existing-transfer-sha256",
+        "data/manifests/elice_transfer_history/",
+        "자동 overwrite하지 않는다",
+        "transfer bytes나 하드웨어",
+    ):
+        assert token in training, f"transfer schema-v2 회전 규칙이 빠졌습니다: {token}"
+
+    transfer_section = training.split("## 2.", 1)[1].split("## 3.", 1)[0]
+    cursor = 0
+    for token in (
+        "clean exact commit 고정",
+        "DNS/DEMAND selector와 source plan",
+        "combined 101",
+        "transfer schema v2 발행",
+    ):
+        position = transfer_section.find(token, cursor)
+        assert position >= 0, (
+            "Elice data artifact는 exact commit 뒤에 순서대로 발행해야 합니다: "
+            f"{token}"
+        )
+        cursor = position + len(token)
+
+    for token in (
+        "raw-only cache",
+        "Drive 검증 receipt",
+        "forensic backup/cache",
+        "data/manifests/canonical_v4/",
+        "data/manifests/elice_bootstrap_receipt.json",
+        "public 재다운로드",
+        "`schema_version`은 2",
+        "bootstrap은 학습을 자동 시작하지 않으므로",
+    ):
+        assert token in staging, f"Drive raw-only 복원 경계가 빠졌습니다: {token}"
+
+    assert "현재 Elice에는" not in staging
+    assert "tar -xf" not in staging
+    for destructive_command in ("rclone delete", "rclone move", "rclone purge"):
+        assert destructive_command not in staging
 
 
 def test_bootstrap_has_explicit_completeness_and_empty_array_guards():

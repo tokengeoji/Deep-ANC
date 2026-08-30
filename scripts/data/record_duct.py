@@ -74,6 +74,16 @@ from deep_anc.data.recorded_qa import (                      # noqa: E402
     RecordedCaptureGateResult,
     evaluate_recorded_capture_gate,
 )
+from deep_anc.data.recording_level_campaign import (        # noqa: E402
+    RECORDING_LEVEL_PLAYBACK_AMPLITUDE,
+    RECORDING_LEVEL_SAMPLE_RATE,
+    RECORDING_LEVEL_SESSION_FRAMES,
+    RecordingLevelCampaignError,
+    build_recording_level_session_binding,
+    rendered_source_level_evidence,
+    validate_recording_level_campaign,
+    validate_recording_level_session_binding,
+)
 from deep_anc.data.holdout_contract import (                 # noqa: E402
     read_regular_file_snapshot,
 )
@@ -141,6 +151,84 @@ def _prepare_file_source_timeline(
 def _repo_path(value: str | Path) -> Path:
     path = Path(value).expanduser()
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _validate_recording_level_authority(
+    args: argparse.Namespace,
+    *,
+    sample_rate: int,
+    now_utc: datetime.datetime,
+) -> dict | None:
+    """Canonical additions의 fresh meter campaign을 audio open 전에 검증한다."""
+
+    receipt = args.recording_level_campaign
+    expected_sha = args.recording_level_campaign_sha256
+    supplied = (receipt is not None, expected_sha is not None)
+    # 무음 dry-run은 meter/campaign 발행보다 먼저 수행할 수 있어야 한다. hidden
+    # canonical flag가 있어도 live 전환 시에만 fresh campaign을 필수화한다.
+    required = bool(args.require_recording_level_campaign and not args.dry_run)
+    if not any(supplied):
+        if required:
+            raise RecordingLevelCampaignError(
+                "canonical 수집에는 --recording-level-campaign과 외부 "
+                "--recording-level-campaign-sha256이 필요합니다"
+            )
+        if args.confirm_same_amplifier_setting:
+            raise RecordingLevelCampaignError(
+                "campaign receipt 없이 --confirm-same-amplifier-setting만 지정할 수 없습니다"
+            )
+        return None
+    if not all(supplied):
+        raise RecordingLevelCampaignError(
+            "--recording-level-campaign과 --recording-level-campaign-sha256은 함께 필요합니다"
+        )
+    if args.confirm_same_amplifier_setting is not True:
+        raise RecordingLevelCampaignError(
+            "recording level campaign 사용에는 --confirm-same-amplifier-setting이 필요합니다"
+        )
+    if args.program != "file":
+        raise RecordingLevelCampaignError(
+            "recording level campaign은 planned file session에만 사용할 수 있습니다"
+        )
+    frames = float(args.seconds) * float(sample_rate)
+    if (
+        sample_rate != RECORDING_LEVEL_SAMPLE_RATE
+        or not np.isclose(
+            frames,
+            float(RECORDING_LEVEL_SESSION_FRAMES),
+            rtol=0.0,
+            atol=1e-9,
+        )
+        or not np.isclose(
+            float(args.amplitude),
+            RECORDING_LEVEL_PLAYBACK_AMPLITUDE,
+            rtol=0.0,
+            atol=1e-12,
+        )
+    ):
+        raise RecordingLevelCampaignError(
+            "recording level campaign session은 exact 48kHz/15초/amplitude 0.06이어야 합니다"
+        )
+    summary = validate_recording_level_campaign(
+        repo_root=REPO_ROOT,
+        campaign_receipt=str(receipt),
+        expected_sha256=str(expected_sha).lower(),
+        now_utc=now_utc,
+        require_fresh=True,
+    )
+    payload = summary.get("payload")
+    hardware = payload.get("hardware") if isinstance(payload, dict) else None
+    config_ref = hardware.get("config") if isinstance(hardware, dict) else None
+    config_path = config_ref.get("path") if isinstance(config_ref, dict) else None
+    if (
+        not isinstance(config_path, str)
+        or Path(os.path.abspath(_repo_path(args.hardware)))
+        != Path(os.path.abspath(_repo_path(config_path)))
+    ):
+        raise RecordingLevelCampaignError(
+            "record_duct --hardware가 fresh campaign에 결속된 hardware config와 다릅니다"
+        )
+    return summary
 
 
 def _sha256(path: Path) -> str:
@@ -663,6 +751,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-row-number", type=int, default=None)
     parser.add_argument("--lineage-key", default=None)
     parser.add_argument("--preassigned-split", choices=VALID_SPLITS, default=None)
+    parser.add_argument(
+        "--recording-level-campaign",
+        default=None,
+        help="fresh recording-level campaign.json 저장소 상대경로",
+    )
+    parser.add_argument(
+        "--recording-level-campaign-sha256",
+        default=None,
+        help="campaign.json의 외부 SHA-256 anchor",
+    )
+    parser.add_argument("--confirm-same-amplifier-setting", action="store_true")
+    parser.add_argument(
+        "--require-recording-level-campaign",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -744,6 +848,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"seconds={args.seconds}, duration={source_duration}"
             )
 
+    try:
+        recording_level_campaign = _validate_recording_level_authority(
+            args,
+            sample_rate=fs,
+            now_utc=datetime.datetime.now(datetime.timezone.utc),
+        )
+    except (OSError, RecordingLevelCampaignError, ValueError) as exc:
+        parser.error(f"recording level campaign 검증 실패: {exc}")
+
     audible_seconds = 0.0 if args.program == "silence" else float(args.seconds)
     print(
         f"수집 계획: program={args.program}, audible={audible_seconds:.1f}초, "
@@ -752,6 +865,11 @@ def main(argv: list[str] | None = None) -> int:
         f"collection provenance: {collection_plan['status']}"
     )
     if args.dry_run:
+        if args.require_recording_level_campaign and recording_level_campaign is None:
+            print(
+                "[DRY-RUN 안내] live canonical 실행에는 fresh recording-level "
+                "campaign path/SHA와 same-amplifier 확인이 필수입니다"
+            )
         print("[DRY-RUN PASS] 파일 생성/수정 및 오디오 장치 open 없음")
         return 0
 
@@ -774,6 +892,15 @@ def main(argv: list[str] | None = None) -> int:
         "source_family": source_family,
         "requested_group_id": requested_group_id,
         "collection_plan": collection_plan,
+        "recording_level_campaign": (
+            {
+                "campaign_id": recording_level_campaign["campaign_id"],
+                "receipt_path": recording_level_campaign["receipt_path"],
+                "receipt_sha256": recording_level_campaign["receipt_sha256"],
+            }
+            if recording_level_campaign is not None
+            else None
+        ),
     }
     try:
         in_dev = resolve_alsa_portaudio_device(
@@ -1016,8 +1143,28 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # input probe 뒤 다른 프로세스가 PCM을 잡았거나 CPU 부하가 생긴 race를 닫는다.
+        current_level_campaign = _validate_recording_level_authority(
+            args,
+            sample_rate=fs,
+            now_utc=datetime.datetime.now(datetime.timezone.utc),
+        )
+        recording_level_binding = None
+        rendered_level = None
+        if current_level_campaign is not None:
+            rendered_level = rendered_source_level_evidence(source[settle : settle + keep])
         assert_live_pcm_clock_preconditions(hw)
-    except (OSError, RuntimeError, ValueError) as exc:
+        # 이 timestamp는 CLI 시작이나 input probe 시작이 아니라, 마지막 live gate가
+        # 끝난 뒤 duplex stream을 여는 바로 직전의 시각이다.
+        session_started_at_utc = datetime.datetime.now(datetime.timezone.utc)
+        if current_level_campaign is not None:
+            assert rendered_level is not None
+            recording_level_binding = build_recording_level_session_binding(
+                current_level_campaign,
+                session_started_at_utc=session_started_at_utc,
+                same_amplifier_setting=args.confirm_same_amplifier_setting,
+                rendered_source=rendered_level,
+            )
+    except (OSError, RuntimeError, RecordingLevelCampaignError, ValueError) as exc:
         _preserve_failed_capture(
             failed_root=_repo_path(args.failed_root),
             stage="immediate_live_gate",
@@ -1071,6 +1218,48 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"[중단] duplex stream 실패: {stream_error}", file=sys.stderr)
         return 1
+
+    # Campaign/source binding은 live 전뿐 아니라 stream close 뒤에도 같은 source bytes와
+    # receipt SHA에서 재유도한다. 출력 중 receipt/raw가 바뀐 경우 active tree에 발행하지 않는다.
+    if recording_level_binding is not None:
+        try:
+            post_campaign = validate_recording_level_campaign(
+                repo_root=REPO_ROOT,
+                campaign_receipt=str(args.recording_level_campaign),
+                expected_sha256=str(args.recording_level_campaign_sha256).lower(),
+                now_utc=session_started_at_utc,
+                require_fresh=True,
+            )
+            validate_recording_level_session_binding(
+                post_campaign, recording_level_binding
+            )
+            post_rendered = rendered_source_level_evidence(
+                source[settle : settle + keep]
+            )
+            if post_rendered != recording_level_binding.get("rendered_source"):
+                raise RecordingLevelCampaignError(
+                    "stream close 뒤 rendered source binding이 pre-live bytes와 다릅니다"
+                )
+        except (OSError, RecordingLevelCampaignError, ValueError) as exc:
+            _preserve_failed_capture(
+                failed_root=_repo_path(args.failed_root),
+                stage="recording_level_binding",
+                reason=str(exc),
+                sample_rate=fs,
+                metadata={
+                    **failure_meta,
+                    "program": prog_cfg,
+                    "captured_frames": captured,
+                    "recording_level_binding": recording_level_binding,
+                },
+                mics_raw=raw_mics,
+                source_raw=raw_source,
+            )
+            print(
+                f"[중단] recording level/source binding 재검증 실패: {exc}",
+                file=sys.stderr,
+            )
+            return 1
 
     # ----- 3) 저장 -----
     # xrun 이 하나라도 있으면 source↔mics 정렬이 깨졌다. 전달맵은 이미 xrun 을 무효화
@@ -1228,6 +1417,10 @@ def main(argv: list[str] | None = None) -> int:
             "routing_and_geometry": True,
         },
         "timeline": timeline_meta,
+        "recording_level_binding": recording_level_binding,
+        "plant_domain": (
+            "current_strict" if recording_level_binding is not None else None
+        ),
         "io_timestamps": _summarise_io_timestamps(stamps[: stamp_count["n"]], fs),
     }
     try:

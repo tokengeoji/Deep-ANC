@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""기존 82세션과 별도 추가 17세션을 immutable recorded generation으로 봉인한다."""
+"""기존 82세션과 별도 추가 19세션을 immutable recorded generation으로 봉인한다."""
 
 from __future__ import annotations
 

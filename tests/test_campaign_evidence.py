@@ -766,7 +766,7 @@ def test_issuer_pairs_every_pilot_and_probe_by_exact_cli_order():
         probe_init_checkpoint=["pilot07-best", "pilot10-best"],
     )
     generation_manifest = (
-        "data/manifests/recorded_generations/highband-coverage-v1/recorded.jsonl"
+        "data/manifests/recorded_generations/stage1-coverage-v2/recorded.jsonl"
     )
     chains = module._ordered_candidate_inputs(
         args, default_manifest=generation_manifest
@@ -792,10 +792,10 @@ def test_issuer_pairs_every_pilot_and_probe_by_exact_cli_order():
 
 def test_measured_probe_policy_uses_current_generation_manifest():
     generation_path = (
-        "data/manifests/recorded_generations/highband-coverage-v1/generation.json"
+        "data/manifests/recorded_generations/stage1-coverage-v2/generation.json"
     )
     generation_manifest = (
-        "data/manifests/recorded_generations/highband-coverage-v1/recorded.jsonl"
+        "data/manifests/recorded_generations/stage1-coverage-v2/recorded.jsonl"
     )
     canonical_cfg = {
         "data": {

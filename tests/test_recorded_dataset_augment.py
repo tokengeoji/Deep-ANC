@@ -426,7 +426,12 @@ def test_lineage_sampler_rejects_legacy_group_id_and_accepts_regrouped_manifest(
 
 def test_shipped_recorded_augmentation_contract_is_safe_first_stage():
     data = load_yaml(REPO_ROOT / "configs/data_sim.yaml")
-    assert data["recorded_sampling"] == "family_lineage_session_balanced"
+    assert data["recorded_sampling"] == (
+        "family_plant_domain_component_session_balanced"
+    )
+    assert data["recorded_current_strict_min_fraction"] == 0.5
+    assert data["recorded_level_calibration"] is None
+    assert data["recorded_level_calibration_sha256"] is None
     augment = RecordedAugmentConfig.from_data_config(data)
     assert augment.enabled
     assert augment.polarity_flip

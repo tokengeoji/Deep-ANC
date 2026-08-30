@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Stage-1 600--1600 Hz coverage 보충용 canonical 17행 plan을 생성·검증한다.
+"""Stage-1 600--1600 Hz coverage 보충용 canonical 19행 plan을 생성·검증한다.
 
-오디오 장치를 열지 않는다. exact environment/music source-pool 8행,
-external DNS speech receipt 5행, ESC-50 repeat composite 4행만 허용한다.
+오디오 장치를 열지 않는다. exact environment/music source-pool 9행,
+immutable DEMAND environment 1행, external DNS speech receipt 5행,
+ESC-50 repeat composite 4행만 허용한다.
 
-역사적 generation-id가 ``highband-coverage-v1``이지만 이 plan은 최종 광대역-v2
+이 stage-1 plan은 최종 광대역-v2
 데이터가 아니다. 1.6/2/4/8 kHz 또는 8 kHz octave 상단 11.314 kHz coverage를
 증명하거나 ``broadband_point_control_150_11314_v2`` receipt에 사용할 수 없다.
 """
@@ -37,6 +38,7 @@ from deep_anc.data.recorded_generation import (  # noqa: E402
     EXTERNAL_REPEAT_COUNT,
     EXTERNAL_TRANSFORM,
     SOURCE_KIND_EXTERNAL,
+    SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT,
     SOURCE_KIND_EXTERNAL_DNS_SPEECH,
     SOURCE_KIND_POOL,
     SOURCE_PLAN_FIELDS,
@@ -48,6 +50,18 @@ from deep_anc.data.recorded_generation import (  # noqa: E402
     _read_source_plan,
     validate_generation_id,
 )
+from deep_anc.data.recorded_demand_selection import (  # noqa: E402
+    DEMAND_LINEAGE_KEY,
+    DEMAND_PUBLIC_GROUP_ID,
+    DEMAND_RECORDED_SPLIT,
+    DEMAND_SELECTION_ORIGIN_SOURCE,
+    DEMAND_SELECTION_RECEIPT,
+    DEMAND_SELECTION_SOURCE,
+    DEMAND_TRANSFORM,
+    DEMAND_WINDOW_SECONDS,
+    DEMAND_WINDOW_START_SECONDS,
+    validate_demand_selection_receipt,
+)
 from deep_anc.data.recorded_dns_selection import (  # noqa: E402
     DNS_REPEAT_COUNT,
     DNS_SELECTION_RECEIPT,
@@ -55,7 +69,7 @@ from deep_anc.data.recorded_dns_selection import (  # noqa: E402
     validate_dns_selection_receipt,
 )
 
-CANONICAL_GENERATION_ID = "highband-coverage-v1"
+CANONICAL_GENERATION_ID = "stage1-coverage-v2"
 
 
 def _snapshot(relative: str, *, label: str):
@@ -72,7 +86,10 @@ def _empty_row() -> dict[str, str]:
 
 
 def build_rows(
-    generation_id: str, *, dns_selection_receipt_sha256: str
+    generation_id: str,
+    *,
+    dns_selection_receipt_sha256: str,
+    demand_selection_receipt_sha256: str,
 ) -> list[dict[str, str]]:
     generation_id = validate_generation_id(generation_id)
     if generation_id != CANONICAL_GENERATION_ID:
@@ -87,6 +104,12 @@ def build_rows(
         repo_root=REPO_ROOT,
         receipt_path=DNS_SELECTION_RECEIPT,
         expected_receipt_sha256=dns_selection_receipt_sha256,
+        require_source_files=True,
+    )
+    demand_selection = validate_demand_selection_receipt(
+        repo_root=REPO_ROOT,
+        receipt_path=DEMAND_SELECTION_RECEIPT,
+        expected_receipt_sha256=demand_selection_receipt_sha256,
         require_source_files=True,
     )
     rows: list[dict[str, str]] = []
@@ -114,6 +137,35 @@ def build_rows(
             }
         )
         rows.append(row)
+
+    demand_selected = demand_selection["selected"]
+    demand_source = demand_selected["bundle_source"]
+    demand_origin = demand_selected["origin_bundle_source"]
+    demand_row = _empty_row()
+    demand_row.update(
+        {
+            "source_kind": SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT,
+            "path": DEMAND_SELECTION_SOURCE,
+            "seconds": str(DEMAND_WINDOW_SECONDS),
+            "start_seconds": str(DEMAND_WINDOW_START_SECONDS),
+            "source_family": "environment",
+            "group_id": DEMAND_PUBLIC_GROUP_ID,
+            "lineage_key": DEMAND_LINEAGE_KEY,
+            "split": DEMAND_RECORDED_SPLIT,
+            "source_file_sha256": str(demand_source["sha256"]),
+            "raw_member_path": DEMAND_SELECTION_ORIGIN_SOURCE,
+            "raw_member_sha256": str(demand_origin["sha256"]),
+            "raw_member_lineage_key": DEMAND_PUBLIC_GROUP_ID,
+            "authority_metadata_sha256": demand_selection[
+                "public_manifest_sha256"
+            ],
+            "inventory_path": demand_selection["receipt_path"],
+            "inventory_sha256": demand_selection["receipt_sha256"],
+            "transform": DEMAND_TRANSFORM,
+            "transform_repeat_count": "1",
+        }
+    )
+    rows.append(demand_row)
 
     for item in dns_selection["selected"]:
         public_group = str(item["public_group_id"])
@@ -249,6 +301,11 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="Elice selector stdout에서 별도 전달한 selection receipt 파일 SHA-256",
     )
+    parser.add_argument(
+        "--demand-selection-receipt-sha256",
+        required=True,
+        help="Elice DEMAND selector stdout에서 별도 전달한 receipt 파일 SHA-256",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check-only", action="store_true")
     mode.add_argument("--write", action="store_true")
@@ -261,13 +318,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         generation_id = validate_generation_id(args.generation_id)
         dns_receipt_sha = str(args.dns_selection_receipt_sha256).lower()
-        if (
-            len(dns_receipt_sha) != 64
-            or any(character not in "0123456789abcdef" for character in dns_receipt_sha)
+        demand_receipt_sha = str(args.demand_selection_receipt_sha256).lower()
+        for option, value in (
+            ("--dns-selection-receipt-sha256", dns_receipt_sha),
+            ("--demand-selection-receipt-sha256", demand_receipt_sha),
         ):
-            raise ValueError(
-                "--dns-selection-receipt-sha256에는 외부 전달 64자리 SHA-256이 필요합니다"
-            )
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(
+                    f"{option}에는 외부 전달 64자리 SHA-256이 필요합니다"
+                )
         destination = REPO_ROOT / SOURCE_PLAN_ROOT / f"{generation_id}.csv"
         if args.verify_existing:
             snapshot, rows, lineage_sha, selection_evidence = _read_source_plan(
@@ -291,10 +352,31 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "기존 source plan DNS 행이 외부 selection receipt SHA와 다릅니다"
                 )
+            demand_summary = validate_demand_selection_receipt(
+                repo_root=REPO_ROOT,
+                receipt_path=DEMAND_SELECTION_RECEIPT,
+                expected_receipt_sha256=demand_receipt_sha,
+                require_source_files=True,
+            )
+            demand_rows = [
+                row
+                for row in rows
+                if row.get("source_kind")
+                == SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT
+            ]
+            if (
+                len(demand_rows) != 1
+                or demand_rows[0].get("inventory_sha256")
+                != demand_summary["receipt_sha256"]
+            ):
+                raise ValueError(
+                    "기존 source plan DEMAND 행이 외부 selection receipt SHA와 다릅니다"
+                )
         else:
             rows = build_rows(
                 generation_id,
                 dns_selection_receipt_sha256=dns_receipt_sha,
+                demand_selection_receipt_sha256=demand_receipt_sha,
             )
             raw = _render(rows)
             _validate_bytes(raw, generation_id=generation_id)

@@ -52,6 +52,10 @@ _ROLES = frozenset(
         "recorded_manifest",
         "parent_recorded_manifest",
         "recorded_generation",
+        "recorded_level_calibration",
+        "recording_level_campaign",
+        "recording_level_meter_raw",
+        "recording_level_meter_receipt",
         "recorded_source_plan",
         "recorded_source_selection",
         "lineage_tracks",
@@ -75,6 +79,10 @@ _ROLE_PREFIXES = {
     "recorded_manifest": "data/manifests/",
     "parent_recorded_manifest": "data/manifests/",
     "recorded_generation": "data/manifests/recorded_generations/",
+    "recorded_level_calibration": "data/manifests/recorded_level_calibration/",
+    "recording_level_campaign": "results/recording_level_campaigns/",
+    "recording_level_meter_raw": "results/",
+    "recording_level_meter_receipt": "results/",
     "recorded_source_plan": "data/source_plans/recorded_additions/",
     "recorded_source_selection": "data/source_plans/recorded_additions/",
     "lineage_tracks": "data/raw/music/fma_metadata/",
@@ -101,6 +109,7 @@ class RecordedTrainingSnapshot:
     recorded_manifest: FileSnapshot
     recorded_generation: FileSnapshot | None
     recorded_generation_summary: dict[str, Any] | None
+    recorded_level_calibration: FileSnapshot | None
     recorded_aggregate_sha256: str
     recorded_files: dict[str, FileSnapshot]
     recorded_subband_coverage_report: FileSnapshot | None
@@ -405,7 +414,13 @@ def validate_transfer_manifest(
                 root / relative,
                 root=root,
                 label=f"transfer file #{index}",
-                capture_bytes=role in {"recorded_manifest", "level_meter_receipt"},
+                capture_bytes=role
+                in {
+                    "recorded_manifest",
+                    "level_meter_receipt",
+                    "recording_level_campaign",
+                    "recording_level_meter_receipt",
+                },
             )
         except HoldoutContractError as exc:
             raise TransferContractError(str(exc)) from exc
@@ -437,6 +452,10 @@ def validate_transfer_manifest(
             for role in (
                 "parent_recorded_manifest",
                 "recorded_generation",
+                "recorded_level_calibration",
+                "recording_level_campaign",
+                "recording_level_meter_raw",
+                "recording_level_meter_receipt",
                 "recorded_source_plan",
                 "recorded_source_selection",
             )
@@ -452,6 +471,19 @@ def validate_transfer_manifest(
         if len(by_role["recorded_generation"]) != 1 or len(by_role["recorded_source_plan"]) != 1:
             raise TransferContractError(
                 "schema v2 recorded_generation/source_plan role은 각각 정확히 1개여야 합니다"
+            )
+        if len(by_role["recorded_level_calibration"]) != 1:
+            raise TransferContractError(
+                "schema v2 recorded_level_calibration receipt role은 정확히 1개여야 합니다"
+            )
+        campaign_count = len(by_role["recording_level_campaign"])
+        if (
+            campaign_count <= 0
+            or len(by_role["recording_level_meter_raw"]) != campaign_count
+            or len(by_role["recording_level_meter_receipt"]) != campaign_count
+        ):
+            raise TransferContractError(
+                "schema v2 recording-level campaign/raw/receipt role은 같은 양수 개수여야 합니다"
             )
     if by_role["lineage_tracks"] != ["data/raw/music/fma_metadata/tracks.csv"]:
         raise TransferContractError("lineage_tracks role은 canonical FMA tracks.csv 1개여야 합니다")
@@ -569,6 +601,87 @@ def validate_transfer_manifest(
 
     if payload.get("recorded_manifest") != by_role["recorded_manifest"][0]:
         raise TransferContractError("recorded_manifest pointer와 role이 다릅니다")
+    calibration_pointer = payload.get("recorded_level_calibration")
+    calibration_snapshot: FileSnapshot | None = None
+    recording_campaign_pointer = payload.get("recording_level_campaigns")
+    if schema_version == TRANSFER_SCHEMA_VERSION:
+        if calibration_pointer is not None:
+            raise TransferContractError(
+                "schema v1에는 recorded_level_calibration pointer를 넣을 수 없습니다"
+            )
+        if recording_campaign_pointer is not None:
+            raise TransferContractError(
+                "schema v1에는 recording_level_campaigns pointer를 넣을 수 없습니다"
+            )
+    else:
+        if calibration_pointer != by_role["recorded_level_calibration"][0]:
+            raise TransferContractError(
+                "recorded_level_calibration pointer와 role이 다릅니다"
+            )
+        from .recorded_level_calibration import (
+            RecordedLevelCalibrationError,
+            validate_recorded_level_calibration_receipt,
+        )
+
+        calibration_entry = entry_by_path[str(calibration_pointer)]
+        calibration_snapshot = validated_file_snapshots[str(calibration_pointer)]
+        try:
+            calibration = validate_recorded_level_calibration_receipt(
+                root / str(calibration_pointer),
+                expected_sha256=str(calibration_entry["sha256"]),
+                repo_root=root,
+                verify_bound_audio=False,
+                verify_current_commit=True,
+            )
+        except RecordedLevelCalibrationError as exc:
+            raise TransferContractError(
+                f"recorded level calibration receipt 검증 실패: {exc}"
+            ) from exc
+        # ``verify_bound_audio=False``는 4 GiB recorded WAV를 두 번 읽지
+        # 않기 위한 선택이지, receipt가 선언한 audio SHA를 믿으라는
+        # 뜻이 아니다. 이미 위 files loop에서 safe snapshot으로 검증한
+        # role=recorded entry map과 82×2 ref를 exact 대조해 stale/재봉인
+        # calibration receipt가 실제 전송 WAV와 다른 경로를 닫는다.
+        calibration_sessions = calibration.payload.get("sessions")
+        if not isinstance(calibration_sessions, list) or len(calibration_sessions) != 82:
+            raise TransferContractError(
+                "recorded level calibration session ref가 exact 82세션이 아닙니다"
+            )
+        audio_ref_count = 0
+        for session_index, session in enumerate(calibration_sessions):
+            if not isinstance(session, dict):
+                raise TransferContractError(
+                    f"recorded level calibration session #{session_index}가 mapping이 아닙니다"
+                )
+            for field in ("source_aligned", "mics"):
+                ref = session.get(field)
+                if not isinstance(ref, dict) or set(ref) != {"path", "sha256", "size"}:
+                    raise TransferContractError(
+                        "recorded level calibration audio ref schema가 다릅니다: "
+                        f"session={session.get('session_id')!r}, field={field}"
+                    )
+                relative = str(ref.get("path") or "")
+                entry = entry_by_path.get(relative)
+                expected_ref = (
+                    None
+                    if entry is None
+                    else {
+                        "path": entry.get("path"),
+                        "sha256": entry.get("sha256"),
+                        "size": entry.get("size"),
+                    }
+                )
+                if entry is None or entry.get("role") != "recorded" or ref != expected_ref:
+                    raise TransferContractError(
+                        "recorded level calibration audio ref가 transfer recorded bytes와 "
+                        "다릅니다: "
+                        f"session={session.get('session_id')!r}, field={field}, path={relative!r}"
+                    )
+                audio_ref_count += 1
+        if audio_ref_count != 164:
+            raise TransferContractError(
+                "recorded level calibration audio ref는 exact 164개여야 합니다"
+            )
     generation_summary: dict[str, Any] | None = None
     if schema_version == TRANSFER_GENERATION_SCHEMA_VERSION:
         generation_pointer = payload.get("recorded_generation")
@@ -611,24 +724,152 @@ def validate_transfer_manifest(
             raise TransferContractError(
                 "schema v2 combined manifest/source plan이 recorded generation과 다릅니다"
             )
-        source_selection = (
-            additions_summary.get("source_selection", {})
-            .get("external_dns_speech_selection", {})
+        expected_campaigns = additions_summary.get("recording_level_campaigns")
+        if (
+            not isinstance(expected_campaigns, list)
+            or not expected_campaigns
+            or recording_campaign_pointer != expected_campaigns
+        ):
+            raise TransferContractError(
+                "schema v2 recording_level_campaigns pointer가 generation과 다릅니다"
+            )
+        campaign_paths: list[str] = []
+        meter_raw_paths: list[str] = []
+        meter_receipt_paths: list[str] = []
+        seen_campaign_ids: set[str] = set()
+        from .recording_level_campaign import (
+            RecordingLevelCampaignError,
+            validate_recording_level_campaign,
         )
-        expected_selection = sorted(
-            str(item.get("path"))
-            for item in source_selection.get("bundle_files", [])
-            if isinstance(item, dict)
-        ) if isinstance(source_selection, dict) else []
+
+        for index, campaign_ref in enumerate(expected_campaigns):
+            if not isinstance(campaign_ref, dict) or set(campaign_ref) != {
+                "campaign_id",
+                "campaign",
+                "meter_raw",
+                "meter_receipt",
+                "hardware_config",
+            }:
+                raise TransferContractError(
+                    f"schema v2 recording level campaign #{index} summary가 불완전합니다"
+                )
+            campaign_id = campaign_ref.get("campaign_id")
+            if not isinstance(campaign_id, str) or campaign_id in seen_campaign_ids:
+                raise TransferContractError(
+                    "schema v2 recording level campaign_id가 누락/중복됐습니다"
+                )
+            seen_campaign_ids.add(campaign_id)
+            for field in ("campaign", "meter_raw", "meter_receipt", "hardware_config"):
+                ref = campaign_ref.get(field)
+                if (
+                    not isinstance(ref, dict)
+                    or set(ref) != {"path", "size", "sha256"}
+                    or not isinstance(ref.get("path"), str)
+                    or not isinstance(ref.get("sha256"), str)
+                ):
+                    raise TransferContractError(
+                        f"schema v2 recording level campaign #{index} {field} ref 오류"
+                    )
+            campaign_file = campaign_ref["campaign"]
+            meter_raw = campaign_ref["meter_raw"]
+            meter_receipt = campaign_ref["meter_receipt"]
+            hardware_config = campaign_ref["hardware_config"]
+            campaign_paths.append(str(campaign_file["path"]))
+            meter_raw_paths.append(str(meter_raw["path"]))
+            meter_receipt_paths.append(str(meter_receipt["path"]))
+            for ref in (campaign_file, meter_raw, meter_receipt):
+                entry = entry_by_path.get(str(ref["path"]))
+                if (
+                    entry is None
+                    or entry.get("sha256") != ref.get("sha256")
+                    or entry.get("size") != ref.get("size")
+                ):
+                    raise TransferContractError(
+                        "schema v2 recording level campaign transfer path/SHA/size 불일치"
+                    )
+            try:
+                hardware_snapshot = read_regular_file_snapshot(
+                    root / str(hardware_config["path"]),
+                    root=root,
+                    label=f"recording level hardware config #{index}",
+                )
+            except HoldoutContractError as exc:
+                raise TransferContractError(str(exc)) from exc
+            if (
+                hardware_snapshot.sha256 != hardware_config.get("sha256")
+                or hardware_snapshot.size != hardware_config.get("size")
+            ):
+                raise TransferContractError(
+                    "schema v2 recording level hardware config SHA/size 불일치"
+                )
+            try:
+                campaign_summary = validate_recording_level_campaign(
+                    repo_root=root,
+                    campaign_receipt=str(campaign_file["path"]),
+                    expected_sha256=str(campaign_file["sha256"]),
+                    require_fresh=False,
+                )
+            except (OSError, RecordingLevelCampaignError, ValueError) as exc:
+                raise TransferContractError(
+                    f"schema v2 recording level campaign 재검증 실패: {exc}"
+                ) from exc
+            campaign_payload = campaign_summary["payload"]
+            if (
+                campaign_summary.get("campaign_id") != campaign_id
+                or campaign_payload.get("meter", {}).get("raw") != meter_raw
+                or campaign_payload.get("meter", {}).get("receipt") != meter_receipt
+                or campaign_payload.get("hardware", {}).get("config")
+                != hardware_config
+            ):
+                raise TransferContractError(
+                    "schema v2 recording level campaign refs가 campaign JSON에서 재유도되지 않습니다"
+                )
+        if (
+            sorted(campaign_paths) != sorted(by_role["recording_level_campaign"])
+            or sorted(meter_raw_paths)
+            != sorted(by_role["recording_level_meter_raw"])
+            or sorted(meter_receipt_paths)
+            != sorted(by_role["recording_level_meter_receipt"])
+        ):
+            raise TransferContractError(
+                "schema v2 recording-level campaign/raw/receipt role exact 집합이 generation과 다릅니다"
+            )
+        source_selections = additions_summary.get("source_selection", {})
+        if not isinstance(source_selections, dict):
+            raise TransferContractError(
+                "schema v2 recorded source selection summary가 mapping이 아닙니다"
+            )
+        selection_kinds = (
+            "external_dns_speech_selection",
+            "external_demand_environment_selection",
+        )
+        selection_refs: dict[str, Any] = {}
+        for selection_kind in selection_kinds:
+            source_selection = source_selections.get(selection_kind)
+            if source_selection is None:
+                continue
+            if not isinstance(source_selection, dict) or not isinstance(
+                source_selection.get("bundle_files"), list
+            ):
+                raise TransferContractError(
+                    f"schema v2 {selection_kind} bundle summary가 유효하지 않습니다"
+                )
+            for ref in source_selection["bundle_files"]:
+                if not isinstance(ref, dict) or not isinstance(ref.get("path"), str):
+                    raise TransferContractError(
+                        f"schema v2 {selection_kind} bundle ref가 유효하지 않습니다"
+                    )
+                ref_path = str(ref["path"])
+                if ref_path in selection_refs:
+                    raise TransferContractError(
+                        "schema v2 source selection bundle path가 selection 간 중복됩니다"
+                    )
+                selection_refs[ref_path] = ref
+        expected_selection = sorted(selection_refs)
         if sorted(by_role["recorded_source_selection"]) != expected_selection:
             raise TransferContractError(
-                "schema v2 recorded_source_selection role이 generation DNS bundle과 다릅니다"
+                "schema v2 recorded_source_selection role이 generation bundle union과 다릅니다"
             )
-        selection_refs = {
-            str(item.get("path")): item
-            for item in source_selection.get("bundle_files", [])
-            if isinstance(item, dict)
-        } if isinstance(source_selection, dict) else {}
         for path in expected_selection:
             entry = next(
                 (item for item in entries if str(item.get("path")) == path),
@@ -641,7 +882,7 @@ def validate_transfer_manifest(
                 or entry.get("size") != ref.get("size")
             ):
                 raise TransferContractError(
-                    "schema v2 DNS selection bundle path/SHA/size가 generation과 다릅니다"
+                    "schema v2 source selection bundle path/SHA/size가 generation과 다릅니다"
                 )
     if payload.get("lineage_tracks") != by_role["lineage_tracks"][0]:
         raise TransferContractError("lineage_tracks pointer와 role이 다릅니다")
@@ -857,6 +1098,15 @@ def validate_transfer_manifest(
             else validated_file_snapshots[by_role["recorded_generation"][0]]
         ),
         "_validated_recorded_generation_summary": generation_summary,
+        "recorded_level_calibration": (
+            None
+            if calibration_snapshot is None
+            else {
+                "path": str(calibration_pointer),
+                "sha256": calibration_snapshot.sha256,
+            }
+        ),
+        "_validated_recorded_level_calibration_snapshot": calibration_snapshot,
         "_validated_recorded_file_snapshots": {
             str(entry["path"]): validated_file_snapshots[str(entry["path"])]
             for entry in recorded_entries
@@ -1155,6 +1405,9 @@ def bind_recorded_transfer_config(
     recorded_generation_summary = summary.get(
         "_validated_recorded_generation_summary"
     )
+    recorded_level_calibration_snapshot = summary.get(
+        "_validated_recorded_level_calibration_snapshot"
+    )
     declared_generation = data_cfg.get("recorded_generation")
     declared_generation_sha = data_cfg.get("recorded_generation_sha256")
     if isinstance(recorded_generation_snapshot, FileSnapshot):
@@ -1182,6 +1435,42 @@ def bind_recorded_transfer_config(
         raise TransferContractError(
             "schema v1 transfer에 data.recorded_generation 선언을 결합할 수 없습니다"
         )
+    declared_calibration = data_cfg.get("recorded_level_calibration")
+    declared_calibration_sha = data_cfg.get("recorded_level_calibration_sha256")
+    if isinstance(recorded_level_calibration_snapshot, FileSnapshot):
+        calibration_relative = (
+            recorded_level_calibration_snapshot.path.relative_to(root).as_posix()
+        )
+        if declared_calibration in (None, "") and declared_calibration_sha in (None, ""):
+            # generation과 같은 transfer trust chain에서 두 필드를 한 번에 만든다.
+            # path만 또는 SHA만 사용자가 채운 상태는 아래에서 실패 폐쇄한다.
+            data_cfg["recorded_level_calibration"] = calibration_relative
+            data_cfg["recorded_level_calibration_sha256"] = (
+                recorded_level_calibration_snapshot.sha256
+            )
+        elif declared_calibration in (None, "") or declared_calibration_sha in (None, ""):
+            raise TransferContractError(
+                "schema v2 recorded_level_calibration path/SHA는 둘 다 비우거나 "
+                "둘 다 exact여야 합니다"
+            )
+        elif (
+            declared_calibration != calibration_relative
+            or declared_calibration_sha != recorded_level_calibration_snapshot.sha256
+        ):
+            raise TransferContractError(
+                "schema v2 transfer의 data.recorded_level_calibration/path SHA가 "
+                "검증값과 다릅니다: "
+                f"expected=({calibration_relative},"
+                f"{recorded_level_calibration_snapshot.sha256}), "
+                f"declared=({declared_calibration},{declared_calibration_sha})"
+            )
+    elif declared_calibration not in (None, "") or declared_calibration_sha not in (
+        None,
+        "",
+    ):
+        raise TransferContractError(
+            "schema v1 transfer에 data.recorded_level_calibration 선언을 결합할 수 없습니다"
+        )
     if (
         not isinstance(manifest_snapshot, FileSnapshot)
         or not isinstance(recorded_manifest_snapshot, FileSnapshot)
@@ -1204,6 +1493,11 @@ def bind_recorded_transfer_config(
         recorded_generation_summary=(
             dict(recorded_generation_summary)
             if isinstance(recorded_generation_summary, dict)
+            else None
+        ),
+        recorded_level_calibration=(
+            recorded_level_calibration_snapshot
+            if isinstance(recorded_level_calibration_snapshot, FileSnapshot)
             else None
         ),
         recorded_aggregate_sha256=aggregate,

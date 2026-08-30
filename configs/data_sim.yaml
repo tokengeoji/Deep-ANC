@@ -8,10 +8,17 @@ segment_seconds: 1.5
 # 실수로 로컬/부분 전송 데이터를 공식 입력으로 쓰지 못하게 하는 fail-closed 값이다.
 bootstrap_receipt: data/manifests/elice_bootstrap_receipt.json
 bootstrap_receipt_sha256: null
-# 82-only transfer schema v1에서는 둘 다 null이다. 추가 17세션을 승격한 schema v2는
+# 82-only transfer schema v1에서는 둘 다 null이다. 추가 19세션을 승격한 schema v2는
 # generation.json의 transfer-검증된 exact path/SHA를 CLI로 함께 주입해야 한다.
 recorded_generation: null
 recorded_generation_sha256: null
+
+# old82 source_aligned→ERR의 물리 레벨을 current strict P 단위에 맞춘 train-only
+# receipt. 공식 measured_probe/fine-tune은 CLI에서 path와 외부 SHA를 함께 주입해야
+# 하며 null이면 run directory 생성 전에 차단된다.
+recorded_level_calibration: null
+recorded_level_calibration_sha256: null
+recorded_current_strict_min_fraction: 0.5
 
 # 레퍼런스 모드 [교차검증 C2 — 두 모드의 지연 물리가 다르다]
 #   digital : 소음원을 Jetson이 생성 → 출력버퍼 지연이 소음/상쇄 양경로에 공통 → 광대역 상쇄 가능
@@ -48,7 +55,7 @@ recorded_lead_mode: timeline
 # 계열→공유 출처의 transitive lineage component→세션을 각 단계에서 균등 추첨한다.
 # 이 모드에서는 regrouped manifest의 source_family/group_id와, 원래 pool 그룹을
 # 보존한 source_pool_group_id가 모두 필수다.
-recorded_sampling: family_lineage_session_balanced
+recorded_sampling: family_plant_domain_component_session_balanced
 
 # 실측 세션 반복 노출을 줄이는 1차 안전 증강. x_ref와 d에 같은 gain/polarity/EQ를
 # 적용하고 마이크 잡음은 모델 입력에만 넣는다. 세션 혼합과 lead jitter는 LTI/시간축

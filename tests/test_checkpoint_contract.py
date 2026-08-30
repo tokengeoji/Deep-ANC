@@ -158,7 +158,7 @@ def _load_bound_canonical(
             data.update(
                 recorded_generation=(
                     "data/manifests/recorded_generations/"
-                    "highband-coverage-v1/generation.json"
+                    "stage1-coverage-v2/generation.json"
                 ),
                 recorded_generation_sha256="d" * 64,
             )
@@ -684,7 +684,7 @@ def test_measured_primary_five_k_probe_is_an_explicit_distinct_contract():
             ],
             (
                 "data/manifests/recorded_generations/"
-                "highband-coverage-v1/recorded.jsonl"
+                "stage1-coverage-v2/recorded.jsonl"
             ),
         ),
         (
@@ -692,7 +692,7 @@ def test_measured_primary_five_k_probe_is_an_explicit_distinct_contract():
             ["data.digital_primary_path_mode=measured"],
             (
                 "data/manifests/recorded_generations/"
-                "highband-coverage-v1/recorded.jsonl"
+                "stage1-coverage-v2/recorded.jsonl"
             ),
         ),
     ],
@@ -709,7 +709,7 @@ def test_schema2_bootstrap_atomically_resolves_all_official_role_manifests(
     )
     assert cfg["data"]["recorded_generation"] == (
         "data/manifests/recorded_generations/"
-        "highband-coverage-v1/generation.json"
+        "stage1-coverage-v2/generation.json"
     )
     assert cfg["data"]["recorded_generation_sha256"] == "d" * 64
     assert cfg.get("recorded_manifest") == expected_recorded_manifest
@@ -1186,7 +1186,7 @@ def test_pilot_or_ineligible_checkpoint_cannot_initialize_official_finetune(
         ("contract_run_dir=false", "contract_run_dir=true"),
         (
             "data.recorded_sampling=uniform_session",
-            "family_lineage_session_balanced",
+            "family_plant_domain_component_session_balanced",
         ),
     ],
 )

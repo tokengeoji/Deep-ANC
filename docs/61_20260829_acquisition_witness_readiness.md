@@ -1,5 +1,11 @@
 # 2026-08-29 실제 acquisition witness readiness 감사
 
+> [!CAUTION]
+> 이 문서는 2026-08-29 장치 inventory와 당시 17/99 수집 계획의 역사 감사다. 현행
+> `stage1-coverage-v2`는 19 additions/101 combined이며
+> [recorded generation 계약](17_recorded_generation.md)과 `HANDOFF.md` §0.15가 수량·실행
+> authority다. 아래 하드웨어 결론은 유지되지만 17/99를 현재 명령에 복사하지 않는다.
+
 이 문서는 현재 Jetson의 실제 ALSA 장치와 repository의 fail-closed gate를 함께
 대조한 기록이다. 정적 설정 파일이 존재한다는 사실을 하드웨어 통과로 읽지 않으며,
 스피커 출력·ALSA PCM open·믹서 변경은 수행하지 않았다.

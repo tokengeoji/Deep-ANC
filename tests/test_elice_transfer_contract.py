@@ -17,7 +17,10 @@ import numpy as np
 import soundfile as sf
 
 import deep_anc.data.transfer_contract as transfer_contract
-from deep_anc.data.holdout_contract import snapshot_regular_tree_metadata
+from deep_anc.data.holdout_contract import (
+    read_regular_file_snapshot,
+    snapshot_regular_tree_metadata,
+)
 from deep_anc.data.transfer_contract import (
     TransferContractError,
     _canonical_recorded_aggregate,
@@ -480,6 +483,106 @@ def test_builder_scans_recorded_and_publishes_no_replace_canonical_json(
         builder._publish_no_replace(manifest, data + b" ", repo_root=tmp_path)
 
 
+def test_builder_rotates_schema_v1_to_v2_with_content_addressed_history(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    manifest = tmp_path / builder.OUTPUT
+    manifest.parent.mkdir(parents=True)
+    old = b'{"schema_version":1}\n'
+    new = b'{"schema_version":2}\n'
+    old_sha = hashlib.sha256(old).hexdigest()
+    manifest.write_bytes(old)
+
+    def validate(path, *, repo_root, expected_sha256):
+        payload = Path(path).read_bytes()
+        assert hashlib.sha256(payload).hexdigest() == expected_sha256
+        assert Path(repo_root) == tmp_path
+        return {}
+
+    monkeypatch.setattr(builder, "validate_transfer_manifest", validate)
+    builder._publish_no_replace(
+        manifest,
+        new,
+        repo_root=tmp_path,
+        rotate_existing_sha256=old_sha,
+    )
+
+    history = (
+        tmp_path
+        / builder.TRANSFER_HISTORY_DIR
+        / f"elice_transfer_manifest.{old_sha}.json"
+    )
+    assert manifest.read_bytes() == new
+    assert history.read_bytes() == old
+
+
+def test_builder_rotation_requires_exact_old_sha_and_v1_to_v2_transition(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    manifest = tmp_path / builder.OUTPUT
+    manifest.parent.mkdir(parents=True)
+    old = b'{"schema_version":1}\n'
+    manifest.write_bytes(old)
+    old_sha = hashlib.sha256(old).hexdigest()
+    monkeypatch.setattr(builder, "validate_transfer_manifest", lambda *a, **k: {})
+
+    with pytest.raises(TransferContractError, match="회전 anchor"):
+        builder._publish_no_replace(
+            manifest,
+            b'{"schema_version":2}\n',
+            repo_root=tmp_path,
+            rotate_existing_sha256="0" * 64,
+        )
+    assert manifest.read_bytes() == old
+
+    with pytest.raises(TransferContractError, match="v1→v2"):
+        builder._publish_no_replace(
+            manifest,
+            b'{"schema_version":1,"changed":true}\n',
+            repo_root=tmp_path,
+            rotate_existing_sha256=old_sha,
+        )
+    assert manifest.read_bytes() == old
+    assert not (tmp_path / builder.TRANSFER_HISTORY_DIR).exists()
+
+
+def test_builder_rotation_keeps_v1_canonical_if_new_bundle_validation_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    manifest = tmp_path / builder.OUTPUT
+    manifest.parent.mkdir(parents=True)
+    old = b'{"schema_version":1}\n'
+    new = b'{"schema_version":2}\n'
+    old_sha = hashlib.sha256(old).hexdigest()
+    manifest.write_bytes(old)
+
+    def validate(path, *, repo_root, expected_sha256):
+        del repo_root, expected_sha256
+        if Path(path).read_bytes() == new:
+            raise TransferContractError("injected new schema validation failure")
+        return {}
+
+    monkeypatch.setattr(builder, "validate_transfer_manifest", validate)
+    with pytest.raises(TransferContractError, match="injected"):
+        builder._publish_no_replace(
+            manifest,
+            new,
+            repo_root=tmp_path,
+            rotate_existing_sha256=old_sha,
+        )
+
+    history = (
+        tmp_path
+        / builder.TRANSFER_HISTORY_DIR
+        / f"elice_transfer_manifest.{old_sha}.json"
+    )
+    assert manifest.read_bytes() == old
+    assert history.read_bytes() == old
+
+
 def test_recorded_config_binder_injects_only_validated_transfer_aggregate(
     tmp_path: Path,
 ) -> None:
@@ -497,6 +600,110 @@ def test_recorded_config_binder_injects_only_validated_transfer_aggregate(
     assert snapshot.bootstrap_receipt is None
     data_cfg["recorded_transfer_aggregate_sha256"] = "0" * 64
     with pytest.raises(TransferContractError, match="검증된 transfer manifest"):
+        bind_recorded_transfer_config(data_cfg, repo_root=tmp_path)
+
+
+def _schema_v2_binding_summary(root: Path) -> tuple[dict[str, object], dict[str, str]]:
+    paths = {
+        "transfer": "data/manifests/elice_transfer_manifest.json",
+        "manifest": "data/manifests/recorded_regrouped_101.jsonl",
+        "generation": "data/manifests/recorded_generations/fixture/generation.json",
+        "calibration": "data/manifests/recorded_level_calibration/fixture.json",
+        "recorded": "data/recorded/session-000/session.json",
+    }
+    for name, relative in paths.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"fixture-{name}\n".encode("utf-8"))
+
+    def snapshot(name: str):
+        return read_regular_file_snapshot(
+            root / paths[name], root=root, label=f"fixture {name}"
+        )
+
+    recorded_snapshot = snapshot("recorded")
+    return (
+        {
+            "recorded_aggregate_sha256": "a" * 64,
+            "canonical_holdout_sha256": "b" * 64,
+            "_validated_transfer_manifest_snapshot": snapshot("transfer"),
+            "_validated_recorded_manifest_snapshot": snapshot("manifest"),
+            "_validated_recorded_generation_snapshot": snapshot("generation"),
+            "_validated_recorded_generation_summary": {"fixture": True},
+            "_validated_recorded_level_calibration_snapshot": snapshot(
+                "calibration"
+            ),
+            "_validated_recorded_file_snapshots": {
+                paths["recorded"]: recorded_snapshot
+            },
+        },
+        paths,
+    )
+
+
+def test_schema_v2_binder_materializes_transfer_validated_level_calibration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    summary, paths = _schema_v2_binding_summary(tmp_path)
+    transfer_snapshot = summary["_validated_transfer_manifest_snapshot"]
+    monkeypatch.setattr(
+        transfer_contract,
+        "validate_transfer_manifest",
+        lambda *args, **kwargs: summary,
+    )
+    data_cfg = {
+        "transfer_manifest": paths["transfer"],
+        "transfer_manifest_sha256": transfer_snapshot.sha256,
+        "recorded_generation": None,
+        "recorded_generation_sha256": None,
+        "recorded_level_calibration": None,
+        "recorded_level_calibration_sha256": None,
+    }
+
+    snapshot = bind_recorded_transfer_config(data_cfg, repo_root=tmp_path)
+
+    calibration_snapshot = summary[
+        "_validated_recorded_level_calibration_snapshot"
+    ]
+    assert snapshot.recorded_level_calibration == calibration_snapshot
+    assert data_cfg["recorded_level_calibration"] == paths["calibration"]
+    assert data_cfg["recorded_level_calibration_sha256"] == (
+        calibration_snapshot.sha256
+    )
+
+
+@pytest.mark.parametrize(
+    ("declared_path", "declared_sha", "message"),
+    [
+        ("data/manifests/recorded_level_calibration/fixture.json", None, "둘 다"),
+        (None, "0" * 64, "둘 다"),
+        ("data/manifests/recorded_level_calibration/other.json", "0" * 64, "검증값"),
+    ],
+)
+def test_schema_v2_binder_rejects_partial_or_mismatched_level_calibration(
+    tmp_path: Path,
+    monkeypatch,
+    declared_path: str | None,
+    declared_sha: str | None,
+    message: str,
+) -> None:
+    summary, paths = _schema_v2_binding_summary(tmp_path)
+    transfer_snapshot = summary["_validated_transfer_manifest_snapshot"]
+    monkeypatch.setattr(
+        transfer_contract,
+        "validate_transfer_manifest",
+        lambda *args, **kwargs: summary,
+    )
+    data_cfg = {
+        "transfer_manifest": paths["transfer"],
+        "transfer_manifest_sha256": transfer_snapshot.sha256,
+        "recorded_generation": None,
+        "recorded_generation_sha256": None,
+        "recorded_level_calibration": declared_path,
+        "recorded_level_calibration_sha256": declared_sha,
+    }
+
+    with pytest.raises(TransferContractError, match=message):
         bind_recorded_transfer_config(data_cfg, repo_root=tmp_path)
 
 

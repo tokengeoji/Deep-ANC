@@ -5,12 +5,32 @@ canonical 데이터 계약과 환경만 준비하며 학습을 자동 시작하�
 실행과 `pretrain_*_corrected`는 150–600 Hz/legacy plant 진단 기록이라 init·resume·성능
 근거로 사용하지 않는다.
 
+## 0. 유일한 운영 진입점
+
+새 Elice 인스턴스의 **유일한 권위 진입점**은
+`scripts/elice/bootstrap_all.sh`다. full bootstrap은 신뢰 채널에서 따로 전달받은 다음 네
+항목을 모두 명시해야 하며, branch 이름·축약 SHA·원격 working tree의 값으로 대신하지 않는다.
+
+- `--expected-commit <40자리_SHA>`
+- `--expected-holdout-sha256 <64자리_SHA256>`
+- `--expected-transfer-manifest-sha256 <64자리_SHA256>`
+- `--no-update`
+
+`scripts/elice/bootstrap.sh`는 호환용 wrapper가 아니라 **폐기된 legacy 진입점**이다. 인자 없음,
+`--train`, 그 밖의 어떤 인자로 실행해도 항상 `exit 2`로 끝나는 fail-closed stub이며 환경 준비나
+학습을 시작하지 않는다. 파일을 복구하거나 과거 commit의 내용을 복사해 되살리지 않는다.
+
+`bootstrap_all.sh --preflight-only`는 exact checkout과 canonical holdout bundle까지만
+read-only 검증한다. 이 성공은 transfer manifest, A100/스토리지, venv, public raw, decoder
+audit 또는 readiness 성공을 뜻하지 않는다. full bootstrap만 transfer 외부 SHA anchor와
+하드웨어를 먼저 검사한 뒤 환경·데이터를 준비하며, full bootstrap도 학습은 시작하지 않는다.
+
 ## 1. 필요한 인스턴스
 
 | 항목 | 최소 계약 |
 |---|---|
-| GPU | A100 80GB 1장 |
-| 저장공간 | 가용 128 GiB 이상 |
+| GPU | 이름이 `NVIDIA A100`으로 시작하고 usable VRAM이 79 GiB 이상인 80GB 1장(MIG partition 불가) |
+| 저장공간 | 파일시스템 총 127.875 GiB 이상; 미완성 corpus 최초 bootstrap은 가용 96 GiB 이상 |
 | 학습 환경 | torch `2.5.1+cu121`, CUDA runtime 12.1 |
 | 공식 world size | 1 |
 
@@ -28,15 +48,45 @@ Elice로 가기 전에 Jetson에서 다음을 완료한다.
 
 1. 전체 pytest와 무음 측정 dry-run
 2. historical source CSV 복구와 160 WAV 불변성 검증
-3. active 82세션 holdout과 lineage-component regrouped split
+3. parent 82세션 holdout과 lineage-component regrouped split 보존
 4. 사용자 입회 strict P/S 측정과 raw/analysis/NPZ 보존
-5. clean exact commit과 push
+5. 모든 tracked 코드·config·문서 변경을 review/commit/push하고 clean exact commit 고정
+6. 그 exact commit에서 DNS/DEMAND selector와 source plan을 새로 발행하고 추가 19세션 QA PASS,
+   combined 101세션 generation/manifest no-replace 발행
+7. old82 train-only strict-P level calibration receipt를 발행하고 같은 commit/generation으로
+   transfer schema v2 발행
 
-strict P/S가 없거나 legacy P/S만 있으면 transfer manifest를 만들지 않는다. 준비된 뒤 다음처럼
-canonical transfer manifest를 만든다. 실제 capture가 만든 파일을 모두 열거해야 한다.
+5번 뒤에는 tracked 파일을 한 byte도 바꾸지 않는다. commit이 달라지면 이전 DNS/DEMAND selector,
+source plan, recorded generation과 transfer manifest는 새 commit의 증거가 될 수 없으므로 selector부터
+다시 발행한다. data artifact의 SHA를 새 commit 문자열로 바꾸는 재봉인은 금지한다.
+
+strict P/S가 없거나 legacy P/S만 있으면 transfer manifest를 만들지 않는다. parent 82만 담은
+schema v1도 새 학습의 입력이 아니다. 추가 19세션을 봉인한 generation을 먼저 검증한 뒤 다음처럼
+**schema v2** transfer manifest를 만든다. 실제 capture가 만든 파일을 모두 열거해야 한다.
 
 ```bash
 EXPECTED_HOLDOUT_SHA256=$(sha256sum data/manifests/recorded_holdout.json | awk '{print $1}')
+RECORDED_GENERATION=data/manifests/recorded_generations/<generation-id>/generation.json
+EXACT_COMMIT=$(git rev-parse HEAD)
+RECORDED_LEVEL_CALIBRATION="data/manifests/recorded_level_calibration/${EXACT_COMMIT}.json"
+
+.venv/bin/python scripts/data/build_recorded_level_calibration.py \
+  --out "$RECORDED_LEVEL_CALIBRATION"
+```
+
+calibration builder는 clean tree와 전체 40자리 HEAD를 다시 검사하고 output을 canonical
+directory 아래 no-replace로만 발행한다. stdout의 SHA-256을 별도 anchor로 보존한다. 기존 파일을
+삭제하거나 덮어써 같은 경로를 새 분석으로 재사용하지 않는다.
+
+builder는 출력 경로를 `data/manifests/elice_transfer_manifest.json`으로 고정하고 기본 동작에서는
+다른 bytes를 자동 overwrite하지 않는다. 기존 schema v1을 schema v2로 바꿀 때만 Jetson의 clean
+`dev`에서 기존 SHA를 외부 anchor로 명시한다. builder는 기존 schema v1 전체를 먼저 검증하고
+`data/manifests/elice_transfer_history/elice_transfer_manifest.<old-sha>.json`에 content-addressed
+hard-link를 보존한 뒤, 새 schema v2 전체 검증이 끝나야 canonical 경로를 원자 교체한다.
+
+```bash
+CURRENT=data/manifests/elice_transfer_manifest.json
+OLD_TRANSFER_SHA256=$(sha256sum "$CURRENT" | awk '{print $1}')
 
 .venv/bin/python scripts/data/build_elice_transfer_manifest.py \
   --rir-bank data/rir_bank/duct_rirs_v1.npz \
@@ -46,15 +96,39 @@ EXPECTED_HOLDOUT_SHA256=$(sha256sum data/manifests/recorded_holdout.json | awk '
   --strict-analysis results/<capture>/analysis_metadata.json \
   --primary-npz assets/measured/primary_path_il_strict_<capture-id>.npz \
   --secondary-npz assets/measured/secondary_path_il_strict_<capture-id>.npz \
-  --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256"
+  --recorded-generation "$RECORDED_GENERATION" \
+  --recorded-level-calibration "$RECORDED_LEVEL_CALIBRATION" \
+  --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
+  --rotate-existing-transfer-sha256 "$OLD_TRANSFER_SHA256"
 
-EXPECTED_TRANSFER_MANIFEST_SHA256=$(sha256sum \
-  data/manifests/elice_transfer_manifest.json | awk '{print $1}')
+test -f "$CURRENT"
+test -f "data/manifests/elice_transfer_history/elice_transfer_manifest.${OLD_TRANSFER_SHA256}.json"
+test "$(sha256sum \
+  "data/manifests/elice_transfer_history/elice_transfer_manifest.${OLD_TRANSFER_SHA256}.json" \
+  | awk '{print $1}')" = "$OLD_TRANSFER_SHA256"
+test "$(.venv/bin/python -I -B - "$CURRENT" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "rb") as handle:
+    print(json.load(handle).get("schema_version"))
+PY
+)" = 2
+
+EXPECTED_TRANSFER_MANIFEST_SHA256=$(sha256sum "$CURRENT" | awk '{print $1}')
 ```
+
+위에서 고정한 exact commit을 유지한다. data tree의 generation/schema-v2 manifest와 보존한
+schema-v1 archive는 Git 외부 immutable artifact로 함께
+백업하되, Elice에는 canonical v2 경로와 그 manifest가 열거한 파일만 전송한다. 회전 anchor가
+다르거나 old/new 전체 검증이 실패하면 builder가 canonical v1을 보존하고 실패해야 한다. history를
+지우거나 schema v1 bytes를 수정해 v2처럼 보이게 하거나 Elice의 schema v1 receipt를 재봉인하지
+않는다. 기존 canonical 파일이 없는 최초 schema-v2 발행에는 회전 옵션을 지정하지 않는다.
 
 manifest가 결속하는 범위:
 
-- `data/recorded/`의 82세션 전체 파일 byte와 aggregate SHA
+- parent `data/recorded/` 82세션과 별도 additions 19세션의 전체 파일 byte 및 combined aggregate SHA
+- 101세션 combined manifest, source plan과 recorded generation report
+- fresh recording-level campaign/meter raw/receipt와 old82 strict-P level calibration receipt
 - `data/rir_bank/duct_rirs_v1.npz`
 - strict P/S raw, metadata, analysis, primary/secondary NPZ
 - `data/manifests/recorded_regrouped.jsonl`
@@ -77,7 +151,8 @@ git clone https://github.com/tokengeoji/Deep-ANC.git
 cd Deep-ANC
 git checkout --detach "$EXPECTED_COMMIT"
 
-# 먼저 다운로드와 venv 생성 없이 코드+bundle만 검증
+# 먼저 다운로드와 venv 생성 없이 코드+holdout bundle만 검증.
+# transfer/GPU/storage 검증은 아직 아니다.
 bash scripts/elice/bootstrap_all.sh \
   --expected-commit "$EXPECTED_COMMIT" \
   --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
@@ -99,8 +174,12 @@ bash scripts/elice/bootstrap_all.sh \
 - replace/graft, assume-unchanged/skip-worktree, tracked blob byte 불일치
 - holdout/provenance/CSV/transfer SHA 또는 schema 불일치
 - symlink·비정규 파일·검증 도중 파일 변경
-- recorded 82세션 aggregate, strict P/S, RIR, lineage metadata 누락
-- A100 80GB/가용 128GiB/torch·CUDA 환경 계약 불일치
+- recorded generation 101세션 aggregate, strict P/S, RIR, lineage/level metadata 누락
+- full A100 80GB, 파일시스템 total/available budget, torch·CUDA 환경 계약 불일치
+
+`--preflight-only`가 transfer SHA 인자를 파싱하더라도 그 단계에서는 transfer bytes나 하드웨어를
+검증하지 않는다. 반드시 같은 네 anchor로 full bootstrap을 끝내고
+`data/manifests/elice_bootstrap_receipt.json`을 얻어야 다음 단계로 갈 수 있다.
 
 ### 3.0.1 Elice 실패 복구와 재발 방지
 
@@ -139,7 +218,10 @@ bootstrap 단계와 실패 시 행동은 다음처럼 고정한다.
 preflight가 PASS한 경우에만 verified count와 외부 decoder SHA를 사용해 cache를 재사용한다.
 각 실행 log에는 commit을 파일명으로 넣고, `HANDOFF.md`에 실패 단계·node·log 경로·재사용한
 bytes·다음 명령을 기록한다. bootstrap receipt가 발행된 뒤에만 같은 SHA로 DNS selector를
-발행하고, 그 receipt를 Jetson source plan의 외부 anchor로 전달한다.
+발행하고, 같은 pre-exclusion public generation에서 DEMAND DKITCHEN selector도 발행한다.
+두 receipt SHA를 각각 stdout와 별도 전달 채널로 Jetson source plan의 외부 anchor로
+전달한다. selector의 exact 명령과 immutable bundle 구성은 `docs/17_recorded_generation.md`
+§4를 따른다. 둘 중 하나만 발행된 source plan은 canonical 19행이 아니다.
 
 긴 다운로드의 직전과 직후에도 code와 transfer bundle을 다시 검증한다. bootstrap 잠금은 동시
 데이터 준비를 차단하며, 실행 중인 `train.py`가 있으면 manifest를 건드리지 않는다.
@@ -228,6 +310,14 @@ bootstrap receipt가 나오기 전에는 현재 점수를 확정하지 않는다
 speech lineage를 독립 원본으로 복구해 **15/17 PASS**를 확인한다. 다음으로 부족 family×대역을
 추가 녹음해 coverage PASS인 **16/17 PASS**를 확인한다. 이 순서를 모두
 마친 뒤에만 G0를 시작하며, 그보다 적거나 coverage가 FAIL이면 학습을 시작하지 않는다.
+
+단, 비용이 발생하는 새 GPU의 kernel/VRAM/처리량/중단·재개 경로만 조기에 확인하는
+`a100_pretrain_smoke`는 15/17 상태에서 200--500 step으로 병렬 실행할 수 있다. 이 예외는
+`init_eligible=false`인 diagnostic-only이며 G0, loss 후보 점수, checkpoint 전이, test 또는
+readiness PASS로 사용할 수 없다. DKITCHEN selection receipt가 이미 존재한다면 public
+DEMAND 16행 exclusion과 새 manifest sidecar가 먼저 검증돼야 smoke도 열린다. selector 발행
+전 82세션 상태에서 시작한 smoke는 500 step을 넘기지 않고, 101세션 canonical 학습의 데이터
+또는 성능 근거로 승격하지 않는다.
 
 ## 5. 사전학습 계약 선택
 

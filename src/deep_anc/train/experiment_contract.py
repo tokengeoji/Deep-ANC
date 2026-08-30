@@ -131,6 +131,7 @@ def _artifact_paths(cfg: dict, root: Path) -> dict[str, Path]:
         ("primary_path", None if causal is not None else digital.get("primary_path_npz")),
         ("rir_bank", data.get("rir_bank")),
         ("recorded_manifest", cfg.get("recorded_manifest")),
+        ("recorded_level_calibration", data.get("recorded_level_calibration")),
         ("bootstrap_receipt", data.get("bootstrap_receipt")),
         ("transfer_manifest", data.get("transfer_manifest")),
         (

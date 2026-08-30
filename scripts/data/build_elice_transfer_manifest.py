@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
+import re
+import stat
 import tempfile
 from pathlib import Path, PurePosixPath
 
@@ -35,9 +38,15 @@ from deep_anc.data.recorded_generation import (  # noqa: E402
     RecordedGenerationError,
     validate_recorded_generation,
 )
+from deep_anc.data.recorded_level_calibration import (  # noqa: E402
+    RecordedLevelCalibrationError,
+    validate_recorded_level_calibration_receipt,
+)
 
 
 OUTPUT = "data/manifests/elice_transfer_manifest.json"
+TRANSFER_HISTORY_DIR = "data/manifests/elice_transfer_history"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _level_meter_support(
@@ -326,6 +335,31 @@ def _build_payload_v1(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
 
 
 def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str, object]:
+    calibration_arg = getattr(args, "recorded_level_calibration", None)
+    if not calibration_arg:
+        raise TransferContractError(
+            "schema-v2 transfer에는 --recorded-level-calibration이 필요합니다"
+        )
+    calibration_relative = _relative(
+        str(calibration_arg),
+        field="recorded_level_calibration",
+        prefix="data/manifests/recorded_level_calibration/",
+    )
+    calibration_entry = _entry(
+        calibration_relative, "recorded_level_calibration", repo_root=repo_root
+    )
+    try:
+        validate_recorded_level_calibration_receipt(
+            repo_root / calibration_relative,
+            expected_sha256=str(calibration_entry["sha256"]),
+            repo_root=repo_root,
+            verify_bound_audio=False,
+            verify_current_commit=True,
+        )
+    except RecordedLevelCalibrationError as exc:
+        raise TransferContractError(
+            f"recorded level calibration receipt 검증 실패: {exc}"
+        ) from exc
     generation_relative = _relative(
         args.recorded_generation,
         field="recorded_generation",
@@ -386,34 +420,107 @@ def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
             _entry(combined_manifest, "recorded_manifest", repo_root=repo_root),
             _entry(generation_relative, "recorded_generation", repo_root=repo_root),
             _entry(source_plan, "recorded_source_plan", repo_root=repo_root),
+            calibration_entry,
         ]
     )
-    source_selection = (
-        additions.get("source_selection", {})
-        .get("external_dns_speech_selection", {})
-    )
-    selection_refs = (
-        source_selection.get("bundle_files", [])
-        if isinstance(source_selection, dict)
-        else []
-    )
-    for index, ref in enumerate(selection_refs):
+    level_campaigns = additions.get("recording_level_campaigns")
+    if not isinstance(level_campaigns, list) or not level_campaigns:
+        raise TransferContractError(
+            "schema-v2 generation에는 recording_level_campaigns가 하나 이상 필요합니다"
+        )
+    campaign_roles = {
+        "campaign": "recording_level_campaign",
+        "meter_raw": "recording_level_meter_raw",
+        "meter_receipt": "recording_level_meter_receipt",
+    }
+    for index, campaign in enumerate(level_campaigns):
+        if not isinstance(campaign, dict) or set(campaign) != {
+            "campaign_id",
+            "campaign",
+            "meter_raw",
+            "meter_receipt",
+            "hardware_config",
+        }:
+            raise TransferContractError(
+                f"recording level campaign summary #{index}가 불완전합니다"
+            )
+        hardware_ref = campaign.get("hardware_config")
         if (
-            not isinstance(ref, dict)
-            or set(ref) != {"path", "sha256", "size"}
-            or not isinstance(ref.get("path"), str)
+            not isinstance(hardware_ref, dict)
+            or set(hardware_ref) != {"path", "sha256", "size"}
         ):
             raise TransferContractError(
-                f"recorded DNS selection bundle ref #{index}가 유효하지 않습니다"
+                f"recording level campaign #{index} hardware config ref가 불완전합니다"
             )
-        entry = _entry(
-            str(ref["path"]), "recorded_source_selection", repo_root=repo_root
+        hardware_entry = _entry(
+            str(hardware_ref.get("path")),
+            # tracked checkout 파일이므로 transfer role에는 추가하지 않고 bytes만 재대조한다.
+            "recording_level_campaign",
+            repo_root=repo_root,
         )
-        if entry["sha256"] != ref.get("sha256") or entry["size"] != ref.get("size"):
+        if (
+            hardware_entry["sha256"] != hardware_ref.get("sha256")
+            or hardware_entry["size"] != hardware_ref.get("size")
+        ):
             raise TransferContractError(
-                f"recorded DNS selection bundle ref #{index} path/SHA/size 불일치"
+                f"recording level campaign #{index} hardware config SHA/size 불일치"
             )
-        files.append(entry)
+        for field, role in campaign_roles.items():
+            ref = campaign.get(field)
+            if (
+                not isinstance(ref, dict)
+                or set(ref) != {"path", "sha256", "size"}
+            ):
+                raise TransferContractError(
+                    f"recording level campaign #{index} {field} ref가 불완전합니다"
+                )
+            entry = _entry(str(ref.get("path")), role, repo_root=repo_root)
+            if (
+                entry["sha256"] != ref.get("sha256")
+                or entry["size"] != ref.get("size")
+            ):
+                raise TransferContractError(
+                    f"recording level campaign #{index} {field} SHA/size 불일치"
+                )
+            files.append(entry)
+    source_selections = additions.get("source_selection", {})
+    if not isinstance(source_selections, dict):
+        raise TransferContractError("recorded source selection summary가 mapping이 아닙니다")
+    selection_kinds = (
+        "external_dns_speech_selection",
+        "external_demand_environment_selection",
+    )
+    for selection_kind in selection_kinds:
+        source_selection = source_selections.get(selection_kind)
+        if source_selection is None:
+            continue
+        if not isinstance(source_selection, dict) or not isinstance(
+            source_selection.get("bundle_files"), list
+        ):
+            raise TransferContractError(
+                f"recorded {selection_kind} bundle summary가 유효하지 않습니다"
+            )
+        for index, ref in enumerate(source_selection["bundle_files"]):
+            if (
+                not isinstance(ref, dict)
+                or set(ref) != {"path", "sha256", "size"}
+                or not isinstance(ref.get("path"), str)
+            ):
+                raise TransferContractError(
+                    f"recorded {selection_kind} bundle ref #{index}가 유효하지 않습니다"
+                )
+            entry = _entry(
+                str(ref["path"]),
+                "recorded_source_selection",
+                repo_root=repo_root,
+            )
+            if entry["sha256"] != ref.get("sha256") or entry["size"] != ref.get(
+                "size"
+            ):
+                raise TransferContractError(
+                    f"recorded {selection_kind} bundle ref #{index} path/SHA/size 불일치"
+                )
+            files.append(entry)
     if len({str(item["path"]) for item in files}) != len(files):
         raise TransferContractError("schema v2 transfer files에 중복 path가 있습니다")
     files.sort(key=lambda item: str(item["path"]))
@@ -446,6 +553,8 @@ def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
         "rir_bank": legacy["rir_bank"],
         "recorded_manifest": combined_manifest,
         "recorded_generation": generation_relative,
+        "recorded_level_calibration": calibration_relative,
+        "recording_level_campaigns": level_campaigns,
         "lineage_tracks": legacy["lineage_tracks"],
         "librispeech_chapters_metadata": legacy[
             "librispeech_chapters_metadata"
@@ -453,6 +562,11 @@ def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
         "esc50_metadata": legacy["esc50_metadata"],
         "canonical_provenance": legacy["canonical_provenance"],
         "strict_ps": legacy["strict_ps"],
+        **(
+            {"level_meter": legacy["level_meter"]}
+            if "level_meter" in legacy
+            else {}
+        ),
     }
 
 
@@ -462,35 +576,175 @@ def build_payload(args: argparse.Namespace, *, repo_root: Path) -> dict[str, obj
     return _build_payload_v1(args, repo_root=repo_root)
 
 
-def _publish_no_replace(path: Path, data: bytes, *, repo_root: Path) -> None:
+def _manifest_schema(data: bytes, *, label: str) -> int:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TransferContractError(f"{label} JSON을 읽을 수 없습니다") from exc
+    schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    if type(schema) is not int or schema not in {1, 2}:
+        raise TransferContractError(f"{label} schema_version은 1 또는 2여야 합니다")
+    return schema
+
+
+def _archive_existing_manifest(
+    path: Path,
+    *,
+    snapshot_sha256: str,
+    snapshot_data: bytes,
+    repo_root: Path,
+) -> Path:
+    """기존 canonical manifest를 content-addressed hard-link로 먼저 보존한다."""
+
+    history = repo_root / TRANSFER_HISTORY_DIR
+    reject_symlink_components(history.parent, root=repo_root)
+    history.mkdir(mode=0o755, parents=False, exist_ok=True)
+    reject_symlink_components(history, root=repo_root)
+    archive = history / f"elice_transfer_manifest.{snapshot_sha256}.json"
+    if archive.exists():
+        existing_archive = read_regular_file_snapshot(
+            archive,
+            root=repo_root,
+            label="existing archived transfer manifest",
+        )
+        if (
+            existing_archive.sha256 != snapshot_sha256
+            or existing_archive.data != snapshot_data
+        ):
+            raise TransferContractError(
+                "content-addressed transfer history bytes가 기존 manifest와 다릅니다"
+            )
+        return archive
+    try:
+        os.link(path, archive, follow_symlinks=False)
+    except FileExistsError:
+        raced = read_regular_file_snapshot(
+            archive,
+            root=repo_root,
+            label="raced archived transfer manifest",
+        )
+        if raced.sha256 != snapshot_sha256 or raced.data != snapshot_data:
+            raise TransferContractError(
+                "transfer history 발행 race의 기존 bytes가 다릅니다"
+            )
+    directory_fd = os.open(history, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return archive
+
+
+def _publish_no_replace(
+    path: Path,
+    data: bytes,
+    *,
+    repo_root: Path,
+    rotate_existing_sha256: str | None = None,
+) -> None:
     expected = repo_root / OUTPUT
     if Path(os.path.abspath(path)) != Path(os.path.abspath(expected)):
         raise TransferContractError(f"출력은 {OUTPUT}로 고정됩니다")
     reject_symlink_components(path.parent, root=repo_root)
-    if path.exists():
-        existing = read_regular_file_snapshot(
-            path, root=repo_root, label="existing transfer manifest"
-        )
-        if existing.data != data:
+    if rotate_existing_sha256 is not None:
+        rotate_existing_sha256 = rotate_existing_sha256.lower()
+        if not _SHA256_RE.fullmatch(rotate_existing_sha256):
             raise TransferContractError(
-                "기존 transfer manifest bytes가 다릅니다. 자동 overwrite하지 않습니다"
+                "rotate-existing-transfer-sha256는 64자리 lowercase SHA-256이어야 합니다"
             )
-        return
-    descriptor, temp_name = tempfile.mkstemp(prefix=".elice-transfer.", dir=path.parent)
-    temporary = Path(temp_name)
+
+    lock_path = path.parent / ".elice-transfer.publish.lock"
+    reject_symlink_components(lock_path, root=repo_root, allow_missing_leaf=True)
+    lock_descriptor = os.open(
+        lock_path,
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
+            raise TransferContractError("transfer publish lock은 regular file이어야 합니다")
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        if path.exists():
+            existing = read_regular_file_snapshot(
+                path, root=repo_root, label="existing transfer manifest"
+            )
+            assert existing.data is not None
+            if existing.data == data:
+                return
+            if rotate_existing_sha256 is None:
+                raise TransferContractError(
+                    "기존 transfer manifest bytes가 다릅니다. 자동 overwrite하지 않습니다"
+                )
+            if existing.sha256 != rotate_existing_sha256:
+                raise TransferContractError(
+                    "기존 transfer manifest SHA가 명시한 회전 anchor와 다릅니다"
+                )
+            old_schema = _manifest_schema(
+                existing.data, label="기존 transfer manifest"
+            )
+            new_schema = _manifest_schema(data, label="새 transfer manifest")
+            if (old_schema, new_schema) != (1, 2):
+                raise TransferContractError(
+                    "transfer manifest 회전은 검증된 schema v1→v2 전이에만 허용됩니다"
+                )
+            validate_transfer_manifest(
+                path,
+                repo_root=repo_root,
+                expected_sha256=existing.sha256,
+            )
+            _archive_existing_manifest(
+                path,
+                snapshot_sha256=existing.sha256,
+                snapshot_data=existing.data,
+                repo_root=repo_root,
+            )
+        elif rotate_existing_sha256 is not None:
+            raise TransferContractError(
+                "회전할 기존 canonical transfer manifest가 없습니다"
+            )
+
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=".elice-transfer.", dir=path.parent
+        )
+        temporary = Path(temp_name)
         try:
-            os.fsync(directory_fd)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path.exists():
+                # 새 bytes도 실제 bundle 전체를 통과한 뒤에만 canonical 이름을
+                # 원자적으로 교체한다. 실패하면 v1 canonical과 history가 모두 남는다.
+                validate_transfer_manifest(
+                    temporary,
+                    repo_root=repo_root,
+                    expected_sha256=hashlib.sha256(data).hexdigest(),
+                )
+                current = read_regular_file_snapshot(
+                    path, root=repo_root, label="pre-replace transfer manifest"
+                )
+                if current.sha256 != rotate_existing_sha256:
+                    raise TransferContractError(
+                        "transfer manifest가 회전 검증 뒤 변경됐습니다"
+                    )
+                os.replace(temporary, path)
+            else:
+                os.link(temporary, path, follow_symlinks=False)
+            directory_fd = os.open(
+                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
-            os.close(directory_fd)
+            temporary.unlink(missing_ok=True)
     finally:
-        temporary.unlink(missing_ok=True)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -520,8 +774,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--recorded-generation",
         default=None,
         help=(
-            "parent 82 + additions 17을 봉인한 generation.json. 지정하면 transfer schema v2와 "
-            "combined 99 manifest를 사용합니다"
+            "parent 82 + additions 19를 봉인한 generation.json. 지정하면 transfer schema v2와 "
+            "combined 101 manifest를 사용합니다"
+        ),
+    )
+    parser.add_argument(
+        "--recorded-level-calibration",
+        default=None,
+        help=(
+            "schema-v2에 포함할 old82 train-only strict-P level calibration receipt. "
+            "--recorded-generation 사용 시 필수"
         ),
     )
     parser.add_argument(
@@ -537,6 +799,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="data/raw/noise/esc50/ESC-50-master/meta/esc50.csv",
     )
     parser.add_argument("--out", default=OUTPUT)
+    parser.add_argument(
+        "--rotate-existing-transfer-sha256",
+        default=None,
+        help=(
+            "기존 schema-v1 canonical manifest를 content-addressed history로 보존하고 "
+            "schema-v2로 원자 전환할 때 요구되는 기존 파일 SHA-256"
+        ),
+    )
     return parser
 
 
@@ -548,7 +818,12 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
         ).encode("utf-8")
         output = REPO_ROOT / args.out
-        _publish_no_replace(output, data, repo_root=REPO_ROOT)
+        _publish_no_replace(
+            output,
+            data,
+            repo_root=REPO_ROOT,
+            rotate_existing_sha256=args.rotate_existing_transfer_sha256,
+        )
         digest = hashlib.sha256(data).hexdigest()
         summary = validate_transfer_manifest(
             output,

@@ -1,4 +1,4 @@
-"""Parent 82 + 별도 additions 17 recorded generation 계약."""
+"""Parent 82 + 별도 additions 19 recorded generation 계약."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import csv
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -15,6 +16,8 @@ import numpy as np
 import soundfile as sf
 
 import deep_anc.data.recorded_generation as generation
+import deep_anc.data.recorded_level_calibration as recorded_level_calibration
+import deep_anc.data.recording_level_campaign as recording_level_campaign
 import deep_anc.data.transfer_contract as transfer_contract
 from deep_anc import config as config_module
 from deep_anc.data.holdout_contract import snapshot_regular_tree_metadata
@@ -36,6 +39,155 @@ def _sha(raw: bytes) -> str:
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _refresh_fixture_recording_level_binding(session: Path) -> None:
+    """테스트가 source.wav를 바꾼 뒤 pre-live fixture seal도 함께 재발행한다."""
+
+    metadata_path = session / "session.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    source, sample_rate = sf.read(
+        session / "source.wav", dtype="float32", always_2d=False
+    )
+    assert sample_rate == 48_000
+    binding = dict(metadata["recording_level_binding"])
+    binding.pop("binding_sha256", None)
+    binding["rendered_source"] = generation.rendered_source_level_evidence(source)
+    metadata["recording_level_binding"] = {
+        **binding,
+        "binding_sha256": _sha(
+            json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+        ),
+    }
+    _write_json(metadata_path, metadata)
+
+
+def _write_level_calibration_fixture(root: Path) -> Path:
+    """schema-v2 transfer용 최소 valid historical level receipt."""
+
+    implementation = root / "src/deep_anc/data/recorded_level_calibration.py"
+    implementation.parent.mkdir(parents=True, exist_ok=True)
+    implementation.write_bytes(b"fixture calibration implementation\n")
+
+    def ref(relative: str) -> dict[str, object]:
+        raw = (root / relative).read_bytes()
+        return {"path": relative, "sha256": _sha(raw), "size": len(raw)}
+
+    shared = "data/recorded/parent-000/mics.wav"
+    sessions = []
+    cohorts = {}
+    for prefix, cohort, gain in (
+        ("20260804", "historical_20260804", 2.0),
+        ("20260806", "historical_20260806", 4.0),
+    ):
+        members = []
+        train = []
+        fitted = float(-20.0 * np.log10(gain))
+        for index in range(41):
+            session_id = f"{prefix}_{index:06d}_file"
+            split = "train" if index < 30 else ("val" if index < 35 else "test")
+            members.append(session_id)
+            if split == "train":
+                train.append(session_id)
+            sessions.append(
+                {
+                    "session_id": session_id,
+                    "split": split,
+                    "source_family": ("speech", "music", "environment", "machine")[
+                        index % 4
+                    ],
+                    "cohort": cohort,
+                    "plant_domain": recorded_level_calibration.HISTORICAL_DOMAIN,
+                    "source_aligned": ref(shared),
+                    "mics": ref(shared),
+                    "observed_to_strict_power_ratio_db": fitted,
+                    "subband_observed_to_strict_power_ratio_db": [fitted] * 4,
+                    "raw_err_abs_peak": 0.1,
+                    "calibrated_err_abs_peak": 0.1 * gain,
+                }
+            )
+        cohorts[cohort] = {
+            "fit_split": "train",
+            "train_fit_count": len(train),
+            "fit_session_ids": sorted(train),
+            "member_session_ids": sorted(members),
+            "fitted_observed_to_strict_power_ratio_db": fitted,
+            "err_amplitude_gain": gain,
+            "heldout_residual_diagnostics": {},
+        }
+    implementation_ref = ref("src/deep_anc/data/recorded_level_calibration.py")
+    analysis = {
+        "schema": recorded_level_calibration.SCHEMA,
+        "welch_recipe": recorded_level_calibration.WELCH_RECIPE,
+        "power_ratio_definition": (
+            "10log10(sum(abs(CSD_source_ERR)^2/PSD_source)/"
+            "sum(PSD_source*abs(H_strict)^2))"
+        ),
+        "cohort_gain_definition": "10**(-median_train_power_ratio_db/20)",
+        "shape_definition": (
+            "aggregate_CSD_over_PSD_then_best_integer_delay_and_complex_scalar"
+        ),
+        "implementation_sha256": implementation_ref["sha256"],
+    }
+    payload = {
+        "schema": recorded_level_calibration.SCHEMA,
+        "source_commit": "a" * 40,
+        "source_tree_clean_at_issue": True,
+        "analysis_contract": analysis,
+        "analysis_contract_sha256": _sha(
+            recorded_level_calibration._canonical_json(analysis)
+        ),
+        "implementation_source": implementation_ref,
+        "purpose": "old82_ERR_to_current_strict_primary_level_only",
+        "reference_mode": "digital",
+        "apply_to": ["ERR", "d"],
+        "forbidden_apply_to": ["source_aligned", "REF", "acoustic_reference"],
+        "fit_policy": {
+            "allowed_split": "train",
+            "heldout_splits_are_diagnostics_only": ["val", "test"],
+            "wav_mutation": False,
+        },
+        "welch_recipe": recorded_level_calibration.WELCH_RECIPE,
+        "recorded_manifest": ref(generation.PARENT_MANIFEST),
+        "strict_primary_npz": ref("assets/measured/primary.npz"),
+        "cohorts": cohorts,
+        "plant_shape_diagnostic": {
+            "definition": analysis["shape_definition"],
+            "band_hz": [150.0, 1600.0],
+            "delay_search_samples": [-2048, 2048],
+            "best_relative_delay_samples": 1540,
+            "complex_agreement": 0.986,
+            "relative_error_after_scalar_and_delay": 0.166,
+            "fit_scope": "train_split_only_shape_diagnostic",
+            "interpretation": (
+                "scalar_level_calibration_does_not_replace_plant_shape_ablation"
+            ),
+            "required_ablation_domains": [
+                recorded_level_calibration.HISTORICAL_DOMAIN,
+                recorded_level_calibration.CURRENT_DOMAIN,
+            ],
+        },
+        "quality_gate": {
+            "thresholds": recorded_level_calibration.CALIBRATION_QUALITY_CONTRACT,
+            "observed": {
+                "heldout_split_median_max_abs_db": 0.0,
+                "all_session_residual_max_abs_db": 0.0,
+                "train_complex_agreement": 0.986,
+                "train_complex_relative_error": 0.166,
+                "calibrated_err_abs_peak": 0.4,
+            },
+            "pass": True,
+            "threshold_policy": "predeclared_not_result_tuned",
+        },
+        "sessions": sorted(sessions, key=lambda item: item["session_id"]),
+    }
+    receipt = (
+        root
+        / "data/manifests/recorded_level_calibration/fixture-calibration.json"
+    )
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_bytes(recorded_level_calibration._canonical_json(payload))
+    return receipt
 
 
 def _valid_capture_timeline() -> dict:
@@ -117,6 +269,21 @@ def _write_recorded_session_artifacts(
         48_000,
         subtype="FLOAT",
     )
+    binding = metadata.get("recording_level_binding")
+    if isinstance(binding, dict):
+        binding["rendered_source"] = generation.rendered_source_level_evidence(
+            expected_source
+        )
+        unsealed = {
+            key: value for key, value in binding.items() if key != "binding_sha256"
+        }
+        binding["binding_sha256"] = _sha(
+            json.dumps(
+                unsealed,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
     metadata["artifacts"] = [
         {
             "path": name,
@@ -137,8 +304,11 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
     monkeypatch.setattr(
         generation,
         "EXPECTED_ADDITION_FAMILY_KIND_COUNTS",
-        {(family, generation.SOURCE_KIND_POOL): (5 if family == "speech" else 4)
-         for family in families},
+        {
+            (family, generation.SOURCE_KIND_POOL):
+            generation.EXPECTED_ADDITION_FAMILY_COUNTS[family]
+            for family in families
+        },
     )
     parent_rows = []
     for index in range(generation.PARENT_SESSION_COUNT):
@@ -223,13 +393,96 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
 
     monkeypatch.setattr(generation, "validate_holdout_contract", validate_holdout)
 
+    campaign_id = "recording-level-" + "a" * 64
+    campaign_files = {
+        "campaign": (
+            root
+            / "results/recording_level_campaigns"
+            / campaign_id
+            / "campaign.json"
+        ),
+        "meter_raw": root / "results/measurement_level/recording_meter_raw.npz",
+        "meter_receipt": (
+            root / "results/measurement_level/recording_meter_raw.receipt.json"
+        ),
+        "hardware_config": root / "configs/hardware_jetson.yaml",
+    }
+    for name, path in campaign_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"fixture-recording-level-{name}\n".encode())
+
+    def campaign_ref(name: str) -> dict[str, object]:
+        path = campaign_files[name]
+        return {
+            "path": path.relative_to(root).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": _sha(path.read_bytes()),
+        }
+
+    campaign_summary = {
+        "campaign_id": campaign_id,
+        "payload": {
+            "campaign_id": campaign_id,
+            "meter": {
+                "raw": campaign_ref("meter_raw"),
+                "receipt": campaign_ref("meter_receipt"),
+            },
+            "hardware": {"config": campaign_ref("hardware_config")},
+        },
+        "receipt_path": campaign_ref("campaign")["path"],
+        "receipt_size": campaign_ref("campaign")["size"],
+        "receipt_sha256": campaign_ref("campaign")["sha256"],
+    }
+
+    def validate_level_campaign(
+        *, repo_root, campaign_receipt, expected_sha256=None, **_kwargs
+    ):
+        assert Path(repo_root) == root
+        assert str(campaign_receipt) == campaign_summary["receipt_path"]
+        if expected_sha256 is not None:
+            assert expected_sha256 == campaign_summary["receipt_sha256"]
+        return json.loads(json.dumps(campaign_summary))
+
+    def rendered_level(samples):
+        values = np.ascontiguousarray(np.asarray(samples), dtype="<f4")
+        peak = float(np.max(np.abs(values)))
+        rms = float(np.sqrt(np.mean(np.square(values, dtype=np.float64))))
+        return {
+            "schema": "recording-rendered-source-fixture-v1",
+            "sample_sha256": _sha(values.tobytes()),
+            "peak_linear": peak,
+            "peak_dbfs": float(20.0 * np.log10(peak)),
+            "rms_dbfs": float(20.0 * np.log10(rms)),
+            "trusted_band_rms_dbfs": float(20.0 * np.log10(rms)),
+        }
+
+    def validate_level_binding(campaign, binding):
+        assert campaign["campaign_id"] == campaign_id
+        assert binding["campaign_id"] == campaign_id
+        return json.loads(json.dumps(binding))
+
+    monkeypatch.setattr(
+        generation, "validate_recording_level_campaign", validate_level_campaign
+    )
+    monkeypatch.setattr(
+        recording_level_campaign,
+        "validate_recording_level_campaign",
+        validate_level_campaign,
+    )
+    monkeypatch.setattr(generation, "rendered_source_level_evidence", rendered_level)
+    monkeypatch.setattr(
+        generation,
+        "validate_recording_level_session_binding",
+        validate_level_binding,
+    )
+
     plan_path = root / generation.SOURCE_PLAN_ROOT / f"{GENERATION_ID}.csv"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_rows = []
     planned_splits = {
         "speech": iter(("train", "train", "val", "test", "test")),
-        "music": iter(("val", "val", "test", "test")),
-        "environment": iter(("val", "test", "test", "test")),
+        "music": iter(("train", "val", "val", "test", "test")),
+        "environment": iter(("train", "val", "test", "test", "test")),
         "machine": iter(("train", "val", "test", "test")),
     }
     for index in range(generation.ADDITION_SESSION_COUNT):
@@ -357,6 +610,7 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
             },
             "timeline": _valid_capture_timeline(),
             "preassigned_split": row["split"],
+            "plant_domain": "current_strict",
             "collection_plan": {
                 "status": "exact",
                 "source_list": plan_path.relative_to(root).as_posix(),
@@ -375,6 +629,28 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
             metadata=metadata,
             source_path=root / row["path"],
         )
+        source_samples, source_sample_rate = sf.read(
+            session / "source.wav", dtype="float32", always_2d=False
+        )
+        assert source_sample_rate == 48_000
+        rendered = rendered_level(source_samples)
+        binding_without_seal = {
+            "campaign_id": campaign_id,
+            "campaign_receipt": campaign_ref("campaign"),
+            "session_started_at_utc": "2026-08-30T00:00:01+00:00",
+            "rendered_source": rendered,
+        }
+        metadata["recording_level_binding"] = {
+            **binding_without_seal,
+            "binding_sha256": _sha(
+                json.dumps(
+                    binding_without_seal,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ),
+        }
+        _write_json(session / "session.json", metadata)
         progress_rows.append(
             {
                 "source_row_number": str(index),
@@ -420,7 +696,7 @@ def _schema_v2_transfer_fixture(
     report: Path,
     holdout: dict,
 ) -> tuple[Path, object]:
-    """실제 transfer builder/validator가 소비하는 generation-99 bundle을 만든다."""
+    """실제 transfer builder/validator가 소비하는 generation-101 bundle을 만든다."""
 
     fixed_files = {
         "data/rir_bank/duct_rirs_v1.npz": b"rir",
@@ -433,6 +709,60 @@ def _schema_v2_transfer_fixture(
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(raw)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Deep ANC Test",
+            "-c",
+            "user.email=deep-anc-test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "fixture source",
+        ],
+        cwd=root,
+        check=True,
+    )
+    calibration_receipt = _write_level_calibration_fixture(root)
+    calibration_payload = json.loads(calibration_receipt.read_text(encoding="utf-8"))
+    calibration_payload["source_commit"] = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    clean_source = {
+        "schema": recorded_level_calibration.SOURCE_TRUST_SCHEMA,
+        "commit": calibration_payload["source_commit"],
+        "head_tree_object_id": "b" * 40,
+        "git_object_format": "sha1",
+        "tracked_file_count": 1,
+        "tracked_inventory_sha256": "c" * 64,
+        "policy": {
+            "tracked_worktree": "exact_HEAD_blob_and_mode",
+            "index": "exact_HEAD_tree_no_hidden_flags",
+            "nonignored_untracked": "forbidden",
+            "protected_ignored_roots": list(
+                recorded_level_calibration.PROTECTED_IGNORED_ROOTS
+            ),
+            "protected_runtime_bytecode": "forbidden",
+            "ignored_artifacts_outside_protected_roots": "allowed",
+            "replace_refs_and_grafts": "forbidden",
+        },
+    }
+    calibration_payload["clean_source"] = clean_source
+    calibration_receipt.write_bytes(
+        recorded_level_calibration._canonical_json(calibration_payload)
+    )
+    monkeypatch.setattr(
+        recorded_level_calibration,
+        "exact_clean_source_evidence",
+        lambda _root, **_kwargs: json.loads(json.dumps(clean_source)),
+    )
 
     spec = importlib.util.spec_from_file_location(
         "recorded_generation_transfer_builder_test",
@@ -468,6 +798,7 @@ def _schema_v2_transfer_fixture(
         expected_holdout_sha256=holdout["sha256"],
         recorded_manifest=generation.PARENT_MANIFEST,
         recorded_generation=report.relative_to(root).as_posix(),
+        recorded_level_calibration=calibration_receipt.relative_to(root).as_posix(),
         allow_missing_generation_source_files=False,
         lineage_tracks="data/raw/music/fma_metadata/tracks.csv",
         librispeech_chapters_metadata="data/raw/speech/LibriSpeech/CHAPTERS.TXT",
@@ -483,7 +814,7 @@ def _schema_v2_transfer_fixture(
     return transfer, builder
 
 
-def test_generation_preserves_parent82_and_binds_exact_additions17(tmp_path, monkeypatch):
+def test_generation_preserves_parent82_and_binds_exact_additions19(tmp_path, monkeypatch):
     report, _holdout = _fixture(tmp_path, monkeypatch)
     summary = generation.validate_recorded_generation(
         report,
@@ -491,8 +822,8 @@ def test_generation_preserves_parent82_and_binds_exact_additions17(tmp_path, mon
         expected_sha256=_sha(report.read_bytes()),
     )
     assert summary["parent_session_count"] == 82
-    assert summary["addition_session_count"] == 17
-    assert summary["recorded_session_count"] == 99
+    assert summary["addition_session_count"] == generation.ADDITION_SESSION_COUNT
+    assert summary["recorded_session_count"] == generation.COMBINED_SESSION_COUNT
     assert summary["recorded_manifest"]["path"].endswith("/recorded.jsonl")
 
 
@@ -518,6 +849,24 @@ def test_generation_rejects_addition_recorded_above_exact_006_level(
             combined_manifest_path=report.parent / "recorded.jsonl",
             require_source_files=True,
         )
+
+
+def test_generation_rejects_addition_without_recording_level_binding(
+    tmp_path, monkeypatch
+):
+    report, _holdout = _fixture(tmp_path, monkeypatch)
+    session_json = sorted(
+        (tmp_path / generation.ADDITIONS_ROOT / GENERATION_ID).glob("*/session.json")
+    )[0]
+    metadata = json.loads(session_json.read_text(encoding="utf-8"))
+    metadata.pop("recording_level_binding")
+    _write_json(session_json, metadata)
+
+    with pytest.raises(
+        generation.RecordedGenerationError,
+        match="recording_level_binding",
+    ):
+        generation.validate_recorded_generation(report, repo_root=tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -632,13 +981,13 @@ def test_bound_schema2_materializes_dynamic_recorded_manifest(role, monkeypatch)
         "recorded_manifest": config_module.CANONICAL_RECORDED_MANIFEST,
         "data": {
             "recorded_generation": (
-                "data/manifests/recorded_generations/highband-coverage-v1/generation.json"
+                "data/manifests/recorded_generations/stage1-coverage-v2/generation.json"
             ),
             "recorded_generation_sha256": "a" * 64,
         },
     }
     config_module._materialize_bound_recorded_manifest(cfg)
-    expected = "data/manifests/recorded_generations/highband-coverage-v1/recorded.jsonl"
+    expected = "data/manifests/recorded_generations/stage1-coverage-v2/recorded.jsonl"
     assert cfg["recorded_manifest"] == expected
     assert calls == [expected]
     cfg["recorded_manifest"] = "data/manifests/forged.jsonl"
@@ -805,11 +1154,11 @@ def test_librispeech_component_map_uses_transitive_reader_book_bridge():
     assert sorted(len(members) for members in components.values()) == [2, 4]
 
 
-def test_canonical_population_requires_pool8_dns5_external_esc4():
+def test_canonical_population_requires_pool9_demand1_dns5_external_esc4():
     split_plan = {
         "speech": ("train", "train", "val", "test", "test"),
-        "music": ("val", "val", "test", "test"),
-        "environment": ("val", "test", "test", "test"),
+        "music": ("train", "val", "val", "test", "test"),
+        "environment": ("train", "val", "test", "test", "test"),
         "machine": ("train", "val", "test", "test"),
     }
     rows = []
@@ -819,6 +1168,8 @@ def test_canonical_population_requires_pool8_dns5_external_esc4():
                 kind = generation.SOURCE_KIND_EXTERNAL
             elif family == "speech":
                 kind = generation.SOURCE_KIND_EXTERNAL_DNS_SPEECH
+            elif family == "environment" and index == 3:
+                kind = generation.SOURCE_KIND_EXTERNAL_DEMAND_ENVIRONMENT
             else:
                 kind = generation.SOURCE_KIND_POOL
             rows.append(
@@ -828,13 +1179,17 @@ def test_canonical_population_requires_pool8_dns5_external_esc4():
     next(row for row in rows if row["source_family"] == "speech")[
         "source_kind"
     ] = generation.SOURCE_KIND_POOL
-    with pytest.raises(generation.RecordedGenerationError, match="source-pool 8"):
+    with pytest.raises(generation.RecordedGenerationError, match="source-pool 9"):
         generation._validate_addition_population(rows)
 
 
 def test_exact_highband_addition_inventory_and_split_matrix_are_frozen():
     assert generation.CANONICAL_SOURCE_POOL_ADDITIONS == {
-        "data/source_pool/environment/environment_008.wav": ("environment", 54.1, "test"),
+        "data/source_pool/environment/environment_006.wav": (
+            "environment",
+            25.75,
+            "train",
+        ),
         "data/source_pool_v2/environment/environment_012.wav": ("environment", 3.0, "test"),
         "data/source_pool_v2/environment/environment_004.wav": ("environment", 5.9, "test"),
         "data/source_pool_v2/environment/environment_017.wav": ("environment", 26.2, "val"),
@@ -842,6 +1197,7 @@ def test_exact_highband_addition_inventory_and_split_matrix_are_frozen():
         "data/source_pool_v2/music/music_007.wav": ("music", 12.8, "test"),
         "data/source_pool_v2/music/music_012.wav": ("music", 17.1, "val"),
         "data/source_pool_v2/music/music_017.wav": ("music", 20.1, "val"),
+        "data/source_pool_v2/music/music_008.wav": ("music", 31.5, "train"),
     }
     assert generation.REJECTED_SOURCE_POOL_SPEECH_ADDITIONS == {
         "data/source_pool/speech/speech_002.wav": ("speech", 51.0, "test"),
@@ -873,6 +1229,9 @@ def test_exact_highband_addition_inventory_and_split_matrix_are_frozen():
         observed[(family, split)] = observed.get((family, split), 0) + 1
     for split in generation.CANONICAL_EXTERNAL_ESC_SPLITS.values():
         observed[("machine", split)] = observed.get(("machine", split), 0) + 1
+    observed[("environment", generation.DEMAND_RECORDED_SPLIT)] = (
+        observed.get(("environment", generation.DEMAND_RECORDED_SPLIT), 0) + 1
+    )
     for split, count in {"train": 2, "val": 1, "test": 2}.items():
         observed[("speech", split)] = count
     assert observed == {
@@ -937,6 +1296,116 @@ def test_source_selection_rejects_shared_transitive_authority_component(
         generation._canonical_source_selection_evidence(tmp_path, lineage)
 
 
+def test_source_selection_requires_exact_eight_file_demand_bundle(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(generation, "CANONICAL_SOURCE_POOL_ADDITIONS", {})
+    monkeypatch.setattr(generation, "REJECTED_SOURCE_POOL_SPEECH_ADDITIONS", {})
+    monkeypatch.setattr(generation, "CANONICAL_EXTERNAL_LIBRISPEECH_FILES", {})
+    monkeypatch.setattr(
+        generation,
+        "_snapshot",
+        lambda *_args, **_kwargs: type(
+            "Snapshot",
+            (),
+            {
+                "sha256": generation.SOURCE_SELECTION_STRICT_PRIMARY_SHA256,
+                "path": tmp_path / generation.SOURCE_SELECTION_STRICT_PRIMARY_PATH,
+                "size": 1,
+            },
+        )(),
+    )
+    dns_selected = []
+    for index in range(5):
+        dns_selected.append(
+            {
+                "raw_output": {
+                    "path": f"data/dns/raw-{index}.wav",
+                    "sha256": f"{index + 1:x}" * 64,
+                    "size": index + 1,
+                },
+                "composite_output": {
+                    "path": f"data/dns/composite-{index}.wav",
+                    "sha256": f"{index + 6:x}" * 64,
+                    "size": index + 6,
+                },
+            }
+        )
+    monkeypatch.setattr(
+        generation,
+        "validate_dns_selection_receipt",
+        lambda **_kwargs: {
+            "receipt_path": "data/dns/receipt.json",
+            "receipt_sha256": "a" * 64,
+            "receipt_size": 1,
+            "public_manifest_path": "data/dns/manifest.jsonl",
+            "public_manifest_sha256": "b" * 64,
+            "public_manifest_size": 2,
+            "bootstrap_receipt_path": "data/dns/bootstrap.json",
+            "bootstrap_receipt_sha256": "c" * 64,
+            "bootstrap_receipt_size": 3,
+            "environment_freeze_path": "data/dns/freeze.txt",
+            "environment_freeze_sha256": "d" * 64,
+            "environment_freeze_size": 4,
+            "strict_primary_path": generation.SOURCE_SELECTION_STRICT_PRIMARY_PATH,
+            "strict_primary_sha256": generation.SOURCE_SELECTION_STRICT_PRIMARY_SHA256,
+            "evidence_sha256": "e" * 64,
+            "selected_group_ids": [f"group-{index}" for index in range(5)],
+            "selected": dns_selected,
+        },
+    )
+    demand_files = [
+        {
+            "path": f"data/demand/bundle-{index}",
+            "sha256": f"{index + 1:x}" * 64,
+            "size": index + 1,
+        }
+        for index in range(8)
+    ]
+    demand_summary = {
+        "receipt_path": "data/demand/bundle-0",
+        "receipt_sha256": "1" * 64,
+        "receipt_size": 1,
+        "evidence_sha256": "f" * 64,
+        "public_manifest_sha256": "2" * 64,
+        "strict_primary_sha256": "3" * 64,
+        "selected": {
+            "public_group_id": generation.DEMAND_PUBLIC_GROUP_ID,
+            "public_group_member_count": 16,
+            "recorded_split": "test",
+            "window_start_seconds": 0.0,
+            "origin_window_start_seconds": 185.6,
+            "window_seconds": 15.0,
+            "strict_p_coverage": {"covered_subband_count": 4},
+            "stationarity": {"one_second_rms_peak_to_peak_db": 5.0},
+            "rendered_level": {"passed": True},
+        },
+        "bundle_files": demand_files,
+    }
+    monkeypatch.setattr(
+        generation,
+        "validate_demand_selection_receipt",
+        lambda **_kwargs: demand_summary,
+    )
+    lineage = {
+        "component_by_path": {},
+        "active_components": set(),
+        "authority_tokens_by_path": {},
+        "active_librispeech_components": set(),
+        "librispeech_chapters": {},
+        "librispeech_component_by_identity": {},
+    }
+    evidence = generation._canonical_source_selection_evidence(tmp_path, lineage)
+    assert (
+        evidence["external_demand_environment_selection"]["bundle_files"]
+        == demand_files
+    )
+
+    demand_summary["bundle_files"] = demand_files[:-1]
+    with pytest.raises(generation.RecordedGenerationError, match="exact 8"):
+        generation._canonical_source_selection_evidence(tmp_path, lineage)
+
+
 def test_unique_lineage_string_cannot_disguise_active_source_component(tmp_path, monkeypatch):
     report, _holdout = _fixture(tmp_path, monkeypatch)
     plan = tmp_path / generation.SOURCE_PLAN_ROOT / f"{GENERATION_ID}.csv"
@@ -959,21 +1428,39 @@ def test_unique_lineage_string_cannot_disguise_active_source_component(tmp_path,
         generation.validate_recorded_generation(report, repo_root=tmp_path)
 
 
-def test_transfer_schema_v2_requires_generation_and_loads_exact99(tmp_path, monkeypatch):
+def test_transfer_schema_v2_requires_generation_and_loads_exact101(tmp_path, monkeypatch):
     report, holdout = _fixture(tmp_path, monkeypatch)
     transfer, builder = _schema_v2_transfer_fixture(
         tmp_path, monkeypatch, report=report, holdout=holdout
     )
     payload = json.loads(transfer.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 2
-    assert payload["recorded"]["session_count"] == 99
+    assert payload["recorded"]["session_count"] == generation.COMBINED_SESSION_COUNT
     summary = transfer_contract.validate_transfer_manifest(
         transfer,
         repo_root=tmp_path,
         expected_sha256=_sha(transfer.read_bytes()),
     )
-    assert summary["recorded_session_count"] == 99
+    assert summary["recorded_session_count"] == generation.COMBINED_SESSION_COUNT
     assert summary["_validated_recorded_manifest_snapshot"].path == report.parent / "recorded.jsonl"
+    original_transfer_payload = json.loads(transfer.read_text(encoding="utf-8"))
+    tampered_transfer_payload = json.loads(json.dumps(original_transfer_payload))
+    tampered_transfer_payload["files"] = [
+        entry
+        for entry in tampered_transfer_payload["files"]
+        if entry["role"] != "recording_level_meter_raw"
+    ]
+    _write_json(transfer, tampered_transfer_payload)
+    with pytest.raises(
+        transfer_contract.TransferContractError,
+        match="campaign/raw/receipt role",
+    ):
+        transfer_contract.validate_transfer_manifest(
+            transfer,
+            repo_root=tmp_path,
+            expected_sha256=_sha(transfer.read_bytes()),
+        )
+    _write_json(transfer, original_transfer_payload)
 
     data_cfg = {
         "transfer_manifest": builder.OUTPUT,
@@ -986,7 +1473,9 @@ def test_transfer_schema_v2_requires_generation_and_loads_exact99(tmp_path, monk
     )
     assert snapshot.recorded_generation is not None
     assert snapshot.recorded_generation_summary is not None
-    assert snapshot.recorded_generation_summary["recorded_session_count"] == 99
+    assert snapshot.recorded_generation_summary["recorded_session_count"] == (
+        generation.COMBINED_SESSION_COUNT
+    )
     auto_cfg = {
         "transfer_manifest": builder.OUTPUT,
         "transfer_manifest_sha256": _sha(transfer.read_bytes()),
@@ -1034,10 +1523,81 @@ def test_transfer_schema_v2_requires_generation_and_loads_exact99(tmp_path, monk
         )
 
 
+def test_transfer_schema_v2_cross_binds_calibration_audio_refs(
+    tmp_path, monkeypatch
+):
+    report, holdout = _fixture(tmp_path, monkeypatch)
+    transfer, _builder = _schema_v2_transfer_fixture(
+        tmp_path, monkeypatch, report=report, holdout=holdout
+    )
+    transfer_payload = json.loads(transfer.read_text(encoding="utf-8"))
+    calibration_entry = next(
+        entry
+        for entry in transfer_payload["files"]
+        if entry["role"] == "recorded_level_calibration"
+    )
+    calibration_path = tmp_path / calibration_entry["path"]
+    calibration_payload = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration_payload["sessions"][0]["mics"]["sha256"] = "0" * 64
+    calibration_payload["sessions"][0]["mics"]["size"] = 1
+    calibration_raw = recorded_level_calibration._canonical_json(
+        calibration_payload
+    )
+    calibration_path.write_bytes(calibration_raw)
+    calibration_entry["sha256"] = _sha(calibration_raw)
+    calibration_entry["size"] = len(calibration_raw)
+    _write_json(transfer, transfer_payload)
+
+    with pytest.raises(
+        transfer_contract.TransferContractError,
+        match="calibration audio ref.*transfer recorded bytes",
+    ):
+        transfer_contract.validate_transfer_manifest(
+            transfer,
+            repo_root=tmp_path,
+            expected_sha256=_sha(transfer.read_bytes()),
+        )
+
+
+def test_transfer_schema_v2_rejects_calibration_from_stale_commit(
+    tmp_path, monkeypatch
+):
+    report, holdout = _fixture(tmp_path, monkeypatch)
+    transfer, _builder = _schema_v2_transfer_fixture(
+        tmp_path, monkeypatch, report=report, holdout=holdout
+    )
+    transfer_payload = json.loads(transfer.read_text(encoding="utf-8"))
+    calibration_entry = next(
+        entry
+        for entry in transfer_payload["files"]
+        if entry["role"] == "recorded_level_calibration"
+    )
+    calibration_path = tmp_path / calibration_entry["path"]
+    calibration_payload = json.loads(calibration_path.read_text(encoding="utf-8"))
+    calibration_payload["source_commit"] = "f" * 40
+    calibration_raw = recorded_level_calibration._canonical_json(
+        calibration_payload
+    )
+    calibration_path.write_bytes(calibration_raw)
+    calibration_entry["sha256"] = _sha(calibration_raw)
+    calibration_entry["size"] = len(calibration_raw)
+    _write_json(transfer, transfer_payload)
+
+    with pytest.raises(
+        transfer_contract.TransferContractError,
+        match="calibration receipt 검증 실패",
+    ):
+        transfer_contract.validate_transfer_manifest(
+            transfer,
+            repo_root=tmp_path,
+            expected_sha256=_sha(transfer.read_bytes()),
+        )
+
+
 def test_schema_v2_generation_survives_official_config_campaign_chain(
     tmp_path, monkeypatch
 ):
-    """99-session generation이 모든 공식 config 해석 경계에서 하나로 유지된다."""
+    """101-session generation이 모든 공식 config 해석 경계에서 하나로 유지된다."""
 
     report, holdout = _fixture(tmp_path, monkeypatch)
     transfer, _builder = _schema_v2_transfer_fixture(
@@ -1049,7 +1609,7 @@ def test_schema_v2_generation_survives_official_config_campaign_chain(
         repo_root=tmp_path,
         expected_sha256=transfer_sha,
     )
-    assert transfer_summary["recorded_session_count"] == 99
+    assert transfer_summary["recorded_session_count"] == generation.COMBINED_SESSION_COUNT
 
     commit = "c" * 40
     freeze = tmp_path / ".venv/environment-freeze.txt"
@@ -1243,7 +1803,9 @@ def test_schema_v2_generation_survives_official_config_campaign_chain(
     expected_manifest = (report.parent / "recorded.jsonl").relative_to(
         tmp_path
     ).as_posix()
-    assert len((tmp_path / expected_manifest).read_text().splitlines()) == 99
+    assert len((tmp_path / expected_manifest).read_text().splitlines()) == (
+        generation.COMBINED_SESSION_COUNT
+    )
     for label, cfg in stages.items():
         assert cfg["data"]["recorded_generation"] == expected_generation, label
         assert (
@@ -1366,6 +1928,7 @@ def test_external_composite_rederives_esc_identity_transform_and_output_sha(
                 metadata=metadata,
                 source_path=output,
             )
+            _refresh_fixture_recording_level_binding(session_json.parent)
         else:
             _write_json(session_json, metadata)
 
@@ -1383,8 +1946,8 @@ def test_external_composite_rederives_esc_identity_transform_and_output_sha(
         "EXPECTED_ADDITION_FAMILY_KIND_COUNTS",
         {
             ("speech", generation.SOURCE_KIND_POOL): 5,
-            ("music", generation.SOURCE_KIND_POOL): 4,
-            ("environment", generation.SOURCE_KIND_POOL): 4,
+            ("music", generation.SOURCE_KIND_POOL): 5,
+            ("environment", generation.SOURCE_KIND_POOL): 5,
             ("machine", generation.SOURCE_KIND_POOL): 3,
             ("machine", generation.SOURCE_KIND_EXTERNAL): 1,
         },
@@ -1411,7 +1974,7 @@ def test_external_composite_rederives_esc_identity_transform_and_output_sha(
     report.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     assert generation.validate_recorded_generation(report, repo_root=tmp_path)[
         "recorded_session_count"
-    ] == 99
+    ] == generation.COMBINED_SESSION_COUNT
 
     pool_path = rows[2]["path"]
     original_tokens = set(source_lineage["authority_tokens_by_path"][pool_path])
@@ -1517,6 +2080,7 @@ def test_external_librispeech_rederives_transitive_component_and_window(
                 metadata=metadata,
                 source_path=source,
             )
+            _refresh_fixture_recording_level_binding(session_json.parent)
         else:
             _write_json(session_json, metadata)
 
@@ -1534,8 +2098,8 @@ def test_external_librispeech_rederives_transitive_component_and_window(
         {
             ("speech", generation.SOURCE_KIND_POOL): 4,
             ("speech", generation.SOURCE_KIND_EXTERNAL_LIBRISPEECH): 1,
-            ("music", generation.SOURCE_KIND_POOL): 4,
-            ("environment", generation.SOURCE_KIND_POOL): 4,
+            ("music", generation.SOURCE_KIND_POOL): 5,
+            ("environment", generation.SOURCE_KIND_POOL): 5,
             ("machine", generation.SOURCE_KIND_POOL): 4,
         },
     )
@@ -1561,7 +2125,7 @@ def test_external_librispeech_rederives_transitive_component_and_window(
     report.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     assert generation.validate_recorded_generation(report, repo_root=tmp_path)[
         "recorded_session_count"
-    ] == 99
+    ] == generation.COMBINED_SESSION_COUNT
 
     other_speech_pool_path = rows[4]["path"]
     original_tokens = set(

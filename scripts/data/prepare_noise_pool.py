@@ -921,7 +921,7 @@ def main() -> int:
         "--recorded-generation",
         default=None,
         help=(
-            "schema v2 recorded generation report. 추가 17세션의 source/raw SHA와 "
+            "schema v2 recorded generation report. 추가 19세션의 source/raw SHA와 "
             "lineage를 합성 manifest exclusion 및 sidecar에 결속한다"
         ),
     )

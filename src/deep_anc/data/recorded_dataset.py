@@ -50,6 +50,12 @@ from .broadband_batch_sampler import (
     target_d_density_ratios,
 )
 from .manifest import read_manifest, read_manifest_bytes
+from .recorded_level_calibration import (
+    CURRENT_DOMAIN,
+    HISTORICAL_DOMAIN,
+    RecordedLevelCalibration,
+    validate_recorded_level_calibration_receipt,
+)
 from .resumable_stream import indexed_rng, worker_global_item_indices
 from .synth_dataset import _delay_np
 from .transfer_contract import (
@@ -68,6 +74,7 @@ __all__ = [
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 _COMMON_EQ_HALF_HISTORY_SAMPLES = 64  # 129-tap common EQ의 왼쪽 경계 영향
+PLANT_DOMAIN_SAMPLING_MODE = "family_plant_domain_component_session_balanced"
 
 
 class RecordedLeadPlan(BaseModel):
@@ -333,6 +340,34 @@ class RecordedANCDataset(IterableDataset):
         raw_segment = int(round(float(data_cfg["segment_seconds"]) * self.fs))
         self.segment = max(256, (raw_segment // 256) * 256)
         self.reference_mode = str(data_cfg.get("reference_mode", "digital"))
+        self._recorded_level_calibration: RecordedLevelCalibration | None = None
+        calibration_path = data_cfg.get("recorded_level_calibration")
+        calibration_sha = data_cfg.get("recorded_level_calibration_sha256")
+        if calibration_path is not None or calibration_sha is not None:
+            if self.reference_mode != "digital":
+                raise ValueError(
+                    "recorded level calibration은 digital-reference ERR/d에만 "
+                    "적용할 수 있습니다 (acoustic-reference 금지)"
+                )
+            if not calibration_path or not calibration_sha:
+                raise ValueError(
+                    "recorded_level_calibration path와 외부 SHA는 함께 필요합니다"
+                )
+            if transfer_repo_root is None:
+                from ..config import REPO_ROOT
+
+                transfer_repo_root = REPO_ROOT
+            self._recorded_level_calibration = (
+                validate_recorded_level_calibration_receipt(
+                    calibration_path,
+                    expected_sha256=str(calibration_sha),
+                    repo_root=transfer_repo_root,
+                    # transfer snapshot이 mics/source_aligned를 실제 SHA로 이미
+                    # 검증한다. 여기서 4 GiB를 두 번 읽지 않고 각 로드도 snapshot
+                    # inode/content 집합 안에서만 허용한다.
+                    verify_bound_audio=self._recorded_transfer is None,
+                )
+            )
         self.digital_reference_lead = int(
             data_cfg.get("digital_reference_lead_samples", 0)
         )
@@ -363,15 +398,21 @@ class RecordedANCDataset(IterableDataset):
             "uniform_session",
             "family_group_session_balanced",
             "family_lineage_session_balanced",
+            PLANT_DOMAIN_SAMPLING_MODE,
             QUALIFIED_SAMPLING_MODE,
         }:
             raise ValueError(
                 f"지원하지 않는 recorded_sampling: {self.sampling_mode!r}"
             )
         self._sampling_hierarchy: dict[str, dict[str, tuple[int, ...]]] = {}
+        self._plant_sampling_hierarchy: dict[
+            str, dict[str, dict[str, tuple[int, ...]]]
+        ] = {}
+        self.current_strict_item_fraction = 0.0
         if self.sampling_mode in {
             "family_group_session_balanced",
             "family_lineage_session_balanced",
+            PLANT_DOMAIN_SAMPLING_MODE,
             QUALIFIED_SAMPLING_MODE,
         }:
             hierarchy: dict[str, dict[str, list[int]]] = {}
@@ -386,6 +427,7 @@ class RecordedANCDataset(IterableDataset):
                     )
                 if self.sampling_mode in {
                     "family_lineage_session_balanced",
+                    PLANT_DOMAIN_SAMPLING_MODE,
                     QUALIFIED_SAMPLING_MODE,
                 }:
                     source_pool_group = str(
@@ -405,6 +447,57 @@ class RecordedANCDataset(IterableDataset):
                 }
                 for family, groups in sorted(hierarchy.items())
             }
+        if self.sampling_mode == PLANT_DOMAIN_SAMPLING_MODE:
+            if self._recorded_level_calibration is None:
+                raise ValueError(
+                    f"{PLANT_DOMAIN_SAMPLING_MODE}에는 검증된 recorded level "
+                    "calibration receipt가 필요합니다"
+                )
+            plant_hierarchy: dict[str, dict[str, dict[str, list[int]]]] = {}
+            for index, entry in enumerate(self.entries):
+                family = str(entry.get("source_family") or "").strip()
+                group = str(entry.get("group_id") or "").strip()
+                domain = self._plant_domain(entry)
+                plant_hierarchy.setdefault(family, {}).setdefault(domain, {}).setdefault(
+                    group, []
+                ).append(index)
+            self._plant_sampling_hierarchy = {
+                family: {
+                    domain: {
+                        group: tuple(indices)
+                        for group, indices in sorted(groups.items())
+                    }
+                    for domain, groups in sorted(domains.items())
+                }
+                for family, domains in sorted(plant_hierarchy.items())
+            }
+            families = tuple(self._plant_sampling_hierarchy)
+            incomplete_families = {
+                family: sorted(self._plant_sampling_hierarchy[family])
+                for family in families
+                if set(self._plant_sampling_hierarchy[family])
+                != {HISTORICAL_DOMAIN, CURRENT_DOMAIN}
+            }
+            if incomplete_families:
+                raise ValueError(
+                    "canonical family→plant_domain sampler에는 모든 family의 train "
+                    "split에 historical_calibrated/current_strict가 모두 필요합니다: "
+                    f"{incomplete_families}"
+                )
+            # 아래 2×family exact cycle에서 각 family가 두 domain을 한 번씩 쓴다.
+            self.current_strict_item_fraction = 0.5
+            required_fraction = float(
+                data_cfg.get("recorded_current_strict_min_fraction", 0.5)
+            )
+            if not math.isclose(required_fraction, 0.5, abs_tol=0.0):
+                raise ValueError(
+                    "recorded_current_strict_min_fraction은 공식 계약 0.5로 고정됩니다"
+                )
+            if self.current_strict_item_fraction < required_fraction:
+                raise ValueError(
+                    "family→plant_domain sampler가 current_strict item 50%를 만들 수 "
+                    f"없습니다: fraction={self.current_strict_item_fraction:.3f}"
+                )
 
         # 재정렬본 강제 여부. 기본은 폴백 허용(기존 세션/픽스처 호환)이고,
         # 파인튜닝 설정에서 true 로 켠다.
@@ -442,6 +535,14 @@ class RecordedANCDataset(IterableDataset):
             else int(self.timing_contract.synthetic_total_advance_samples)
         )
         self.augment = RecordedAugmentConfig.from_data_config(data_cfg)
+        if (
+            self.sampling_mode == PLANT_DOMAIN_SAMPLING_MODE
+            and self.augment.mix_probability > 0.0
+        ):
+            raise ValueError(
+                "plant-domain sampler는 서로 다른 물리 domain의 session mix를 "
+                "허용하지 않습니다"
+            )
         self._broadband_batch_planner: BroadbandQualifiedBatchPlanner | None = None
         self._broadband_eq_suffix_samples = 0
         self.broadband_reference_dropout_probability = 0.0
@@ -581,6 +682,30 @@ class RecordedANCDataset(IterableDataset):
             return {}
         return value if isinstance(value, dict) else {}
 
+    def _plant_domain(self, entry: dict) -> str:
+        """manifest/session evidence에서 plant domain을 유도한다."""
+
+        session_id = str(entry.get("session_id") or "")
+        calibration = self._recorded_level_calibration
+        if calibration is not None and session_id in calibration.plant_domain_by_session:
+            return HISTORICAL_DOMAIN
+        domain = str(entry.get("plant_domain") or "").strip()
+        if not domain:
+            metadata = self._session_metadata(entry)
+            binding = metadata.get("recording_level_campaign")
+            if isinstance(binding, dict):
+                domain = str(binding.get("plant_domain") or "").strip()
+            if not domain:
+                binding = metadata.get("recording_level")
+                if isinstance(binding, dict):
+                    domain = str(binding.get("plant_domain") or "").strip()
+        if domain != CURRENT_DOMAIN:
+            raise ValueError(
+                f"{session_id}: historical receipt 밖 세션에는 검증된 "
+                f"plant_domain={CURRENT_DOMAIN!r} binding이 필요합니다"
+            )
+        return domain
+
     def _has_session_file(self, path: Path) -> bool:
         if self._recorded_transfer is not None:
             return self._recorded_transfer.has_recorded_file(path)
@@ -688,6 +813,16 @@ class RecordedANCDataset(IterableDataset):
         else:
             source = np.zeros_like(err)
         n = min(err.size, ref.size, source.size)
+        if self._recorded_level_calibration is not None:
+            session_id = str(entry.get("session_id") or "")
+            gain = self._recorded_level_calibration.err_gain_by_session.get(session_id)
+            if gain is None:
+                if self._plant_domain(entry) != CURRENT_DOMAIN:
+                    raise ValueError(f"{session_id}: ERR level gain/domain이 없습니다")
+                gain = 1.0
+            # 원본 WAV와 x_ref/REF는 불변이다. strict P와 단위가 다른 historical
+            # ERR(=d)만 train-only receipt의 scalar로 맞춘다.
+            err = (err * float(gain)).astype(np.float32)
         if self._recorded_transfer is not None:
             # session.json은 lead/lineage 의미를 결정하므로 audio cache와 같은
             # generation에 계속 고정한다.
@@ -736,9 +871,25 @@ class RecordedANCDataset(IterableDataset):
 
         return np.random.default_rng(self.seed + int(worker_id) * 1013)
 
-    def _sample_session_index(self, rng: np.random.Generator) -> int:
+    def _sample_session_index(
+        self, rng: np.random.Generator, *, global_index: int | None = None
+    ) -> int:
         if self.sampling_mode == "uniform_session":
             return int(rng.integers(len(self.entries)))
+        if self.sampling_mode == PLANT_DOMAIN_SAMPLING_MODE:
+            if global_index is None:
+                raise ValueError("plant-domain sampler에는 global_index가 필요합니다")
+            # 2×family cycle: 각 family가 historical/current를 정확히 한 번씩 쓴다.
+            # worker/resume에서도 global item index가 같으면 동일해 long-run current
+            # fraction은 추정값이 아니라 exact 0.5다.
+            families = tuple(self._plant_sampling_hierarchy)
+            family = families[(int(global_index) // 2) % len(families)]
+            domains = self._plant_sampling_hierarchy[family]
+            domain = CURRENT_DOMAIN if int(global_index) % 2 else HISTORICAL_DOMAIN
+            groups = tuple(domains[domain])
+            group = groups[int(rng.integers(len(groups)))]
+            sessions = domains[domain][group]
+            return int(sessions[int(rng.integers(len(sessions)))])
         families = tuple(self._sampling_hierarchy)
         family = families[int(rng.integers(len(families)))]
         groups = tuple(self._sampling_hierarchy[family])
@@ -890,7 +1041,9 @@ class RecordedANCDataset(IterableDataset):
                 attempt = 0
                 while pair is None:
                     rng = indexed_rng(self.seed, 0x524543, global_index, attempt)
-                    pair = self._draw_pair(self._sample_session_index(rng), rng)
+                    pair = self._draw_pair(
+                        self._sample_session_index(rng, global_index=global_index), rng
+                    )
                     attempt += 1
                     if attempt > max(32, len(self.entries) * 2):
                         raise RuntimeError(
@@ -904,7 +1057,9 @@ class RecordedANCDataset(IterableDataset):
                 and count > 1
                 and rng.random() < self.augment.mix_probability
             ):
-                other = self._draw_pair(self._sample_session_index(rng), rng)
+                other = self._draw_pair(
+                    self._sample_session_index(rng, global_index=global_index), rng
+                )
                 if other is not None:
                     a = float(rng.uniform(0.3, 1.0))
                     b = float(rng.uniform(*self.augment.mix_weight_range))
@@ -1008,6 +1163,12 @@ class RecordedANCDataset(IterableDataset):
             "require_aligned_source": self.require_aligned_source,
             "lead_mode": self.lead_mode,
             "sampling_mode": self.sampling_mode,
+            "current_strict_item_fraction": self.current_strict_item_fraction,
+            "recorded_level_calibration_sha256": (
+                None
+                if self._recorded_level_calibration is None
+                else self._recorded_level_calibration.sha256
+            ),
             "broadband_batch_qualified": self._broadband_batch_planner is not None,
             "constant_lead_samples": self.digital_reference_lead,
             "total_advance_samples": self.total_advance_samples,
