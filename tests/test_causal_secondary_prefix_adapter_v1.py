@@ -300,7 +300,16 @@ def test_full_prefix_primary_and_secondary_crop_match_independent_direct_oracle(
     )
     assert torch.allclose(result.primary_target, expected_primary, atol=2e-7, rtol=2e-6)
     assert torch.allclose(result.secondary_target, expected_secondary, atol=2e-7, rtol=2e-6)
-    assert torch.allclose(result.error_target, expected_primary + expected_secondary)
+    # 서로 다른 causal FIR oracle 경로의 FP32 누적 순서가 Torch 버전별로 수십
+    # 나노 단위 달라질 수 있다. adapter 내부의 composition은 먼저 exact하게
+    # 검증하고, 독립 direct oracle과의 비교에는 위 crop 검증과 같은 허용오차를 쓴다.
+    assert torch.equal(result.error_target, result.primary_target + result.secondary_target)
+    assert torch.allclose(
+        result.error_target,
+        expected_primary + expected_secondary,
+        atol=2e-7,
+        rtol=2e-6,
+    )
     assert result.primary_target.dtype == torch.float32
     assert result.secondary_target.dtype == torch.float32
     assert result.binding_sha256 == binding.digest()

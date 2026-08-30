@@ -40,6 +40,75 @@ from deep_anc.data.recorded_generation import (  # noqa: E402
 OUTPUT = "data/manifests/elice_transfer_manifest.json"
 
 
+def _level_meter_support(
+    args: argparse.Namespace, *, repo_root: Path
+) -> tuple[str, str] | None:
+    """tracked level evidence가 참조하는 raw/receipt를 transfer bundle에 결속한다.
+
+    레벨 JSON은 git tracked 파일이고, 큰 NPZ는 보통 git-ignored다. 따라서 JSON만
+    clone된 Elice에서 pytest가 조용히 빠지지 않도록 raw와 canonical sibling receipt를
+    별도 role로 봉인한다. fixture처럼 level evidence가 없는 최소 builder 입력은
+    기존 schema v1 동작을 유지한다.
+    """
+
+    raw_arg = getattr(args, "level_meter_raw", None)
+    receipt_arg = getattr(args, "level_meter_receipt", None)
+    if (raw_arg is None) != (receipt_arg is None):
+        raise TransferContractError(
+            "level_meter_raw와 level_meter_receipt는 함께 지정해야 합니다"
+        )
+    evidence_path = repo_root / "assets/measured/measurement_level_evidence.json"
+    if raw_arg is None and not evidence_path.is_file():
+        return None
+    if raw_arg is None:
+        try:
+            evidence_snapshot = read_regular_file_snapshot(
+                evidence_path,
+                root=repo_root,
+                label="tracked measurement level evidence",
+            )
+            payload = json.loads(evidence_snapshot.data.decode("utf-8"))
+            raw_value = payload["meter_raw"]["path"]
+            expected_raw_sha = str(payload["meter_raw"]["sha256"]).lower()
+        except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TransferContractError(
+                "tracked measurement level evidence의 meter_raw 참조를 읽을 수 없습니다"
+            ) from exc
+        raw = _relative(str(raw_value), field="level_meter_raw", prefix="results/")
+        receipt = PurePosixPath(raw).with_name(
+            f"{PurePosixPath(raw).stem}.receipt.json"
+        ).as_posix()
+    else:
+        raw = _relative(str(raw_arg), field="level_meter_raw", prefix="results/")
+        receipt = _relative(
+            str(receipt_arg), field="level_meter_receipt", prefix="results/"
+        )
+        expected_raw_sha = None
+
+    raw_entry = _entry(raw, "level_meter_raw", repo_root=repo_root)
+    receipt_entry = _entry(receipt, "level_meter_receipt", repo_root=repo_root)
+    if expected_raw_sha is not None and raw_entry["sha256"] != expected_raw_sha:
+        raise TransferContractError(
+            "tracked measurement level evidence와 level meter raw SHA가 다릅니다"
+        )
+    try:
+        receipt_payload = json.loads(
+            (repo_root / receipt).read_bytes().decode("utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TransferContractError("level meter receipt JSON을 읽을 수 없습니다") from exc
+    expected_receipt = {
+        "raw_path": raw,
+        "raw_sha256": raw_entry["sha256"],
+        "schema": "measurement_level_meter_raw_receipt_v1",
+    }
+    if receipt_payload != expected_receipt:
+        raise TransferContractError(
+            "level meter receipt가 raw path/SHA/schema와 exact하게 일치하지 않습니다"
+        )
+    return raw, receipt
+
+
 def _relative(value: str, *, field: str, prefix: str | None = None) -> str:
     path = PurePosixPath(value.replace("\\", "/"))
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
@@ -189,12 +258,20 @@ def _build_payload_v1(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
         (str(canonical_source_csv[1]), "source_pool_v2_csv"),
         (canonical_report, "provenance_report"),
     ]
+    level_meter = _level_meter_support(args, repo_root=repo_root)
+    if level_meter is not None:
+        fixed.extend(
+            [
+                (level_meter[0], "level_meter_raw"),
+                (level_meter[1], "level_meter_receipt"),
+            ]
+        )
     if len({value for value, _role in fixed}) != len(fixed):
         raise TransferContractError("서로 다른 transfer role이 같은 파일을 가리킵니다")
     entries.extend(_entry(value, role, repo_root=repo_root) for value, role in fixed)
     entries.sort(key=lambda item: str(item["path"]))
     recorded_entries = [entry for entry in entries if entry["role"] == "recorded"]
-    return {
+    payload = {
         "schema_version": 1,
         "files": entries,
         "recorded": {
@@ -240,6 +317,12 @@ def _build_payload_v1(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
             "secondary_npz": secondary,
         },
     }
+    if level_meter is not None:
+        payload["level_meter"] = {
+            "raw": level_meter[0],
+            "receipt": level_meter[1],
+        }
+    return payload
 
 
 def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str, object]:
@@ -418,6 +501,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strict-analysis", action="append", required=True)
     parser.add_argument("--primary-npz", required=True)
     parser.add_argument("--secondary-npz", required=True)
+    parser.add_argument(
+        "--level-meter-raw",
+        default=None,
+        help="tracked measurement level evidence가 참조하는 PASS meter raw (기본: evidence에서 자동 발견)",
+    )
+    parser.add_argument(
+        "--level-meter-receipt",
+        default=None,
+        help="PASS meter raw의 canonical .receipt.json (기본: raw sibling 자동 유도)",
+    )
     parser.add_argument("--expected-holdout-sha256", required=True)
     parser.add_argument(
         "--recorded-manifest",

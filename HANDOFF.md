@@ -235,6 +235,38 @@ log를 보존한 채 원인을 분석하며 자동 재실행하지 않는다. �
 hardware blocker를 해제하지 않으며, Stage-1 82세션 bootstrap과 추가 17세션 수집 전에는
 pretrain/fine-tune을 시작하지 않는다.
 
+### 0.10 2026-08-30 Elice bootstrap pytest 중단 및 재개 경계
+
+`560d44b1b4c7b2a47db4d273054bd20402d889d2`로 같은 Elice 인스턴스에서 Stage-1
+bootstrap을 실행했다. A100 80GB, exact torch `2.5.1+cu121`, public raw 다운로드/decoder
+감사(`candidate=37761`, `accept=36868`)와 transfer full semantic 검증은 통과했지만,
+마지막 pytest에서 5개 실패로 exit 1했다. 따라서 bootstrap receipt·readiness·checkpoint·학습
+디렉터리는 생성되지 않았고, 기존 venv/raw는 보존돼 있다. 원본 로그는
+`/home/elicer/deep_anc_logs/stage1_bootstrap_560d44b.log`에 남아 있다.
+
+실패는 다음처럼 분리했다.
+
+1. Torch 2.5.1에서 causal P/S 독립 oracle의 FP32 누적 순서가 기본 `allclose`보다 작은
+   오차를 냈다. adapter 내부 composition은 `torch.equal`로 유지하고 독립 oracle 비교에
+   기존 crop 검증과 같은 `atol=2e-7, rtol=2e-6`을 적용했다.
+2. `fullband_v5_meter` portable static loader가 오디오 없는 Elice의 `/proc/asound`를
+   읽던 결함을 수정했다. 기본 static 검증은 tracked attestation의 physical snapshot만
+   사용하며, 실제 Jetson live 경계는 현재 ALSA fingerprint를 명시적으로 수집해 두 번째
+   결속 호출을 한다. live hardware gate를 제거한 것이 아니다.
+3. `set_amp_level.py`는 fullband-v5의 다섯 operator confirmation을 raw/evidence preflight
+   전에 검사하도록 순서를 고쳤다.
+4. tracked `measurement_level_evidence.json`이 참조하는 historical meter raw/receipt가
+   transfer bundle에 없던 계보 결함을 고쳤다. `transfer_contract`에
+   `level_meter_raw/level_meter_receipt` role과 pointer/SHA/receipt exact 검증을 추가했고,
+   builder가 evidence에서 두 파일을 자동 발견한다. 새 로컬 manifest는 346파일,
+   SHA-256 `7881262a574b8ad793e43879fcab0bcb297831213496195ae0877b9807ccf261`이다.
+
+로컬 변경 실패군 pytest는 통과했고 `git diff --check`/`bash -n`도 통과했다. 전체 pytest는
+Jetson의 장시간 scipy 회귀 도중 중단했으므로 새 exact commit의 Elice 전체 pytest가 최종
+게이트다. 다음 순서는 새 커밋 push → 기존 Elice checkout fast-forward/clean 확인 → 새
+346파일 manifest와 두 meter 파일 전송 → 동일 venv에서 bootstrap 재개다. pytest와 canonical
+recorded coverage가 통과하기 전에는 pretrain/fine-tune을 시작하지 않는다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
