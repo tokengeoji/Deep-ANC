@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """덕트 실측 수집 — 소음 재생(ch0) + 레퍼런스/에러 마이크 동시 녹음 (ANC OFF).
 
-  .venv/bin/python scripts/data/record_duct.py --program tone --frequency 300 --seconds 60
-  .venv/bin/python scripts/data/record_duct.py --program band --seconds 120
-  .venv/bin/python scripts/data/record_duct.py --program silence --seconds 30   # 암소음 측정
+  .venv/bin/python scripts/data/record_duct.py --program tone --frequency 300 --seconds 15 --dry-run
+  # dry-run PASS 뒤 실제 출력은 세 확인을 모두 명시한다.
+  .venv/bin/python scripts/data/record_duct.py --program tone --frequency 300 --seconds 15 \
+    --confirm-user-present --confirm-volume-minimum --confirm-routing-and-geometry
 
 저장: data/recorded/<타임스탬프_프로그램>/
       {mics.wav(2ch PCM_32), source.wav(원본 provenance), source_aligned.wav(학습용), session.json}
@@ -24,15 +25,23 @@ UAC1 ADAPTIVE(full speed, 피드백 엔드포인트 없음)라 장치 PLL 이 �
 * ``source.wav`` 는 재생한 그대로 남긴다 (원본 provenance — 절대 덮어쓰지 않는다).
 * REF 마이크(ch1)는 ERR 과 **같은 ADC** 를 타므로 재생 신호의 시간축 증인이다.
   이 증인으로 시변 지연 L(t) 를 추정해 ``source_aligned.wav`` 를 만든다.
-* 검증은 추정에 쓰지 않은 ERR 채널로 한다(홀드아웃). 기준 미달이면 **저장하지 않는다.**
+* 검증은 추정에 쓰지 않은 ERR 채널로 한다(홀드아웃). 기준 미달 raw는 canonical 세션으로
+  발행하지 않고 ``--failed-root`` 아래 no-replace 진단 증거로 보존한다.
 * PortAudio 콜백 타임스탬프는 provenance 로만 남긴다 — 실측상 ``dac−adc`` 가
   0.010/0.020 s 두 값 사이를 16 샘플 단위로만 튀어 실제 ±130 샘플 변조를 전혀
   보여주지 않는다. **진단용이지 수정 수단이 아니다.**
 """
 
 import argparse
+import csv
+import ctypes
 import datetime
+import errno
+import hashlib
+import io
 import json
+import os
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -44,15 +53,21 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.audio_io import (                              # noqa: E402
+    MAX_RECORDING_OUTPUT_PEAK,
+    MIN_PROBE_DBFS,
     pcm_int32_to_float32,
     resolve_alsa_portaudio_device,
     rms_dbfs,
 )
 from deep_anc.config import REPO_ROOT, load_yaml             # noqa: E402
 from deep_anc.data.manifest import (                         # noqa: E402
+    VALID_SPLITS,
     validate_group_id,
     validate_session_id,
     validate_source_family,
+)
+from deep_anc.data.holdout_contract import (                 # noqa: E402
+    read_regular_file_snapshot,
 )
 from deep_anc.data.timeline import (                         # noqa: E402
     TimelineSettings,
@@ -62,6 +77,9 @@ from deep_anc.audio_io import (                             # noqa: E402
     MAX_PROBE_CLIP_RATIO,
     input_rail_gate,
 )
+from deep_anc.dsp.measurement_level import (                 # noqa: E402
+    assert_live_pcm_clock_preconditions,
+)
 from deep_anc.realtime.noise_gen import NoiseProgram         # noqa: E402
 
 # 게이트 하한. CLI 는 이 값 **이상**만 받는다(강화 전용).
@@ -69,10 +87,342 @@ from deep_anc.realtime.noise_gen import NoiseProgram         # noqa: E402
 # 세션은 0.87~0.96 이고 붕괴 세션은 0.02~0.13 이라 그 사이 골짜기가 넓다.
 DEFAULT_MIN_TIMELINE_COHERENCE = 0.90
 DEFAULT_MIN_VALID_WINDOW_RATIO = 0.90
+PROGRAM_PEAK_FACTORS = {
+    "white": 4.0,
+    "band": 4.0,
+    "multitone": 1.5,
+}
 # 자가진단 상한. QA 의 max_clip_ratio(0.005)와 같은 자리에서 판정하되, 재생 전에 본다.
 # 레일 게이트와 임계는 src/deep_anc/audio_io.py 가 단일 출처다.
 # 여기 두면 다른 도구가 sys.path 를 조작해 스크립트에서 import 해야 하고,
 # 실제로 그 불편함이 "새 도구는 그냥 안 쓴다" 로 이어졌다(2026-08-06).
+
+
+def _repo_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _artifact_evidence(paths: list[Path], *, base: Path) -> list[dict]:
+    evidence: list[dict] = []
+    for path in paths:
+        _fsync_file(path)
+        stat = path.stat()
+        evidence.append(
+            {
+                "path": path.relative_to(base).as_posix(),
+                "size_bytes": int(stat.st_size),
+                "sha256": _sha256(path),
+            }
+        )
+    return evidence
+
+
+def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Linux renameat2(RENAME_NOREPLACE)로 디렉터리를 원자 발행한다."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("renameat2(RENAME_NOREPLACE)를 지원하지 않아 안전 발행을 거부합니다")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,  # AT_FDCWD
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,  # RENAME_NOREPLACE
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, "발행 대상이 이미 존재합니다", destination)
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _write_json_exclusive(path: Path, payload: dict) -> None:
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _seal_staging_failure(
+    *, staging_dir: Path, failed_root: Path, stage: str, reason: str, metadata: dict
+) -> Path:
+    """results staging 전체를 failure evidence로 봉인해 원자 이동한다."""
+
+    artifact_paths = sorted(
+        path for path in staging_dir.iterdir() if path.is_file() and path.name != "failure.json"
+    )
+    artifacts = _artifact_evidence(artifact_paths, base=staging_dir)
+    _write_json_exclusive(
+        staging_dir / "failure.json",
+        {
+            "schema_version": 1,
+            "status": "failed_capture",
+            "failure_stage": stage,
+            "failure_reason": reason,
+            "raw_available": any(item["path"].endswith(".wav") for item in artifacts),
+            "artifacts": artifacts,
+            **metadata,
+        },
+    )
+    _fsync_directory(staging_dir)
+    failed_root.mkdir(parents=True, exist_ok=True)
+    final = failed_root / f"{staging_dir.name.removeprefix('.staging_')}_{stage}"
+    _atomic_rename_noreplace(staging_dir, final)
+    _fsync_directory(staging_dir.parent)
+    _fsync_directory(failed_root)
+    print(f"[보존] 실패 staging 전체: {final}", file=sys.stderr)
+    return final
+
+
+def _validate_collection_plan(args, parser: argparse.ArgumentParser) -> dict:
+    """CLI provenance가 지정됐다면 source-list의 exact byte/row와 교차 검증한다."""
+
+    names = (
+        "source_list",
+        "source_list_sha256",
+        "source_row_number",
+        "lineage_key",
+        "preassigned_split",
+    )
+    supplied = [getattr(args, name) is not None for name in names]
+    if not any(supplied):
+        return {
+            "status": "unbound_diagnostic",
+            "reason": "source-list SHA/row/lineage/preassigned split이 지정되지 않음",
+        }
+    if not all(supplied):
+        missing = [f"--{name.replace('_', '-')}" for name in names if getattr(args, name) is None]
+        parser.error("collection plan 일부만 지정됨: " + ", ".join(missing))
+
+    source_list = _repo_path(args.source_list)
+    if not source_list.is_file():
+        parser.error(f"--source-list 파일 없음: {source_list}")
+    expected_sha = str(args.source_list_sha256).lower()
+    if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
+        parser.error("--source-list-sha256은 64자리 소문자 hex여야 합니다")
+    raw = source_list.read_bytes()
+    actual_sha = hashlib.sha256(raw).hexdigest()
+    if actual_sha != expected_sha:
+        parser.error(
+            f"source-list SHA 불일치: expected={expected_sha}, actual={actual_sha}, path={source_list}"
+        )
+    if args.source_row_number < 2:
+        parser.error("--source-row-number는 CSV header 다음인 2 이상이어야 합니다")
+    try:
+        lineage_key = validate_group_id(args.lineage_key)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.preassigned_split not in VALID_SPLITS:
+        parser.error(f"--preassigned-split은 {VALID_SPLITS} 중 하나여야 합니다")
+
+    try:
+        reader = csv.DictReader(raw.decode("utf-8").splitlines())
+    except UnicodeDecodeError as exc:
+        parser.error(f"source-list UTF-8 오류: {exc}")
+    selected = None
+    for logical_row, row in enumerate(reader, start=2):
+        if logical_row == args.source_row_number:
+            selected = row
+            break
+    if selected is None:
+        parser.error(f"source-list에 {args.source_row_number}행이 없습니다")
+
+    row_lineage = selected.get("lineage_key") or selected.get("group_id")
+    comparisons = {
+        "path": (selected.get("path"), args.file),
+        "source_family": (selected.get("source_family"), args.source_family),
+        "group_id": (selected.get("group_id"), args.group_id),
+        "lineage_key": (row_lineage, lineage_key),
+    }
+    for field, (planned, observed) in comparisons.items():
+        if planned != observed:
+            parser.error(
+                f"source-list {args.source_row_number}행 {field} 불일치: "
+                f"planned={planned!r}, cli={observed!r}"
+            )
+    row_split = (selected.get("split") or "").strip()
+    if row_split and row_split != args.preassigned_split:
+        parser.error(
+            f"source-list split 불일치: planned={row_split!r}, cli={args.preassigned_split!r}"
+        )
+    try:
+        row_seconds = float(selected.get("seconds", ""))
+    except ValueError:
+        parser.error(f"source-list {args.source_row_number}행 seconds가 숫자가 아닙니다")
+    if not np.isclose(row_seconds, args.seconds, rtol=0.0, atol=1e-9):
+        parser.error(
+            f"source-list seconds 불일치: planned={row_seconds}, cli={args.seconds}"
+        )
+    try:
+        row_start = float(selected.get("start_seconds") or 0.0)
+    except ValueError:
+        parser.error(f"source-list {args.source_row_number}행 start_seconds가 숫자가 아닙니다")
+    if not np.isclose(row_start, args.file_start_seconds, rtol=0.0, atol=1e-9):
+        parser.error(
+            f"source-list start_seconds 불일치: planned={row_start}, "
+            f"cli={args.file_start_seconds}"
+        )
+
+    source_file = _repo_path(args.file)
+    if not source_file.is_file():
+        parser.error(f"계획된 source 파일 없음: {source_file}")
+    source_digest = _sha256(source_file)
+    declared_source_digest = (selected.get("source_file_sha256") or "").strip()
+    if declared_source_digest:
+        if (
+            len(declared_source_digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in declared_source_digest)
+        ):
+            parser.error(
+                f"source-list {args.source_row_number}행 source_file_sha256은 "
+                "64자리 소문자 hex여야 합니다"
+            )
+        if source_digest != declared_source_digest:
+            parser.error(
+                f"source-list 원본 SHA 불일치: planned={declared_source_digest}, "
+                f"actual={source_digest}"
+            )
+    return {
+        "status": "exact",
+        "source_list": str(source_list),
+        "source_list_sha256": actual_sha,
+        "source_row_number": int(args.source_row_number),
+        "lineage_key": lineage_key,
+        "preassigned_split": args.preassigned_split,
+        "split_source": "csv" if row_split else "explicit_cli",
+        "source_file_sha256": source_digest,
+        "start_seconds": float(args.file_start_seconds),
+    }
+
+
+def _preserve_failed_capture(
+    *,
+    failed_root: Path,
+    stage: str,
+    reason: str,
+    sample_rate: int,
+    metadata: dict,
+    mics_raw: np.ndarray | None = None,
+    source_raw: np.ndarray | None = None,
+) -> Path:
+    """실패 증거를 새 디렉터리에 no-replace로 보존한다.
+
+    출력 stream이 닫힌 뒤 메모리에 존재하는 raw만 보존할 수 있다. 프로세스 강제 종료,
+    전원 손실 또는 PortAudio가 콜백을 돌려주기 전의 실패에는 raw가 없으며 metadata에
+    ``raw_available=false``가 남는다.
+    """
+
+    failed_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    token = secrets.token_hex(4)
+    staging_dir = failed_root / f".staging_{stamp}_{token}"
+    staging_dir.mkdir(exist_ok=False)
+    raw_paths: list[Path] = []
+    if mics_raw is not None and np.asarray(mics_raw).size:
+        path = staging_dir / "mics_raw.wav"
+        sf.write(path, np.asarray(mics_raw), sample_rate, subtype="PCM_32")
+        raw_paths.append(path)
+    if source_raw is not None and np.asarray(source_raw).size:
+        path = staging_dir / "source_raw.wav"
+        sf.write(path, np.asarray(source_raw), sample_rate, subtype="FLOAT")
+        raw_paths.append(path)
+    artifacts = _artifact_evidence(raw_paths, base=staging_dir)
+    payload = {
+        "schema_version": 1,
+        "status": "failed_capture",
+        "failure_stage": stage,
+        "failure_reason": reason,
+        "raw_available": bool(raw_paths),
+        "sample_rate": int(sample_rate),
+        "artifacts": artifacts,
+        **metadata,
+    }
+    _write_json_exclusive(staging_dir / "failure.json", payload)
+    _fsync_directory(staging_dir)
+    failure_dir = failed_root / f"{stamp}_{stage}_{token}"
+    _atomic_rename_noreplace(staging_dir, failure_dir)
+    _fsync_directory(failed_root)
+    print(f"[보존] 실패 raw/metadata: {failure_dir}", file=sys.stderr)
+    return failure_dir
+
+
+def _publish_session(
+    *,
+    out_root: Path,
+    staging_root: Path,
+    failed_root: Path,
+    session_name: str,
+    sample_rate: int,
+    mics: np.ndarray,
+    source: np.ndarray,
+    aligned: np.ndarray | None,
+    metadata: dict,
+) -> Path:
+    """results staging을 durable하게 만든 뒤 active tree에 원자 발행한다."""
+
+    staging_root.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_hex(4)
+    staging_dir = staging_root / f".staging_{session_name}_{token}"
+    staging_dir.mkdir(exist_ok=False)
+    _fsync_directory(staging_root)
+    try:
+        mics_path = staging_dir / "mics.wav"
+        source_path = staging_dir / "source.wav"
+        sf.write(mics_path, mics, sample_rate, subtype="PCM_32")
+        sf.write(source_path, source, sample_rate, subtype="FLOAT")
+        artifact_paths = [mics_path, source_path]
+        if aligned is not None:
+            aligned_path = staging_dir / "source_aligned.wav"
+            sf.write(aligned_path, aligned, sample_rate, subtype="FLOAT")
+            artifact_paths.append(aligned_path)
+        artifacts = _artifact_evidence(artifact_paths, base=staging_dir)
+        session_meta = {**metadata, "artifacts": artifacts}
+        _write_json_exclusive(staging_dir / "session.json", session_meta)
+        _fsync_directory(staging_dir)
+
+        out_root.mkdir(parents=True, exist_ok=True)
+        destination = out_root / session_name
+        _atomic_rename_noreplace(staging_dir, destination)
+        _fsync_directory(staging_root)
+        _fsync_directory(out_root)
+        return destination
+    except Exception as exc:
+        if staging_dir.exists():
+            _seal_staging_failure(
+                staging_dir=staging_dir,
+                failed_root=failed_root,
+                stage="canonical_publish",
+                reason=repr(exc),
+                metadata={"sample_rate": int(sample_rate), **metadata},
+            )
+        raise
 
 
 def timeline_gate(report, *, min_coherence: float, min_valid_window_ratio: float) -> bool:
@@ -132,7 +482,7 @@ def _summarise_io_timestamps(stamps: np.ndarray, fs: int) -> dict:
     return summary
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hardware", default="configs/hardware_jetson.yaml")
     parser.add_argument(
@@ -144,8 +494,24 @@ def main() -> int:
     parser.add_argument("--amplitude", type=float, default=0.05)
     parser.add_argument("--band", type=float, nargs=2, default=[80.0, 1000.0])
     parser.add_argument("--file", default=None, help="program=file 재생 wav")
+    parser.add_argument(
+        "--file-start-seconds",
+        type=float,
+        default=0.0,
+        help="program=file의 사전 계획된 시작 offset",
+    )
     parser.add_argument("--seconds", type=float, default=60.0)
     parser.add_argument("--out-root", default="data/recorded")
+    parser.add_argument(
+        "--failed-root",
+        default="results/recording_failures/record_duct",
+        help="실패 raw/metadata를 no-replace로 보존할 루트",
+    )
+    parser.add_argument(
+        "--staging-root",
+        default="results/recording_staging/record_duct",
+        help="active recorded tree 발행 전 durable staging 루트",
+    )
     parser.add_argument(
         "--source-family",
         default=None,
@@ -188,7 +554,22 @@ def main() -> int:
         default=0.90,
         help="지연 추정에 성공한 창의 비율 하한. 강화만 허용된다",
     )
-    args = parser.parse_args()
+    parser.add_argument("--dry-run", action="store_true", help="파일/오디오를 변경하지 않고 계획만 검증")
+    parser.add_argument("--confirm-speaker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--confirm-user-present", action="store_true")
+    parser.add_argument("--confirm-volume-minimum", action="store_true")
+    parser.add_argument("--confirm-routing-and-geometry", action="store_true")
+    parser.add_argument("--source-list", default=None)
+    parser.add_argument("--source-list-sha256", default=None)
+    parser.add_argument("--source-row-number", type=int, default=None)
+    parser.add_argument("--lineage-key", default=None)
+    parser.add_argument("--preassigned-split", choices=VALID_SPLITS, default=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     # 게이트 인자는 **강화 방향으로만** 열려 있다. 완화 값을 주면 그 자리에서 거부한다 —
     # 게이트를 인자로 풀 수 있으면 그것은 게이트가 아니라 제안이다.
@@ -202,6 +583,30 @@ def main() -> int:
             f"--min-valid-window-ratio 는 {DEFAULT_MIN_VALID_WINDOW_RATIO} 이상이어야 "
             f"합니다 (받은 값 {args.min_valid_window_ratio}) — 게이트는 강화만 합니다"
         )
+    if args.force:
+        parser.error("--force는 입력 무신호/rail 안전 게이트를 우회하므로 더 이상 허용하지 않습니다")
+    if args.ref_check_dbfs < MIN_PROBE_DBFS:
+        parser.error(
+            f"--ref-check-dbfs는 공용 하한 {MIN_PROBE_DBFS:.0f} dBFS 이상으로만 강화할 수 있습니다"
+        )
+    if not np.isfinite(args.seconds) or args.seconds <= 0.0:
+        parser.error("--seconds는 양수 finite여야 합니다")
+    if not np.isfinite(args.settle_seconds) or args.settle_seconds < 0.0:
+        parser.error("--settle-seconds는 0 이상 finite여야 합니다")
+    if not np.isfinite(args.amplitude) or args.amplitude < 0.0:
+        parser.error("--amplitude는 0 이상 finite여야 합니다")
+    peak_factor = PROGRAM_PEAK_FACTORS.get(args.program, 1.0)
+    maximum_peak = float(args.amplitude) * peak_factor
+    if args.program != "silence" and args.amplitude <= 0.0:
+        parser.error("무음 외 program의 --amplitude는 0보다 커야 합니다")
+    if maximum_peak > MAX_RECORDING_OUTPUT_PEAK + 1e-12:
+        parser.error(
+            f"program={args.program}의 최대 출력 peak 상한은 "
+            f"{MAX_RECORDING_OUTPUT_PEAK:.3f}입니다: amplitude {args.amplitude} × "
+            f"factor {peak_factor} = {maximum_peak:.3f}"
+        )
+    if not np.isfinite(args.file_start_seconds) or args.file_start_seconds < 0.0:
+        parser.error("--file-start-seconds는 0 이상 finite여야 합니다")
 
     try:
         source_family = validate_source_family(args.source_family or args.program)
@@ -211,24 +616,99 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    import sounddevice as sd
-
-    hw = load_yaml(REPO_ROOT / args.hardware)["audio"]
+    collection_plan = _validate_collection_plan(args, parser)
+    hw = load_yaml(_repo_path(args.hardware))["audio"]
     fs = int(hw["sample_rate"])
     block = int(hw["block_size"])
+    if args.program == "file":
+        if not args.file:
+            parser.error("--program file에는 --file이 필요합니다")
+        source_path = _repo_path(args.file)
+        if not source_path.is_file():
+            parser.error(f"재생 파일 없음: {source_path}")
+        try:
+            source_info = sf.info(str(source_path))
+        except RuntimeError as exc:
+            parser.error(f"재생 파일을 열 수 없습니다: {source_path}: {exc}")
+        source_duration = float(source_info.frames) / float(source_info.samplerate)
+        if args.file_start_seconds + args.seconds > source_duration + 1e-9:
+            parser.error(
+                f"계획 구간이 source 길이를 넘습니다: start={args.file_start_seconds}, "
+                f"seconds={args.seconds}, duration={source_duration}"
+            )
 
-    in_dev = resolve_alsa_portaudio_device(hw["input"]["card"], hw["input"]["pcm"], "input", 2)
-    out_dev = resolve_alsa_portaudio_device(hw["output"]["card"], hw["output"]["pcm"], "output", 2)
+    audible_seconds = 0.0 if args.program == "silence" else float(args.seconds)
+    print(
+        f"수집 계획: program={args.program}, audible={audible_seconds:.1f}초, "
+        f"output-open={args.seconds + args.settle_seconds:.1f}초, "
+        "input-only preflight≈3.5초(PCM/CPU/clock gate 2회 포함)\n"
+        f"collection provenance: {collection_plan['status']}"
+    )
+    if args.dry_run:
+        print("[DRY-RUN PASS] 파일 생성/수정 및 오디오 장치 open 없음")
+        return 0
+
+    confirmations = {
+        "--confirm-user-present": args.confirm_user_present,
+        "--confirm-volume-minimum": args.confirm_volume_minimum,
+        "--confirm-routing-and-geometry": args.confirm_routing_and_geometry,
+    }
+    missing_confirmations = [name for name, confirmed in confirmations.items() if not confirmed]
+    if missing_confirmations:
+        print("[중단] 실기 확인 누락: " + ", ".join(missing_confirmations), file=sys.stderr)
+        return 2
+
+    import sounddevice as sd
+
+    failure_meta = {
+        "requested_program": args.program,
+        "requested_file": args.file,
+        "requested_seconds": float(args.seconds),
+        "source_family": source_family,
+        "requested_group_id": requested_group_id,
+        "collection_plan": collection_plan,
+    }
+    try:
+        in_dev = resolve_alsa_portaudio_device(
+            hw["input"]["card"], hw["input"]["pcm"], "input", 2
+        )
+        out_dev = resolve_alsa_portaudio_device(
+            hw["output"]["card"], hw["output"]["pcm"], "output", 2
+        )
+        # /dev/snd 점유, CPU idle, capture clock을 입력 probe보다 먼저 확인한다.
+        # 출력 open 직전에도 한 번 더 호출해 probe 동안 생긴 점유 race를 닫는다.
+        assert_live_pcm_clock_preconditions(hw)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="device_preflight",
+            reason=str(exc),
+            sample_rate=fs,
+            metadata=failure_meta,
+        )
+        print(f"[중단] 장치/PCM/CPU/clock preflight 실패: {exc}", file=sys.stderr)
+        return 1
 
     # ----- 1) 레퍼런스 마이크 자가진단 (2초 무음 캡처) -----
     print("레퍼런스 마이크 점검 중 (2초)...")
     # 앞 1초는 기동 트랜지언트라 버린다. 이걸 포함해서 재면 무신호 마이크도 -42dBFS 로
     # 보여 "살아 있다"고 오판한다 — 이 점검의 목적을 정확히 무력화한다.
     probe_settle = int(1.0 * fs)
-    probe = sd.rec(
-        probe_settle + int(2 * fs), samplerate=fs, channels=2, dtype="int32", device=in_dev
-    )
-    sd.wait()
+    try:
+        probe = sd.rec(
+            probe_settle + int(2 * fs), samplerate=fs, channels=2, dtype="int32", device=in_dev
+        )
+        sd.wait()
+    except (OSError, RuntimeError, ValueError) as exc:
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="input_probe",
+            reason=str(exc),
+            sample_rate=fs,
+            metadata=failure_meta,
+        )
+        print(f"[중단] input-only probe 실패: {exc}", file=sys.stderr)
+        return 1
     probe_f = pcm_int32_to_float32(probe[probe_settle:])
     err_db = rms_dbfs(probe_f[:, 0])
     ref_db = rms_dbfs(probe_f[:, 1])
@@ -237,15 +717,45 @@ def main() -> int:
         f"  ch0(err) {err_db:7.2f} dBFS | ch1(ref) {ref_db:7.2f} dBFS | "
         f"레일 비율 {clip_ratio[0]:.4f}/{clip_ratio[1]:.4f}"
     )
-    if ref_db < args.ref_check_dbfs and not args.force:
+    dead_channels = [
+        name for name, level in (("ERR ch0", err_db), ("REF ch1", ref_db))
+        if level < args.ref_check_dbfs
+    ]
+    if dead_channels:
+        reason = (
+            f"마이크 무신호: {', '.join(dead_channels)}; ERR={err_db:.1f}, REF={ref_db:.1f}, "
+            f"threshold={args.ref_check_dbfs:.1f} dBFS"
+        )
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="input_level_gate",
+            reason=reason,
+            sample_rate=fs,
+            metadata={**failure_meta, "probe_dbfs": {"err": err_db, "ref": ref_db}},
+        )
         print(
-            f"[중단] 레퍼런스 마이크(ch1)가 무신호로 보입니다 ({ref_db:.1f} dBFS < "
-            f"{args.ref_check_dbfs}). 배선 점검(docs/02_hardware_setup.md) 후 재시도하거나 "
-            "--force 로 강행하세요.", file=sys.stderr,
+            f"[중단] {reason}. 배선 점검(docs/02_hardware_setup.md) 후 다시 dry-run부터 "
+            "시작하세요.",
+            file=sys.stderr,
         )
         return 1
     # 판정 근거는 input_rail_gate() 의 docstring 에 있다. 재생 **전에** 막는다.
-    if not args.force and not rail_ok:
+    if not rail_ok:
+        reason = (
+            f"마이크 입력 rail: ch0={clip_ratio[0]:.4f}, ch1={clip_ratio[1]:.4f}, "
+            f"limit={MAX_PROBE_CLIP_RATIO}"
+        )
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="input_rail_gate",
+            reason=reason,
+            sample_rate=fs,
+            metadata={
+                **failure_meta,
+                "probe_dbfs": {"err": err_db, "ref": ref_db},
+                "probe_rail_ratio": clip_ratio,
+            },
+        )
         print(
             f"[중단] 마이크 입력이 풀스케일에 붙어 있습니다 (레일 비율 "
             f"ch0 {clip_ratio[0]:.4f} / ch1 {clip_ratio[1]:.4f} > {MAX_PROBE_CLIP_RATIO}). "
@@ -262,8 +772,49 @@ def main() -> int:
         "amplitude": args.amplitude,
         "band": args.band,
         "file": args.file,
+        "file_start_seconds": args.file_start_seconds,
     }
-    program = NoiseProgram(prog_cfg, fs)
+    try:
+        source_bytes = None
+        if args.program == "file":
+            source_snapshot = read_regular_file_snapshot(
+                _repo_path(args.file),
+                root=REPO_ROOT,
+                label="record_duct planned source",
+                capture_bytes=True,
+            )
+            assert source_snapshot.data is not None
+            source_bytes = source_snapshot.data
+            planned_sha = collection_plan.get("source_file_sha256")
+            if (
+                collection_plan.get("status") == "exact"
+                and source_snapshot.sha256 != planned_sha
+            ):
+                raise ValueError(
+                    "재생 직전 source snapshot SHA가 collection plan과 다릅니다: "
+                    f"planned={planned_sha}, actual={source_snapshot.sha256}"
+                )
+            snapshot_info = sf.info(io.BytesIO(source_bytes))
+            snapshot_duration = float(snapshot_info.frames) / float(
+                snapshot_info.samplerate
+            )
+            if args.file_start_seconds + args.seconds > snapshot_duration + 1e-9:
+                raise ValueError(
+                    "재생 직전 source snapshot window가 파일 길이를 넘습니다: "
+                    f"start={args.file_start_seconds}, seconds={args.seconds}, "
+                    f"duration={snapshot_duration}"
+                )
+        program = NoiseProgram(prog_cfg, fs, file_bytes=source_bytes)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="program_prepare",
+            reason=str(exc),
+            sample_rate=fs,
+            metadata={**failure_meta, "program": prog_cfg},
+        )
+        print(f"[중단] 재생 프로그램 준비 실패: {exc}", file=sys.stderr)
+        return 1
 
     # I2S 입력은 스트림을 연 직후 약 0.5초 동안 큰 기동 트랜지언트를 낸다
     # (실측: 0.0-0.5초 -36.3 dBFS peak 0.062 → 0.5초 이후 -67.4 dBFS peak 0.002).
@@ -338,27 +889,104 @@ def main() -> int:
         if cursor["in"] >= total:
             raise sd.CallbackStop
 
+    try:
+        # input probe 뒤 다른 프로세스가 PCM을 잡았거나 CPU 부하가 생긴 race를 닫는다.
+        assert_live_pcm_clock_preconditions(hw)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="immediate_live_gate",
+            reason=str(exc),
+            sample_rate=fs,
+            metadata={**failure_meta, "program": prog_cfg},
+        )
+        print(f"[중단] 출력 직전 PCM/CPU/clock gate 실패: {exc}", file=sys.stderr)
+        return 1
+
     print(f"녹음 시작: {args.program}, {args.seconds:.0f}초 (ANC 없음, ch1 무음)")
-    with sd.Stream(
-        samplerate=fs,
-        blocksize=block,
-        device=(in_dev, out_dev),
-        channels=(2, 2),
-        dtype=("int32", "int16"),
-        latency=("low", "low"),
-        callback=callback,
-        prime_output_buffers_using_stream_callback=True,
-    ):
-        while cursor["in"] < total:
-            time.sleep(0.1)
+    stream_error: Exception | None = None
+    try:
+        with sd.Stream(
+            samplerate=fs,
+            blocksize=block,
+            device=(in_dev, out_dev),
+            channels=(2, 2),
+            dtype=("int32", "int16"),
+            latency=("low", "low"),
+            callback=callback,
+            prime_output_buffers_using_stream_callback=True,
+        ):
+            while cursor["in"] < total:
+                time.sleep(0.1)
+    except Exception as exc:  # PortAudio/callback 오류도 메모리에 남은 partial raw를 보존한다.
+        stream_error = exc
+    finally:
+        # 정렬/저장보다 먼저 알려야 스피커가 분석 시간 동안 연결된 채 방치되지 않는다.
+        print("출력 종료 — 지금 스피커를 분리하세요.", flush=True)
+
+    captured = min(int(cursor["in"]), int(cursor["out"]), total)
+    raw_mics = recorded[:captured]
+    raw_source = source[:captured]
+    if stream_error is not None:
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="duplex_stream",
+            reason=repr(stream_error),
+            sample_rate=fs,
+            metadata={
+                **failure_meta,
+                "program": prog_cfg,
+                "captured_frames": captured,
+                "requested_frames": total,
+                "xrun_count": int(xrun_state["count"]),
+                "xrun_flags": sorted(xrun_state["flags"]),
+            },
+            mics_raw=raw_mics,
+            source_raw=raw_source,
+        )
+        print(f"[중단] duplex stream 실패: {stream_error}", file=sys.stderr)
+        return 1
 
     # ----- 3) 저장 -----
     # xrun 이 하나라도 있으면 source↔mics 정렬이 깨졌다. 전달맵은 이미 xrun 을 무효화
     # 사유로 쓰는데(measure_duct_transfer_map) 학습데이터 수집기만 기준이 느슨했다.
     if xrun_state["count"] > 0:
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="xrun_gate",
+            reason=(
+                f"xrun {xrun_state['count']}회: "
+                f"{', '.join(sorted(xrun_state['flags']))}"
+            ),
+            sample_rate=fs,
+            metadata={
+                **failure_meta,
+                "program": prog_cfg,
+                "captured_frames": captured,
+                "requested_frames": total,
+                "io_timestamps": _summarise_io_timestamps(stamps[: stamp_count["n"]], fs),
+            },
+            mics_raw=raw_mics,
+            source_raw=raw_source,
+        )
         print(
             f"[중단] 오디오 xrun {xrun_state['count']}회 ({', '.join(sorted(xrun_state['flags']))}) — "
             "source 와 mics 의 정렬이 깨져 학습에 쓸 수 없습니다. 세션을 저장하지 않습니다.",
+            file=sys.stderr,
+        )
+        return 1
+    if captured != total:
+        _preserve_failed_capture(
+            failed_root=_repo_path(args.failed_root),
+            stage="incomplete_capture",
+            reason=f"captured_frames={captured}, requested_frames={total}",
+            sample_rate=fs,
+            metadata={**failure_meta, "program": prog_cfg},
+            mics_raw=raw_mics,
+            source_raw=raw_source,
+        )
+        print(
+            f"[중단] 캡처 길이 부족: {captured}/{total} frames. 실패 raw를 보존했습니다.",
             file=sys.stderr,
         )
         return 1
@@ -366,8 +994,8 @@ def main() -> int:
     # ----- 3a) 시간축 재정렬 (저장 **전에** 판정한다) -----
     # settle 구간을 양쪽에서 동일하게 잘라낸다. 이 자르기가 보존하는 것은 인덱스
     # 동일성일 뿐 물리 시각 동일성이 아니다 — 그래서 바로 아래에서 실제로 측정한다.
-    mics_keep = recorded[settle:]
-    source_keep = source[settle:]
+    mics_keep = recorded[settle:captured]
+    source_keep = source[settle:captured]
 
     silent_program = args.program == "silence" or source_family == "silence"
     timeline_meta: dict = {}
@@ -383,13 +1011,33 @@ def main() -> int:
         print("[안내] 무음 세션이라 시간축 재정렬을 건너뜁니다 (digital-ref 학습에 쓸 수 없음)")
     else:
         print("시간축 재정렬 중 (REF 마이크를 증인으로 사용)...")
-        aligned, report = align_source_to_adc(
-            source_keep,
-            mics_keep[:, 1],   # 증인 = REF (추정 전용)
-            mics_keep[:, 0],   # 홀드아웃 = ERR (검증 전용)
-            fs,
-            settings=TimelineSettings(sample_rate=fs),
-        )
+        try:
+            aligned, report = align_source_to_adc(
+                source_keep,
+                mics_keep[:, 1],   # 증인 = REF (추정 전용)
+                mics_keep[:, 0],   # 홀드아웃 = ERR (검증 전용)
+                fs,
+                settings=TimelineSettings(sample_rate=fs),
+            )
+        except (RuntimeError, ValueError) as exc:
+            _preserve_failed_capture(
+                failed_root=_repo_path(args.failed_root),
+                stage="timeline_alignment",
+                reason=str(exc),
+                sample_rate=fs,
+                metadata={
+                    **failure_meta,
+                    "program": prog_cfg,
+                    "captured_frames": captured,
+                    "io_timestamps": _summarise_io_timestamps(
+                        stamps[: stamp_count["n"]], fs
+                    ),
+                },
+                mics_raw=raw_mics,
+                source_raw=raw_source,
+            )
+            print(f"[중단] 시간축 재정렬 예외: {exc}", file=sys.stderr)
+            return 1
         timeline_meta = report.as_metadata()
         timeline_meta["usable_for_digital_reference"] = True
         print(
@@ -409,6 +1057,26 @@ def main() -> int:
             min_coherence=args.min_timeline_coherence,
             min_valid_window_ratio=args.min_valid_window_ratio,
         ):
+            _preserve_failed_capture(
+                failed_root=_repo_path(args.failed_root),
+                stage="timeline_gate",
+                reason=(
+                    f"coh2={report.coh2_150_600_after:.6f}, "
+                    f"valid_window_ratio={report.valid_window_ratio:.6f}"
+                ),
+                sample_rate=fs,
+                metadata={
+                    **failure_meta,
+                    "program": prog_cfg,
+                    "timeline": timeline_meta,
+                    "captured_frames": captured,
+                    "io_timestamps": _summarise_io_timestamps(
+                        stamps[: stamp_count["n"]], fs
+                    ),
+                },
+                mics_raw=raw_mics,
+                source_raw=raw_source,
+            )
             print(
                 "[중단] 시간축 재정렬 실패 — 세션을 저장하지 않습니다 "
                 f"(coh² {report.coh2_150_600_after:.3f} < {args.min_timeline_coherence}, "
@@ -420,15 +1088,8 @@ def main() -> int:
             return 1
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_dir = REPO_ROOT / args.out_root / f"{stamp}_{args.program}"
-    session_dir.mkdir(parents=True, exist_ok=True)
-    sf.write(session_dir / "mics.wav", mics_keep, fs, subtype="PCM_32")
-    # source.wav 는 **원본 provenance** 다. 절대 재정렬본으로 덮어쓰지 마라 —
-    # 덮어쓰면 워프 알고리즘을 고쳤을 때 되돌릴 방법이 없다.
-    sf.write(session_dir / "source.wav", source_keep, fs, subtype="FLOAT")
-    if aligned is not None:
-        sf.write(session_dir / "source_aligned.wav", aligned, fs, subtype="FLOAT")
-    session_id = validate_session_id(session_dir.name)
+    session_name = f"{stamp}_{args.program}_{secrets.token_hex(4)}"
+    session_id = validate_session_id(session_name)
     group_id = requested_group_id or validate_group_id(session_id)
     meta = {
         "session_id": session_id,
@@ -441,12 +1102,35 @@ def main() -> int:
         "channels": {"err_mic": 0, "ref_mic": 1, "noise_out": 0, "cancel_out": 1},
         "ref_check_dbfs": {"err": err_db, "ref": ref_db},
         "timestamp": stamp,
+        "collection_plan": collection_plan,
+        "preassigned_split": collection_plan.get("preassigned_split"),
+        "safety_confirmations": {
+            "user_present": True,
+            "volume_minimum": True,
+            "routing_and_geometry": True,
+        },
         "timeline": timeline_meta,
         "io_timestamps": _summarise_io_timestamps(stamps[: stamp_count["n"]], fs),
     }
-    (session_dir / "session.json").write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    try:
+        session_dir = _publish_session(
+            out_root=_repo_path(args.out_root),
+            staging_root=_repo_path(args.staging_root),
+            failed_root=_repo_path(args.failed_root),
+            session_name=session_name,
+            sample_rate=fs,
+            mics=mics_keep,
+            source=source_keep,
+            aligned=aligned,
+            metadata=meta,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(
+            f"[중단] canonical 세션 원자 발행 실패: {exc}. active recorded tree에는 "
+            "partial session을 발행하지 않았습니다.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"저장 완료: {session_dir}")
     print("다음: .venv/bin/python scripts/data/make_recorded_manifest.py 로 manifest 갱신")
     return 0

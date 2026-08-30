@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""소스 풀을 순서대로 재생하며 recorded 세션을 **연속으로** 수집한다.
+"""사전 계획된 소스 목록을 순서대로 재생해 recorded 세션을 수집한다.
 
-⚠ 스피커에서 계속 소리가 난다. 사용자 입회 하에만 실행한다.
+이 도구는 무인 장시간 재생기가 아니다. 실제 실행은 사용자 입회·볼륨 최저·배선/덕트
+geometry 확인을 모두 명시해야 하며, 재시도는 기본적으로 하지 않는다. 먼저 ``--dry-run``으로
+소스 목록, 계보/split, 예상 audible/connected 시간과 세션별 hard timeout을 검증한다.
 
-왜 배치인가
------------
-파인튜닝 게이트는 80세션 **그리고** 90분을 요구한다. 세션 하나를 손으로 돌리면 80번을
-사람이 지켜봐야 하고, 중간에 하나가 실패하면 어디까지 됐는지 알 수 없다. 이 스크립트는
-
-* ``data/source_pool/sources.csv`` 를 순서대로 소비하고,
-* 이미 녹음된 소스는 건너뛰며(재개 가능),
-* **세션마다 즉시 QA** 를 돌려 클리핑/무신호를 그 자리에서 잡고,
-* 진행 상황을 ``batch_progress.csv`` 에 한 행씩 남긴다.
-
-즉시 QA 가 핵심이다. 2시간을 다 돌린 뒤에 "전부 클리핑이었다"를 알면 2시간을 다시 써야 한다.
-
-    .venv/bin/python scripts/data/record_session_batch.py --confirm-speaker
+소스 CSV 필수 열은 ``path,seconds,source_family,group_id``다. ``lineage_key``가 없으면
+``group_id``를 lineage key로 사용한다. split은 각 행의 ``split`` 또는 실행 전에 명시한
+``--preassigned-split``에서만 가져오며, 녹음 뒤에 배정하지 않는다.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
+import errno
+import hashlib
 import json
+import os
+import secrets
+import stat
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -33,12 +33,53 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from deep_anc.data.manifest import (  # noqa: E402
+    VALID_SPLITS,
+    validate_group_id,
+    validate_source_family,
+)
+from deep_anc.data.recorded_generation import (  # noqa: E402
+    ADDITION_SESSION_COUNT,
+    ADDITIONS_ROOT,
+    RecordedGenerationError,
+    SOURCE_PLAN_FIELDS,
+    SOURCE_PLAN_ROOT,
+    _read_source_plan,
+    _read_session_metadata,
+    _validate_session_artifacts,
+    validate_generation_id,
+)
+from deep_anc.audio_io import MAX_RECORDING_OUTPUT_PEAK  # noqa: E402
 from deep_anc.eval.artifacts import write_csv  # noqa: E402
 
-# 마이크 입력의 허용 범위. 상한은 클리핑 직전, 하한은 "스피커가 실제로 울렸는가".
 MAX_CLIP_RATIO = 0.0
 MIN_ERR_RMS_DBFS = -60.0
 MAX_ERR_PEAK = 0.95
+
+# record_duct의 input-only probe(앞 1초 settle + 뒤 2초 판정)와 CPU idle witness.
+# 실제 출력 시간과 혼동하지 않도록 dry-run에서 별도 항목으로 표시한다.
+INPUT_ONLY_PREFLIGHT_SECONDS = 3.5
+
+
+@dataclass(frozen=True)
+class ChildResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+
+
+def _repo_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def analyse_session(session_dir: Path) -> dict:
@@ -73,171 +114,861 @@ def qa_verdict(stats: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
-def already_recorded(out_root: Path) -> set[str]:
-    """이미 수집된 세션의 소스 경로 집합. 재개 시 중복 녹음을 막는다."""
+def _plan_key(entry: dict, source_list_sha256: str) -> tuple[str, str, int, str, str, float]:
+    return (
+        str(entry["path"]),
+        source_list_sha256,
+        int(entry["source_row_number"]),
+        str(entry["lineage_key"]),
+        str(entry["split"]),
+        float(entry["start_seconds"]),
+    )
 
-    done: set[str] = set()
+
+def already_recorded(out_root: Path) -> set[tuple[str, str, int, str, str, float]]:
+    """정확히 같은 수집 계획에 결속된 성공 세션만 완료로 센다."""
+
+    done: set[tuple[str, str, int, str, str, float]] = set()
+    if not out_root.exists():
+        return done
     for meta_path in sorted(out_root.glob("*/session.json")):
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            plan = meta["collection_plan"]
+            key = (
+                str((meta.get("program") or {})["file"]),
+                str(plan["source_list_sha256"]),
+                int(plan["source_row_number"]),
+                str(plan["lineage_key"]),
+                str(plan["preassigned_split"]),
+                float(plan.get("start_seconds", 0.0)),
+            )
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             continue
-        source = (meta.get("program") or {}).get("file")
-        if source:
-            done.add(str(source))
+        done.add(key)
     return done
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--sources",
-        default="data/source_pool_v2/sources.csv",
-        help=(
-            "재생할 소스 목록. **v2 가 기본이다** — v1 은 machine 이 8 그룹뿐이라 "
-            "분할 하한(계열별 9 = val 4 + test 4 + train 1)을 만족할 수 없고, "
-            "그 풀로 녹음하면 make_recorded_manifest 가 EXIT=2 로 거부한다"
-        ),
+def _lexical_repo_path(value: str | Path) -> Path:
+    candidate = Path(value).expanduser()
+    candidate = candidate if candidate.is_absolute() else REPO_ROOT / candidate
+    return Path(os.path.abspath(candidate))
+
+
+def _reject_existing_symlink_components(path: Path) -> Path:
+    """아직 없는 canonical out-root도 허용하되 기존 component symlink는 거부한다."""
+
+    candidate = _lexical_repo_path(path)
+    boundary = _lexical_repo_path(REPO_ROOT)
+    try:
+        relative = candidate.relative_to(boundary)
+    except ValueError as exc:
+        raise ValueError(f"canonical additions 경로가 저장소 밖입니다: {candidate}") from exc
+    current = boundary
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"canonical additions symlink 경로 component 금지: {current}")
+    return candidate
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Linux renameat2(RENAME_NOREPLACE)로 session directory를 원자 발행한다."""
+
+    if not source.is_dir() or source.is_symlink():
+        raise ValueError(f"발행할 staged session이 regular directory가 아닙니다: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _reject_existing_symlink_components(destination.parent)
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("renameat2(RENAME_NOREPLACE)를 지원하지 않아 canonical 발행을 중단합니다")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
     )
+    if result != 0:
+        code = ctypes.get_errno()
+        if code == errno.EEXIST:
+            raise FileExistsError(f"canonical session을 덮어쓰지 않습니다: {destination}")
+        raise OSError(code, os.strerror(code), f"{source} -> {destination}")
+    _fsync_directory(source.parent)
+    _fsync_directory(destination.parent)
+
+
+def _new_attempt_root(*, generation_id: str, row_number: int, attempt: int) -> Path:
+    root = _repo_path(
+        Path("results/recording_staging/record_session_batch") / generation_id
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    _reject_existing_symlink_components(root)
+    name = (
+        f"row{row_number:04d}_attempt{attempt}_{int(time.time())}_"
+        f"{secrets.token_hex(8)}"
+    )
+    candidate = root / name
+    candidate.mkdir(mode=0o700)
+    return candidate
+
+
+def _quarantine_staged_session(
+    *,
+    staged_session: Path,
+    failed_root: Path,
+    generation_id: str,
+    row_number: int,
+    attempt: int,
+) -> Path:
+    """QA 실패 raw를 canonical root 밖의 no-replace evidence로 이동한다."""
+
+    batch_root = (
+        failed_root
+        / "batch_qa"
+        / generation_id
+        / f"row{row_number:04d}_attempt{attempt}_{int(time.time())}_{secrets.token_hex(4)}"
+    )
+    batch_root.mkdir(parents=True, exist_ok=False)
+    destination = batch_root / staged_session.name
+    _atomic_rename_noreplace(staged_session, destination)
+    return destination
+
+
+def _canonical_already_recorded(
+    *,
+    out_root: Path,
+    rows: list[dict],
+    source_list: Path,
+    source_list_sha256: str,
+) -> set[tuple[str, str, int, str, str, float]]:
+    """exact plan·artifact·progress가 모두 맞는 canonical 세션만 resume 완료로 센다."""
+
+    if not out_root.exists():
+        return set()
+    if not out_root.is_dir():
+        raise ValueError(f"canonical additions out-root가 directory가 아닙니다: {out_root}")
+    row_by_number = {int(row["source_row_number"]): row for row in rows}
+    session_by_row: dict[int, str] = {}
+    for child in sorted(out_root.iterdir(), key=lambda item: item.name):
+        info = child.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"canonical additions root 내부 symlink 금지: {child}")
+        if stat.S_ISREG(info.st_mode) and child.name == "batch_progress.csv":
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(
+                "canonical additions root에는 session directory와 "
+                f"batch_progress.csv만 허용합니다: {child}"
+            )
+        try:
+            metadata = _read_session_metadata(child, repo_root=REPO_ROOT)
+        except (OSError, RecordedGenerationError, ValueError) as exc:
+            raise ValueError(f"canonical 기존 session metadata 검증 실패: {child}: {exc}") from exc
+        if metadata.get("session_id") != child.name:
+            raise ValueError(f"canonical 기존 session_id/directory 불일치: {child}")
+        plan = metadata.get("collection_plan")
+        required_plan_keys = {
+            "status",
+            "source_list",
+            "source_list_sha256",
+            "source_row_number",
+            "lineage_key",
+            "preassigned_split",
+            "split_source",
+            "source_file_sha256",
+            "start_seconds",
+        }
+        if not isinstance(plan, dict) or set(plan) != required_plan_keys:
+            raise ValueError(f"canonical 기존 session collection_plan이 exact가 아닙니다: {child}")
+        row_number = plan.get("source_row_number")
+        if isinstance(row_number, bool) or not isinstance(row_number, int):
+            raise ValueError(f"canonical 기존 session source row가 유효하지 않습니다: {child}")
+        row = row_by_number.get(row_number)
+        if row is None or row_number in session_by_row:
+            raise ValueError(f"canonical 기존 session source row 중복/범위 오류: {child}")
+        try:
+            declared_source_list = _lexical_repo_path(str(plan["source_list"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"canonical 기존 session source_list 오류: {child}") from exc
+        expected_plan = {
+            "status": "exact",
+            "source_list": plan["source_list"],
+            "source_list_sha256": source_list_sha256,
+            "source_row_number": row_number,
+            "lineage_key": row["lineage_key"],
+            "preassigned_split": row["split"],
+            "split_source": "csv",
+            "source_file_sha256": row["source_file_sha256"],
+            "start_seconds": row["start_seconds"],
+        }
+        program = metadata.get("program")
+        if (
+            plan != expected_plan
+            or declared_source_list != source_list
+            or not isinstance(program, dict)
+            or program.get("type") != "file"
+            or program.get("file") != row["path"]
+            or program.get("file_start_seconds") != row["start_seconds"]
+            or metadata.get("source_family") != row["source_family"]
+            or metadata.get("group_id") != row["group_id"]
+            or metadata.get("preassigned_split") != row["split"]
+        ):
+            raise ValueError(f"canonical 기존 session/source plan 불일치: {child}")
+        try:
+            _validate_session_artifacts(
+                session_dir=child,
+                metadata=metadata,
+                row=row,
+                expected_seconds=float(row["seconds"]),
+                repo_root=REPO_ROOT,
+            )
+        except (OSError, RecordedGenerationError, ValueError) as exc:
+            raise ValueError(f"canonical 기존 session artifact 검증 실패: {child}: {exc}") from exc
+        session_by_row[row_number] = child.name
+
+    progress_path = out_root / "batch_progress.csv"
+    if not session_by_row and not progress_path.exists():
+        return set()
+    if not progress_path.is_file() or progress_path.is_symlink():
+        raise ValueError("canonical 기존 session에는 regular batch_progress.csv가 필요합니다")
+    try:
+        with progress_path.open(encoding="utf-8", newline="") as handle:
+            progress = list(csv.DictReader(handle))
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ValueError(f"canonical batch_progress.csv 읽기 실패: {exc}") from exc
+    successful: list[tuple[int, str]] = []
+    for item in progress:
+        if item.get("verdict") != "ok":
+            continue
+        row_text = item.get("source_row_number", "")
+        if not row_text.isdigit() or not item.get("session_id"):
+            raise ValueError("canonical batch_progress.csv PASS 행이 불완전합니다")
+        row_number = int(row_text)
+        planned = row_by_number.get(row_number)
+        try:
+            progress_seconds = float(item.get("seconds", ""))
+            progress_start = float(item.get("start_seconds", ""))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "canonical batch_progress.csv PASS 행 seconds가 없습니다"
+            ) from exc
+        if (
+            planned is None
+            or not np.isfinite(progress_seconds)
+            or progress_seconds != float(planned["seconds"])
+            or item.get("source_path") != planned["path"]
+            or item.get("source_file_sha256") != planned["source_file_sha256"]
+            or item.get("source_list_sha256") != source_list_sha256
+            or item.get("lineage_key") != planned["lineage_key"]
+            or item.get("preassigned_split") != planned["split"]
+            or progress_start != float(planned["start_seconds"])
+        ):
+            raise ValueError(
+                "canonical batch_progress.csv PASS 행이 exact source plan과 다릅니다"
+            )
+        successful.append((row_number, str(item["session_id"])))
+    expected_pairs = sorted(session_by_row.items())
+    if sorted(successful) != expected_pairs or len(successful) != len(set(successful)):
+        raise ValueError(
+            "canonical 기존 session과 batch_progress.csv PASS exact 집합이 다릅니다. "
+            "QA 실패/불완전 session을 canonical root에 남긴 경우 자동 삭제하지 말고 "
+            "별도 quarantine으로 이동하거나 새 generation-id를 사용하세요"
+        )
+    return {
+        _plan_key(row_by_number[row_number], source_list_sha256)
+        for row_number, _session_id in expected_pairs
+    }
+
+
+def _load_plan(
+    sources_path: Path, *, families: list[str] | None, default_split: str | None
+) -> tuple[list[dict], str]:
+    raw = sources_path.read_bytes()
+    source_list_sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"소스 목록이 UTF-8이 아닙니다: {sources_path}: {exc}") from exc
+    reader = csv.DictReader(text.splitlines())
+    required = {"path", "seconds", "source_family", "group_id"}
+    missing = sorted(required - set(reader.fieldnames or ()))
+    if missing:
+        raise ValueError(f"소스 목록 필수 열 누락: {missing}")
+
+    family_filter = set(families or ())
+    entries: list[dict] = []
+    group_splits: dict[str, str] = {}
+    for row_number, raw_entry in enumerate(reader, start=2):
+        if family_filter and raw_entry["source_family"] not in family_filter:
+            continue
+        entry = dict(raw_entry)
+        try:
+            entry["source_family"] = validate_source_family(entry["source_family"])
+            entry["group_id"] = validate_group_id(entry["group_id"])
+            entry["lineage_key"] = validate_group_id(
+                entry.get("lineage_key") or entry["group_id"]
+            )
+            entry["seconds"] = float(entry["seconds"])
+            entry["start_seconds"] = float(entry.get("start_seconds") or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"소스 목록 {row_number}행 오류: {exc}") from exc
+        if entry["seconds"] <= 0.0 or not np.isfinite(entry["seconds"]):
+            raise ValueError(f"소스 목록 {row_number}행 seconds는 양수 finite여야 합니다")
+        if entry["start_seconds"] < 0.0 or not np.isfinite(entry["start_seconds"]):
+            raise ValueError(f"소스 목록 {row_number}행 start_seconds는 0 이상 finite여야 합니다")
+        split = (entry.get("split") or default_split or "").strip()
+        if split not in VALID_SPLITS:
+            raise ValueError(
+                f"소스 목록 {row_number}행 split이 사전 지정되지 않았습니다. "
+                f"행의 split 또는 --preassigned-split {VALID_SPLITS} 중 하나가 필요합니다"
+            )
+        previous = group_splits.setdefault(entry["lineage_key"], split)
+        if previous != split:
+            raise ValueError(
+                f"lineage_key={entry['lineage_key']!r}가 split {previous!r}/{split!r}에 걸칩니다"
+            )
+        source_path = _repo_path(entry["path"])
+        if not source_path.is_file():
+            raise ValueError(f"소스 목록 {row_number}행 파일 없음: {source_path}")
+        import soundfile as sf
+
+        try:
+            source_info = sf.info(str(source_path))
+        except RuntimeError as exc:
+            raise ValueError(f"소스 목록 {row_number}행 파일을 열 수 없습니다: {exc}") from exc
+        duration = float(source_info.frames) / float(source_info.samplerate)
+        if entry["start_seconds"] + entry["seconds"] > duration + 1e-9:
+            raise ValueError(
+                f"소스 목록 {row_number}행 window가 파일 길이를 넘습니다: "
+                f"start={entry['start_seconds']}, seconds={entry['seconds']}, duration={duration}"
+            )
+        source_digest = _sha256(source_path)
+        declared_digest = (entry.get("source_file_sha256") or "").strip()
+        if declared_digest:
+            if (
+                len(declared_digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in declared_digest)
+            ):
+                raise ValueError(
+                    f"소스 목록 {row_number}행 source_file_sha256은 64자리 소문자 hex여야 합니다"
+                )
+            if declared_digest != source_digest:
+                raise ValueError(
+                    f"소스 목록 {row_number}행 source_file_sha256 불일치: "
+                    f"declared={declared_digest}, actual={source_digest}"
+                )
+        entry["split"] = split
+        entry["source_row_number"] = row_number
+        entry["source_file_sha256"] = source_digest
+        entries.append(entry)
+    if not entries:
+        raise ValueError("선택된 소스가 없습니다")
+    return entries, source_list_sha256
+
+
+def _pump_stream(stream, console, log_handle, log_lock: threading.Lock, sink: list[str]) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            sink.append(line)
+            console.write(line)
+            console.flush()
+            with log_lock:
+                log_handle.write(line)
+                log_handle.flush()
+    finally:
+        stream.close()
+
+
+def run_child_live(command: list[str], *, timeout_seconds: float, log_path: Path) -> ChildResult:
+    """stdout/stderr를 터미널과 no-replace 로그에 동시에 보존하며 hard timeout을 건다."""
+
+    if timeout_seconds <= 0.0 or not np.isfinite(timeout_seconds):
+        raise ValueError("timeout_seconds는 양수 finite여야 합니다")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    with log_path.open("x", encoding="utf-8") as log_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None and process.stderr is not None
+        lock = threading.Lock()
+        threads = [
+            threading.Thread(
+                target=_pump_stream,
+                args=(process.stdout, sys.stdout, log_handle, lock, stdout_lines),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_pump_stream,
+                args=(process.stderr, sys.stderr, log_handle, lock, stderr_lines),
+                daemon=True,
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            print(
+                f"[중단] 세션 hard timeout {timeout_seconds:.1f}초 초과 — 자식을 종료합니다.",
+                file=sys.stderr,
+                flush=True,
+            )
+            process.terminate()
+            try:
+                returncode = process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                returncode = 124
+        for thread in threads:
+            thread.join(timeout=2.0)
+    return ChildResult(
+        returncode=124 if timed_out else int(returncode),
+        stdout="".join(stdout_lines),
+        stderr="".join(stderr_lines),
+        timed_out=timed_out,
+    )
+
+
+def _confirm_reconnect(reason: str) -> bool:
+    """분리 안내 뒤 다음 출력 전에 현장 사용자의 재연결 확인을 다시 받는다."""
+
+    if not sys.stdin.isatty():
+        print(
+            f"[중단] {reason}: 다음 출력 전 스피커 재연결 확인에는 대화형 TTY가 필요합니다.",
+            file=sys.stderr,
+        )
+        return False
+    input(
+        f"{reason}: 스피커를 분리한 상태에서 직전 raw/log를 확인하세요. "
+        "다음 출력 직전에 다시 연결하고 볼륨/배선/geometry를 확인한 뒤 Enter: "
+    )
+    return True
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sources", default="data/source_pool_v2/sources.csv")
     parser.add_argument("--out-root", default="data/recorded")
+    parser.add_argument("--failed-root", default="results/recording_failures/record_duct")
+    parser.add_argument("--log-root", default="results/recording_logs/record_session_batch")
     parser.add_argument("--amplitude", type=float, default=0.15)
     parser.add_argument("--limit", type=int, default=None, help="이번 실행에서 녹음할 최대 세션 수")
     parser.add_argument("--families", nargs="+", default=None)
     parser.add_argument("--settle-seconds", type=float, default=1.0)
     parser.add_argument("--max-consecutive-failures", type=int, default=3)
     parser.add_argument(
-        "--no-retry",
-        action="store_true",
-        help="일시적 xrun 재시도를 끈다(진단용). 기본은 세션당 1회 재시도",
+        "--session-timeout-overhead-seconds",
+        type=float,
+        default=120.0,
+        help="각 행의 seconds+settle에 더할 정렬/저장 hard-timeout 여유",
     )
     parser.add_argument(
-        "--confirm-speaker",
+        "--retry-once",
         action="store_true",
-        help="사용자 입회 확인. 없으면 실행하지 않는다",
+        help="실패 세션을 딱 한 번 다시 재생한다. 기본은 재시도 없음",
     )
+    parser.add_argument("--no-retry", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--preassigned-split", choices=VALID_SPLITS, default=None)
+    parser.add_argument(
+        "--canonical-additions-generation",
+        default=None,
+        help=(
+            "추가 17세션 canonical 수집 모드. source plan/out-root를 generation-id별 "
+            "별도 경로에 고정하고 exact CSV를 강제합니다"
+        ),
+    )
+    parser.add_argument("--dry-run", action="store_true", help="파일/오디오를 변경하지 않고 계획만 검증")
+    parser.add_argument("--confirm-speaker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--confirm-user-present", action="store_true")
+    parser.add_argument("--confirm-volume-minimum", action="store_true")
+    parser.add_argument("--confirm-routing-and-geometry", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
-
-    if not args.confirm_speaker:
-        print(
-            "[중단] 스피커에서 장시간 소리가 재생됩니다. --confirm-speaker 로 확인하세요.",
-            file=sys.stderr,
+    if args.no_retry and args.retry_once:
+        parser.error("--retry-once와 legacy --no-retry를 함께 쓸 수 없습니다")
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit은 양수여야 합니다")
+    for name in ("settle_seconds", "session_timeout_overhead_seconds"):
+        value = float(getattr(args, name))
+        if not np.isfinite(value) or value < 0.0:
+            parser.error(f"--{name.replace('_', '-')}는 0 이상 finite여야 합니다")
+    if (
+        not np.isfinite(args.amplitude)
+        or args.amplitude <= 0.0
+        or args.amplitude > MAX_RECORDING_OUTPUT_PEAK
+    ):
+        parser.error(
+            f"--amplitude는 0 초과 {MAX_RECORDING_OUTPUT_PEAK:.3f} 이하여야 합니다"
         )
+
+    confirmations = {
+        "--confirm-user-present": args.confirm_user_present,
+        "--confirm-volume-minimum": args.confirm_volume_minimum,
+        "--confirm-routing-and-geometry": args.confirm_routing_and_geometry,
+    }
+    missing_confirmations = [name for name, confirmed in confirmations.items() if not confirmed]
+    if missing_confirmations and not args.dry_run:
+        print("[중단] 실기 확인 누락: " + ", ".join(missing_confirmations), file=sys.stderr)
         return 2
 
-    sources_path = REPO_ROOT / args.sources
-    if not sources_path.exists():
+    sources_path = _repo_path(args.sources)
+    if not sources_path.is_file():
         print(f"[중단] 소스 목록이 없습니다: {sources_path}", file=sys.stderr)
-        print("  먼저: .venv/bin/python scripts/data/build_recording_sources.py", file=sys.stderr)
+        return 2
+    try:
+        entries, source_list_sha256 = _load_plan(
+            sources_path, families=args.families, default_split=args.preassigned_split
+        )
+    except (OSError, ValueError) as exc:
+        print(f"[중단] 수집 계획 오류: {exc}", file=sys.stderr)
         return 2
 
-    entries = list(csv.DictReader(sources_path.open(encoding="utf-8")))
-    if args.families:
-        entries = [e for e in entries if e["source_family"] in set(args.families)]
-    out_root = REPO_ROOT / args.out_root
-    out_root.mkdir(parents=True, exist_ok=True)
-    done = already_recorded(out_root)
-
-    pending = [e for e in entries if e["path"] not in done]
+    out_root = _repo_path(args.out_root)
+    canonical_rows: list[dict] | None = None
+    if args.canonical_additions_generation is not None:
+        try:
+            generation_id = validate_generation_id(args.canonical_additions_generation)
+        except ValueError as exc:
+            parser.error(str(exc))
+        expected_sources = _lexical_repo_path(
+            f"{SOURCE_PLAN_ROOT}/{generation_id}.csv"
+        )
+        expected_out = _lexical_repo_path(f"{ADDITIONS_ROOT}/{generation_id}")
+        actual_sources = _lexical_repo_path(sources_path)
+        try:
+            actual_out = _reject_existing_symlink_components(out_root)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if actual_sources != expected_sources:
+            parser.error(
+                "canonical additions source plan 경로 불일치: "
+                f"expected={expected_sources}, actual={actual_sources}"
+            )
+        if actual_out != expected_out:
+            parser.error(
+                "canonical additions out-root 경로 불일치: "
+                f"expected={expected_out}, actual={actual_out}"
+            )
+        if args.families is not None or args.preassigned_split is not None:
+            parser.error(
+                "canonical additions는 CSV 17행 전체의 family/split을 사용하며 "
+                "--families/--preassigned-split override를 허용하지 않습니다"
+            )
+        if len(entries) != ADDITION_SESSION_COUNT:
+            parser.error(
+                f"canonical additions source plan은 정확히 {ADDITION_SESSION_COUNT}행이어야 합니다"
+            )
+        with sources_path.open(encoding="utf-8", newline="") as handle:
+            fieldnames = tuple(csv.DictReader(handle).fieldnames or ())
+        if fieldnames != SOURCE_PLAN_FIELDS:
+            parser.error("canonical additions source plan header가 exact 계약과 다릅니다")
+        try:
+            (
+                canonical_snapshot,
+                canonical_rows,
+                _lineage_sha,
+                _selection_evidence,
+            ) = _read_source_plan(
+                repo_root=REPO_ROOT,
+                relative=sources_path.relative_to(REPO_ROOT).as_posix(),
+                require_source_files=True,
+            )
+        except (OSError, RecordedGenerationError, ValueError) as exc:
+            parser.error(f"canonical additions 권위 source-plan 검증 실패: {exc}")
+        if (
+            canonical_snapshot.sha256 != source_list_sha256
+            or len(canonical_rows) != ADDITION_SESSION_COUNT
+        ):
+            parser.error(
+                "canonical additions source-plan snapshot이 initial dry-run snapshot과 다릅니다"
+            )
+    if canonical_rows is not None:
+        if args.retry_once:
+            parser.error(
+                "canonical additions는 실패 raw를 먼저 분석해야 하므로 --retry-once를 "
+                "허용하지 않습니다"
+            )
+        try:
+            done = _canonical_already_recorded(
+                out_root=out_root,
+                rows=canonical_rows,
+                source_list=expected_sources,
+                source_list_sha256=source_list_sha256,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(f"canonical additions 기존 상태 검증 실패: {exc}")
+    else:
+        done = already_recorded(out_root)
+    pending = [entry for entry in entries if _plan_key(entry, source_list_sha256) not in done]
     if args.limit is not None:
         pending = pending[: args.limit]
     if not pending:
-        print("모든 소스가 이미 녹음되었습니다.")
+        print("정확히 같은 source-list SHA/행/lineage/split의 모든 소스가 이미 녹음되었습니다.")
         return 0
 
-    planned_seconds = sum(float(e["seconds"]) for e in pending)
-    print(f"소스 {len(entries)}개 중 {len(done)}개 완료 · 이번 실행 {len(pending)}개")
-    print(f"예상 재생 {planned_seconds / 60.0:.1f}분 (+ 세션당 준비 시간)")
-    print(f"소스 진폭 {args.amplitude} · 출력 {out_root}\n")
+    audible_seconds = sum(float(entry["seconds"]) for entry in pending)
+    output_open_seconds = audible_seconds + len(pending) * float(args.settle_seconds)
+    connected_upper_seconds = (
+        output_open_seconds
+        + len(pending) * INPUT_ONLY_PREFLIGHT_SECONDS
+        + max(0, len(pending) - 1) * float(args.settle_seconds)
+    )
+    print(
+        f"소스 {len(entries)}개 · exact 완료 {len(done)}개 · 이번 계획 {len(pending)}개\n"
+        f"source-list SHA256: {source_list_sha256}\n"
+        f"예상 audible: {audible_seconds:.1f}초 ({audible_seconds / 60.0:.2f}분)\n"
+        f"예상 output-open: {output_open_seconds:.1f}초\n"
+        f"예상 connected 상한(분석/저장 제외): {connected_upper_seconds:.1f}초\n"
+        f"세션 hard timeout: 각 seconds + settle + {args.session_timeout_overhead_seconds:.1f}초\n"
+        f"자동 재시도: {'실패당 1회(opt-in)' if args.retry_once else '없음'}"
+    )
+    for index, entry in enumerate(pending, start=1):
+        print(
+            f"  {index:03d} row={entry['source_row_number']} split={entry['split']} "
+            f"lineage={entry['lineage_key']} start={entry['start_seconds']:.3f}s "
+            f"seconds={entry['seconds']:.1f} "
+            f"source={entry['path']} sha256={entry['source_file_sha256']}"
+        )
+    if args.dry_run:
+        print("[DRY-RUN PASS] 파일 생성/수정 및 오디오 장치 open 없음")
+        return 0
 
+    out_root.mkdir(parents=True, exist_ok=True)
     progress_path = out_root / "batch_progress.csv"
     rows: list[dict] = []
     if progress_path.exists():
         rows = list(csv.DictReader(progress_path.open(encoding="utf-8")))
 
     consecutive_failures = 0
+    run_had_failure = False
     started = time.monotonic()
-    attempt_retry = not args.no_retry
-
     for index, entry in enumerate(pending, start=1):
-        before = {p.name for p in out_root.iterdir() if p.is_dir()}
-        command = [
-            ".venv/bin/python", "scripts/data/record_duct.py",
-            "--program", "file",
-            "--file", entry["path"],
-            "--seconds", str(float(entry["seconds"])),
-            "--amplitude", str(args.amplitude),
-            "--source-family", entry["source_family"],
-            "--group-id", entry["group_id"],
-            "--out-root", args.out_root,
+        command_prefix = [
+            sys.executable,
+            str(REPO_ROOT / "scripts/data/record_duct.py"),
+            "--program", "file", "--file", entry["path"],
+            "--file-start-seconds", str(entry["start_seconds"]),
+            "--seconds", str(entry["seconds"]), "--amplitude", str(args.amplitude),
+            "--settle-seconds", str(args.settle_seconds),
+            "--source-family", entry["source_family"], "--group-id", entry["group_id"],
+            "--source-list", str(sources_path), "--source-list-sha256", source_list_sha256,
+            "--source-row-number", str(entry["source_row_number"]),
+            "--lineage-key", entry["lineage_key"], "--preassigned-split", entry["split"],
+            "--confirm-user-present", "--confirm-volume-minimum", "--confirm-routing-and-geometry",
         ]
+        timeout_seconds = (
+            float(entry["seconds"]) + float(args.settle_seconds)
+            + float(args.session_timeout_overhead_seconds)
+        )
         elapsed = time.monotonic() - started
         print(
             f"[{index}/{len(pending)}] {entry['source_family']:11s} "
-            f"{Path(entry['path']).name}  (경과 {elapsed / 60.0:.1f}분)"
-        )
-        result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
-        created = sorted(
-            {p.name for p in out_root.iterdir() if p.is_dir()} - before
+            f"{Path(entry['path']).name} (경과 {elapsed / 60.0:.1f}분, "
+            f"timeout {timeout_seconds:.1f}초)"
         )
 
-        # xrun 은 일시적이다 — 특히 **배치의 첫 세션**은 full-duplex 스트림을 처음 여는
-        # 순간이라 거의 항상 한 번 걸린다(실측: music_000 이 배치 선두일 때 4회 연속 실패,
-        # 같은 파일이 배치 중간에 있을 때는 통과). 한 번은 다시 시도한다. 두 번 연속
-        # 실패하면 일시적 문제가 아니므로 그대로 기록한다.
-        if (result.returncode != 0 or not created) and attempt_retry:
-            print("    [재시도] 일시적 xrun 으로 보입니다")
-            time.sleep(1.0)
-            before = {p.name for p in out_root.iterdir() if p.is_dir()}
-            result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
-            created = sorted({p.name for p in out_root.iterdir() if p.is_dir()} - before)
+        attempts = 2 if args.retry_once else 1
+        result = ChildResult(1, "", "", False)
+        created: list[str] = []
+        child_out_root = out_root
+        completed_attempt = 1
+        for attempt in range(1, attempts + 1):
+            completed_attempt = attempt
+            child_out_root = (
+                _new_attempt_root(
+                    generation_id=str(args.canonical_additions_generation),
+                    row_number=int(entry["source_row_number"]),
+                    attempt=attempt,
+                )
+                if canonical_rows is not None
+                else out_root
+            )
+            command = [
+                *command_prefix,
+                "--out-root",
+                str(child_out_root),
+                "--failed-root",
+                str(_repo_path(args.failed_root)),
+            ]
+            before = {p.parent.name for p in child_out_root.glob("*/session.json")}
+            log_name = (
+                f"row{entry['source_row_number']:04d}_attempt{attempt}_"
+                f"{int(time.time())}_{secrets.token_hex(4)}.log"
+            )
+            result = run_child_live(
+                command,
+                timeout_seconds=timeout_seconds,
+                log_path=_repo_path(args.log_root) / log_name,
+            )
+            created = sorted(
+                {p.parent.name for p in child_out_root.glob("*/session.json")} - before
+            )
+            if result.returncode == 0 and len(created) == 1:
+                break
+            if attempt < attempts:
+                print("출력 종료 — 지금 스피커를 분리하세요.", flush=True)
+                if not _confirm_reconnect("명시적 --retry-once"):
+                    break
+                print("[명시적 재시도] --retry-once가 지정되어 같은 세션을 한 번 더 재생합니다.")
 
         row = {
-            "source_family": entry["source_family"],
-            "group_id": entry["group_id"],
-            "source_path": entry["path"],
-            "returncode": result.returncode,
-            "session_id": created[0] if created else "",
+            "source_family": entry["source_family"], "group_id": entry["group_id"],
+            "lineage_key": entry["lineage_key"], "preassigned_split": entry["split"],
+            "start_seconds": entry["start_seconds"],
+            "seconds": entry["seconds"],
+            "source_path": entry["path"], "source_file_sha256": entry["source_file_sha256"],
+            "source_list_sha256": source_list_sha256,
+            "source_row_number": entry["source_row_number"], "returncode": result.returncode,
+            "timed_out": result.timed_out, "session_id": "",
         }
-        if result.returncode != 0 or not created:
+        if result.returncode != 0 or len(created) != 1:
             row["verdict"] = "record_failed"
-            row["detail"] = (result.stderr or result.stdout).strip().splitlines()[-1:] or [""]
-            row["detail"] = row["detail"][0][:200]
+            detail_lines = [line for line in (result.stderr + result.stdout).splitlines() if line]
+            detail = detail_lines[-1] if detail_lines else "자식 산출물 없음"
+            if len(created) > 1:
+                detail = f"자식이 session {len(created)}개를 발행함"
+            row["detail"] = detail[:200]
+            if canonical_rows is not None and created:
+                quarantined = []
+                for session_id in created:
+                    quarantined.append(
+                        _quarantine_staged_session(
+                            staged_session=child_out_root / session_id,
+                            failed_root=_repo_path(args.failed_root),
+                            generation_id=str(args.canonical_additions_generation),
+                            row_number=int(entry["source_row_number"]),
+                            attempt=completed_attempt,
+                        )
+                    )
+                row["failure_artifact"] = ";".join(str(path) for path in quarantined)
             consecutive_failures += 1
+            run_had_failure = True
             print(f"    [실패] {row['detail']}")
         else:
-            session_dir = out_root / created[0]
-            stats = analyse_session(session_dir)
-            ok, reason = qa_verdict(stats)
+            session_dir = child_out_root / created[0]
+            try:
+                stats = analyse_session(session_dir)
+                ok, reason = qa_verdict(stats)
+                if ok and canonical_rows is not None:
+                    canonical_row = next(
+                        item
+                        for item in canonical_rows
+                        if int(item["source_row_number"])
+                        == int(entry["source_row_number"])
+                    )
+                    metadata = _read_session_metadata(session_dir, repo_root=REPO_ROOT)
+                    _validate_session_artifacts(
+                        session_dir=session_dir,
+                        metadata=metadata,
+                        row=canonical_row,
+                        expected_seconds=float(canonical_row["seconds"]),
+                        repo_root=REPO_ROOT,
+                    )
+            except (OSError, RuntimeError, StopIteration, ValueError, RecordedGenerationError) as exc:
+                stats = {}
+                ok, reason = False, f"batch QA/exact artifact 검증 실패: {exc}"
             row.update(stats)
             row["verdict"] = "ok" if ok else "qa_failed"
             row["detail"] = reason
-            if ok:
-                consecutive_failures = 0
+            if canonical_rows is not None:
+                if ok:
+                    destination = out_root / created[0]
+                    try:
+                        _atomic_rename_noreplace(session_dir, destination)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        ok = False
+                        row["verdict"] = "publish_failed"
+                        row["detail"] = f"canonical atomic publish 실패: {exc}"
+                    else:
+                        row["session_id"] = created[0]
+                if not ok:
+                    if session_dir.exists():
+                        quarantined = _quarantine_staged_session(
+                            staged_session=session_dir,
+                            failed_root=_repo_path(args.failed_root),
+                            generation_id=str(args.canonical_additions_generation),
+                            row_number=int(entry["source_row_number"]),
+                            attempt=completed_attempt,
+                        )
+                        row["failure_artifact"] = str(quarantined)
+                    run_had_failure = True
+            else:
+                row["session_id"] = created[0]
+                run_had_failure = run_had_failure or not ok
+            consecutive_failures = 0 if ok else consecutive_failures + 1
+            if stats:
                 print(
-                    f"    ERR {stats['err_rms_dbfs']:6.1f} dBFS peak {stats['err_peak']:.3f} · "
-                    f"REF {stats['ref_rms_dbfs']:6.1f} dBFS · clip {stats['clip_ratio']:.3%}"
+                    f"    [{'PASS' if ok else 'QA 실패'}] ERR {stats['err_rms_dbfs']:6.1f} dBFS "
+                    f"peak {stats['err_peak']:.3f} · REF {stats['ref_rms_dbfs']:6.1f} dBFS · "
+                    f"clip {stats['clip_ratio']:.3%}"
                 )
             else:
-                consecutive_failures += 1
-                print(f"    [QA 실패] {reason}")
+                print(f"    [QA 실패] {row['detail']}")
 
         rows.append(row)
         write_csv(progress_path, rows)
-
-        if consecutive_failures >= args.max_consecutive_failures:
+        if canonical_rows is not None and row.get("verdict") != "ok":
             print(
-                f"\n[중단] {consecutive_failures}회 연속 실패. 스피커/배선/볼륨을 확인하세요.",
+                "[중단] canonical 세션 실패 raw는 별도 failure root에 보존했습니다. "
+                "오프라인 분석 없이 다음 소스를 재생하지 않습니다.",
                 file=sys.stderr,
             )
+            print("출력 종료 — 지금 스피커를 분리하세요.", flush=True)
             return 1
-        time.sleep(args.settle_seconds)
+        if consecutive_failures >= args.max_consecutive_failures:
+            print(
+                f"[중단] {consecutive_failures}회 연속 실패. 오프라인 raw/로그를 먼저 분석하세요.",
+                file=sys.stderr,
+            )
+            print("출력 종료 — 지금 스피커를 분리하세요.", flush=True)
+            return 1
+        if index < len(pending):
+            if not _confirm_reconnect(f"다음 세션 {index + 1}/{len(pending)}"):
+                return 2
+            time.sleep(args.settle_seconds)
 
-    ok_rows = [r for r in rows if r.get("verdict") == "ok"]
-    total_seconds = sum(float(r.get("seconds", 0) or 0) for r in ok_rows)
-    print(f"\n완료 세션 {len(ok_rows)}개 · {total_seconds / 60.0:.1f}분")
+    print("출력 종료 — 지금 스피커를 분리하세요.", flush=True)
+    ok_rows = [row for row in rows if row.get("verdict") == "ok"]
+    total_seconds = sum(float(row.get("seconds", 0) or 0) for row in ok_rows)
+    print(f"완료 세션 {len(ok_rows)}개 · {total_seconds / 60.0:.1f}분")
     print(f"진행 기록: {progress_path}")
-    print("다음: .venv/bin/python scripts/data/make_recorded_manifest.py")
-    return 0
+    return 1 if run_had_failure else 0
 
 
 if __name__ == "__main__":

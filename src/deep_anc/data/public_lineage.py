@@ -4,12 +4,12 @@
 Freesound source의 다른 take를 놓친다. 이 모듈은 코퍼스가 제공한 권위 metadata와 raw
 content SHA를 한 번에 결속하고, 그 키들의 transitive closure를 ``group_id``로 만든다.
 
-DNS ``read_speech``의 파일명에는 reader/book 식별자가 있지만 DNS 배포본에는 이를
-LibriSpeech의 LibriVox/Gutenberg ID로 변환하는 crosswalk가 포함되어 있지 않다. 두
-namespace를 같은 것으로 추측하지 않도록 DNS 키에는 ``dns_`` 접두사를 유지한다. 따라서
-DNS와 recorded 사이의 lineage join은 하지 않으며, 양쪽을 가로지르는 중복은 공통
-content SHA와 basename으로만 차단한다. 이 정책은 오디오 바이트 수준의 중복을 엄격히
-제거하면서도, 존재하지 않는 crosswalk를 만들어 잘못된 component를 만드는 것을 막는다.
+DNS ``read_speech``의 파일명에는 reader/book 숫자가 있지만 DNS 배포본에는 이를
+LibriSpeech의 LibriVox/Gutenberg ID로 변환하는 official crosswalk가 없다. 원 namespace
+키는 그대로 보존한다. 다만 같은 숫자가 양쪽에 나타났는데도 무조건 별개라고 가정하면
+holdout 누수 false-negative가 된다. 그래서 **동일 인물/책이라는 사실을 주장하지 않는**
+보수적 숫자 충돌 alias를 양쪽에서 함께 파생한다. 이 alias는 component union과 holdout
+제외에만 쓰며, 충돌 component 전체를 제외해 false positive 쪽으로 안전하게 기운다.
 """
 
 from __future__ import annotations
@@ -32,7 +32,25 @@ from .holdout_contract import (
 )
 
 
-PUBLIC_LINEAGE_SCHEMA = "public-corpus-lineage/v1"
+PUBLIC_LINEAGE_SCHEMA = "public-corpus-lineage/v2"
+PUBLIC_CROSSWALK_POLICY = {
+    "dns_read_speech_to_librispeech": (
+        "no_official_crosswalk_conservative_numeric_collision_alias_v1"
+    ),
+    "alias_semantics": "exclusion_only_not_asserted_cross_corpus_identity",
+    "reader_namespaces": ["dns_reader", "librivox_reader"],
+    "book_namespaces": ["dns_book", "gutenberg_book"],
+    "derived_alias_prefixes": [
+        "conservative_speech_reader_numeric",
+        "conservative_speech_book_numeric",
+    ],
+    "component_action": "union_and_exclude_entire_component_on_holdout_overlap",
+    "cross_namespace_overlap_checks": [
+        "content_sha256",
+        "basename",
+        "conservative_numeric_alias",
+    ],
+}
 LIBRISPEECH_CHAPTERS = "data/raw/speech/LibriSpeech/CHAPTERS.TXT"
 FMA_TRACKS = "data/raw/music/fma_metadata/tracks.csv"
 ESC50_METADATA = "data/raw/noise/esc50/ESC-50-master/meta/esc50.csv"
@@ -48,6 +66,18 @@ _DNS_SPEECH_RE = re.compile(
     r"^book_(?P<book>\d+)_chp_(?P<chapter>\d+)_reader_(?P<reader>\d+)"
     r"(?:_[A-Za-z0-9]+)*$",
     re.IGNORECASE,
+)
+_SPEECH_NUMERIC_SOURCE_PREFIXES = {
+    "dns_reader": "conservative_speech_reader_numeric",
+    "librivox_reader": "conservative_speech_reader_numeric",
+    "dns_book": "conservative_speech_book_numeric",
+    "gutenberg_book": "conservative_speech_book_numeric",
+}
+_SPEECH_NUMERIC_ALIAS_PREFIXES = frozenset(
+    _SPEECH_NUMERIC_SOURCE_PREFIXES.values()
+)
+_SPEECH_NUMERIC_PREFIXES = (
+    frozenset(_SPEECH_NUMERIC_SOURCE_PREFIXES) | _SPEECH_NUMERIC_ALIAS_PREFIXES
 )
 _AUDIOSET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _MIMII_ID_RE = re.compile(r"^id_(\d+)$", re.IGNORECASE)
@@ -131,6 +161,62 @@ def canonical_json_sha256(value: object) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def conservative_cross_corpus_speech_lineage_keys(
+    keys: Iterable[str],
+) -> tuple[str, ...]:
+    """DNS/Libri reader·book 숫자 충돌 alias의 canonical closure를 만든다.
+
+    이 함수는 crosswalk가 아니다. 원 namespace key를 지우거나 서로 변환하지 않고,
+    동일한 decimal token에 같은 exclusion-only alias를 추가할 뿐이다. 이미 alias가
+    들어온 manifest도 원 key에서 다시 유도한 exact 집합과 같아야 하므로, 수기 alias
+    삽입/삭제로 component를 조작할 수 없다.
+    """
+
+    original = [str(value) for value in keys]
+    if not original or any(not value or value != value.strip() for value in original):
+        raise PublicLineageError("lineage key는 비어 있지 않은 canonical 문자열이어야 합니다")
+    if len(original) != len(set(original)):
+        raise PublicLineageError("lineage key가 중복됩니다")
+    source_aliases: set[str] = set()
+    declared_aliases: set[str] = set()
+    for key in original:
+        prefix, separator, raw_identifier = key.partition(":")
+        if not separator:
+            raise PublicLineageError(f"lineage key namespace가 없습니다: {key}")
+        if prefix not in _SPEECH_NUMERIC_PREFIXES:
+            continue
+        if (
+            not raw_identifier.isdigit()
+            or (len(raw_identifier) > 1 and raw_identifier.startswith("0"))
+        ):
+            raise PublicLineageError(
+                f"speech reader/book lineage ID는 canonical decimal이어야 합니다: {key}"
+            )
+        if prefix in _SPEECH_NUMERIC_SOURCE_PREFIXES:
+            source_aliases.add(
+                f"{_SPEECH_NUMERIC_SOURCE_PREFIXES[prefix]}:{raw_identifier}"
+            )
+        else:
+            declared_aliases.add(key)
+    if declared_aliases - source_aliases:
+        raise PublicLineageError(
+            "speech numeric alias는 DNS/Libri 원 namespace key에서만 파생할 수 있습니다: "
+            f"{sorted(declared_aliases - source_aliases)}"
+        )
+    return tuple(sorted((set(original) - declared_aliases) | source_aliases))
+
+
+def validate_public_crosswalk_policy(value: object) -> dict[str, Any]:
+    """stored generation이 보수적 alias 정책을 정확히 선언하는지 검증한다."""
+
+    if not isinstance(value, Mapping) or dict(value) != PUBLIC_CROSSWALK_POLICY:
+        raise PublicLineageError(
+            "public lineage crosswalk_policy가 canonical conservative alias 정책과 다릅니다"
+        )
+    # caller가 module 상수를 변형할 수 없도록 JSON-compatible deep copy를 반환한다.
+    return json.loads(json.dumps(PUBLIC_CROSSWALK_POLICY, sort_keys=True))
 
 
 def _snapshot_metadata(
@@ -936,8 +1022,14 @@ def build_public_lineage(
     }
     excluded_basenames = holdout_basenames | extra_basenames
     holdout_content = {item["content_sha256"] for item in holdout}
+    # immutable recorded holdout bytes는 바꾸지 않는다. 소비 시점에 그 안의
+    # authoritative Libri namespace key로부터 exclusion-only alias를 재유도한다.
     holdout_keys = {
-        str(key) for item in holdout for key in item.get("lineage_keys", [])
+        key
+        for item in holdout
+        for key in conservative_cross_corpus_speech_lineage_keys(
+            item.get("lineage_keys", [])
+        )
     }
     metadata: dict[str, dict[str, Any]] = {}
     chapters: dict[int, tuple[int, int]] | None = None
@@ -1024,11 +1116,12 @@ def build_public_lineage(
                 keys = dns_audioset_lineage_keys(path.name)
             else:
                 raise PublicLineageBlocked(f"public lineage parser가 없는 tag입니다: {tag}")
+            keys = conservative_cross_corpus_speech_lineage_keys(keys)
             node = f"{tag}:{index}"
             nodes.append(node)
             tag_for_node[node] = tag
             item["lineage_schema"] = PUBLIC_LINEAGE_SCHEMA
-            item["lineage_keys"] = sorted(set(keys))
+            item["lineage_keys"] = list(keys)
             rows[node] = item
     dsu = _DisjointSet(nodes)
     owners: dict[str, str] = {}
@@ -1100,10 +1193,7 @@ def build_public_lineage(
         "components": canonical_components,
         "holdout_clips_sha256": holdout_lineage.get("clips_sha256"),
         "excluded_by_tag": dict(sorted(excluded_by_tag.items())),
-        "crosswalk_policy": {
-            "dns_read_speech_to_librispeech": "namespace_disjoint_no_official_crosswalk",
-            "cross_namespace_overlap_checks": ["content_sha256", "basename"],
-        },
+        "crosswalk_policy": validate_public_crosswalk_policy(PUBLIC_CROSSWALK_POLICY),
     }
     if dns_marker_partition is not None:
         evidence["decoder_rejected_marker_partition"] = dns_marker_partition
@@ -1135,6 +1225,18 @@ def validate_public_manifest_lineage(entries_by_tag: Mapping[str, Sequence[Mappi
                 or split not in {"train", "val", "test"}
             ):
                 errors.append(f"{tag}[{index}] lineage 필드가 불완전합니다")
+                continue
+            try:
+                canonical_keys = list(
+                    conservative_cross_corpus_speech_lineage_keys(keys)
+                )
+            except PublicLineageError as exc:
+                errors.append(f"{tag}[{index}] speech alias 결속 오류: {exc}")
+                continue
+            if keys != canonical_keys:
+                errors.append(
+                    f"{tag}[{index}] speech numeric alias closure가 canonical 값이 아닙니다"
+                )
                 continue
             item = by_group[group]
             item["splits"].add(split)
@@ -1185,6 +1287,7 @@ __all__ = [
     "ESC50_METADATA",
     "FMA_TRACKS",
     "LIBRISPEECH_CHAPTERS",
+    "PUBLIC_CROSSWALK_POLICY",
     "PUBLIC_LINEAGE_SCHEMA",
     "PublicLineageBlocked",
     "PublicLineageBuild",
@@ -1192,6 +1295,7 @@ __all__ = [
     "build_public_lineage",
     "build_recorded_clip_lineage",
     "canonical_json_sha256",
+    "conservative_cross_corpus_speech_lineage_keys",
     "demand_lineage_keys",
     "dns_audioset_lineage_keys",
     "dns_speech_lineage_keys",
@@ -1203,6 +1307,7 @@ __all__ = [
     "parse_fma_tracks_bytes",
     "parse_librispeech_chapters_bytes",
     "validate_dns_marker_partition",
+    "validate_public_crosswalk_policy",
     "validate_recorded_clip_lineage",
     "validate_public_manifest_lineage",
 ]

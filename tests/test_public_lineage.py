@@ -12,11 +12,13 @@ from deep_anc.data.public_lineage import (
     ESC50_METADATA,
     FMA_TRACKS,
     LIBRISPEECH_CHAPTERS,
+    PUBLIC_CROSSWALK_POLICY,
     PUBLIC_LINEAGE_SCHEMA,
     PublicLineageBlocked,
     PublicLineageError,
     build_public_lineage,
     canonical_json_sha256,
+    conservative_cross_corpus_speech_lineage_keys,
     demand_lineage_keys,
     dns_audioset_lineage_keys,
     dns_speech_lineage_keys,
@@ -28,6 +30,7 @@ from deep_anc.data.public_lineage import (
     parse_fma_tracks_bytes,
     parse_librispeech_chapters_bytes,
     validate_dns_marker_partition,
+    validate_public_crosswalk_policy,
     validate_public_manifest_lineage,
 )
 
@@ -206,7 +209,7 @@ def test_public_dsu_excludes_recorded_source_pool_basename(tmp_path: Path) -> No
         )
 
 
-def test_dns_speech_uses_explicit_namespace_without_crosswalk(tmp_path: Path) -> None:
+def test_dns_speech_preserves_namespace_and_adds_conservative_alias(tmp_path: Path) -> None:
     root = tmp_path / "data/raw/noise/speech"
     root.mkdir(parents=True)
     marker = tmp_path / "data/raw/noise/speech000.tar.bz2.extracted"
@@ -225,13 +228,151 @@ def test_dns_speech_uses_explicit_namespace_without_crosswalk(tmp_path: Path) ->
         holdout_lineage=_holdout(family="speech"),
     )
     assert built.entries_by_tag["speech"][0]["lineage_keys"] == [
+        "conservative_speech_book_numeric:12",
+        "conservative_speech_reader_numeric:4",
         "dns_book:12",
         "dns_reader:4",
     ]
-    assert built.evidence["crosswalk_policy"] == {
-        "dns_read_speech_to_librispeech": "namespace_disjoint_no_official_crosswalk",
-        "cross_namespace_overlap_checks": ["content_sha256", "basename"],
+    assert built.evidence["crosswalk_policy"] == PUBLIC_CROSSWALK_POLICY
+
+
+def test_dns_and_libri_numeric_keys_derive_same_exclusion_aliases() -> None:
+    dns = conservative_cross_corpus_speech_lineage_keys(
+        ["dns_reader:422", "dns_book:340"]
+    )
+    libri = conservative_cross_corpus_speech_lineage_keys(
+        ["librivox_reader:422", "gutenberg_book:340"]
+    )
+    assert {
+        "conservative_speech_reader_numeric:422",
+        "conservative_speech_book_numeric:340",
+    }.issubset(dns)
+    assert {
+        "conservative_speech_reader_numeric:422",
+        "conservative_speech_book_numeric:340",
+    }.issubset(libri)
+    assert "dns_reader:422" in dns
+    assert "librivox_reader:422" in libri
+
+
+@pytest.mark.parametrize(
+    ("dns_key", "libri_key", "alias"),
+    [
+        (
+            "dns_book:340",
+            "gutenberg_book:340",
+            "conservative_speech_book_numeric:340",
+        ),
+        (
+            "dns_book:5946",
+            "gutenberg_book:5946",
+            "conservative_speech_book_numeric:5946",
+        ),
+        (
+            "dns_book:8201",
+            "gutenberg_book:8201",
+            "conservative_speech_book_numeric:8201",
+        ),
+        (
+            "dns_reader:422",
+            "librivox_reader:422",
+            "conservative_speech_reader_numeric:422",
+        ),
+        (
+            "dns_reader:652",
+            "librivox_reader:652",
+            "conservative_speech_reader_numeric:652",
+        ),
+    ],
+)
+def test_observed_elice_numeric_collisions_share_conservative_alias(
+    dns_key: str, libri_key: str, alias: str
+) -> None:
+    assert alias in conservative_cross_corpus_speech_lineage_keys([dns_key])
+    assert alias in conservative_cross_corpus_speech_lineage_keys([libri_key])
+
+
+def test_numeric_holdout_overlap_excludes_entire_dns_components(tmp_path: Path) -> None:
+    """numeric alias와 이어진 비충돌 row까지 component 단위로 함께 제외한다."""
+
+    root = tmp_path / "data/raw/noise/speech"
+    root.mkdir(parents=True)
+    members = [
+        "book_340_chp_1_reader_100.wav",
+        "book_777_chp_2_reader_100.wav",
+        "book_888_chp_3_reader_422.wav",
+        "book_888_chp_4_reader_200.wav",
+        "book_999_chp_5_reader_201.wav",
+    ]
+    entries = []
+    for index, member in enumerate(members, start=1):
+        path = root / member
+        path.write_bytes(member.encode("utf-8"))
+        entries.append({"path": str(path), "content_sha256": str(index) * 64})
+    marker = tmp_path / "data/raw/noise/speech000.tar.bz2.extracted"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("\n".join(members) + "\n", encoding="utf-8")
+
+    built = build_public_lineage(
+        {"speech": entries},
+        tag_roots={"speech": [root]},
+        repo_root=tmp_path,
+        holdout_lineage=_holdout(
+            family="speech",
+            keys=["gutenberg_book:340", "librivox_reader:422"],
+        ),
+        decoder_rejected_members_by_tag={"speech": ()},
+        decoder_audit_inventory_sha256="a" * 64,
+    )
+
+    assert built.excluded_by_tag == {"speech": 4}
+    assert [Path(row["path"]).name for row in built.entries_by_tag["speech"]] == [
+        "book_999_chp_5_reader_201.wav"
+    ]
+    excluded_components = [
+        row
+        for row in built.evidence["components"].values()
+        if row["excluded_by_holdout"]
+    ]
+    assert sorted(len(row["members"]) for row in excluded_components) == [2, 2]
+    overlap_keys = {
+        key for row in excluded_components for key in row["overlap"]["lineage_keys"]
     }
+    assert overlap_keys == {
+        "conservative_speech_book_numeric:340",
+        "conservative_speech_reader_numeric:422",
+    }
+
+
+def test_crosswalk_policy_and_manifest_alias_closure_fail_closed() -> None:
+    with pytest.raises(PublicLineageError, match="crosswalk_policy"):
+        validate_public_crosswalk_policy(
+            {
+                "dns_read_speech_to_librispeech": (
+                    "namespace_disjoint_no_official_crosswalk"
+                )
+            }
+        )
+
+    raw_keys = ["dns_book:12", "dns_reader:4"]
+    group = "public-lineage-" + canonical_json_sha256(
+        {"lineage_keys": raw_keys, "content_sha256": ["1" * 64]}
+    )
+    with pytest.raises(PublicLineageError, match="alias closure"):
+        validate_public_manifest_lineage(
+            {
+                "speech": [
+                    {
+                        "path": "/raw/book_12_chp_3_reader_4.wav",
+                        "content_sha256": "1" * 64,
+                        "lineage_schema": PUBLIC_LINEAGE_SCHEMA,
+                        "lineage_keys": raw_keys,
+                        "group_id": group,
+                        "split": "train",
+                    }
+                ]
+            }
+        )
 
 
 def test_dns_marker_exact_partition_keeps_decoder_reject_out_of_lineage(

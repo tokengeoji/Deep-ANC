@@ -6,6 +6,14 @@
 > 금지한 작업: PCM 장치 open, 음향/전기 출력, 시스템 설정 변경,
 > `DeepANC_CRN_n_codex` 접근·변경
 
+> **2026-08-29 정정:** 이 문서의 외부 I2S2 DAC 우선 결론은 온보드 RT5640을 누락한
+> 당시 감사 결과다. 후속 실제 장치 감사에서 `/sys/bus/i2c/devices/8-001c`의 RT5640,
+> I2S1↔ADMAIF1 route, `hw:APE,0` playback, I2S1/I2S2의 공통 `PLL_A_OUT0` 계열을
+> 확인했다. 따라서 1차 후보는 `I2S2 마이크 입력 + I2S1/RT5640 출력`이고 외부 I2S2
+> DAC는 2차 fallback이다. 다만 J511 배선·동시 duplex·sample-slip 0은 아직 미확인이라
+> shared-clock authority는 계속 BLOCK이다. 현행 설계는 [40](40_fullband_v7_nonaffine_clock.md)
+> §5를 우선한다.
+
 ## 결론
 
 현재 `APE hw:1,1` 입력과 `AB13X hw:2,0` 출력은 **서로 다른 PCM/clock

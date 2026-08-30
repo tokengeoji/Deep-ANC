@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
 import tempfile
@@ -40,7 +41,11 @@ from deep_anc.train.trainer import (
     validate_finite_parameters,
     validate_g0_nmse,
 )
-from deep_anc.train.campaign_evidence import publish_g0_evidence
+from deep_anc.train.campaign_evidence import (
+    configure_g0_evidence_determinism,
+    publish_failed_g0_evidence,
+    publish_g0_evidence,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -189,6 +194,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1.0e-3)
     parser.add_argument(
+        "--loss-alpha",
+        type=float,
+        choices=[0.7, 0.85, 1.0],
+        default=None,
+        help="alpha별 공식 G0/pilot identity의 nmse_cvar_alpha",
+    )
+    parser.add_argument(
+        "--loss-lambda-dnh",
+        type=float,
+        default=None,
+        help="alpha별 공식 G0/pilot identity의 finite 양수 lambda_dnh",
+    )
+    parser.add_argument(
         "--lead-samples",
         type=int,
         default=None,
@@ -244,8 +262,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--evidence-dir",
         default=None,
         help=(
-            "성공한 approved G0의 immutable raw checkpoint/batch/receipt directory. "
-            "기존 directory는 절대 덮어쓰지 않습니다."
+            "G0의 immutable raw checkpoint/batch/receipt directory. 합격하면 campaign "
+            "G0 kind, 실패하면 lambda 재추천 전용 failed-diagnostic kind로 봉인합니다. "
+            "프로세스 시작 전 승인된 CUBLAS_WORKSPACE_CONFIG가 필요하고, "
+            "live 결정론 backend를 함께 결속합니다. 기존 directory는 절대 "
+            "덮어쓰지 않습니다."
         ),
     )
     return parser
@@ -279,6 +300,12 @@ def build_diagnostic_overrides(args: argparse.Namespace, ckpt_dir: str) -> list[
         overrides.append(
             f"data.digital_reference_lead_samples={int(args.lead_samples)}"
         )
+    if args.loss_alpha is not None:
+        alpha = float(args.loss_alpha)
+        alpha_literal = f"{alpha:.1f}" if alpha.is_integer() else f"{alpha:.12g}"
+        overrides.append(f"loss.nmse_cvar_alpha={alpha_literal}")
+    if args.loss_lambda_dnh is not None:
+        overrides.append(f"loss.lambda_dnh={float(args.loss_lambda_dnh)!r}")
     bootstrap_sha = getattr(args, "bootstrap_receipt_sha256", None)
     if bootstrap_sha is not None:
         overrides.append(f"data.bootstrap_receipt_sha256={str(bootstrap_sha).lower()}")
@@ -317,10 +344,43 @@ def main() -> int:
         parser.error("steps, batch-size, log-every는 1 이상이어야 합니다")
     if args.nmse_only and args.disable_loss_term:
         parser.error("--nmse-only와 --disable-loss-term은 함께 사용할 수 없습니다")
+    if args.loss_lambda_dnh is not None and (
+        not math.isfinite(float(args.loss_lambda_dnh))
+        or float(args.loss_lambda_dnh) <= 0.0
+    ):
+        parser.error("--loss-lambda-dnh는 finite 양수여야 합니다")
     if args.evidence_dir is not None:
         bootstrap = str(args.bootstrap_receipt_sha256 or "").lower()
         if len(bootstrap) != 64 or any(char not in "0123456789abcdef" for char in bootstrap):
             parser.error("--evidence-dir에는 64자리 --bootstrap-receipt-sha256이 필요합니다")
+        if args.loss_alpha is None or args.loss_lambda_dnh is None:
+            parser.error(
+                "공식 --evidence-dir에는 alpha별 --loss-alpha와 "
+                "--loss-lambda-dnh가 모두 필요합니다"
+            )
+        if (
+            args.mode != "nominal"
+            or args.steps != 500
+            or args.batch_size != 4
+            or args.primary_mode != "secondary_surrogate"
+            or args.nmse_only
+            or args.disable_loss_term
+            or args.lead_samples is not None
+            or args.require_nmse_db != -6.0
+        ):
+            parser.error(
+                "공식 G0 evidence는 nominal/500-step/batch4/secondary_surrogate/"
+                "full-loss/derived-lead/NMSE<-6 계약만 허용합니다"
+            )
+
+    # 일반 diagnostic-only 경로는 기존처럼 backend 상태를 강제하지 않는다. 반면
+    # campaign을 여는 G0 evidence는 모델/optimizer/CUDA context를 만들기 전에
+    # 결정론 backend를 활성화하고 그 live 시작 상태를 마지막 receipt와 결속한다.
+    g0_determinism_environment = (
+        configure_g0_evidence_determinism()
+        if args.evidence_dir is not None
+        else None
+    )
 
     diagnostic_dir = tempfile.mkdtemp(prefix=f"deep_anc_overfit_{args.mode}_")
     overrides = build_diagnostic_overrides(args, diagnostic_dir)
@@ -417,6 +477,7 @@ def main() -> int:
         trainer.writer.close()
     if trainer.loss_log is not None:
         trainer.loss_log.close()
+    g0_failure: BaseException | None = None
     if args.require_nmse_db is not None:
         try:
             validate_g0_nmse(
@@ -424,10 +485,15 @@ def main() -> int:
             )
         except (FloatingPointError, ValueError) as exc:
             print(f"[실패] {exc}", file=sys.stderr)
-            return 2
+            g0_failure = exc
     if args.evidence_dir is not None:
         raw_model = model.module if hasattr(model, "module") else model
-        receipt = publish_g0_evidence(
+        publisher = (
+            publish_failed_g0_evidence
+            if g0_failure is not None
+            else publish_g0_evidence
+        )
+        receipt = publisher(
             repo_root=REPO_ROOT,
             output_dir=args.evidence_dir,
             cfg=cfg,
@@ -439,9 +505,19 @@ def main() -> int:
             require_nmse_db=args.require_nmse_db,
             nmse_only=args.nmse_only,
             disable_loss_terms=args.disable_loss_term,
+            determinism_environment=g0_determinism_environment,
         )
-        print(f"[campaign G0] raw receipt → {receipt}", flush=True)
-    return 0
+        if g0_failure is None:
+            print(f"[campaign G0] PASS raw receipt → {receipt}", flush=True)
+        else:
+            print(
+                "[campaign G0] FAIL diagnostic raw receipt → "
+                f"{receipt}\n"
+                "[campaign G0] 이 receipt는 pilot/init 자격이 없고, "
+                "DNH lambda 추천 후 fresh G0를 처음부터 재실행하는 데만 씁니다.",
+                flush=True,
+            )
+    return 2 if g0_failure is not None else 0
 
 
 if __name__ == "__main__":

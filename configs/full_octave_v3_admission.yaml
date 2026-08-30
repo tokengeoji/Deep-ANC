@@ -1,0 +1,33 @@
+# 이 파일은 train.py에 넣는 학습 설정이 아니다.
+#
+# v3 125 Hz--8 kHz physical P/S, data lineage, sampler, DNH gradient evidence가
+# raw-first로 발행되기 전에는 path와 sha256을 함께 null로 둔다. 기존 Stage-1/v2
+# artifact를 채워 넣거나 단순히 true/SHA를 적어 학습을 열 수 없다.
+schema: full_octave_v3_admission_config_v1
+role: admission_only_no_trainer_no_audio
+
+control_band_contract:
+  id: broadband_full_octave_88_11314_v3
+  sha256: 53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2
+
+artifacts:
+  # NPZ/raw-first fullband RT5640 S32 capture. old USB AB13X/S16 raw는 불가.
+  fullband_raw_capture:
+    path: null
+    sha256: null
+  # full_octave_causal_plant_authority_v3 JSON
+  causal_plant_authority:
+    path: null
+    sha256: null
+  # full_octave_population_authority_v3 JSON
+  population_authority:
+    path: null
+    sha256: null
+  # full_octave_family_balanced_batch_receipt_v3 JSON
+  family_balanced_batch_receipt:
+    path: null
+    sha256: null
+  # full_octave_dnh_gradient_calibration_v3 JSON
+  dnh_gradient_calibration:
+    path: null
+    sha256: null

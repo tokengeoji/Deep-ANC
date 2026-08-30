@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import json
 import math
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from scipy.signal import fftconvolve
+import deep_anc.dsp.fullband_causal_v5 as causal_v5
 
 from deep_anc.dsp.fullband_causal_v5 import (
     CONDITION_AUDIT_SUPPORT,
@@ -17,6 +19,7 @@ from deep_anc.dsp.fullband_causal_v5 import (
     build_plan_v5,
     estimate_common_affine_clock_v5,
     exact_condition_audit_v5,
+    exact_shifted_condition_audit_v5,
     score_candidate_on_role_v5,
     estimate_common_clock_from_waveforms_v5,
     synthesize_affine_capture_v5,
@@ -82,9 +85,91 @@ def test_v5_exact_support_1024_condition_passes_and_longer_are_not_claimed() -> 
     assert receipt["joint_fit_condition_number"] == pytest.approx(9.05803353091781)
     assert receipt["role_condition_numbers"]["fit_a"] == pytest.approx(11.571714021472099)
     assert receipt["role_condition_numbers"]["fit_b"] == pytest.approx(12.575291092522646)
+    assert receipt["zeros_before_fir_samples"] == [0, 0]
+    assert receipt["operator_definition"]["zeros_before_fir_samples"] == {
+        "primary": 0,
+        "secondary": 0,
+    }
+    assert len(receipt["operator_definition_sha256"]) == 64
+    assert receipt["operator_quadratic_form_crosscheck_passed"] is True
+    assert len(receipt["operator_quadratic_form_probe_receipts"]) == 4
+    assert (
+        receipt["operator_quadratic_form_relative_error"]
+        <= receipt["operator_quadratic_form_maximum_allowed"]
+    )
     assert set(receipt["longer_supports"].values()) == {"NOT_AUDITED_NO_CLAIM"}
     with pytest.raises(ValueError, match="1024"):
         exact_condition_audit_v5(plan, pcm, support=2048)
+    with pytest.raises(ValueError, match="exact integer"):
+        exact_shifted_condition_audit_v5(
+            plan,
+            pcm,
+            zeros_by_path=(1386.5, 1245),  # type: ignore[arg-type]
+        )
+
+    shifted = exact_shifted_condition_audit_v5(
+        plan, pcm, zeros_by_path=(1386, 1245)
+    )
+    assert shifted["owned_input_receipt"]["canonical_plan_exact"] is True
+    assert shifted["owned_input_receipt"]["toctou_entry_exit_equal"] is True
+    changed = copy.deepcopy(plan)
+    changed["layout"][1]["central_start_frame"] += 1
+    with pytest.raises(ValueError, match="canonical v5"):
+        exact_shifted_condition_audit_v5(
+            changed, pcm, zeros_by_path=(1386, 1245)
+        )
+
+
+@pytest.mark.parametrize("audit", ["unshifted", "shifted"])
+@pytest.mark.parametrize("mutation", ["layout", "payload"])
+def test_public_exact_audits_reject_rehashed_plan_tampering_before_heavy_math(
+    monkeypatch: pytest.MonkeyPatch, audit: str, mutation: str
+) -> None:
+    plan, pcm = build_plan_v5()
+    changed = copy.deepcopy(plan)
+    if mutation == "layout":
+        changed["layout"][1]["central_start_frame"] += 1
+    else:
+        changed["excitation"]["payloads"]["primary_fit_a"]["seed"] += 2
+    unsigned = {
+        key: value for key, value in changed.items()
+        if key != "canonical_payload_sha256"
+    }
+    changed["canonical_payload_sha256"] = causal_v5._payload_sha256(unsigned)
+
+    def forbidden_heavy_audit(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("canonical 변조가 heavy Gram 계산 전에 거부되지 않았습니다")
+
+    monkeypatch.setattr(
+        causal_v5, "_exact_condition_audit_with_shifts_v5", forbidden_heavy_audit
+    )
+    with pytest.raises(ValueError, match="canonical v5 plan/layout/payload/PCM"):
+        if audit == "unshifted":
+            exact_condition_audit_v5(changed, pcm)
+        else:
+            exact_shifted_condition_audit_v5(
+                changed, pcm, zeros_by_path=(1386, 1245)
+            )
+
+
+@pytest.mark.parametrize("mutation", ["pcm", "plan"])
+def test_shifted_heavy_audit_detects_source_toctou(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    plan, pcm = build_plan_v5()
+    original = causal_v5._exact_condition_audit_with_shifts_v5
+
+    def mutate_after_owned_audit(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        result = original(*args, **kwargs)
+        if mutation == "pcm":
+            pcm[0, 0] ^= np.int16(1)
+        else:
+            plan["layout"][0]["kind"] = "mutated_after_owned_copy"
+        return result
+
+    monkeypatch.setattr(causal_v5, "_exact_condition_audit_with_shifts_v5", mutate_after_owned_audit)
+    with pytest.raises(ValueError, match="TOCTOU mutation"):
+        exact_shifted_condition_audit_v5(plan, pcm, zeros_by_path=(1386, 1245))
 
 
 @pytest.mark.parametrize("ppm", [-413.931, 0.0, 413.931])
@@ -150,6 +235,8 @@ def test_v5_raw_waveform_clock_uses_actual_two_input_denominator(ppm: float) -> 
     assert receipt["estimated_ppm"] == pytest.approx(ppm, abs=0.01)
     assert receipt["actual_submitted_denominator_includes_pe"] is True
     assert receipt["highband_result_based_phase_repair_samples"] == 0.0
+    assert receipt["validation_policy"] == "holdout_and_tail_legacy"
+    assert receipt["operator_holdout_used_for_clock_validation"] is True
     assert receipt["passed"] is True
 
     # pilot-only 또는 float 의도 신호를 분모로 바꾸면 plan PCM SHA에서 먼저 닫힌다.

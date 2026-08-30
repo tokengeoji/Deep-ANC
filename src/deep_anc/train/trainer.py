@@ -21,22 +21,25 @@ from torch.utils.data import DataLoader
 
 from ..config import (
     CANONICAL_DETERMINISM_POLICY,
+    CANONICAL_LOSS_PILOT_STEPS,
     PRETRAIN_DERIVATIVE_STRICT_ROLES,
     REPO_ROOT,
     loss_selection_sha256,
     validate_canonical_training_policy,
 )
-from ..data.recorded_dataset import RecordedANCDataset
+from ..data.recorded_dataset import RecordedANCDataset, make_recorded_eval_batch
 from ..data.transfer_contract import bind_recorded_transfer_config
 from ..data.resumable_stream import indexed_rng
-from ..data.synth_dataset import SynthANCDataset, make_eval_batch
-from ..dsp.nonlinear import RandomNonlinear
-from ..dsp.secondary_path import DifferentiableSecondaryPath, load_secondary_path
+from ..data.synth_dataset import (
+    BROADBAND_SYNTH_PRIMARY_GENERATOR_SCHEMA,
+    SynthANCDataset,
+    make_eval_batch,
+)
 # 지연·대역 부기의 단일 출처. trainer 가 handoff/대역을 스스로 유도하면 게이트와
 # 갈라진다 — 실제로 lead 가 109 와 113 으로 갈라졌다 (발생기 A).
-from ..dsp.timing import BandPlan, PlantSettle, handoff_samples_from_config
-from ..losses import ANCLoss
+from ..dsp.timing import PlantSettle, handoff_samples_from_config
 from ..models import build_model
+from ..losses.broadband_loss import CausalFIRPath
 from .checkpoint import (
     load_checkpoint,
     read_checkpoint_snapshot,
@@ -59,6 +62,11 @@ from .experiment_contract import (
     validate_resume_experiment,
 )
 from .reproducibility import set_seed, snapshot_run
+from .criterion_factory import (
+    BROADBAND_CRITERION_ROLE,
+    admit_criterion_config,
+    build_criterion_from_config,
+)
 
 
 # pilot/probe는 canonical init 자체는 아니지만, winner를 결정하는 raw evidence다.
@@ -244,6 +252,26 @@ def validate_canonical_run_entry(
             f"{rule}: "
             f"requested={requested}, expected={expected}"
         )
+
+
+def resolve_validation_source(
+    *, criterion_role: str, has_recorded_stream: bool, recorded_ratio: float
+) -> str:
+    """Stage-1 동작을 보존하면서 causal broadband fine-tune만 recorded val로 고정."""
+
+    ratio = float(recorded_ratio)
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("recorded_ratio는 [0,1]이어야 합니다")
+    if criterion_role != BROADBAND_CRITERION_ROLE or ratio == 0.0:
+        return "synthetic_val"
+    if not bool(has_recorded_stream):
+        raise FileNotFoundError(
+            "causal broadband recorded_ratio>0 실행은 실제 recorded manifest와 "
+            "recorded-val-only model selection이 필요합니다"
+        )
+    return "recorded_val_only"
+
+
 def validate_init_checkpoint_role(state: dict, cfg: dict) -> None:
     """공식 fine-tune init은 완료 가능한 canonical pretrain만 허용한다."""
 
@@ -268,7 +296,8 @@ def validate_init_checkpoint_role(state: dict, cfg: dict) -> None:
             "init checkpoint가 init_eligible=true가 아닙니다 — loss pilot/measured "
             "probe checkpoint는 공식 fine-tune 초기값으로 사용할 수 없습니다"
         )
-    if str(cfg.get("experiment_role", "")) == "canonical_finetune":
+    current_role = str(cfg.get("experiment_role", ""))
+    if current_role in {"canonical_finetune", "measured_probe"}:
         validate_canonical_training_policy(saved_cfg)
         saved_loss_sha = str(saved_cfg.get("loss_selection_sha256", ""))
         current_loss_sha = str(cfg.get("loss_selection_sha256", ""))
@@ -278,9 +307,67 @@ def validate_init_checkpoint_role(state: dict, cfg: dict) -> None:
             raise ValueError("fine-tune loss-selection digest가 resolved loss와 다릅니다")
         if saved_loss_sha != current_loss_sha:
             raise ValueError(
-                "canonical pretrain과 fine-tune loss selection이 다릅니다: "
-                f"pretrain={saved_loss_sha}, finetune={current_loss_sha}"
+                "init checkpoint와 현재 학습의 loss selection이 다릅니다: "
+                f"init={saved_loss_sha}, current={current_loss_sha}"
             )
+
+
+def validate_measured_probe_init_chain(
+    state: dict,
+    cfg: dict,
+    init_path: str | Path,
+) -> None:
+    """5k probe를 열기 전에 동일 alpha의 완료된 20k pilot을 확인한다.
+
+    pilot은 100k schedule의 20k operational stop이라 completion receipt를 만들지
+    않는다. 그렇다고 best.pt 하나만 보고 probe를 시작하면 아직 돌고 있는 pilot이나
+    다른 alpha의 best에 A100 5k를 낭비할 수 있다. 같은 ckpt 디렉터리의 last.pt가
+    정확히 20k에 도달했고 best/last 계약·loss가 같은지 read-only로 먼저 닫는다.
+    """
+
+    if str(cfg.get("experiment_role", "")) != "measured_probe":
+        return
+    checkpoint = Path(init_path)
+    if checkpoint.name != "best.pt":
+        raise ValueError("measured_probe init은 loss_pilot best.pt여야 합니다")
+    saved_cfg = state.get("cfg")
+    if not isinstance(saved_cfg, dict):
+        raise ValueError("measured_probe init best.pt에 resolved cfg가 없습니다")
+    # role과 같은 loss-selection 검사는 best checkpoint 자체에서 먼저 수행한다.
+    validate_init_checkpoint_role(state, cfg)
+    if int(saved_cfg.get("run_until_step", -1)) != CANONICAL_LOSS_PILOT_STEPS:
+        raise ValueError("measured_probe init best.pt가 승인된 20k pilot 계약이 아닙니다")
+
+    last_path = checkpoint.with_name("last.pt")
+    if not last_path.is_file() or last_path.is_symlink():
+        raise FileNotFoundError(
+            "measured_probe 시작 전 loss_pilot의 완료된 sibling last.pt가 필요합니다: "
+            f"{last_path}"
+        )
+    last_state, _ = read_checkpoint_snapshot(last_path, map_location="cpu")
+    last_cfg = last_state.get("cfg")
+    if not isinstance(last_cfg, dict):
+        raise ValueError("loss_pilot last.pt에 resolved cfg가 없습니다")
+    validate_canonical_training_policy(last_cfg)
+    if str(last_cfg.get("experiment_role", "")) != "loss_pilot":
+        raise ValueError("measured_probe sibling last.pt가 loss_pilot이 아닙니다")
+    if (
+        int(last_state.get("step", -1)) != CANONICAL_LOSS_PILOT_STEPS
+        or int(last_cfg.get("run_until_step", -1))
+        != CANONICAL_LOSS_PILOT_STEPS
+    ):
+        raise ValueError("measured_probe sibling loss_pilot last.pt가 정확히 20k 완료되지 않았습니다")
+    if (
+        saved_cfg.get("experiment_contract_sha256")
+        != last_cfg.get("experiment_contract_sha256")
+    ):
+        raise ValueError("loss_pilot best.pt와 last.pt experiment contract가 다릅니다")
+    best_loss_sha = str(saved_cfg.get("loss_selection_sha256", ""))
+    last_loss_sha = str(last_cfg.get("loss_selection_sha256", ""))
+    if last_loss_sha != loss_selection_sha256(last_cfg.get("loss") or {}):
+        raise ValueError("loss_pilot last.pt loss-selection digest가 embedded loss와 다릅니다")
+    if best_loss_sha != last_loss_sha:
+        raise ValueError("loss_pilot best.pt와 last.pt loss selection이 다릅니다")
 
 
 def validate_training_physics(cfg: dict) -> str:
@@ -288,10 +375,15 @@ def validate_training_physics(cfg: dict) -> str:
     data_cfg = cfg.get("data", {})
     reference = str(data_cfg.get("reference_mode", "digital"))
     primary_mode = str(data_cfg.get("digital_primary_path_mode", "rir_surrogate"))
+    causal_mode = (
+        primary_mode == "causal_joint_v4"
+        and isinstance(cfg.get("broadband_causal_training_authority"), dict)
+    )
     if (
         bool(cfg.get("require_measured_primary_path", False))
         and reference == "digital"
         and primary_mode != "measured"
+        and not causal_mode
     ):
         raise ValueError(
             "이 학습 설정은 실측 P(z)가 필수입니다. "
@@ -300,6 +392,8 @@ def validate_training_physics(cfg: dict) -> str:
         )
     if reference != "digital":
         return "acoustic_rir_training"
+    if causal_mode:
+        return "fullband_causal_joint_fir_training"
     if primary_mode == "measured":
         return "measured_primary_path"
     return f"{primary_mode}_representation_pretrain"
@@ -318,11 +412,51 @@ CVaR 은 평균보다 **항상 크므로** 옛 best 가 영원히 이겨 best.pt
 """
 
 _LEGACY_BEST_METRIC_KEY = "nmse_trusted_db"
+BROADBAND_BEST_METRIC_KEY = "nmse_subband_guard_cvar_db"
 
 
 def _require_finite_tensor(name: str, value: torch.Tensor) -> None:
     if value.numel() == 0 or not bool(torch.isfinite(value.detach()).all().item()):
         raise FloatingPointError(f"G0 finite 계약 위반: {name}에 NaN/Inf 또는 빈 tensor")
+
+
+def _require_finite_named_tensors(
+    named_values: list[tuple[str, torch.Tensor]],
+) -> None:
+    """정상 경로에서 device별 한 번만 host와 동기화해 finite를 검사한다.
+
+    개별 tensor마다 ``.item()``을 호출하면 CUDA stream이 파라미터
+    수만큼 매 step 동기화된다. 정상이면 device 하나당 집계 flag
+    하나만 읽고, 집계가 실패했을 때만 기존 개별 검사를 다시 실행해
+    정확한 tensor 이름을 보고한다. 빈 tensor도 같은 실패 경로로 보내
+    기존 순서와 오류 메시지를 보존한다.
+    """
+
+    if not named_values:
+        return
+
+    by_device: dict[torch.device, list[torch.Tensor]] = {}
+    has_empty = False
+    for _, value in named_values:
+        if value.numel() == 0:
+            has_empty = True
+            continue
+        by_device.setdefault(value.device, []).append(value)
+
+    aggregate_failed = has_empty
+    for values in by_device.values():
+        finite_flags = [torch.isfinite(value.detach()).all() for value in values]
+        device_is_finite = torch.stack(finite_flags).all()
+        if not bool(device_is_finite.item()):
+            aggregate_failed = True
+
+    if not aggregate_failed:
+        return
+
+    # 실패한 경우에만 이전과 같은 순서로 개별 검사해 이름을 특정한다.
+    for name, value in named_values:
+        _require_finite_tensor(name, value)
+    raise FloatingPointError("G0 finite 계약 위반: 집계 finite 검사가 실패했습니다")
 
 
 def validate_finite_batch(batch: dict) -> None:
@@ -366,16 +500,24 @@ def validate_finite_loss_metrics(loss: torch.Tensor, metrics: dict) -> None:
 def validate_finite_gradients(model: torch.nn.Module) -> None:
     """optimizer가 non-finite gradient를 상태에 반영하기 전에 차단한다."""
 
-    for name, parameter in model.named_parameters():
-        if parameter.grad is not None:
-            _require_finite_tensor(f"gradient.{name}", parameter.grad)
+    _require_finite_named_tensors(
+        [
+            (f"gradient.{name}", parameter.grad)
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        ]
+    )
 
 
 def validate_finite_parameters(model: torch.nn.Module) -> None:
     """optimizer step이 생성한 non-finite 가중치도 즉시 차단한다."""
 
-    for name, parameter in model.named_parameters():
-        _require_finite_tensor(f"parameter.{name}", parameter)
+    _require_finite_named_tensors(
+        [
+            (f"parameter.{name}", parameter)
+            for name, parameter in model.named_parameters()
+        ]
+    )
 
 
 def validate_g0_nmse(
@@ -529,6 +671,26 @@ def mixed_branch_counts(seed: int, batches: int, ratio: float) -> tuple[int, int
 class Trainer:
     def __init__(self, cfg: dict, *, resume_preflight=None) -> None:
         self.cfg = cfg
+        # 광대역 schema/S-NPZ/contract SHA는 CUDA 조회, DDP 초기화, model/RNG 및
+        # DataLoader worker보다 먼저 닫는다. strict-v1 NPZ에 광대역 이름만 붙인
+        # 설정은 여기서 즉시 실패한다.
+        self._criterion_admission = admit_criterion_config(
+            cfg,
+            repo_root=REPO_ROOT,
+            require_bound=True,
+        )
+        expected_best_metric = (
+            BROADBAND_BEST_METRIC_KEY
+            if self._criterion_admission.role == BROADBAND_CRITERION_ROLE
+            else BEST_METRIC_KEY
+        )
+        self.best_metric_key = str(cfg.get("best_metric_key", expected_best_metric))
+        if self.best_metric_key != expected_best_metric:
+            raise ValueError(
+                "criterion role과 best_metric_key가 다릅니다: "
+                f"role={self._criterion_admission.role}, "
+                f"configured={self.best_metric_key}, required={expected_best_metric}"
+            )
         self.physics_status = validate_training_physics(cfg)
         self.rank, self.world, self.local_rank = _ddp_env()
         validate_training_world_size(cfg, self.world)
@@ -543,6 +705,14 @@ class Trainer:
         seed = int(cfg.get("seed", 0)) + self.rank
 
         self.stage = str(cfg.get("stage", "open_loop"))
+        if (
+            self._criterion_admission.causal_authority is not None
+            and self.stage != "open_loop"
+        ):
+            raise RuntimeError(
+                "v4 causal broadband authority는 현재 open_loop만 승인합니다; "
+                "stateful closed-loop prefix 동치 검증 전입니다"
+            )
         if self.stage == "closed_loop" and self.world > 1:
             # 폐루프는 언랩된 모듈의 streaming_step 을 직접 호출하므로 DDP 그래디언트
             # 동기화가 동작하지 않는다 (리뷰 확정 결함 #3). 20~50k step 단기 학습이므로
@@ -579,14 +749,17 @@ class Trainer:
             if init_required_preview:
                 if init_path.name != "best.pt":
                     raise ValueError(
-                        "공식 init checkpoint는 완료 receipt에 묶인 best.pt여야 합니다"
+                        "필수 init checkpoint는 선택된 best.pt여야 합니다"
                     )
-                receipt = validate_completion_receipt(
-                    init_path.parent,
-                    expected_role=str(cfg.get("required_init_experiment_role")),
-                    expected_init_eligible=True,
-                    repo_root=REPO_ROOT,
-                )
+                if bool(cfg.get("require_init_completion_receipt", True)):
+                    receipt = validate_completion_receipt(
+                        init_path.parent,
+                        expected_role=str(cfg.get("required_init_experiment_role")),
+                        expected_init_eligible=bool(
+                            cfg.get("require_init_eligible", True)
+                        ),
+                        repo_root=REPO_ROOT,
+                    )
             init_state, init_snapshot = read_checkpoint_snapshot(
                 init_path, map_location="cpu"
             )
@@ -597,6 +770,8 @@ class Trainer:
             validate_init_checkpoint_role(init_state, cfg)
             if init_required_preview:
                 validate_embedded_experiment_contract(init_state["cfg"])
+                validate_canonical_training_policy(init_state["cfg"])
+                validate_measured_probe_init_chain(init_state, cfg, init_path)
                 if init_state["cfg"].get("model") != cfg.get("model"):
                     raise ValueError("init checkpoint model 설정이 fine-tune과 다릅니다")
                 if init_state["cfg"].get("trusted_band_hz") != cfg.get(
@@ -700,81 +875,76 @@ class Trainer:
 
         # ----- 플랜트 + 손실 -----
         duct = cfg["duct"]
-        sp = load_secondary_path(REPO_ROOT / duct["secondary_path"]["npz"])
-        if sp.sample_rate != self.fs:
-            raise ValueError(
-                f"S(z) npz 샘플레이트 {sp.sample_rate} ≠ 데이터 {self.fs} — "
-                "duct.yaml secondary_path.npz 를 확인하세요 (감사 M7)"
-            )
-        pp = cfg["data"].get("plant_perturbation", {})
-        plant = DifferentiableSecondaryPath(
-            sp,
-            handoff_extra_samples=handoff_samples_from_config(duct),
-            delay_jitter_range=tuple(pp.get("delay_jitter_range", [0, 0])),
-            gain_db_range=tuple(pp.get("gain_db", [0.0, 0.0])),
-            tilt_db_per_octave_range=tuple(pp.get("gain_tilt_db_per_octave", [0.0, 0.0])),
-            allpass_perturb=bool(pp.get("allpass_perturb", False)),
-            seed=seed + 17,
-        ).to(self.device)
-        nl_cfg = cfg["data"].get("nonlinear", {})
-        nonlinear = RandomNonlinear(
-            nl_cfg.get("sef_eta_choices", [10.0]),
-            tuple(nl_cfg.get("drive_range", [1.0, 1.0])),
-            hardclip_prob=float(nl_cfg.get("hardclip_prob", 0.0)),
-            seed=seed + 29,
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        criterion_bundle = build_criterion_from_config(
+            cfg,
+            repo_root=REPO_ROOT,
+            limiter_limit=float(raw_model.limit),
+            device=self.device,
+            admission=self._criterion_admission,
         )
-        acoustics = duct.get("acoustics", {})
-        cutoff = float(acoustics.get("plane_wave_cutoff_hz", 1633.0))
-        # 대역은 BandPlan 이 유일하게 유도한다. 예전에는 이 세 줄이 trainer /
-        # eval.recorded / evaluate_offline / evaluate_session / render_anc_demo 에
-        # **다섯 벌** 복붙돼 있었고, S npz 의 신뢰대역을 넓혀도 따라오지 않는 곳이 생겼다.
-        self.band_plan = BandPlan.resolve(
-            plant_trusted_band_hz=sp.trusted_band_hz(),
-            duct_cfg=duct,
-            sample_rate=self.fs,
-        )
-        target_band = self.band_plan.target.as_tuple()
-        self.trusted_band_hz = self.band_plan.optimize.as_tuple()
+        self.criterion = criterion_bundle.criterion
+        sp = criterion_bundle.admission.secondary
+        self.band_plan = criterion_bundle.admission.band_plan
+        target_band = criterion_bundle.admission.target_band_hz
+        self.trusted_band_hz = criterion_bundle.admission.trusted_band_hz
         if self.is_main:
-            print(
-                "[trainer] NMSE trusted band: "
-                f"{self.trusted_band_hz[0]:.0f}–{self.trusted_band_hz[1]:.0f}Hz "
-                f"(S 신뢰 {sp.trusted_band_hz()[0]:.0f}–{sp.trusted_band_hz()[1]:.0f}Hz "
-                f"∩ 목표 {target_band[0]:.0f}–{target_band[1]:.0f}Hz)"
-            )
+            if criterion_bundle.admission.role == BROADBAND_CRITERION_ROLE:
+                print(
+                    "[trainer] broadband equal-subband NMSE: "
+                    f"{self.trusted_band_hz[0]:.0f}–{self.trusted_band_hz[1]:.0f}Hz "
+                    f"(contract {criterion_bundle.admission.control_band_contract_sha256})"
+                )
+            else:
+                assert sp is not None
+                print(
+                    "[trainer] NMSE trusted band: "
+                    f"{self.trusted_band_hz[0]:.0f}–{self.trusted_band_hz[1]:.0f}Hz "
+                    f"(S 신뢰 {sp.trusted_band_hz()[0]:.0f}–{sp.trusted_band_hz()[1]:.0f}Hz "
+                    f"∩ 목표 {target_band[0]:.0f}–{target_band[1]:.0f}Hz)"
+                )
             print(f"[trainer] physics status: {self.physics_status}")
             if self.physics_status.endswith("_representation_pretrain"):
                 print(
                     "[trainer 경고] surrogate P(z) 표현 사전학습입니다 — "
                     "실측 덕트 감쇠 성능으로 해석하지 마세요."
                 )
-        # 리미터 한계는 **모델이 단일 출처**다. 예전에는 loss.clip_margin 과
-        # model.limiter.limit 이 서로 다른 두 곳에 적힌 같은 물리량이었고, trainer 가
-        # 부등식 하나로 대조하는 것이 전부였다 (감사 L8). 이제 손실이 모델 값을
-        # 그대로 받는다 — 두 번째 유도가 존재하지 않는다.
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        self.criterion = ANCLoss(
-            plant, cfg["loss"], self.fs, nonlinear=nonlinear,
-            cutoff_hz=cutoff, target_band_hz=target_band,
-            trusted_band_hz=self.trusted_band_hz,
-            limiter_limit=float(raw_model.limit),
-        ).to(self.device)
-
         # S(z) 총지연 + FIR 정착 구간은 y 가 무엇이든 e = d 로 고정된다.
         # 합성 d 는 P(z) 지연 때문에 그 구간이 비어 있어 공짜지만(trusted 하한 −59.8 dB),
         # 실측 d 는 실신호가 들어 있어 노출된다(하한 mean −20.3 / CVaR10 −10.1 / worst
         # −4.8 dB). 평균 집계에서는 0.03 dB 로 작아 보였지만 CVaR 로 바꾸는 순간
         # 달성 불가능한 목표에 그래디언트가 집중된다 — 두 변경은 반드시 같이 간다.
         # 값의 단일 출처는 PlantSettle 이고, 평가기 warmup 도 같은 값을 하한으로 쓴다.
-        self.plant_settle = PlantSettle.derive(
-            secondary_delay_samples=int(sp.delay_samples),
-            handoff_samples=handoff_samples_from_config(duct),
-            fir_taps=int(sp.fir.size),
-            sample_rate=self.fs,
-        )
-        self.loss_start_sample = int(
-            cfg.get("loss_start_sample", self.plant_settle.samples)
-        )
+        if criterion_bundle.admission.secondary_causal is not None:
+            causal_secondary = criterion_bundle.admission.secondary_causal
+            self.plant_settle = PlantSettle.derive(
+                secondary_delay_samples=int(
+                    causal_secondary.coarse_delay_samples
+                ),
+                handoff_samples=int(causal_secondary.handoff_extra_samples),
+                fir_taps=int(causal_secondary.support_samples),
+                sample_rate=self.fs,
+            )
+            required_prefix = criterion_bundle.admission.broadband_valid_prefix_samples
+            if required_prefix is None:
+                raise RuntimeError("causal criterion admission valid prefix가 없습니다")
+            self.loss_start_sample = int(cfg.get("loss_start_sample", -1))
+            if self.loss_start_sample != int(required_prefix):
+                raise ValueError(
+                    "causal loss_start_sample은 authority/model/P/S valid prefix와 "
+                    f"같아야 합니다: {self.loss_start_sample} != {required_prefix}"
+                )
+        else:
+            assert sp is not None
+            self.plant_settle = PlantSettle.derive(
+                secondary_delay_samples=int(sp.delay_samples),
+                handoff_samples=handoff_samples_from_config(duct),
+                fir_taps=int(sp.fir.size),
+                sample_rate=self.fs,
+            )
+            self.loss_start_sample = int(
+                cfg.get("loss_start_sample", self.plant_settle.samples)
+            )
         if self.loss_start_sample < 0:
             raise ValueError("loss_start_sample 은 0 이상이어야 합니다")
         if self.is_main:
@@ -810,16 +980,37 @@ class Trainer:
                 total_missing = sum(float(mix[t]) for t in missing)
                 print("=" * 70)
                 print(f"[trainer 경고] manifest 부재 태그 {missing} (비율 합 {total_missing:.0%})")
-                print("  → 해당 비율은 합성원으로 대체됩니다. 의도가 아니면 학습을 중단하고")
+                print("  → 이 경로는 diagnostic 설정에서만 합성원으로 대체됩니다.")
+                print("    canonical 역할은 config admission에서 이 상태를 이미 거부합니다.")
+                print("    의도가 아니면 학습을 중단하고")
                 print("    scripts/data/prepare_noise_pool.py 를 실행하세요.")
                 print("=" * 70)
 
         batch_size = int(cfg["batch_size"])
+        broadband_batch_qualified = (
+            self._criterion_admission.role == BROADBAND_CRITERION_ROLE
+        )
+        causal_primary = (
+            None
+            if self._criterion_admission.primary_causal is None
+            else CausalFIRPath(self._criterion_admission.primary_causal)
+        )
+        causal_prefix = self._criterion_admission.broadband_valid_prefix_samples
+        causal_timing = (
+            None
+            if self._criterion_admission.causal_authority is None
+            else self._criterion_admission.causal_authority.timing_contract
+        )
         recorded_for_stream = cfg.get("recorded_manifest")
         if recorded_for_stream and not Path(recorded_for_stream).is_absolute():
             recorded_for_stream = str(REPO_ROOT / recorded_for_stream)
         has_recorded_stream = bool(
             recorded_for_stream and Path(recorded_for_stream).is_file()
+        )
+        validation_source = resolve_validation_source(
+            criterion_role=self._criterion_admission.role,
+            has_recorded_stream=has_recorded_stream,
+            recorded_ratio=float(cfg.get("recorded_ratio", 0.0)),
         )
         if has_recorded_stream:
             synth_resume_batches, recorded_resume_batches = mixed_branch_counts(
@@ -840,6 +1031,20 @@ class Trainer:
             seed=seed,
             training_batch_size=batch_size,
             resume_batch_index=synth_resume_batches,
+            broadband_batch_qualified=broadband_batch_qualified,
+            broadband_primary_operator=(
+                None if causal_primary is None else causal_primary.filter_numpy
+            ),
+            broadband_primary_generator_schema=(
+                None
+                if causal_primary is None
+                else BROADBAND_SYNTH_PRIMARY_GENERATOR_SCHEMA
+            ),
+            broadband_primary_history_samples=(
+                None if causal_primary is None else causal_primary.history_samples
+            ),
+            broadband_valid_prefix_samples=causal_prefix,
+            broadband_timing_contract=causal_timing,
         )
         if synth_train.timing_contract is not None:
             cfg["data"]["training_timing_contract"] = (
@@ -878,6 +1083,7 @@ class Trainer:
                 timing_contract=synth_train.timing_contract,
                 training_batch_size=batch_size,
                 resume_batch_index=recorded_resume_batches,
+                broadband_valid_prefix_samples=causal_prefix,
             )
             rec_loader = DataLoader(
                 rec, batch_size=batch_size, num_workers=2,
@@ -893,13 +1099,55 @@ class Trainer:
         elif recorded_manifest and self.is_main:
             print(f"[trainer] recorded_manifest({recorded_manifest}) 없음 — 합성 데이터만 사용")
 
-        val_ds = SynthANCDataset(cfg["data"], duct, split="val", seed=1234)
         # CVaR 목적함수는 분위 추정이다. 16개면 q=0.25 가 top-4 뿐이라 추정이 흔들린다.
         # val 배치는 학습 batch_size 와 무관하게 키울 수 있다(그래디언트가 없다).
         self.val_items = int(cfg.get("val_items", 64))
         if self.val_items < 1:
             raise ValueError(f"val_items 는 1 이상이어야 합니다: {self.val_items}")
-        self.val_batch = make_eval_batch(val_ds, n_items=self.val_items)
+        if validation_source == "recorded_val_only":
+            assert recorded_manifest is not None
+            recorded_val_data = copy.deepcopy(cfg["data"])
+            # 모델 선택은 실제 recorded val 자체를 본다. train 증강은 고정 RNG라도
+            # 원본 val metric이 아니므로 validation branch에서 명시적으로 끈다.
+            recorded_val_data["recorded_augment"] = {"enabled": False}
+            recorded_val = RecordedANCDataset(
+                recorded_manifest,
+                recorded_val_data,
+                split="val",
+                seed=1234,
+                timing_contract=synth_train.timing_contract,
+                training_batch_size=self.val_items,
+                resume_batch_index=0,
+                broadband_valid_prefix_samples=causal_prefix,
+            )
+            self.val_batch = make_recorded_eval_batch(
+                recorded_val, n_items=self.val_items
+            )
+            self.validation_source = validation_source
+        else:
+            val_ds = SynthANCDataset(
+                cfg["data"],
+                duct,
+                split="val",
+                seed=1234,
+                training_batch_size=self.val_items,
+                broadband_batch_qualified=broadband_batch_qualified,
+                broadband_primary_operator=(
+                    None if causal_primary is None else causal_primary.filter_numpy
+                ),
+                broadband_primary_generator_schema=(
+                    None
+                    if causal_primary is None
+                    else BROADBAND_SYNTH_PRIMARY_GENERATOR_SCHEMA
+                ),
+                broadband_primary_history_samples=(
+                    None if causal_primary is None else causal_primary.history_samples
+                ),
+                broadband_valid_prefix_samples=causal_prefix,
+                broadband_timing_contract=causal_timing,
+            )
+            self.val_batch = make_eval_batch(val_ds, n_items=self.val_items)
+            self.validation_source = validation_source
 
         # ----- 옵티마이저/스케줄 -----
         opt_cfg = cfg["optimizer"]
@@ -1033,7 +1281,18 @@ class Trainer:
             )
             try:
                 stochastic = state["training_state"]
-                self.criterion.plant.rng.bit_generator.state = stochastic["plant_rng"]
+                if int(stochastic.get("schema_version", -1)) == 1:
+                    self.criterion.plant.rng.bit_generator.state = stochastic["plant_rng"]
+                elif (
+                    int(stochastic.get("schema_version", -1)) == 2
+                    and stochastic.get("plant_rng_kind")
+                    == "not_applicable_frozen_causal_fir"
+                    and stochastic.get("plant_rng") is None
+                    and self._criterion_admission.causal_authority is not None
+                ):
+                    pass
+                else:
+                    raise ValueError("training_state plant RNG kind/schema가 다릅니다")
                 if self.criterion.nonlinear is not None:
                     self.criterion.nonlinear.rng.bit_generator.state = stochastic[
                         "nonlinear_rng"
@@ -1053,7 +1312,7 @@ class Trainer:
         return cfg_snapshot(
             cfg,
             self.trusted_band_hz,
-            best_metric_key=BEST_METRIC_KEY,
+            best_metric_key=self.best_metric_key,
             loss_start_sample=self.loss_start_sample,
             cvar_scope="rank_local" if self.world > 1 else "global",
         )
@@ -1061,6 +1320,19 @@ class Trainer:
     def _training_state_snapshot(self) -> dict:
         """global RNG 밖 학습 구성요소의 순차 RNG 상태."""
 
+        if self._criterion_admission.causal_authority is not None:
+            return {
+                "schema_version": 2,
+                "plant_rng_kind": "not_applicable_frozen_causal_fir",
+                "plant_rng": None,
+                "nonlinear_rng": (
+                    None
+                    if self.criterion.nonlinear is None
+                    else copy.deepcopy(
+                        self.criterion.nonlinear.rng.bit_generator.state
+                    )
+                ),
+            }
         return {
             "schema_version": 1,
             "plant_rng": copy.deepcopy(self.criterion.plant.rng.bit_generator.state),
@@ -1075,7 +1347,23 @@ class Trainer:
 
     # ---------- 스텝 ----------
 
+    def _validate_causal_batch_prefix(self, batch: dict) -> None:
+        required = self._criterion_admission.broadband_valid_prefix_samples
+        if required is None:
+            return
+        value = batch.get("valid_start_sample")
+        if not isinstance(value, torch.Tensor):
+            raise ValueError("causal broadband batch에 valid_start_sample이 없습니다")
+        flat = value.detach().cpu().reshape(-1)
+        if flat.numel() < 1 or flat.dtype not in (torch.int32, torch.int64):
+            raise ValueError("causal broadband valid_start_sample dtype/shape가 다릅니다")
+        if not bool(torch.all(flat == int(required)).item()):
+            raise ValueError(
+                "causal broadband batch valid crop이 authority prefix와 다릅니다"
+            )
+
     def _forward_loss(self, batch: dict) -> tuple[torch.Tensor, dict]:
+        self._validate_causal_batch_prefix(batch)
         validate_finite_batch(batch)
         x = batch["x"].to(self.device, non_blocking=True)
         d = batch["d"].to(self.device, non_blocking=True)
@@ -1151,6 +1439,7 @@ class Trainer:
         self.model.eval()
         self.criterion.eval()
         with torch.no_grad():
+            self._validate_causal_batch_prefix(self.val_batch)
             x = self.val_batch["x"].to(self.device)
             d = self.val_batch["d"].to(self.device)
             validate_finite_batch({"x": x, "d": d})
@@ -1166,8 +1455,8 @@ class Trainer:
         return metrics
 
     def _validate(self) -> float:
-        """기존 호출 호환용 단일 값 검증 API — trusted-band NMSE를 반환."""
-        return self._validate_metrics()["nmse_trusted_db"]
+        """기존 호출 호환용 단일 값 검증 API — role별 best metric을 반환."""
+        return self._validate_metrics()[self.best_metric_key]
 
     # ---------- 메인 루프 ----------
 
@@ -1215,7 +1504,7 @@ class Trainer:
                 t0 = time.time()
                 line = (
                     f"step {self.step:7d} | loss {metrics['loss']:8.3f} | "
-                    f"nmse_t {metrics['nmse_trusted_db']:7.2f} dB | "
+                    f"nmse_t {metrics[self.best_metric_key]:7.2f} dB | "
                     f"nmse_f {metrics['nmse_fullband_db']:7.2f} dB | "
                     f"lr {lr:.2e} | {sps:5.2f} it/s"
                 )
@@ -1233,16 +1522,25 @@ class Trainer:
                 # best 선택도 최악값 기준. 평가 G4 가 family 별 worst10(=CVaR@10%)을
                 # 보는데 선택만 평균을 보면, 게이트에서 떨어질 checkpoint 를 best 로
                 # 저장하게 된다 (결함 4 재현 경로).
-                val_mean = float(val_metrics["nmse_trusted_db"])
-                val_nmse = float(
-                    val_metrics.get("nmse_trusted_cvar_db", val_metrics["nmse_trusted_db"])
-                )
-                val_worst = float(val_metrics.get("nmse_trusted_worst_db", float("nan")))
+                if self._criterion_admission.role == BROADBAND_CRITERION_ROLE:
+                    val_mean = float(val_metrics["nmse_subband_equal_db"])
+                    val_worst = float(val_metrics["nmse_subband_worst_db"])
+                else:
+                    val_mean = float(val_metrics["nmse_trusted_db"])
+                    val_worst = float(
+                        val_metrics.get("nmse_trusted_worst_db", float("nan"))
+                    )
+                val_nmse = float(val_metrics[self.best_metric_key])
                 val_fullband_nmse = val_metrics["nmse_fullband_db"]
                 stop_flag = torch.zeros(1, device=self.device)
                 if self.is_main:
+                    metric_label = (
+                        "broadband subband CVaR"
+                        if self._criterion_admission.role == BROADBAND_CRITERION_ROLE
+                        else "trusted CVaR"
+                    )
                     print(
-                        f"[eval] step {self.step}: val trusted CVaR {val_nmse:+.2f} dB "
+                        f"[eval] step {self.step}: val {metric_label} {val_nmse:+.2f} dB "
                         f"(mean {val_mean:+.2f}, worst {val_worst:+.2f}) | "
                         f"fullband {val_fullband_nmse:+.2f} dB | "
                         f"대역밖 최악 {val_metrics.get('dnh_worst_db', float('nan')):+.2f} dB",
@@ -1251,7 +1549,17 @@ class Trainer:
                     if self.writer:
                         # 기존 대시보드의 val/nmse_db는 목적함수 alias로 유지.
                         self.writer.add_scalar("val/nmse_db", val_nmse, self.step)
-                        self.writer.add_scalar("val/nmse_trusted_db", val_mean, self.step)
+                        if self._criterion_admission.role == BROADBAND_CRITERION_ROLE:
+                            self.writer.add_scalar(
+                                "val/nmse_subband_equal_db", val_mean, self.step
+                            )
+                            self.writer.add_scalar(
+                                f"val/{self.best_metric_key}", val_nmse, self.step
+                            )
+                        else:
+                            self.writer.add_scalar(
+                                "val/nmse_trusted_db", val_mean, self.step
+                            )
                         for key in (
                             "nmse_trusted_cvar_db",
                             "nmse_trusted_worst_db",

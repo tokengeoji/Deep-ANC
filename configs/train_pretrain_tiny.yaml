@@ -32,6 +32,9 @@ loss:
   nmse_cvar_q: 0.25
   nmse_cvar_alpha: 0.7
   nmse_cvar_min_k: 4
+  # 시작값일 뿐 canonical 승인값이 아니다. 각 alpha의 fresh G0가 NMSE<-6 dB를
+  # 통과한 뒤 같은 checkpoint/batch의 strict-S output-y gradient share 0.2–0.4를
+  # 통과한 λ만 그 candidate identity로 사용할 수 있다.
   lambda_dnh: 0.00075
   dnh_weight_below: 1.0
   dnh_weight_above: 2.0
@@ -64,7 +67,9 @@ resume: null
 seed: 20260803
 
 # pilot은 frame-metric-only(lambda_frame=0)로 고정하고 alpha∈{0.7,1.0}를 비교한다.
-# 차이가 0.2dB 이내일 때만 alpha=0.85를 추가한다. alpha=1.0 non-finite/실행 실패는
+# 각 20k pilot best.pt에서 별도 5k measured 70:30 probe를 실행한다. 두
+# measured-probe recorded-val 점수 차이가 0.2dB 이내일 때만 alpha=0.85의
+# 20k+5k chain을 추가한다. alpha=1.0 non-finite/실행 실패는
 # 재현 가능한 immutable failure receipt가 생기기 전까지 0.85 fallback의 근거가 아니며
 # canonical을 막는다. signed frame-CVaR 0.5/0.2는 fixed-batch control에서 영출력 붕괴를
 # 재현해 승인 후보가 아니다.
@@ -73,8 +78,13 @@ seed: 20260803
 # --set run_until_step=20000`으로 같은 초반 곡선을 비교한다. role과 두 loss
 # 값은 contract SHA/run dir에 포함되고, run_until은 같은 run의 재개를 위해 제외된다.
 #
-# 20k recorded-val 승자를 고정한 뒤 실측 P 5k probe는 새 contract run으로 실행한다:
+# 각 20k 후보의 실측 P 5k probe는 새 contract run으로 실행한다:
 #   --set experiment_role=measured_probe --set init_eligible=false \
 #   --set data.digital_primary_path_mode=measured --set run_until_step=5000 \
-#   --set init_ckpt=<selected-20k-best.pt>
-# probe도 synthetic/recorded val만 보고 test는 열지 않는다.
+#   --set init_ckpt=<same-alpha-20k-best.pt>
+# measured_probe role은 설정 로더에서 아래 항목을 원자적으로 물질화하며 상충 override를
+# 즉시 거부한다: canonical recorded_regrouped.jsonl, recorded_ratio=0.7(실측 70% +
+# synthetic 30%), require_recorded_manifest=true, require_measured_primary_path=true,
+# same-alpha loss_pilot best.pt init 필수. 따라서 이 단계는 synthetic-only probe가
+# 아니라 짧은 measured fine-tune이다. 최종 alpha와 0.2dB/0.85 판정은
+# 후보별 measured-probe recorded val만 보고 test는 열지 않는다.

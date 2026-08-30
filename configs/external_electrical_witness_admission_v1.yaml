@@ -1,0 +1,64 @@
+# 외부 동기 electrical witness의 무출력 요구사항만 고정한다.
+# 이 파일은 실제 ADC 연결/배선/raw를 선언하지 않는다. 실측 raw adapter가 별도 receipt로
+# 결속하기 전에는 아래 null/false 필드를 바꾸어도 canonical authority가 생기지 않는다.
+schema: external_electrical_witness_admission_v1
+role: fullband_external_electrical_witness_static_requirements_only
+
+control_band_contract:
+  id: broadband_full_octave_88_11314_v3
+  sha256: 53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2
+  sample_rate_hz: 48000
+  block_size: 256
+
+s32_transport_requirement:
+  planned_s32_callback_sha256_required: true
+  actual_callback_s32_sha256_required: true
+  aperiodic_command_to_tap_frame_map_required: true
+  callback_xrun_drop_add_must_be_zero: true
+  actual_callback_s32_sha256: null
+
+topology_requirement:
+  allowed_topologies:
+    - single_acquisition_clock_all_four
+    - ape_external_hardware_frame_bridge
+  required_roles: [ERR, REF, NOISE_TAP, CANCEL_TAP]
+  minimum_simultaneous_inputs: 4
+  ape_external_split_requires_hardware_frame_bridge: true
+  nominal_rate_or_host_timestamp_only_accepted: false
+  selected_topology: null
+
+raw_evidence_requirement:
+  native_raw_file_sha256_required: true
+  canonical_raw_file_sha256_required: true
+  analysis_file_sha256_required: true
+  no_replace_publication_required: true
+  native_raw_file_sha256: null
+  canonical_raw_file_sha256: null
+  analysis_file_sha256: null
+
+tap_safety_requirement:
+  high_impedance_required: true
+  isolated_required: true
+  dc_blocked_required: true
+  attenuated_required: true
+  direct_speaker_terminal_to_adc_allowed: false
+  agc_disabled_required: true
+  limiter_disabled_required: true
+  fixed_gain_required: true
+  polarity_channel_test_required: true
+  clip_stuck_must_be_zero: true
+  pre_amplifier_tap_scope: dac_line_input_witness_only_not_amplifier_speaker_transfer
+
+spatial_requirement:
+  plant_identification_minimum_inputs: 4
+  final_quiet_zone_minimum_simultaneous_inputs: 8
+  final_quiet_zone_err_positions: 5
+  sequential_err_positions_accepted: false
+
+authority:
+  static_requirements_only: true
+  topology_contract_met: false
+  electrical_witness_pass: false
+  fullband_plant_identification_pass: false
+  canonical_training_eligible: false
+  deployment_eligible: false

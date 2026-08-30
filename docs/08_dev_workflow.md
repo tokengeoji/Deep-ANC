@@ -107,16 +107,18 @@ git diff --check
 - [ ] untouched public raw 6종을 복수 full-decode/seek decoder audit으로 전수 검증하고,
   audit-bound `data/manifests/canonical_v4` content-hashed manifest 재생성
 - [ ] noise QA, recorded QA, 전체 pytest
-- [ ] canonical init만 FAIL인 readiness 15/16
+- [ ] strict 부대역 coverage 복구 후 canonical init만 FAIL인 readiness 16/17
 
 ### 5.4 학습과 평가
 
-- [ ] strict S 기준 `lambda_dnh` gradient 비중 0.2–0.4
-- [ ] G0 trusted NMSE < −6 dB
-- [ ] frame-metric-only 2개 alpha 20k+5k 후보와 필요 시 alpha 0.85를 val-only로 선택
+- [ ] alpha별 fresh G0 trusted NMSE < −6 dB
+- [ ] 같은 approved G0 checkpoint/batch와 strict S·settle·150–1600 Hz 기준, 현재 cfg
+  `lambda_dnh`의 model-output y-gradient share 0.2–0.4
+- [ ] frame-metric-only 후보 identity `(alpha, frame, lambda_dnh)`별 20k+5k와 필요 시
+  alpha 0.85를 val-only로 선택
 - [ ] A100 200–500 smoke와 중단/재개 등가 receipt
 - [ ] 선택 tiny 계약의 새 100k canonical pretrain
-- [ ] readiness 16/16 뒤 open-loop 50k fine-tune
+- [ ] readiness 17/17 뒤 open-loop 50k fine-tune
 - [ ] val selection 고정 뒤 campaign one-shot test G4 PASS
 - [ ] G4 뒤 natural-crest challenge PASS
 
@@ -136,8 +138,10 @@ G4와 crest challenge 전에는 closed-loop, ONNX export, 실제 ANC ON 평가�
 | recorded 평가 | `scripts/eval/evaluate_recorded.py` |
 
 실행 상태와 정확한 다음 명령은 [HANDOFF.md](../HANDOFF.md)를 단일 인수인계 문서로 사용한다.
+임계값, 필수 evidence, 학습 역할, one-shot 평가와 배포 중단 조건은
+[canonical 파인튜닝 강제 가드레일](16_canonical_finetune_guardrails.md)을 함께 적용한다.
 
-## 7. 브랜치 경계와 병합 규칙 (2026-08-27)
+## 7. 브랜치 경계와 병합 규칙 (2026-08-28)
 
 현재 브랜치는 내용이 섞인 임시 작업선이 아니라, 서로 의존하는 준비 계약을 순서대로 쌓은
 검증 기준선이다. 과거 커밋을 재작성하거나 강제 reset하지 않고 아래 네임스페이스로 이후
@@ -148,13 +152,16 @@ G4와 crest challenge 전에는 closed-loop, ONNX export, 실제 ANC ON 평가�
 | `main` | 공개 릴리스 기준선과 검토된 병합만 | 직접 실측·학습·실험 커밋 |
 | `fix/finetune-readiness-repair` | timing/계보/strict P/S/readiness/bootstrap 계약의 기준선 유지 | 고주파 가설, canonical 학습 결과, legacy 결과를 기준선으로 승격 |
 | `work/canonical-training` | 선택된 loss 계약의 tiny 100k pretrain과 50k measured fine-tune 코드·설정 | pilot을 init으로 재사용, 고주파 P/S·모드 실험 |
-| `work/high-frequency-validation` | 1.6 kHz 밖의 P/S·덕트 모드·기하 확인과 별도 고주파 목적함수 실험 | 공식 150–1600 Hz 계약과 strict 자산 덮어쓰기 |
+| `work/broadband-anc-v2` | 저역을 보존하면서 2/4/8 kHz까지 확장하는 P/S·source-v2·loss·runtime·matched FxLMS 계약의 현행 통합 작업선 | 실제 raw 없이 고역 PASS 선언, Stage-1 strict 자산 덮어쓰기, 차단된 학습 강제 시작 |
+| `work/high-frequency-validation` | 2026-08-27 진단 branch를 그대로 보존하는 과거 실험선 | 현행 광대역-v2로 merge하거나 canonical 증거로 승격 |
 | `archive/*` | 역사적 분석·재작성 전 ref 보존과 read-only 비교 | 실행, 재학습, 성능 근거 승격 |
 
-두 `work/*` 브랜치는 2026-08-27 기준선에서 의도적으로 같은 commit으로 시작한다. 이후
-실험은 해당 브랜치에서만 커밋하고, 결과·체크포인트·raw는 Git에 넣지 않고 Elice 실행
-receipt/transfer manifest로 결속한다. 한 실험의 변경을 다른 작업선에 cherry-pick할 때는
-전체 계약 SHA, pytest, provenance와 음향 평가 artifact를 함께 재검증한다.
+`work/high-frequency-validation`의 `d4b0c0a`는 당시 full-duplex 진단 경계를 보존한
+forensic branch다. 현행 광대역 설계는 이를 merge하지 않고
+`fix/finetune-readiness-repair`의 검증 기준선에서 `work/broadband-anc-v2`로 분기한다.
+결과·체크포인트·raw는 Git에 넣지 않고 Elice 실행 receipt/transfer manifest로 결속한다.
+한 실험의 변경을 다른 작업선에 cherry-pick할 때는 전체 계약 SHA, pytest, provenance와
+음향 평가 artifact를 함께 재검증한다.
 
 Elice 학습은 항상 `--expected-commit`으로 기록된 detached checkout에서 실행한다. 학습 중인
 checkout의 branch 이동·reset·force-push는 하지 않는다. 기준선으로 병합하기 전에는 다음을
@@ -165,3 +172,28 @@ checkout의 branch 이동·reset·force-push는 하지 않는다. 기준선으�
 bash -n scripts/elice/bootstrap_all.sh scripts/elice/setup_env.sh
 git diff --check
 ```
+
+### 7.1 최종 두-브랜치 정리 정책 (2026-08-29 사용자 결정)
+
+파인튜닝 준비가 실제 artifact 기준으로 끝난 **뒤에만** 작업 브랜치를 정리한다. 준비 중에는
+P/S·witness·data provenance의 독립 commit을 지우지 않는다. 최종 운영 branch는 다음 둘이다.
+
+| 브랜치 | 역할 |
+|---|---|
+| `dev` | canonical fullband P/S 이후의 Elice pretrain, fine-tune, evaluation, 수정의 유일한 개발선 |
+| `main` | `dev`의 G4·실측·OOD 결과까지 검토된 안정 기준선 |
+
+정리 순서는 고정한다.
+
+1. 현재 분리 work branch에서 검증된 clean commit만 `dev`에 통합한다. raw, checkpoint,
+   private key, 대용량 data는 절대 Git으로 옮기지 않는다.
+2. `dev`에서 full pytest, no-audio dry-run, exact commit/manifest/receipt를 다시 확인한다.
+3. `dev`의 canonical fine-tune과 one-shot G4, 필요한 real duct/OOD 평가가 끝난 뒤에만
+   `main`에 fast-forward 또는 검토된 merge로 반영한다.
+4. 각 retired branch의 최종 commit이 `dev` 또는 `main`에서 도달 가능한지 `git merge-base
+   --is-ancestor`로 확인하고, 필요하면 immutable tag를 만든다. 그 뒤에만 local/origin의
+   `work/*`, `fix/*`, `archive/*`를 정리한다.
+
+따라서 지금처럼 fullband witness/P/S가 없는 동안에는 branch 삭제·force-push·history
+rewrite를 하지 않는다. Elice detached checkout과 연결된 commit도 학습 receipt가 끝날 때까지
+이동하거나 삭제하지 않는다.

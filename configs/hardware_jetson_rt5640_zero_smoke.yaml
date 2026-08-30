@@ -1,0 +1,55 @@
+# RT5640/I2S1 공유-rate 후보의 무음 transport smoke 전용 설정.
+#
+# 이 파일은 runtime ANC, level meter, P/S 측정 설정이 아니다. 출력은 bitwise zero만
+# 허용하며, PASS해도 sample identity/shared-clock/P/S/학습 권한을 만들지 않는다.
+
+schema: rt5640_zero_duplex_hardware_v1
+
+audio:
+  sample_rate: 48000
+  block_size: 256
+  latency: low
+  input:
+    card: APE
+    pcm: 1
+    channels: 2
+    dtype: int32
+    route: I2S2_ADMAIF2_ERR_REF
+  output:
+    card: APE
+    pcm: 0
+    channels: 2
+    dtype: int32
+    route: ADMAIF1_I2S1_RT5640_J511
+
+# 기존 공용 hardware validator가 요구하는 채널 mapping이다. zero smoke에서는 어떤
+# channel도 noise/cancel 신호를 내지 않으며 두 output channel 모두 exact zero다.
+channels:
+  error_mic: 0
+  reference_mic: 1
+  noise_out: 0
+  cancel_out: 1
+
+zero_duplex_smoke:
+  generation: rt5640_zero_duplex_v1
+  duration_seconds: 60
+  expected_frames: 2880000
+  expected_callbacks: 11250
+  output_semantics: bitwise_zero_only_no_signal_model_or_input_monitoring
+  result_directory: results/rt5640_zero_duplex/v1
+  physical_barriers:
+    require_j511_disconnected: true
+    require_amplifier_power_off: true
+    require_amplifier_input_disconnected: true
+    require_ab13x_amplifier_disconnected: true
+  maximum_authority:
+    status: ZERO_DUPLEX_TRANSPORT_SMOKE_PASS
+    common_clock_topology_pass: false
+    hardware_frame_identity_pass: false
+    shared_clock_authority_pass: false
+    physical_output_route_pass: false
+    sample_identity_pass: false
+    plant_identification_assessed: false
+    attenuation_assessed: false
+    canonical_training_eligible: false
+    deployment_eligible: false

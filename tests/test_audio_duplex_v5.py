@@ -1,0 +1,380 @@
+import signal
+
+import numpy as np
+import pytest
+
+from deep_anc.audio_duplex_v5 import (
+    DUPLEX_TELEMETRY_SCHEMA,
+    DuplexCaptureFailure,
+    STATUS_INPUT_OVERFLOW,
+    capture_duplex_v5,
+)
+
+
+class Stop(Exception):
+    pass
+
+
+class Abort(Exception):
+    pass
+
+
+class Status:
+    input_overflow = True
+
+    def __bool__(self):
+        return True
+
+
+class Backend:
+    CallbackStop = Stop
+    CallbackAbort = Abort
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+        self.calls = []
+        self.kwargs = {}
+        self.outputs = []
+
+    def Stream(self, **kwargs):
+        self.kwargs = kwargs
+        outer = self
+        outer.calls.append("stream_created")
+
+        class Stream:
+            def start(self):
+                outer.calls.append("start")
+                for index in range(getattr(outer, "blocks", 4)):
+                    frames = getattr(outer, "frames", 256)
+                    input_data = np.full(
+                        (frames, 2),
+                        index + 1,
+                        dtype=getattr(outer, "in_dtype", "<i4"),
+                    )
+                    output_data = np.full(
+                        getattr(outer, "out_shape", (frames, 2)),
+                        77,
+                        dtype=getattr(outer, "out_dtype", "<i2"),
+                    )
+                    outer.outputs.append(output_data)
+                    time_value = float(index)
+                    time_info = {
+                        "inputBufferAdcTime": time_value + 0.1,
+                        "outputBufferDacTime": time_value + 0.2,
+                        "currentTime": time_value + 0.3,
+                    }
+                    if getattr(outer, "bad_time", None) == "nan" and index == 1:
+                        time_info["currentTime"] = np.nan
+                    if getattr(outer, "bad_time", None) == "back" and index == 1:
+                        time_info = {key: -1.0 for key in time_info}
+                    status = (
+                        Status()
+                        if getattr(outer, "xrun", False) and index == 1
+                        else None
+                    )
+                    try:
+                        kwargs["callback"](
+                            input_data,
+                            output_data,
+                            frames,
+                            time_info,
+                            status,
+                        )
+                    except (Stop, Abort):
+                        break
+
+            def stop(self, *, ignore_errors):
+                outer.calls.append(("stop", ignore_errors))
+                if getattr(outer, "stop_error", False):
+                    raise RuntimeError("stop failed")
+
+            def abort(self, *, ignore_errors):
+                outer.calls.append(("abort", ignore_errors))
+                if getattr(outer, "abort_error", False):
+                    raise RuntimeError("abort failed")
+
+            def close(self, *, ignore_errors):
+                outer.calls.append(("close", ignore_errors))
+                if getattr(outer, "close_error", False):
+                    raise RuntimeError("close failed")
+
+        return Stream()
+
+
+def pcm():
+    return np.arange(2048, dtype="<i2").reshape(1024, 2)
+
+
+def run(backend, **kwargs):
+    return capture_duplex_v5(
+        backend,
+        submitted_pcm=pcm(),
+        input_device=1,
+        output_device=2,
+        **kwargs,
+    )
+
+
+def test_normal_exact_zero_status_and_stop():
+    backend = Backend()
+    raw, telemetry = run(backend)
+    assert backend.kwargs["prime_output_buffers_using_stream_callback"] is False
+    assert (
+        backend.kwargs["samplerate"],
+        backend.kwargs["blocksize"],
+        backend.kwargs["latency"],
+        backend.kwargs["channels"],
+    ) == (48_000, 256, ("low", "low"), (2, 2))
+    assert np.all(telemetry["callback_status_bitmask"] == 0)
+    assert telemetry["schema"] == DUPLEX_TELEMETRY_SCHEMA
+    assert telemetry["resolved_input_device"] == 1
+    assert telemetry["resolved_output_device"] == 2
+    assert telemetry["capture_monotonic_completed"] >= telemetry["capture_monotonic_started"]
+    assert telemetry["capture_monotonic_elapsed_seconds"] == pytest.approx(
+        telemetry["capture_monotonic_completed"]
+        - telemetry["capture_monotonic_started"]
+    )
+    assert telemetry["watchdog_grace_seconds"] == 2.0
+    assert np.array_equal(telemetry["actual_submitted_pcm"], pcm())
+    assert telemetry["portaudio_xrun_status_witness"] is True
+    assert telemetry["hardware_sample_slip_authority"] is False
+    assert telemetry["watchdog_coverage"] == (
+        "host_wait_until_planned_frames_plus_grace_not_hardware_deadline_witness"
+    )
+    assert telemetry["submitted_frames"] == len(pcm())
+    assert telemetry["canonical_invalid_reasons"] == []
+    assert telemetry["stream_stop_error"] is None
+    assert telemetry["stream_abort_error"] is None
+    assert telemetry["stream_close_error"] is None
+    assert telemetry["normal_stop_completed"] is True
+    assert telemetry["output_stop_confirmed"] is True
+    assert telemetry["capture_valid_mask"].dtype == np.dtype(np.bool_)
+    assert telemetry["submitted_valid_mask"].dtype == np.dtype(np.bool_)
+    assert np.all(telemetry["capture_valid_mask"])
+    assert np.all(telemetry["submitted_valid_mask"])
+    assert backend.calls[-2:] == [("stop", False), ("close", False)]
+    assert raw.dtype == np.dtype("<i4")
+
+
+@pytest.mark.parametrize("name,value", [("input_device", -1), ("output_device", -1), ("input_device", "1"), ("output_device", True)])
+def test_device_identity_is_exact_before_stream_open(name, value):
+    backend = Backend()
+    arguments = {"input_device": 1, "output_device": 2, name: value}
+    with pytest.raises(ValueError, match="device"):
+        capture_duplex_v5(backend, submitted_pcm=pcm(), **arguments)
+    assert backend.calls == []
+
+
+def test_failure_telemetry_always_carries_resolved_devices():
+    backend = Backend(frames=128)
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend)
+    assert caught.value.telemetry["resolved_input_device"] == 1
+    assert caught.value.telemetry["resolved_output_device"] == 2
+    assert caught.value.telemetry["capture_monotonic_completed"] >= (
+        caught.value.telemetry["capture_monotonic_started"]
+    )
+    assert caught.value.telemetry["capture_monotonic_elapsed_seconds"] >= 0.0
+
+
+def test_xrun_completes_then_invalid_with_actual_prefix():
+    backend = Backend(xrun=True)
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend)
+    failure = caught.value
+    assert failure.telemetry["completed"]
+    assert failure.telemetry["xrun_count"] == 1
+    assert int(failure.telemetry["callback_status_bitmask"][1]) & STATUS_INPUT_OVERFLOW
+    assert np.all(failure.submitted_valid_mask)
+    assert np.array_equal(failure.submitted_pcm, pcm())
+    assert ("abort", False) in backend.calls
+    assert ("close", False) in backend.calls
+
+
+@pytest.mark.parametrize(
+    "args,match,expected",
+    [
+        (("frames", 128), "exact 256", 0),
+        (("out_dtype", "<i4"), "output은 exact <i2", 0),
+        (("out_shape", (256, 1)), "output은 exact <i2", 0),
+        (("bad_time", "nan"), "finite", 256),
+        (("bad_time", "back"), "strict-monotonic", 256),
+    ],
+)
+def test_bad_callback_atomic_partial(args, match, expected):
+    backend = Backend(**{args[0]: args[1]})
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend)
+    failure = caught.value
+    assert match in str(failure)
+    assert failure.telemetry["captured_frames"] == expected
+    assert failure.telemetry["submitted_frames"] == expected
+    assert np.count_nonzero(failure.capture_valid_mask) == expected
+    assert ("abort", False) in backend.calls
+    assert ("close", False) in backend.calls
+    if args[0] not in {"out_dtype", "out_shape"}:
+        assert np.all(backend.outputs[-1] == 0)
+
+
+def test_external_plan_copy_and_watchdog_prefix():
+    source = pcm()
+    backend = Backend()
+    _, telemetry = capture_duplex_v5(
+        backend,
+        submitted_pcm=source,
+        input_device=1,
+        output_device=2,
+        pre_open_check=lambda: source.fill(0),
+    )
+    assert np.array_equal(telemetry["actual_submitted_pcm"], pcm())
+
+    backend = Backend(blocks=2)
+    ticks = iter([0.0, 0.0, 0.0, 99.0, 99.0])
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend, monotonic=lambda: next(ticks), sleep=lambda _: None)
+    failure = caught.value
+    assert failure.telemetry["captured_frames"] == 512
+    assert np.all(failure.submitted_valid_mask[:512])
+    assert not np.any(failure.submitted_valid_mask[512:])
+
+
+def test_slow_pre_open_is_excluded_from_capture_watchdog_and_elapsed():
+    backend = Backend()
+    ticks = iter([10.0, 71.0, 71.0, 71.025])
+
+    _, telemetry = run(
+        backend,
+        pre_open_check=lambda: None,
+        monotonic=lambda: next(ticks),
+        sleep=lambda _seconds: None,
+    )
+
+    assert telemetry["capture_monotonic_started"] == 71.0
+    assert telemetry["capture_monotonic_completed"] == 71.025
+    assert telemetry["capture_monotonic_elapsed_seconds"] == pytest.approx(0.025)
+    assert "pre_open_monotonic_started" not in telemetry
+    assert telemetry["normal_stop_completed"] is True
+
+
+def test_pre_open_failure_never_constructs_stream_or_submits_output():
+    backend = Backend()
+    ticks = iter([5.0, 66.0])
+
+    with pytest.raises(DuplexCaptureFailure, match="pre-open rejected") as caught:
+        run(
+            backend,
+            pre_open_check=lambda: (_ for _ in ()).throw(
+                RuntimeError("pre-open rejected")
+            ),
+            monotonic=lambda: next(ticks),
+            sleep=lambda _seconds: None,
+        )
+
+    failure = caught.value
+    assert backend.calls == []
+    assert backend.outputs == []
+    assert failure.telemetry["captured_frames"] == 0
+    assert failure.telemetry["submitted_frames"] == 0
+    assert failure.telemetry["capture_monotonic_started"] == 66.0
+    assert failure.telemetry["capture_monotonic_completed"] == 66.0
+    assert failure.telemetry["capture_monotonic_elapsed_seconds"] == 0.0
+
+
+def test_cleanup_errors_not_ignored():
+    backend = Backend(stop_error=True, abort_error=True, close_error=True)
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend)
+    assert all(
+        call in backend.calls
+        for call in (("stop", False), ("abort", False), ("close", False))
+    )
+    assert all(
+        message in str(caught.value)
+        for message in ("stop failed", "abort failed", "close failed")
+    )
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_live_signal_aborts_and_closes_before_failure_returns(signum):
+    backend = Backend(blocks=2)
+
+    def interrupt(_seconds):
+        signal.raise_signal(signum)
+
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend, sleep=interrupt)
+    assert caught.value.telemetry["termination_signal"] == int(signum)
+    assert backend.calls[-2:] == [("abort", False), ("close", False)]
+
+
+def test_post_close_interrupt_still_reports_closed_before_failure():
+    backend = Backend()
+    events = []
+    ticks = iter([0.0, 0.0, 0.0])
+
+    def monotonic():
+        try:
+            return next(ticks)
+        except StopIteration:
+            raise KeyboardInterrupt("post-close injected")
+
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(
+            backend,
+            monotonic=monotonic,
+            on_output_closed=lambda confirmed: events.append(("notice", confirmed)),
+        )
+    assert events == [("notice", True)]
+    assert backend.calls[-2:] == [("stop", False), ("close", False)]
+    assert "post-close injected" in str(caught.value)
+
+
+def test_output_buffer_write_failure_is_atomic():
+    backend = Backend()
+    original_stream = backend.Stream
+
+    def stream(**kwargs):
+        instance = original_stream(**kwargs)
+
+        class FailingOutput:
+            def __init__(self):
+                self.array = np.zeros((256, 2), dtype="<i2")
+
+            def __array__(self, dtype=None, copy=None):
+                return self.array
+
+            def __setitem__(self, key, value):
+                raise RuntimeError("sink write failed")
+
+        def start():
+            backend.calls.append("start")
+            try:
+                kwargs["callback"](
+                    np.ones((256, 2), dtype="<i4"),
+                    FailingOutput(),
+                    256,
+                    {
+                        "inputBufferAdcTime": 0.1,
+                        "outputBufferDacTime": 0.2,
+                        "currentTime": 0.3,
+                    },
+                    None,
+                )
+            except Abort:
+                pass
+
+        instance.start = start
+        return instance
+
+    backend.Stream = stream
+    with pytest.raises(DuplexCaptureFailure) as caught:
+        run(backend)
+    failure = caught.value
+    assert "sink write failed" in str(failure)
+    assert failure.telemetry["captured_frames"] == 0
+    assert failure.telemetry["submitted_frames"] == 0
+    assert not np.any(failure.capture_valid_mask)
+    assert not np.any(failure.submitted_valid_mask)
+    assert "output_silence_not_confirmed_on_callback_failure" in failure.telemetry[
+        "canonical_invalid_reasons"
+    ]

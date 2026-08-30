@@ -11,6 +11,14 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from ..dsp.measurement_level import meter_receipt_path
+from ..dsp.causal_training_operator import (
+    CausalTrainingAuthorityData,
+    load_causal_training_authority,
+)
+
 
 SCHEMA_VERSION = 2
 _OPERATIONAL_TOP_LEVEL_KEYS = {
@@ -92,25 +100,102 @@ def _path(root: Path, value: str | Path) -> Path:
     return path if path.is_absolute() else root / path
 
 
+def _causal_authority_from_config(
+    cfg: dict, root: Path
+) -> CausalTrainingAuthorityData | None:
+    raw = cfg.get("broadband_causal_training_authority")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "schema", "path", "file_sha256", "evidence_sha256"
+    }:
+        raise ValueError("causal authority config key 집합이 exact하지 않습니다")
+    return load_causal_training_authority(
+        _path(root, raw["path"]),
+        expected_file_sha256=str(raw["file_sha256"]),
+        expected_evidence_sha256=str(raw["evidence_sha256"]),
+        require_live_authority=True,
+    )
+
+
 def _artifact_paths(cfg: dict, root: Path) -> dict[str, Path]:
     paths: dict[str, Path] = {}
     data = cfg.get("data") or {}
     duct = cfg.get("duct") or {}
     secondary = duct.get("secondary_path") or {}
     digital = duct.get("digital_reference") or {}
+    causal = _causal_authority_from_config(cfg, root)
 
     for name, value in (
-        ("secondary_path", secondary.get("npz")),
-        ("primary_path", digital.get("primary_path_npz")),
+        ("secondary_path", None if causal is not None else secondary.get("npz")),
+        ("primary_path", None if causal is not None else digital.get("primary_path_npz")),
         ("rir_bank", data.get("rir_bank")),
         ("recorded_manifest", cfg.get("recorded_manifest")),
         ("bootstrap_receipt", data.get("bootstrap_receipt")),
         ("transfer_manifest", data.get("transfer_manifest")),
+        (
+            "recorded_broadband_train_batch_receipt",
+            data.get("recorded_broadband_batch_receipt"),
+        ),
+        (
+            "recorded_broadband_val_batch_receipt",
+            data.get("recorded_broadband_val_batch_receipt"),
+        ),
         ("campaign_prerequisite", cfg.get("campaign_prerequisite")),
         ("init_checkpoint", cfg.get("init_ckpt")),
     ):
         if value:
             paths[name] = _path(root, value)
+
+    if causal is not None:
+        paths["causal_training_authority"] = causal.authority_path
+        paths["causal_joint_ps_operator"] = causal.operator.path
+        for index, reference in enumerate(causal.referenced_paths):
+            if reference in (causal.authority_path, causal.operator.path):
+                continue
+            paths[f"causal_authority_ref:{index:02d}:{reference.name}"] = reference
+
+    # 광대역 S artifact는 최종 analysis receipt를 역참조하지 않는다(그 receipt가 P/S
+    # SHA를 포함하므로 순환한다). 대신 publisher가 S NPZ에 결속한 immutable raw /
+    # analysis NPZ / level evidence를 실험 계약의 실제 artifact fingerprint로 승격한다.
+    # Stage-1은 schema discriminator가 없으므로 이 분기를 전혀 타지 않는다.
+    loss = cfg.get("loss") or {}
+    secondary_value = secondary.get("npz")
+    if (
+        isinstance(loss, dict)
+        and loss.get("schema_version") == "broadband_equal_subband_loss_v3"
+        and secondary_value
+        and causal is None
+    ):
+        secondary_path = _path(root, secondary_value)
+        if secondary_path.is_file():
+            try:
+                with np.load(secondary_path, allow_pickle=False) as archive:
+                    for name, key in (
+                        ("broadband_source_raw", "source_raw_npz_path"),
+                        ("broadband_source_analysis", "source_analysis_npz_path"),
+                        (
+                            "broadband_measurement_level_evidence",
+                            "measurement_level_evidence_path",
+                        ),
+                        ("broadband_source_plan", "source_plan_path"),
+                        ("broadband_fresh_meter_raw", "fresh_meter_raw_path"),
+                    ):
+                        if key not in archive or np.asarray(archive[key]).size != 1:
+                            raise ValueError(
+                                f"광대역 S NPZ에 scalar {key} metadata가 없습니다"
+                            )
+                        paths[name] = _path(
+                            root, str(np.asarray(archive[key]).item())
+                        )
+                    paths["broadband_fresh_meter_receipt"] = meter_receipt_path(
+                        paths["broadband_fresh_meter_raw"]
+                    )
+            except (OSError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "광대역 experiment contract가 S NPZ 외부 provenance를 "
+                    f"해석할 수 없습니다: {exc}"
+                ) from exc
 
     manifest_dir = data.get("noise_manifest_dir")
     mix = data.get("source_mix_ratio") or {}
@@ -148,6 +233,21 @@ def _artifact_fingerprints(cfg: dict, root: Path) -> dict[str, dict[str, Any]]:
             stat = resolved.stat()
             entry.update(size_bytes=int(stat.st_size), sha256=_file_sha256(resolved))
         fingerprints[name] = entry
+    causal = _causal_authority_from_config(cfg, root)
+    if causal is not None:
+        fingerprints["causal_authority_evidence"] = {
+            "inline": True,
+            "sha256": causal.authority_evidence_sha256,
+        }
+        fingerprints["causal_operator_internal"] = {
+            "inline": True,
+            "sha256": causal.operator.internal_sha256,
+        }
+        for name, digest in sorted(causal.inline_receipt_sha256.items()):
+            fingerprints[f"causal_inline_receipt:{name}"] = {
+                "inline": True,
+                "sha256": digest,
+            }
     return fingerprints
 
 

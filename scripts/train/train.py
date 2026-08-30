@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """학습 진입점.
 
-  .venv/bin/python scripts/train/train.py --config configs/train_pretrain.yaml
-  .venv/bin/torchrun --nproc_per_node=2 scripts/train/train.py --config configs/train_pretrain.yaml
-  .venv/bin/python scripts/train/train.py --config configs/train_finetune.yaml --set stage=closed_loop
+Canonical pretrain/fine-tune은 bootstrap/campaign/init SHA anchor를 요구하므로
+설정 파일만 주어서는 실행되지 않는다. 실제 명령은
+``docs/05_training_elice.md``와 최신 ``HANDOFF.md``를 따른다.
+
+진단용 예시:
+  .venv/bin/python scripts/train/train.py \
+    --config configs/train_pretrain_tiny.yaml \
+    --set experiment_role=diagnostic_overfit --set init_eligible=false \
+    --set contract_run_dir=false --set run_until_step=500
 """
 
 import argparse
@@ -13,7 +19,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from deep_anc.config import load_train_config          # noqa: E402
+from deep_anc.config import load_train_config, load_yaml  # noqa: E402
+from deep_anc.train.full_octave_v3_admission import (  # noqa: E402
+    is_full_octave_v3_admission_config,
+)
 from deep_anc.train.finetune_readiness import (        # noqa: E402
     require_finetune_readiness,
 )
@@ -51,7 +60,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # full-octave v3 admission YAML은 의도적으로 학습 설정이 아니다. 기존 Trainer는
+    # Stage-1/v2 path만 소비하므로, 이를 억지로 train.py에 넣으면 2/4/8 kHz를
+    # 학습했다고 오표기할 위험이 있다. model/GPU/lock/run-dir 전에 종료한다.
+    raw_config = load_yaml(args.config)
+    if is_full_octave_v3_admission_config(raw_config):
+        print(
+            "[중단] full_octave_v3 admission-only config는 아직 Trainer에 사용할 수 "
+            "없습니다. scripts/train/check_full_octave_v3_admission.py로만 검사하세요.",
+            file=sys.stderr,
+        )
+        return 2
     cfg = load_train_config(args.config, args.overrides)
+    if is_full_octave_v3_admission_config(cfg):
+        print(
+            "[중단] full_octave_v3 admission-only config는 학습 진입을 허용하지 않습니다.",
+            file=sys.stderr,
+        )
+        return 2
     if args.resume:
         cfg["resume"] = args.resume
     # canonical resume은 ProcessLock/state-dir조차 만들기 전에 동일 immutable

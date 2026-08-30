@@ -33,12 +33,26 @@ from ..data.holdout_contract import (
 )
 from ..data.manifest import read_manifest, read_manifest_bytes
 from ..data.manifest_contract import validate_manifest_generation
+from ..data.recorded_generation_exclusion import (
+    RecordedGenerationExclusionError,
+    derive_recorded_generation_exclusion,
+    find_recorded_generation_overlaps,
+)
+from ..data.recorded_subband_coverage import (
+    CANONICAL_COVERAGE_SPLITS,
+    CANONICAL_EDGE_TRIM_SECONDS,
+    CANONICAL_MAX_SEGMENTS_PER_SESSION,
+    build_recorded_subband_coverage_contract,
+    recorded_subband_coverage_report_path,
+    validate_recorded_subband_coverage_report,
+)
 from ..data.transfer_contract import validate_recorded_training_snapshot
 # 지연·lead 부기의 단일 출처. 게이트가 lead 를 **스스로 유도하면** 그것이 두 번째
 # 유도가 되고, trainer 와 갈라진 채로 양쪽 다 "통과" 한다 (발생기 A, 커밋 aaeef41).
 from ..dsp.invariants import (
     ABSOLUTE_OBJECTIVE_BAND_HZ,
     REQUIRED_SOURCE_FAMILIES,
+    REQUIRED_SOURCE_FAMILY_MIX_TAGS,
 )
 from ..dsp.secondary_path import load_secondary_path
 from ..dsp.interleaved_probe import build_interleaved_probe
@@ -52,12 +66,16 @@ from ..data.recorded_qa import (
     settings_from_data_config,
     validate_recorded_sessions,
 )
+from ..eval.trusted_subbands import (
+    STRICT_TRUSTED_SUBBANDS_HZ,
+)
 from .completion_receipt import validate_completion_receipt
 from .evaluation_contract import (
     canonical_test_ledger_event_paths_from_payload,
     canonical_test_ledger_paths_from_payload,
     read_json_snapshot,
     snapshot_regular_file,
+    validate_persisted_g4_metrics,
     validate_test_open_selection,
 )
 from .experiment_contract import validate_embedded_experiment_contract
@@ -65,6 +83,9 @@ from .experiment_contract import validate_embedded_experiment_contract
 
 DEFAULT_REQUIRED_PATH_BAND_HZ = (80.0, 1600.0)
 DEFAULT_REQUIRED_SOURCE_FAMILIES = ("speech", "music", "environment", "machine")
+_RECORDED_TRANSFER_TRUST_ROLES = frozenset(
+    {"canonical_finetune", "measured_probe"}
+)
 
 # official P/S 를 만들 수 있는 측정 방식.
 #
@@ -204,7 +225,7 @@ INTERLEAVED_OPERATOR_CONFIRMATION_FIELDS = (
 )
 INTERLEAVED_MAX_RELATIVE_TAU_ABS_SAMPLES = 1.0
 INTERLEAVED_COMPACT_TRANSFER_SUB_BANDS_HZ = np.asarray(
-    ((150.0, 300.0), (300.0, 600.0), (600.0, 1000.0), (1000.0, 1600.0)),
+    STRICT_TRUSTED_SUBBANDS_HZ,
     dtype=np.float64,
 )
 
@@ -382,7 +403,7 @@ def sha256_file(path: str | Path, *, block_bytes: int = 1024 * 1024) -> str:
 
 
 def _canonical_recorded_lineage_snapshot(
-    manifest_path: Path, data_cfg: dict
+    manifest_path: Path, data_cfg: dict, transfer_snapshot: Any = None
 ) -> tuple[list[dict], str, dict[str, Any]]:
     """holdout provenance가 증명한 regrouped manifest의 동일 bytes만 반환한다."""
 
@@ -422,6 +443,59 @@ def _canonical_recorded_lineage_snapshot(
     lineage = holdout_summary.get("lineage")
     if not isinstance(lineage, dict):
         raise ValueError("canonical holdout provenance에 lineage summary가 없습니다")
+    if (
+        transfer_snapshot is not None
+        and getattr(transfer_snapshot, "recorded_generation", None) is not None
+    ):
+        generation_summary = getattr(
+            transfer_snapshot, "recorded_generation_summary", None
+        )
+        recorded_snapshot = getattr(transfer_snapshot, "recorded_manifest", None)
+        if not isinstance(generation_summary, dict) or recorded_snapshot is None:
+            raise ValueError("validated recorded generation/combined manifest snapshot이 없습니다")
+        expected_path = Path(os.path.abspath(recorded_snapshot.path))
+        actual_path = Path(os.path.abspath(manifest_path))
+        if actual_path != expected_path:
+            raise ValueError(
+                "학습 recorded_manifest가 transfer-검증된 generation combined manifest와 "
+                f"다릅니다: configured={actual_path}, proven={expected_path}"
+            )
+        combined = generation_summary.get("combined")
+        additions = generation_summary.get("additions")
+        if (
+            not isinstance(combined, dict)
+            or not isinstance(combined.get("manifest"), dict)
+            or combined["manifest"].get("sha256") != recorded_snapshot.sha256
+            or combined.get("session_count") != 99
+            or not isinstance(additions, dict)
+            or additions.get("expected_session_count") != 17
+        ):
+            raise ValueError("recorded generation combined/additions summary가 exact 82+17이 아닙니다")
+        assert recorded_snapshot.data is not None
+        entries = read_manifest_bytes(
+            recorded_snapshot.data, manifest_path=actual_path
+        )
+        if len(entries) != 99:
+            raise ValueError(f"recorded generation combined manifest row가 99가 아닙니다: {len(entries)}")
+        generation_lineage = dict(lineage)
+        generation_lineage.update(
+            {
+                "regrouped_manifest": combined["manifest"].get("path"),
+                "regrouped_manifest_sha256": recorded_snapshot.sha256,
+                "regrouped_row_count": len(entries),
+                "component_count": int(lineage.get("component_count", 0)) + 17,
+                "component_membership_sha256": hashlib.sha256(
+                    (
+                        str(lineage.get("component_membership_sha256", ""))
+                        + str(additions.get("session_aggregate_sha256", ""))
+                        + str(additions.get("source_lineage_evidence_sha256", ""))
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        generation_holdout = dict(holdout_summary)
+        generation_holdout["lineage"] = generation_lineage
+        return entries, recorded_snapshot.sha256, generation_holdout
     declared_manifest = lineage.get("regrouped_manifest")
     if declared_manifest != "data/manifests/recorded_regrouped.jsonl":
         raise ValueError(
@@ -2490,6 +2564,115 @@ def _audit_statistical_power(
     )
 
 
+def _audit_recorded_subband_coverage(
+    audit: "_Audit",
+    cfg: dict,
+    readiness_cfg: dict,
+    *,
+    manifest_path: Path | None,
+    transfer_snapshot: Any = None,
+) -> None:
+    """G2d — 학습·val·test target에 strict 고역 판정 에너지가 실제로 있는가."""
+
+    report_dir_value = readiness_cfg.get("recorded_subband_coverage_report_dir")
+    if not isinstance(report_dir_value, str) or not report_dir_value.strip():
+        audit.fail(
+            "recorded_subband_coverage",
+            "readiness.recorded_subband_coverage_report_dir가 없습니다",
+        )
+        return
+    if manifest_path is None:
+        audit.fail(
+            "recorded_subband_coverage",
+            "recorded manifest를 검증하지 못해 부대역 coverage report를 결속할 수 없습니다",
+        )
+        return
+    try:
+        minimum = int(
+            readiness_cfg.get(
+                "min_groups_per_family_per_split", _min_groups_per_family_default()
+            )
+        )
+        manifest_snapshot = snapshot_regular_file(manifest_path)
+        coverage_contract = build_recorded_subband_coverage_contract(
+            manifest_path=manifest_snapshot.path,
+            manifest_content=manifest_snapshot.content,
+            data_cfg=cfg.get("data", {}) or {},
+            model_hop=int((cfg.get("model") or {}).get("hop", 0)),
+            splits=CANONICAL_COVERAGE_SPLITS,
+            max_segments_per_session=CANONICAL_MAX_SEGMENTS_PER_SESSION,
+            edge_trim_seconds=CANONICAL_EDGE_TRIM_SECONDS,
+        )
+        report_path = recorded_subband_coverage_report_path(
+            _repo_path(report_dir_value), coverage_contract
+        )
+        summary = validate_recorded_subband_coverage_report(
+            report_path,
+            manifest_path=manifest_path,
+            data_cfg=cfg.get("data", {}) or {},
+            model_hop=int((cfg.get("model") or {}).get("hop", 0)),
+            required_families=_required_families(readiness_cfg),
+            configured_min_groups_per_family=minimum,
+            splits=CANONICAL_COVERAGE_SPLITS,
+            max_segments_per_session=CANONICAL_MAX_SEGMENTS_PER_SESSION,
+            edge_trim_seconds=CANONICAL_EDGE_TRIM_SECONDS,
+        )
+        if str(cfg.get("experiment_role", "")) in _RECORDED_TRANSFER_TRUST_ROLES:
+            if transfer_snapshot is None:
+                raise ValueError(
+                    "canonical/probe coverage는 외부 SHA로 고정한 bootstrap receipt가 "
+                    "필요합니다"
+                )
+            receipt = transfer_snapshot.recorded_subband_coverage_receipt
+            receipt_snapshot = transfer_snapshot.recorded_subband_coverage_report
+            if not isinstance(receipt, dict) or receipt_snapshot is None:
+                raise ValueError(
+                    "bootstrap receipt에 recorded subband coverage binding이 없습니다"
+                )
+            expected_binding = {
+                "path": Path(summary["report_path"]).relative_to(REPO_ROOT).as_posix(),
+                "sha256": summary["report_sha256"],
+                "evidence_sha256": summary["evidence_sha256"],
+                "manifest_sha256": summary["manifest_sha256"],
+                "training_timing_contract_sha256": coverage_contract[
+                    "training_timing_contract_sha256"
+                ],
+                "coverage_contract_sha256": coverage_contract[
+                    "coverage_contract_sha256"
+                ],
+                "all_requested_splits_pass": summary[
+                    "all_requested_splits_pass"
+                ],
+            }
+            if receipt != expected_binding or receipt_snapshot.sha256 != summary["report_sha256"]:
+                raise ValueError(
+                    "recorded subband coverage report가 외부 bootstrap receipt binding과 다릅니다"
+                )
+        if not summary["all_requested_splits_pass"]:
+            weak = list(summary["weak"])
+            examples = ", ".join(
+                f"{row['split']}/{row['source_family']}/"
+                f"{row['band_hz'][0]:g}-{row['band_hz'][1]:g}Hz="
+                f"{row['n_covered_groups']}그룹"
+                for row in weak[:8]
+            )
+            audit.fail(
+                "recorded_subband_coverage",
+                "strict 150–1600 Hz target coverage가 부족합니다: "
+                f"{examples}. 실제 에너지가 없는 대역은 ANC 성능을 학습·판정할 수 "
+                "없으므로 해당 family의 독립 원본을 추가 녹음해야 합니다",
+                **summary,
+            )
+            return
+        audit.pass_(
+            "recorded_subband_coverage",
+            "train/val/test 모든 family×strict 부대역에 독립 target 그룹이 충분합니다",
+            **summary,
+        )
+    except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        audit.fail("recorded_subband_coverage", str(exc))
+
+
 def _recorded_source_clips(csv_path: Path) -> dict[str, list[str]]:
     """``sources.csv`` 의 ``clips`` 열에서 계열별 원본 클립 목록을 읽는다."""
 
@@ -2634,7 +2817,11 @@ def _synthetic_clip_index(
 
 
 def _audit_corpus_leak(
-    audit: "_Audit", readiness_cfg: dict, data_cfg: dict, entries: list[dict] | None = None
+    audit: "_Audit",
+    readiness_cfg: dict,
+    data_cfg: dict,
+    entries: list[dict] | None = None,
+    transfer_snapshot: Any = None,
 ) -> None:
     """D1 — 합성 학습 스트림과 실측이 **같은 원본 오디오**를 쓰지 않는가.
 
@@ -2745,8 +2932,76 @@ def _audit_corpus_leak(
                 "다른 데이터로 돕니다. scripts/data/prepare_noise_pool.py 로 해당 태그의 "
                 "manifest 를 만들거나, 쓰지 않는 태그라면 source_mix_ratio 에서 지우세요"
             )
+        generation_exclusion = generation.get(
+            "_validated_recorded_generation_exclusion"
+        )
+        transferred_generation = (
+            getattr(transfer_snapshot, "recorded_generation", None)
+            if transfer_snapshot is not None
+            else None
+        )
+        if transferred_generation is not None:
+            if not isinstance(generation_exclusion, dict):
+                raise ValueError(
+                    "schema v2 recorded transfer는 public manifest sidecar에 "
+                    "recorded_generation_exclusion을 결속해야 합니다"
+                )
+            generation_ref = generation_exclusion.get("generation")
+            try:
+                transferred_path = transferred_generation.path.relative_to(
+                    REPO_ROOT
+                ).as_posix()
+            except ValueError as exc:
+                raise ValueError(
+                    "transfer recorded generation report가 저장소 밖입니다"
+                ) from exc
+            expected_ref = {
+                "path": transferred_path,
+                "sha256": transferred_generation.sha256,
+                "size": transferred_generation.size,
+            }
+            if generation_ref != expected_ref:
+                raise ValueError(
+                    "public manifest exclusion이 transfer가 검증한 recorded generation과 "
+                    f"다릅니다: expected={expected_ref}, actual={generation_ref}"
+                )
+            generation_summary = getattr(
+                transfer_snapshot, "recorded_generation_summary", None
+            )
+            if not isinstance(generation_summary, dict):
+                raise ValueError(
+                    "schema v2 transfer에 validated recorded generation summary가 없습니다"
+                )
+            expected_exclusion = derive_recorded_generation_exclusion(
+                generation_summary, repo_root=REPO_ROOT
+            )
+            if generation_exclusion != expected_exclusion:
+                raise ValueError(
+                    "public manifest exclusion identity가 transfer generation source plan의 "
+                    "source/raw SHA·lineage와 다릅니다"
+                )
+        generation_overlaps: list[dict[str, Any]] = []
+        if isinstance(generation_exclusion, dict):
+            generation_overlaps = find_recorded_generation_overlaps(
+                generation_exclusion,
+                generation.get("_validated_entries") or {},
+                repo_root=REPO_ROOT,
+            )
+            if generation_overlaps:
+                raise ValueError(
+                    "recorded generation additions와 synthetic 6종 manifest의 "
+                    "source/raw SHA·lineage 교집합이 남았습니다: "
+                    f"{generation_overlaps[:8]}"
+                )
         result = check_corpus_disjoint(recorded, synthetic, synthetic_splits=splits)
-    except (FileNotFoundError, OSError, ValueError, KeyError, TypeError) as exc:
+    except (
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        RecordedGenerationExclusionError,
+    ) as exc:
         audit.fail("corpus_disjoint", str(exc))
         return
     if result.ok:
@@ -2766,6 +3021,15 @@ def _audit_corpus_leak(
                 "manifest_component_membership_sha256"
             ),
             excluded_by_holdout=lineage.get("excluded_by_tag"),
+            recorded_generation_exclusion_sha256=(
+                None
+                if not isinstance(
+                    (generation or {}).get("recorded_generation_exclusion"), dict
+                )
+                else (generation or {})["recorded_generation_exclusion"].get(
+                    "identities_sha256"
+                )
+            ),
         )
     else:
         audit.fail("corpus_disjoint", result.detail, **result.measured)
@@ -3004,8 +3268,9 @@ def _audit_plant_confidence_ceiling(
     두 상한 중 **작은 쪽**으로 판정한다
     ----------------------------------
     γ 기반 상한은 플랜트를 몰라서 잃는 몫만 센다. 복구된 플랜트에서 그 값은 약 28 dB
-    인데, 정규방정식으로 직접 계산한 설계 상한은 **6.53 dB** (M=2048, lead=116,
-    150-600Hz)다. 4배 이상 낙관적이다 — 인과성과 FIR 길이가 진짜 병목이기 때문이다.
+    인데, legacy 캡처의 정규방정식 설계 상한은 훨씬 낮았다. 현행 수치는
+    ``configs/duct.yaml``의 strict P/S와 lead에서 매번 다시 푼다. 인과성과 FIR 길이를
+    포함하지 않은 γ 상한만 믿으면 여전히 낙관적이기 때문이다.
     낙관적인 상한 하나만 믿는 것이 이 저장소에서 반복된 사고의 형태이므로, 설정이
     ``measured_design_ceiling_db`` 로 직접 계산한 값을 선언하면 그쪽도 함께 본다.
     """
@@ -3039,13 +3304,13 @@ def _audit_plant_confidence_ceiling(
     if design_value is None:
         # **선언 생략도 우회다.** 값 날조(=30.0)는 2026-08-06 에 막았지만 생략(=null)은
         # 남아 있었고, 그러면 구속 상한이 플랜트 일관성(27.73 dB)으로 폴백해 통과한다.
-        # 실제 인과 FIR 상한은 최악 옥타브에서 2.16 dB 이므로 12배 낙관적인 값으로
-        # 통과하는 것이다. "선언 안 하면 검사 안 함" 은 검사가 없는 것과 같다.
+        # 실제 인과 FIR 상한은 current P/S에서 다시 풀어야 한다. "선언 안 하면 검사
+        # 안 함"은 검사가 없는 것과 같고 γ 상한으로 조용히 폴백하게 된다.
         audit.fail(
             "plant_confidence_ceiling",
             "readiness.measured_design_ceiling_db 가 선언되지 않았습니다 — 선언이 없으면 "
             "구속 상한이 플랜트 일관성(약 27.7 dB)으로 폴백해 물리적으로 불가능한 목표도 "
-            "통과합니다. 실측 인과 FIR 상한은 최악 옥타브에서 2.16 dB 입니다. "
+            "통과합니다. 실측 인과 FIR 상한은 current strict P/S에서 다시 풀어야 합니다. "
             "measured_design_ceiling_db 와 measured_design_ceiling_band_hz 를 선언하세요 "
             "(게이트가 아티팩트에서 다시 풀어 대조하므로 날조할 수 없습니다)",
         )
@@ -3124,10 +3389,9 @@ def _audit_plant_confidence_ceiling(
                 sample_rate=float(secondary["sample_rate"]),
             )
             # **옥타브별 최악값이 진짜 구속이다.** 대역평균은 저역의 큰 여유가 중역의
-            # 병목을 가린다 — 실측 official 에서 전대역 4.83 dB 인데 옥타브 500 은
-            # 2.159 dB 뿐이다. 절대목표 1의 평가(G4)가 옥타브별이므로 진입 게이트도
-            # 같은 축에서 판정해야 한다. 평균이 최악값을 가리는 것이 이 저장소가
-            # 반복해서 겪은 실패 형태다.
+            # 병목을 가릴 수 있다. 절대목표 1의 평가(G4)가 옥타브별이므로 진입
+            # 게이트도 current strict P/S를 같은 축에서 다시 풀어 판정한다. 평균이
+            # 최악값을 가리는 것이 이 저장소가 반복해서 겪은 실패 형태다.
             worst_octave_db, worst_octave_hz = worst_octave_ceiling_db(
                 _repo_path(primary["path"]),
                 _repo_path(secondary["path"]),
@@ -3254,15 +3518,17 @@ def _audit_absolute_objective_scope(
                 f"[{obj_lo:g}, {obj_hi:g}] 를 덮지 않습니다"
             )
 
-    # ── 절대목표 2: 소음·음성·음악 **모두**. 혼합비에서 계열을 뺄 수 없다.
+    # ── 절대목표 2: 네 source family **모두**. 혼합비에서 계열을 뺄 수 없다.
     mix = data_cfg.get("source_mix_ratio") or {}
     if isinstance(mix, dict):
         for family in REQUIRED_SOURCE_FAMILIES:
-            weight = float(mix.get(family, 0.0) or 0.0)
+            tags = REQUIRED_SOURCE_FAMILY_MIX_TAGS[family]
+            weight = sum(float(mix.get(tag, 0.0) or 0.0) for tag in tags)
             if weight <= 0.0:
                 problems.append(
-                    f"data.source_mix_ratio 에 {family!r} 비중이 없습니다 "
-                    f"(현재 {weight:g}) — 절대목표 2 는 음성·음악을 포함합니다"
+                    f"data.source_mix_ratio 에 {family!r} 계열 비중이 없습니다 "
+                    f"(tags={list(tags)}, 합계 {weight:g}) — 절대목표 2 는 "
+                    "speech/music/environment/machine 모두를 포함합니다"
                 )
 
     if problems:
@@ -3294,6 +3560,7 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
     readiness_cfg = cfg.get("readiness", {}) or {}
     data_cfg = cfg.get("data", {}) or {}
     duct_cfg = cfg.get("duct", {}) or {}
+    recorded_transfer_snapshot: Any = None
 
     required_flags = (
         "require_measured_primary_path",
@@ -3310,11 +3577,12 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
     else:
         audit.pass_("config_fail_closed_flags", "필수 fail-closed 설정 3종이 활성입니다")
 
-    if str(cfg.get("experiment_role", "")) == "canonical_finetune":
+    if str(cfg.get("experiment_role", "")) in _RECORDED_TRANSFER_TRUST_ROLES:
         try:
             transfer = validate_recorded_training_snapshot(
                 data_cfg, repo_root=REPO_ROOT
             )
+            recorded_transfer_snapshot = transfer
             audit.pass_(
                 "recorded_transfer_snapshot",
                 "bootstrap receipt→transfer manifest→recorded bytes snapshot이 정합합니다",
@@ -3728,13 +3996,19 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
     recorded_report: dict | None = None
     manifest_sha256: str | None = None
     lineage_summary: dict[str, Any] | None = None
+    recorded_manifest_path: Path | None = None
     try:
         if not manifest_value:
             raise ValueError("recorded_manifest가 비었습니다")
         manifest_path = _repo_path(manifest_value)
-        if str(cfg.get("experiment_role", "")) == "canonical_finetune":
+        recorded_manifest_path = manifest_path
+        if str(cfg.get("experiment_role", "")) in _RECORDED_TRANSFER_TRUST_ROLES:
             entries, manifest_sha256, holdout_summary = (
                 _canonical_recorded_lineage_snapshot(manifest_path, data_cfg)
+                if recorded_transfer_snapshot is None
+                else _canonical_recorded_lineage_snapshot(
+                    manifest_path, data_cfg, recorded_transfer_snapshot
+                )
             )
             lineage_summary = holdout_summary.get("lineage")
         else:
@@ -3829,7 +4103,20 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
 
     _audit_recorded_alignment(audit, readiness_cfg, recorded_report, full_recorded_qa)
     _audit_statistical_power(audit, readiness_cfg, entries)
-    _audit_corpus_leak(audit, readiness_cfg, data_cfg, entries)
+    _audit_recorded_subband_coverage(
+        audit,
+        cfg,
+        readiness_cfg,
+        manifest_path=recorded_manifest_path,
+        transfer_snapshot=recorded_transfer_snapshot,
+    )
+    _audit_corpus_leak(
+        audit,
+        readiness_cfg,
+        data_cfg,
+        entries,
+        transfer_snapshot=recorded_transfer_snapshot,
+    )
     _audit_measured_source_delay(
         audit,
         readiness_cfg,
@@ -3873,6 +4160,8 @@ def _audit_g4_metrics(
     path: str | Path,
     *,
     expected_split: str,
+    manifest_bytes: bytes,
+    manifest_path: str | Path,
     checkpoint_sha256: str,
     manifest_sha256: str,
     required_source_families: tuple[str, ...],
@@ -3882,6 +4171,8 @@ def _audit_g4_metrics(
     test_consumed_marker_sha256: str | None = None,
     timing_contract_sha256: str | None = None,
     timing_contract: TrainingTimingContract | None = None,
+    checkpoint_cfg: dict[str, Any] | None = None,
+    canonical_sampling_binding: bool = True,
 ) -> dict[str, Any]:
     metrics_path = _repo_path(path).resolve()
     if not metrics_path.is_file():
@@ -3967,6 +4258,22 @@ def _audit_g4_metrics(
                 "(절대목표 1), 통계적 검정력, 플랜트 지문을 판정하지 않는 구버전 "
                 "평가기의 산출물입니다. evaluate_recorded.py 로 재평가하세요."
             )
+        # 선택 경로와 completion이 동일한 authority를 써야 한다. 이 validator는
+        # summary scalar/boolean 대신 raw global/family/octave arrays를 재계산하고,
+        # selected manifest bytes의 모든 session/family/group와 전단사 결속한다.
+        # 여기에서만 strict 부대역을 따로 믿으면 scalar-trust 우회가 다시 생긴다.
+        persisted_g4 = validate_persisted_g4_metrics(
+            data,
+            expected_split=expected_split,
+            manifest_bytes=manifest_bytes,
+            manifest_path=manifest_path,
+            checkpoint_cfg=(checkpoint_cfg if canonical_sampling_binding else None),
+            canonical=canonical_sampling_binding,
+            min_groups=MIN_GROUPS_PER_FAMILY_PER_SPLIT,
+        )
+        strict_subband_summary = persisted_g4["strict_subband"]
+        if strict_subband_summary is None:  # canonical=True 방어
+            raise ValueError("canonical G4 strict subband raw evidence가 없습니다")
         verdict = str(_npz_scalar(data, "g4_verdict"))
         do_no_harm_pass = bool(_npz_scalar(data, "g4_do_no_harm_pass"))
         power_pass = bool(_npz_scalar(data, "g4_power_pass"))
@@ -4050,6 +4357,21 @@ def _audit_g4_metrics(
         errors.append(
             "계열별 cluster bootstrap CI 상단이 0 아래가 아닙니다 — 점추정만으로 "
             "개선을 주장할 수 없습니다"
+        )
+    strict_flags = strict_subband_summary["flags"]
+    if not strict_flags["g4_trusted_subband_pass"]:
+        errors.append(
+            "strict trusted 150–1600Hz 부대역 G4를 통과하지 못했습니다: "
+            f"coverage={strict_flags['g4_trusted_subband_coverage_pass']}, "
+            f"groups={strict_flags['g4_trusted_subband_power_pass']}, "
+            f"mean={strict_flags['g4_trusted_subband_mean_pass']}, "
+            f"worst10={strict_flags['g4_trusted_subband_worst10_pass']}, "
+            f"ci={strict_flags['g4_trusted_subband_ci_pass']}"
+        )
+    if not strict_flags["g4_upper_trusted_subband_pass"]:
+        errors.append(
+            "trusted upper 1000–1600Hz가 family별 mean/worst10/coverage/CI를 모두 "
+            "통과하지 못했습니다 — 전체 150–1600Hz 평균으로 숨길 수 없습니다"
         )
     missing_families = sorted(set(required_source_families).difference(families))
     if missing_families:
@@ -4165,6 +4487,7 @@ def audit_finetune_completion(
     contract_sha: str | None = None
     timing_contract_sha: str | None = None
     timing_contract_model: TrainingTimingContract | None = None
+    checkpoint_cfg: dict[str, Any] | None = None
     strict_canonical_completion = (
         str(cfg.get("experiment_role", "")) == "canonical_finetune"
     )
@@ -4173,6 +4496,7 @@ def audit_finetune_completion(
         checkpoint_path = checkpoint_snapshot.path
         state = _decode_checkpoint_state(checkpoint_snapshot.content, checkpoint_path)
         saved_cfg = state["cfg"]
+        checkpoint_cfg = saved_cfg
         if strict_canonical_completion:
             contract_sha = str(
                 validate_embedded_experiment_contract(saved_cfg)["sha256"]
@@ -4233,9 +4557,12 @@ def audit_finetune_completion(
         audit.fail("measured_finetune_checkpoint", str(exc))
 
     manifest_path = _repo_path(cfg.get("recorded_manifest", ""))
+    manifest_bytes: bytes | None = None
     try:
         manifest_snapshot = snapshot_regular_file(manifest_path)
         manifest_sha = manifest_snapshot.sha256
+        manifest_bytes = manifest_snapshot.content
+        manifest_path = manifest_snapshot.path
     except (FileNotFoundError, OSError, ValueError) as exc:
         manifest_sha = ""
         audit.fail("recorded_manifest_provenance", str(exc))
@@ -4356,7 +4683,7 @@ def audit_finetune_completion(
     fingerprints: dict[str, str] = {}
     for split, path in (("val", val_metrics), ("test", test_metrics)):
         check_id = f"recorded_{split}_g4"
-        if candidate_sha is None or not manifest_sha or (
+        if candidate_sha is None or checkpoint_cfg is None or not manifest_sha or manifest_bytes is None or (
             strict_canonical_completion and contract_sha is None
         ):
             audit.fail(check_id, "checkpoint/manifest provenance가 없어 G4를 검증할 수 없습니다")
@@ -4365,6 +4692,8 @@ def audit_finetune_completion(
             details = _audit_g4_metrics(
                 path,
                 expected_split=split,
+                manifest_bytes=manifest_bytes,
+                manifest_path=manifest_path,
                 checkpoint_sha256=candidate_sha,
                 manifest_sha256=manifest_sha,
                 required_source_families=required_families,
@@ -4382,6 +4711,8 @@ def audit_finetune_completion(
                 ),
                 timing_contract_sha256=timing_contract_sha,
                 timing_contract=timing_contract_model,
+                checkpoint_cfg=checkpoint_cfg,
+                canonical_sampling_binding=strict_canonical_completion,
             )
             fingerprints[split] = str(details.pop("plant_fingerprint_json"))
             audit.pass_(check_id, f"독립 recorded {split} G4가 통과했습니다", **details)

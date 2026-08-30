@@ -246,6 +246,10 @@ def test_clean_capture_round_trips_to_the_injected_plant(tmp_path):
     # 마지막 nominal segment에는 다음 cycle이 없어 독립 q/cubic witness를 만들 수 없다.
     assert int(report["keep"].sum()) == REPEATS - 1
     assert report["relative_delay_spread_samples"] == 0
+    np.testing.assert_array_equal(
+        report["separation"]["clock_band_hz"],
+        np.asarray(mpi.CLOCK_BAND_HZ, dtype=np.float64),
+    )
     p_model = results["noise"]["model"]
     s_model = results["cancel"]["model"]
     p_delay = p_model["delay_samples"]
@@ -262,8 +266,62 @@ def test_clean_capture_round_trips_to_the_injected_plant(tmp_path):
         assert item["model"]["consistency"] > 0.999
         check = item["model"]["compact_transfer_round_trip"]
         assert check["passed"] is True
+        np.testing.assert_array_equal(
+            item["model"]["band_consistency_hz"],
+            np.asarray(mpi.CONSISTENCY_SUB_BANDS_HZ, dtype=np.float64),
+        )
+        assert tuple(tuple(row["band_hz"]) for row in check["subbands"]) == (
+            mpi.COMPACT_TRANSFER_SUB_BANDS_HZ
+        )
         assert check["complex_agreement"] >= mpi.MIN_COMPACT_TRANSFER_AGREEMENT
         assert check["relative_error"] <= mpi.MAX_COMPACT_TRANSFER_RELATIVE_ERROR
+    for drive in ("noise", "cancel"):
+        crosscheck = report["separation_crosscheck"][drive]
+        assert tuple(row["band_hz"] for row in crosscheck["subbands"]) == (
+            mpi.COMPACT_TRANSFER_SUB_BANDS_HZ
+        )
+        assert crosscheck["overall"]["band_hz"] == (
+            mpi.SEPARATION_CROSSCHECK_OVERALL_BAND_HZ
+        )
+
+
+def test_analysis_band_parameters_are_propagated_without_v1_globals(tmp_path):
+    capture = ra.load_capture(_write_capture(tmp_path / "custom-bands"))
+    custom_clock = (200.0, 1400.0)
+    custom_subbands = (
+        (150.0, 400.0),
+        (400.0, 800.0),
+        (800.0, 1200.0),
+        (1200.0, 1600.0),
+    )
+
+    results, report = _analyse(
+        capture,
+        clock_band_hz=custom_clock,
+        consistency_subbands_hz=custom_subbands,
+        compact_transfer_subbands_hz=custom_subbands,
+        crosscheck_subbands_hz=custom_subbands,
+        crosscheck_overall_band_hz=(150.0, 1600.0),
+    )
+
+    np.testing.assert_array_equal(
+        report["separation"]["clock_band_hz"],
+        np.asarray(custom_clock, dtype=np.float64),
+    )
+    for drive in ("noise", "cancel"):
+        model = results[drive]["model"]
+        np.testing.assert_array_equal(
+            model["band_consistency_hz"],
+            np.asarray(custom_subbands, dtype=np.float64),
+        )
+        assert tuple(
+            tuple(row["band_hz"])
+            for row in model["compact_transfer_round_trip"]["subbands"]
+        ) == custom_subbands
+        crosscheck = report["separation_crosscheck"][drive]
+        assert tuple(row["band_hz"] for row in crosscheck["subbands"]) == (
+            custom_subbands
+        )
 
 
 def test_postconversion_gate_rejects_odd_bin_periodic_preroll(tmp_path, monkeypatch):

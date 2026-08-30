@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -59,6 +60,7 @@ def _overrides(
     label: str,
     run_until_step: int,
     loss_alpha: float | None = None,
+    loss_lambda_dnh: float | None = None,
 ) -> list[str]:
     overrides = [
         f"experiment_role={A100_PRETRAIN_SMOKE_ROLE}",
@@ -78,6 +80,11 @@ def _overrides(
         # YAML scalar type도 target JSON에 들어간다. ``:g``는 1.0을 정수 ``1``로
         # 바꾸어 canonical 후보(1.0)와 다른 contract를 만들므로 float literal을 보존한다.
         overrides.append(f"loss.nmse_cvar_alpha={float(loss_alpha)!r}")
+    if loss_lambda_dnh is not None:
+        value = float(loss_lambda_dnh)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("selected lambda_dnh는 finite 양수여야 합니다")
+        overrides.append(f"loss.lambda_dnh={value!r}")
     return overrides
 
 
@@ -88,6 +95,7 @@ def _resolved_cfg(
     label: str,
     run_until_step: int,
     loss_alpha: float | None = None,
+    loss_lambda_dnh: float | None = None,
 ) -> dict:
     return load_train_config(
         config,
@@ -96,6 +104,7 @@ def _resolved_cfg(
             label=label,
             run_until_step=run_until_step,
             loss_alpha=loss_alpha,
+            loss_lambda_dnh=loss_lambda_dnh,
         ),
     )
 
@@ -108,6 +117,7 @@ def _run_train(
     run_until_step: int,
     cublas_workspace_config: str,
     loss_alpha: float | None = None,
+    loss_lambda_dnh: float | None = None,
     resume: Path | None = None,
 ) -> dict:
     cfg = _resolved_cfg(
@@ -116,6 +126,7 @@ def _run_train(
         label=label,
         run_until_step=run_until_step,
         loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
     )
     command = [
         sys.executable,
@@ -128,6 +139,7 @@ def _run_train(
         label=label,
         run_until_step=run_until_step,
         loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
     ):
         command.extend(["--set", override])
     if resume is not None:
@@ -206,11 +218,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--loss-alpha",
         type=float,
         choices=(0.7, 0.85, 1.0),
-        default=None,
+        required=True,
         help=(
             "선택된 loss pilot의 alpha로 smoke semantic target을 결속한다 "
-            "(기본: config의 alpha)"
+            "(raw winner 값 필수)"
         ),
+    )
+    parser.add_argument(
+        "--loss-lambda-dnh",
+        type=float,
+        required=True,
+        help="선택된 loss pilot의 alpha별 calibrated lambda_dnh",
     )
     parser.add_argument(
         "--cublas-workspace-config",
@@ -232,7 +250,10 @@ def main() -> int:
         raise ValueError("--bootstrap-receipt-sha256은 64자리 SHA-256이어야 합니다")
     stop_step = int(args.stop_step)
     final_step = int(args.final_step)
-    loss_alpha = None if args.loss_alpha is None else float(args.loss_alpha)
+    loss_alpha = float(args.loss_alpha)
+    loss_lambda_dnh = float(args.loss_lambda_dnh)
+    if not math.isfinite(loss_lambda_dnh) or loss_lambda_dnh <= 0.0:
+        raise ValueError("--loss-lambda-dnh는 finite 양수여야 합니다")
     if not 200 <= stop_step <= 500 or not stop_step < final_step <= 500:
         raise ValueError("A100 smoke는 200 <= stop-step < final-step <= 500 이어야 합니다")
     _preflight_a100(cublas_workspace_config=args.cublas_workspace_config)
@@ -245,6 +266,7 @@ def main() -> int:
         label="uninterrupted",
         run_until_step=final_step,
         loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
     )
     target = str(preview["smoke_target_sha256"])
     target_root = smoke_run_directory(preview, repo_root=REPO_ROOT).parent
@@ -261,6 +283,7 @@ def main() -> int:
         run_until_step=final_step,
         cublas_workspace_config=args.cublas_workspace_config,
         loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
     )
     resumed_initial_cfg = _run_train(
         config,
@@ -269,6 +292,7 @@ def main() -> int:
         run_until_step=stop_step,
         cublas_workspace_config=args.cublas_workspace_config,
         loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
     )
     full_dir = smoke_run_directory(full_cfg, repo_root=REPO_ROOT)
     resumed_dir = smoke_run_directory(resumed_initial_cfg, repo_root=REPO_ROOT)
@@ -293,6 +317,7 @@ def main() -> int:
         run_until_step=final_step,
         cublas_workspace_config=args.cublas_workspace_config,
         loss_alpha=loss_alpha,
+        loss_lambda_dnh=loss_lambda_dnh,
         resume=stop_checkpoint,
     )
     if str(resumed_cfg["smoke_target_sha256"]) != target:

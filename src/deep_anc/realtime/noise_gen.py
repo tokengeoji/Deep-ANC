@@ -7,6 +7,7 @@ tone / multitone / white / band / nonlinear(고조파+소프트클립) / sweep /
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import numpy as np
@@ -59,7 +60,9 @@ class DigitalReferenceBuffer:
 
 
 class NoiseProgram:
-    def __init__(self, cfg: dict, sample_rate: int) -> None:
+    def __init__(
+        self, cfg: dict, sample_rate: int, *, file_bytes: bytes | None = None
+    ) -> None:
         self.fs = int(sample_rate)
         self.kind = str(cfg.get("type", "tone"))
         self.amplitude = float(cfg.get("amplitude", 0.05))
@@ -102,14 +105,31 @@ class NoiseProgram:
                 raise ValueError("file 프로그램에는 file 경로가 필요합니다")
             import soundfile as sf
 
-            data, sr = sf.read(str(Path(path).expanduser()), dtype="float32", always_2d=True)
+            data, sr = sf.read(
+                io.BytesIO(file_bytes)
+                if file_bytes is not None
+                else str(Path(path).expanduser()),
+                dtype="float32",
+                always_2d=True,
+            )
             mono = data.mean(axis=1)
             if sr != self.fs:
                 from math import gcd
 
                 g = gcd(int(sr), self.fs)
                 mono = signal.resample_poly(mono, self.fs // g, int(sr) // g)
+            # offset이 달라도 원본 전체 파일의 gain 기준은 바뀌지 않는다. 선택 window만
+            # 다시 peak-normalize하면 조용한 후보가 예기치 않게 과증폭된다.
             peak = float(np.max(np.abs(mono)) + 1e-9)
+            start_seconds = float(cfg.get("file_start_seconds", 0.0))
+            if not np.isfinite(start_seconds) or start_seconds < 0.0:
+                raise ValueError("file_start_seconds는 0 이상 finite여야 합니다")
+            start_frame = int(round(start_seconds * self.fs))
+            if start_frame >= mono.size:
+                raise ValueError(
+                    f"file_start_seconds={start_seconds}가 재생 파일 길이를 벗어납니다"
+                )
+            mono = mono[start_frame:]
             self._file_data = (mono / peak * self.amplitude).astype(np.float32)
         elif self.kind in ("white", "silence"):
             pass

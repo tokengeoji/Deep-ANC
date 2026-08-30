@@ -9,6 +9,9 @@
 2. **기능 2**: 노이즈뿐 아니라 대화(음성)·음악 등 **모든 소리**를 제거할 것 (quiet zone)
 
 측정 매핑·판정 기준: docs/07 §0. 데이터·모델·평가 결정은 이 둘로 소급 판단한다.
+최종 125 Hz 옥타브부터 8 kHz 옥타브까지의 광대역 역할은
+`docs/27_broadband_v3_full_octave_contract.md`를 추가 가드로 사용한다. 기존 150 Hz 하단
+v2 결과를 125 Hz 옥타브 PASS로 승격하지 않는다.
 
 ## 절대 규칙 (사용자 명시 지시 — 위반 금지)
 
@@ -67,13 +70,15 @@
    지연 규약이 이 프로젝트의 심장이다.** 코드 수정 전 반드시 이해할 것
 3. [docs/00_overview.md](docs/00_overview.md) — 전체 구조, 3단계 로드맵, 저장소 지도
 4. [docs/04_model_architecture.md](docs/04_model_architecture.md) — 모델/스트리밍/ONNX 규약
-5. 나머지 docs/02~09 + [docs/appendix_legacy_fxlms.md](docs/appendix_legacy_fxlms.md)
+5. [docs/16_canonical_finetune_guardrails.md](docs/16_canonical_finetune_guardrails.md) — 저·고역,
+   네 소리 계열, 지연, one-shot G4와 배포 차단의 강제 기준
+6. 나머지 docs/02~15 + [docs/appendix_legacy_fxlms.md](docs/appendix_legacy_fxlms.md)
 
 ## 건드릴 때 조심해야 하는 불변식 (테스트가 강제하지만, 의미를 알고 고칠 것)
 
 - 지연 규약: 학습 플랜트 총지연 = S(z) npz delay + 스레드 핸드오프(256).
-  ⚠ 숫자를 여기 적지 마라 — 2026-08-06 까지 `1342` 가 적혀 있었는데 그것은 폐기된
-  순차 ESS 아티팩트 값이고 현행은 **1462** 다. 값은 npz 가 단일 출처이고,
+  ⚠ P/S delay 숫자를 여기에 적지 마라. 과거 순차 ESS/legacy 숫자를 현행으로
+  오인한 사고가 반복됐다. 값은 strict npz 가 단일 출처이고,
   lead 는 `PlantDelays.lead()` 로만 만들 수 있다(손으로 쓰면 TypeError).
   digital-ref d 경로는 핸드오프 없음. **RIR에는 음향 온셋이 이미 포함 — D_noise 결합 시 t_ac(NS→ERR)를 빼는 이유** (synth_dataset.py 주석)
 - 극성: `e = d + S·y` — 어디에서도 추가 부호 반전 금지 (측정 FIR에 극성 포함)

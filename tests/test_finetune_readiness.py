@@ -7,6 +7,7 @@ import hashlib
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -26,18 +27,42 @@ from deep_anc.data.decoder_audit import (
 )
 from deep_anc.data.manifest import read_manifest, write_manifest
 from deep_anc.data.public_lineage import (
+    PUBLIC_CROSSWALK_POLICY,
     PUBLIC_LINEAGE_SCHEMA,
     canonical_json_sha256,
     validate_public_manifest_lineage,
+)
+from deep_anc.data.recorded_subband_coverage import (
+    RECORDED_SUBBAND_COVERAGE_KIND,
+    RECORDED_SUBBAND_COVERAGE_SCHEMA_VERSION,
+    build_recorded_subband_coverage_contract,
+    recorded_subband_coverage_report_path,
+    seal_recorded_subband_coverage_report,
+)
+from deep_anc.eval.trusted_subbands import (
+    MIN_SUBBAND_SOURCE_ENERGY_DENSITY_RATIO,
+    STRICT_TRUSTED_SUBBAND_SCHEMA,
+    STRICT_TRUSTED_SUBBANDS_HZ,
+)
+from deep_anc.eval.recorded_sampling import (
+    CANONICAL_EDGE_TRIM_SECONDS,
+    CANONICAL_MAX_SEGMENTS_PER_SESSION,
+    CANONICAL_SEGMENT_SECONDS,
+    RECORDED_SAMPLING_CONTRACT_SCHEMA,
+    canonical_feedback_delay_samples,
+    canonical_warmup_samples,
+    effective_segment_samples,
 )
 from deep_anc.train import finetune_readiness as readiness
 from deep_anc.train.completion_receipt import write_completion_receipt
 from deep_anc.train.evaluation_contract import (
     canonical_test_ledger_paths,
     classify_recorded_val_metrics,
+    cluster_bootstrap_ci,
     complete_test_evaluation,
     consume_test_capability,
     issue_test_capability,
+    seed_neutral_campaign_sha256,
     snapshot_regular_file,
     write_json_exclusive,
 )
@@ -573,7 +598,7 @@ def _recorded_band_noise(frames: int, seed: int) -> np.ndarray:
 def _recorded_manifest(
     root: Path,
     *,
-    frames: int = 4_096,
+    frames: int = 16_384,
     groups_per_family: int = GROUPS_PER_FAMILY_PER_SPLIT,
     collapse_alignment: bool = False,
     source_delay_samples: int = ERR_MIC_DELAY_SAMPLES,
@@ -693,7 +718,23 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
         }
         for name in music_paths
     ]
-    for entry in speech_entries + music_entries:
+    other_entries = {
+        tag: [
+            {
+                "path": str(root / "raw" / tag / f"fixture-{tag}.wav"),
+                "duration_s": 5.0,
+                "sample_rate": FS,
+                "channels": 1,
+                "tag": tag,
+                "split": "train",
+            }
+        ]
+        for tag in ("demand", "esc50", "machine")
+    }
+    all_entries = speech_entries + music_entries + [
+        entry for entries in other_entries.values() for entry in entries
+    ]
+    for entry in all_entries:
         raw_path = Path(entry["path"])
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_bytes(f"fixture-audio:{raw_path.name}\n".encode())
@@ -711,11 +752,16 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
         )
     write_manifest(speech_entries, manifest_dir / "speech.jsonl")
     write_manifest(music_entries, manifest_dir / "music.jsonl")
+    for tag, entries in other_entries.items():
+        write_manifest(entries, manifest_dir / f"{tag}.jsonl")
 
-    # prepare_noise_pool의 세대 sidecar를 축소 재현한다. JSONL 두 개가 서로 다른
+    # prepare_noise_pool의 세대 sidecar를 축소 재현한다. JSONL들이 서로 다른
     # holdout/config 세대에서 온 혼합 상태면 corpus_disjoint가 PASS하면 안 된다.
     data_config = root / "fixture_data_config.json"
-    data_config.write_text('{"source_mix_ratio":{"music":0.5,"speech":0.5}}\n')
+    data_config.write_text(
+        '{"source_mix_ratio":{"demand":0.15,"esc50":0.10,"machine":0.25,'
+        '"music":0.25,"speech":0.25}}\n'
+    )
     lineage_metadata = root / "fixture_public_lineage_metadata.txt"
     lineage_metadata.write_text("fixture authoritative lineage\n")
     metadata_evidence = {
@@ -764,7 +810,7 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
         + "\n"
     )
     manifests = {}
-    for tag in ("music", "speech"):
+    for tag in ("demand", "esc50", "machine", "music", "speech"):
         path = manifest_dir / f"{tag}.jsonl"
         manifests[tag] = {
             "file": path.name,
@@ -772,12 +818,13 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
     entries_by_tag = {
+        **other_entries,
         "music": music_entries,
         "speech": speech_entries,
     }
     audit_inventory = []
     for entry in sorted(
-        speech_entries + music_entries,
+        all_entries,
         key=lambda item: Path(str(item["path"])).relative_to(root).as_posix(),
     ):
         raw_path = Path(str(entry["path"]))
@@ -856,6 +903,7 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
                 "component_membership_sha256"
             ],
             "holdout_clips_sha256": holdout_lineage["clips_sha256"],
+            "crosswalk_policy": json.loads(json.dumps(PUBLIC_CROSSWALK_POLICY)),
         },
     }
     canonical = (json.dumps(generation, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
@@ -865,6 +913,91 @@ def _corpus_fixture(root: Path, *, leak: bool = False) -> tuple[Path, Path]:
         json.dumps(generation, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     )
     return csv_path, manifest_dir
+
+
+def _coverage_report_path(cfg: dict) -> Path:
+    manifest = Path(cfg["recorded_manifest"])
+    snapshot = snapshot_regular_file(manifest)
+    contract = build_recorded_subband_coverage_contract(
+        manifest_path=snapshot.path,
+        manifest_content=snapshot.content,
+        data_cfg=cfg["data"],
+        model_hop=int(cfg["model"]["hop"]),
+    )
+    return recorded_subband_coverage_report_path(
+        cfg["readiness"]["recorded_subband_coverage_report_dir"], contract
+    )
+
+
+def _write_coverage_fixture(cfg: dict, destination_dir: Path) -> None:
+    """WAV FFT와 분리해 readiness report 계약/집계를 시험하는 정상 증거."""
+
+    manifest = Path(cfg["recorded_manifest"])
+    manifest_snapshot = snapshot_regular_file(manifest)
+    entries = read_manifest(manifest)
+    contract = build_recorded_subband_coverage_contract(
+        manifest_path=manifest_snapshot.path,
+        manifest_content=manifest_snapshot.content,
+        data_cfg=cfg["data"],
+        model_hop=int(cfg["model"]["hop"]),
+    )
+    destination = recorded_subband_coverage_report_path(destination_dir, contract)
+    split_payloads = {}
+    overall_pass = True
+    for split in ("train", "val", "test"):
+        selected = [entry for entry in entries if entry["split"] == split]
+        rows = []
+        split_pass = True
+        total_segments = 0
+        for family in sorted(FAMILIES):
+            groups = sorted(
+                {
+                    str(entry["group_id"])
+                    for entry in selected
+                    if entry["source_family"] == family
+                }
+            )
+            sessions = sum(1 for entry in selected if entry["source_family"] == family)
+            total_segments += sessions
+            row_pass = len(groups) >= GROUPS_PER_FAMILY_PER_SPLIT
+            split_pass = split_pass and row_pass
+            for band in STRICT_TRUSTED_SUBBANDS_HZ:
+                rows.append(
+                    {
+                        "source_family": family,
+                        "band_hz": [float(band[0]), float(band[1])],
+                        "n_segments": sessions,
+                        "n_covered_segments": sessions,
+                        "n_covered_groups": len(groups),
+                        "covered_group_ids": groups,
+                        "density_mean": 1.0,
+                        "density_median": 1.0,
+                        "density_p10": 1.0,
+                        "group_power_pass": row_pass,
+                    }
+                )
+        split_payloads[split] = {
+            "n_sessions": len(selected),
+            "n_segments": total_segments,
+            "group_power_pass": split_pass,
+            "rows": rows,
+        }
+        overall_pass = overall_pass and split_pass
+    payload = seal_recorded_subband_coverage_report(
+        {
+            "schema_version": RECORDED_SUBBAND_COVERAGE_SCHEMA_VERSION,
+            "kind": RECORDED_SUBBAND_COVERAGE_KIND,
+            **contract,
+            "all_requested_splits_pass": overall_pass,
+            "splits": split_payloads,
+        }
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = False) -> dict:
@@ -907,7 +1040,7 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
     _checkpoint(init_best, cfg=pretrain_cfg, step=8)
     _checkpoint(init_best.parent / "last.pt", cfg=pretrain_cfg, step=10)
 
-    return {
+    cfg = {
         "stage": "open_loop",
         "model": model_cfg,
         "data": {
@@ -928,7 +1061,13 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
             },
             # 코퍼스 누수 게이트(D1)가 읽는 합성 스트림 구성.
             "noise_manifest_dir": str(synth_dir),
-            "source_mix_ratio": {"speech": 0.5, "music": 0.5},
+            "source_mix_ratio": {
+                "speech": 0.25,
+                "music": 0.25,
+                "demand": 0.15,
+                "esc50": 0.10,
+                "machine": 0.25,
+            },
         },
         "duct": {
             "acoustics": {"realistic_target_band_hz": [150, 1_600]},
@@ -962,6 +1101,9 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
             "target_cancellation_db": 3.0,
             "cancellation_ceiling_margin_db": 3.0,
             "min_groups_per_family_per_split": GROUPS_PER_FAMILY_PER_SPLIT,
+            "recorded_subband_coverage_report_dir": str(
+                tmp_path / "recorded_subband_coverage"
+            ),
             "recorded_source_pool_csv": str(source_csv),
             # 설계 상한 선언 — **생략도 우회다**(2026-08-06). 선언이 없으면 구속 상한이
             # 플랜트 일관성으로 폴백해 물리적으로 불가능한 목표도 통과한다.
@@ -974,6 +1116,10 @@ def _ready_config(tmp_path: Path, *, manifest: Path | None = None, leak: bool = 
             "max_measured_delay_mismatch_samples": 8.0,
         },
     }
+    _write_coverage_fixture(
+        cfg, Path(cfg["readiness"]["recorded_subband_coverage_report_dir"])
+    )
+    return cfg
 
 
 def _refresh_timing_contract(cfg: dict) -> TrainingTimingContract:
@@ -1030,7 +1176,7 @@ def _g4_metrics(
     worst_source_db: float = -4.0,
     include_source_fields: bool = True,
     include_modern_fields: bool = True,
-    verdict: str = "PASS",
+    verdict: str | None = None,
     do_no_harm_pass: bool = True,
     power_pass: bool = True,
     ci_pass: bool = True,
@@ -1044,12 +1190,231 @@ def _g4_metrics(
     timing_contract_sha256: str = "",
     recorded_lead_samples: int = 3,
     recorded_delay_samples: float = 2.0,
+    include_strict_subband_fields: bool = True,
+    strict_upper_subband_nmse_db: float = -2.0,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    checkpoint_cfg = checkpoint_state.get("cfg", {})
+    checkpoint_data = checkpoint_cfg.get("data", {})
+    # persisted canonical G4는 selected manifest의 session/family/group를 그대로
+    # 보존해야 한다. manifest fixture의 split별 row와 같은 순서/ID를 사용한다.
+    families = tuple(sorted(FAMILIES))
+    segment_family = np.repeat(np.asarray(families, dtype=np.str_), 4)
+    segment_group = np.asarray(
+        [
+            f"group-{family}-{split}-{group}"
+            for family in families
+            for group in range(4)
+        ],
+        dtype=np.str_,
+    )
+    segment_session = np.asarray(
+        [f"{family}-{split}-{group}" for family in families for group in range(4)],
+        dtype=np.str_,
+    )
+
+    # raw global/family G4 evidence. speech를 별도 최악 family로 두어 source-level
+    # rejection이 평균 global PASS를 우회하지 못하는지 검증한다.
+    speech_db = worst_source_db if source_pass else max(worst_source_db, 0.1)
+    source_values = {
+        family: np.full(4, speech_db if family == "speech" else -4.1)
+        for family in families
+    }
+    per_segment_trusted = np.concatenate(
+        [source_values[family] for family in families]
+    ).astype(np.float64)
+    per_segment_fullband = np.full(16, -2.0, dtype=np.float64)
+    per_segment_gap = per_segment_trusted - per_segment_fullband
+
+    def _distribution(values: np.ndarray, *, worst_is_high: bool) -> dict[str, float]:
+        ordered = np.sort(np.asarray(values, dtype=np.float64))
+        count = max(1, int(np.ceil(ordered.size * 0.1)))
+        worst = ordered[-count:] if worst_is_high else ordered[:count]
+        return {
+            "mean": float(np.mean(ordered)),
+            "median": float(np.median(ordered)),
+            "worst10": float(np.mean(worst)),
+        }
+
+    trusted_stats = _distribution(per_segment_trusted, worst_is_high=True)
+    fullband_stats = _distribution(per_segment_fullband, worst_is_high=True)
+    source_n_segments = []
+    source_n_sessions = []
+    source_n_groups = []
+    source_trusted_mean = []
+    source_trusted_worst10 = []
+    source_fullband_mean = []
+    source_fullband_worst10 = []
+    source_gap_mean = []
+    source_ci_lo = []
+    source_ci_hi = []
+    for family in families:
+        family_values = source_values[family]
+        family_fullband = np.full(4, -2.0, dtype=np.float64)
+        stats = _distribution(family_values, worst_is_high=True)
+        full_stats = _distribution(family_fullband, worst_is_high=True)
+        lo, hi, _ = cluster_bootstrap_ci(
+            family_values,
+            np.asarray(
+                [f"group-{family}-{split}-{group}" for group in range(4)],
+                dtype=np.str_,
+            ),
+            min_groups=4,
+        )
+        source_n_segments.append(4)
+        source_n_sessions.append(4)
+        source_n_groups.append(4)
+        source_trusted_mean.append(stats["mean"])
+        source_trusted_worst10.append(stats["worst10"])
+        source_fullband_mean.append(full_stats["mean"])
+        source_fullband_worst10.append(full_stats["worst10"])
+        source_gap_mean.append(float(np.mean(family_values - family_fullband)))
+        source_ci_lo.append(lo)
+        source_ci_hi.append(hi)
+
+    expected_source_pass = bool(
+        np.all(np.asarray(source_trusted_mean) < 0.0)
+        and np.all(np.asarray(source_trusted_worst10) < 0.0)
+    )
+    expected_ci_pass = bool(np.all(np.asarray(source_ci_hi) < 0.0))
+    worst_source_index = int(np.argmax(np.asarray(source_trusted_mean)))
+    expected_worst_source_family = families[worst_source_index]
+    expected_worst_source_mean = float(source_trusted_mean[worst_source_index])
+    expected_worst_source_worst10 = float(np.max(source_trusted_worst10))
+    global_source_ci_lo = np.asarray(source_ci_lo, dtype=np.float64)
+    global_source_ci_hi = np.asarray(source_ci_hi, dtype=np.float64)
+
+    # persisted canonical G4에는 octave별 segment raw matrix와 그 재계산 summary가
+    # 모두 있어야 한다. 대상 octave만 인자로 조절해 do-no-harm negative case를 만든다.
+    octave_centers = np.asarray(
+        (125.0, 250.0, 500.0, 1000.0, 1600.0, 2000.0, 4000.0, 8000.0),
+        dtype=np.float64,
+    )
+    per_segment_octave = np.full((16, octave_centers.size), 4.0, dtype=np.float64)
+    requested_octave_center = float(worst_octave_center_hz)
+    # do-no-harm authority는 trusted 내부 octave가 아니라 대역 밖 octave만 본다.
+    # 기존 경계 fixture의 500 Hz 인자는 유지하되, raw canonical evidence에서는
+    # 동률 없는 대역 밖 125 Hz 관측점으로 투영한다.
+    if 150.0 <= requested_octave_center <= 1600.0:
+        requested_octave_center = 125.0
+    octave_index = int(np.where(octave_centers == requested_octave_center)[0][0])
+    octave_target_db = (
+        float(worst_octave_worst10_db)
+        if do_no_harm_pass
+        else min(float(worst_octave_worst10_db), -1.1)
+    )
+    per_segment_octave[:, octave_index] = octave_target_db
+    octave_mean = np.mean(per_segment_octave, axis=0)
+    octave_median = np.median(per_segment_octave, axis=0)
+    octave_count = max(1, int(np.ceil(per_segment_octave.shape[0] * 0.1)))
+    octave_worst10 = np.mean(
+        np.sort(per_segment_octave, axis=0)[:octave_count], axis=0
+    )
+    octave_trusted = np.asarray(
+        (False, True, True, True, True, False, False, False), dtype=np.bool_
+    )
+    out_of_band = ~octave_trusted
+    expected_do_no_harm_pass = bool(not np.any(octave_worst10[out_of_band] <= -1.0))
+    worst_octave_index = int(
+        np.flatnonzero(out_of_band)[np.argmin(octave_worst10[out_of_band])]
+    )
+
+    # power_pass/ci_pass 인자가 False인 legacy negative 호출은 generic family group
+    # 수를 위조할 수 없으므로, strict raw coverage를 비워 INCONCLUSIVE를 만든다.
+    strict_density_value = 1.0 if power_pass and ci_pass else 0.0
+    sampling_hop = int((checkpoint_cfg.get("model") or {}).get("hop", 128))
+    sampling_segment_samples = effective_segment_samples(
+        sample_rate=INTERLEAVED_FS,
+        model_hop=sampling_hop,
+        segment_seconds=CANONICAL_SEGMENT_SECONDS,
+    )
+    sampling_edge_trim = int(
+        round(CANONICAL_EDGE_TRIM_SECONDS * INTERLEAVED_FS)
+    )
+    plant_settle_samples = int(checkpoint_cfg.get("loss_start_sample", 0))
+    feedback_delay_samples = (
+        canonical_feedback_delay_samples(checkpoint_data)
+        if checkpoint_data
+        else 0
+    )
+    sampling_warmup = (
+        canonical_warmup_samples(
+            checkpoint_data,
+            sample_rate=INTERLEAVED_FS,
+            plant_settle_samples=plant_settle_samples,
+        )
+        if checkpoint_data
+        and int(checkpoint_data.get("sample_rate", INTERLEAVED_FS)) == INTERLEAVED_FS
+        else 0
+    )
     payload = {
         "split": np.asarray(split),
+        "g4_metric_scope": np.asarray("canonical_recorded_g4"),
         "physics_status": np.asarray("measured_primary_path"),
         "allow_surrogate": np.asarray(False),
+        "sample_rate": np.asarray(INTERLEAVED_FS, dtype=np.int64),
+        "recorded_sampling_contract_schema": np.asarray(
+            RECORDED_SAMPLING_CONTRACT_SCHEMA
+        ),
+        "recorded_sampling_canonical": np.asarray(True),
+        "recorded_sampling_model_hop": np.asarray(
+            sampling_hop, dtype=np.int64
+        ),
+        "recorded_sampling_max_segments_per_session": np.asarray(
+            CANONICAL_MAX_SEGMENTS_PER_SESSION, dtype=np.int64
+        ),
+        "recorded_sampling_segment_seconds": np.asarray(
+            CANONICAL_SEGMENT_SECONDS, dtype=np.float64
+        ),
+        "recorded_sampling_plant_settle_samples": np.asarray(
+            plant_settle_samples, dtype=np.int64
+        ),
+        "segment_samples": np.asarray(
+            sampling_segment_samples, dtype=np.int64
+        ),
+        "metric_samples_per_segment": np.asarray(
+            sampling_segment_samples - sampling_warmup, dtype=np.int64
+        ),
+        "edge_trim_samples": np.asarray(
+            sampling_edge_trim, dtype=np.int64
+        ),
+        "warmup_samples": np.asarray(sampling_warmup, dtype=np.int64),
+        "feedback_delay_samples": np.asarray(
+            feedback_delay_samples, dtype=np.int64
+        ),
+        "digital_reference_lead_samples": np.asarray(
+            int(
+                checkpoint_data.get(
+                    "digital_reference_lead_samples", recorded_lead_samples
+                )
+            ),
+            dtype=np.int64,
+        ),
+        "primary_delay_samples": np.asarray(
+            int(
+                (checkpoint_data.get("training_timing_contract") or {}).get(
+                    "primary_zeros_before_fir_samples", recorded_delay_samples
+                )
+            ),
+            dtype=np.int64,
+        ),
+        "secondary_delay_samples": np.asarray(
+            int(
+                (checkpoint_data.get("training_timing_contract") or {}).get(
+                    "secondary_delay_samples", 0
+                )
+            ),
+            dtype=np.int64,
+        ),
+        "secondary_handoff_samples": np.asarray(
+            int(
+                (checkpoint_data.get("training_timing_contract") or {}).get(
+                    "handoff_samples", 0
+                )
+            ),
+            dtype=np.int64,
+        ),
         "checkpoint_sha256": np.asarray(sha256_file(checkpoint)),
         "manifest_sha256": np.asarray(sha256_file(manifest)),
         "experiment_contract_sha256": np.asarray(experiment_contract_sha256),
@@ -1058,15 +1423,32 @@ def _g4_metrics(
         "test_consumed_marker_sha256": np.asarray(
             test_consumed_marker_sha256
         ),
-        "g4_trusted_pass": np.asarray(True),
-        "g4_fullband_pass": np.asarray(True),
-        "g4_pass": np.asarray(bool(source_pass)),
-        "nmse_trusted_mean_db": np.asarray(-2.0),
-        "nmse_fullband_mean_db": np.asarray(-2.0),
-        "nmse_trusted_worst10_mean_db": np.asarray(-1.5),
-        "source_family": np.asarray(FAMILIES),
-        "n_sessions": np.asarray(4, dtype=np.int64),
+        "g4_trusted_pass": np.asarray(trusted_stats["mean"] < 0.0),
+        "g4_fullband_pass": np.asarray(fullband_stats["mean"] <= 0.0),
+        "g4_pass": np.asarray(False),
+        "nmse_trusted_mean_db": np.asarray(trusted_stats["mean"]),
+        "nmse_trusted_median_db": np.asarray(trusted_stats["median"]),
+        "nmse_trusted_worst10_mean_db": np.asarray(trusted_stats["worst10"]),
+        "nmse_fullband_mean_db": np.asarray(fullband_stats["mean"]),
+        "nmse_fullband_median_db": np.asarray(fullband_stats["median"]),
+        "nmse_fullband_worst10_mean_db": np.asarray(fullband_stats["worst10"]),
+        "nmse_gap_trusted_minus_fullband_mean_db": np.asarray(
+            float(np.mean(per_segment_gap))
+        ),
+        "trusted_band_hz": np.asarray((150.0, 1600.0), dtype=np.float64),
+        "source_family": np.asarray(families),
+        "n_sessions": np.asarray(16, dtype=np.int64),
         "n_segments": np.asarray(16, dtype=np.int64),
+        "n_groups": np.asarray(16, dtype=np.int64),
+        "segment_session_id": segment_session,
+        "segment_source_family": segment_family,
+        "segment_group_id": segment_group,
+        "segment_start_sample": np.full(
+            16, sampling_edge_trim, dtype=np.int64
+        ),
+        "per_segment_trusted_db": per_segment_trusted,
+        "per_segment_fullband_db": per_segment_fullband,
+        "per_segment_gap_db": per_segment_gap,
         "segment_recorded_lead_samples": np.full(
             16, recorded_lead_samples, dtype=np.int64
         ),
@@ -1077,28 +1459,188 @@ def _g4_metrics(
             [timing_contract_sha256] * 16
         ),
         "segment_source_timeline": np.asarray(["source_aligned.wav"] * 16),
+        "source_n_segments": np.asarray(source_n_segments, dtype=np.int64),
+        "source_n_sessions": np.asarray(source_n_sessions, dtype=np.int64),
+        "source_n_groups": np.asarray(source_n_groups, dtype=np.int64),
+        "source_nmse_trusted_mean_db": np.asarray(source_trusted_mean),
+        "source_nmse_trusted_worst10_mean_db": np.asarray(source_trusted_worst10),
+        "source_nmse_fullband_mean_db": np.asarray(source_fullband_mean),
+        "source_nmse_fullband_worst10_mean_db": np.asarray(source_fullband_worst10),
+        "source_gap_trusted_minus_fullband_mean_db": np.asarray(source_gap_mean),
+        "source_trusted_ci_lo_db": global_source_ci_lo,
+        "source_trusted_ci_hi_db": global_source_ci_hi,
+        "octave_center_hz": octave_centers,
+        "per_segment_octave_attenuation_db": per_segment_octave,
+        "octave_attenuation_mean_db": octave_mean,
+        "octave_attenuation_median_db": octave_median,
+        "octave_attenuation_worst10_mean_db": octave_worst10,
+        "octave_trusted": octave_trusted,
+        "g4_max_out_of_band_amplification_db": np.asarray(1.0),
+        "g4_worst_octave_center_hz": np.asarray(
+            float(octave_centers[worst_octave_index])
+        ),
+        "g4_worst_octave_worst10_db": np.asarray(
+            float(octave_worst10[worst_octave_index])
+        ),
+        "g4_min_groups_per_family": np.asarray(4, dtype=np.int64),
+        "g4_underpowered_families": np.asarray([], dtype=np.str_),
+        "g4_worst_source_trusted_mean_db": np.asarray(expected_worst_source_mean),
+        "g4_worst_source_trusted_worst10_db": np.asarray(
+            expected_worst_source_worst10
+        ),
+        "g4_worst_source_family": np.asarray(expected_worst_source_family),
     }
     if include_source_fields:
         # 기능 2(모든 소리 제거)는 소스별 최악값 판정이다 — 평균만 담은 옛 형식은
         # 게이트가 거부해야 한다(include_source_fields=False 로 그 회귀를 검사한다).
         payload.update(
-            g4_source_pass=np.asarray(bool(source_pass)),
-            g4_worst_source_trusted_mean_db=np.asarray(float(worst_source_db)),
-            g4_worst_source_trusted_worst10_db=np.asarray(float(worst_source_db) + 1.0),
-            g4_worst_source_family=np.asarray("speech"),
+            g4_source_pass=np.asarray(expected_source_pass),
+            g4_worst_source_trusted_mean_db=np.asarray(expected_worst_source_mean),
+            g4_worst_source_trusted_worst10_db=np.asarray(
+                expected_worst_source_worst10
+            ),
+            g4_worst_source_family=np.asarray(expected_worst_source_family),
         )
+    if include_strict_subband_fields:
+        # canonical four-band fixture: family마다 4개 독립 group과 실제 source-energy
+        # coverage를 갖는다. upper만 양수로 바꾸면 aggregate G4가 좋아도 completion은
+        # fail-closed해야 한다.
+        subbands = np.asarray(STRICT_TRUSTED_SUBBANDS_HZ, dtype=np.float64)
+        per_segment = np.full(
+            (16, len(STRICT_TRUSTED_SUBBANDS_HZ)), -2.0, dtype=np.float64
+        )
+        per_segment[:, -1] = float(strict_upper_subband_nmse_db)
+        source_mean = np.full((len(families), 4), np.nan, dtype=np.float64)
+        source_worst10 = np.full((len(families), 4), np.nan, dtype=np.float64)
+        source_ci_lo = np.full((len(families), 4), np.nan, dtype=np.float64)
+        source_ci_hi = np.full((len(families), 4), np.nan, dtype=np.float64)
+        density = np.full((16, 4), strict_density_value, dtype=np.float64)
+        coverage = density >= MIN_SUBBAND_SOURCE_ENERGY_DENSITY_RATIO
+        source_coverage = np.zeros((len(families), 4), dtype=np.bool_)
+        source_power = np.zeros((len(families), 4), dtype=np.bool_)
+        source_n_segments = np.zeros((len(families), 4), dtype=np.int64)
+        source_n_groups = np.zeros((len(families), 4), dtype=np.int64)
+        source_coverage_fraction = np.zeros((len(families), 4), dtype=np.float64)
+        source_density_mean = np.zeros((len(families), 4), dtype=np.float64)
+        for family_index, family in enumerate(families):
+            family_mask = segment_family == family
+            for band_index in range(4):
+                valid = coverage[family_mask, band_index]
+                selected = per_segment[family_mask, band_index][valid]
+                selected_groups = segment_group[family_mask][valid]
+                source_n_segments[family_index, band_index] = selected.size
+                source_n_groups[family_index, band_index] = np.unique(
+                    selected_groups
+                ).size
+                source_coverage_fraction[family_index, band_index] = np.mean(valid)
+                source_density_mean[family_index, band_index] = np.mean(
+                    density[family_mask, band_index]
+                )
+                source_coverage[family_index, band_index] = selected.size > 0
+                source_power[family_index, band_index] = bool(
+                    selected.size > 0 and source_n_groups[family_index, band_index] >= 4
+                )
+                if selected.size:
+                    source_mean[family_index, band_index] = np.mean(selected)
+                    count = max(1, int(np.ceil(selected.size * 0.1)))
+                    source_worst10[family_index, band_index] = np.mean(
+                        np.sort(selected)[-count:]
+                    )
+                    source_ci_lo[family_index, band_index], source_ci_hi[
+                        family_index, band_index
+                    ], _ = cluster_bootstrap_ci(
+                        selected, selected_groups, min_groups=4
+                    )
+        source_mean_pass = source_mean < 0.0
+        source_worst10_pass = source_worst10 < 0.0
+        source_ci_pass = source_ci_hi < 0.0
+        source_pass_matrix = (
+            source_coverage
+            & source_power
+            & source_mean_pass
+            & source_worst10_pass
+            & source_ci_pass
+        )
+        payload.update(
+            strict_trusted_subband_schema=np.asarray(STRICT_TRUSTED_SUBBAND_SCHEMA),
+            strict_trusted_subband_min_source_energy_density_ratio=np.asarray(
+                MIN_SUBBAND_SOURCE_ENERGY_DENSITY_RATIO
+            ),
+            trusted_subband_hz=subbands,
+            per_segment_trusted_subband_nmse_db=per_segment,
+            per_segment_trusted_subband_coverage=coverage,
+            per_segment_trusted_subband_source_energy_density_ratio=density,
+            source_trusted_subband_n_segments=source_n_segments,
+            source_trusted_subband_n_groups=source_n_groups,
+            source_trusted_subband_coverage_fraction=source_coverage_fraction,
+            source_trusted_subband_source_energy_density_ratio_mean=source_density_mean,
+            source_trusted_subband_nmse_mean_db=source_mean,
+            source_trusted_subband_nmse_worst10_mean_db=source_worst10,
+            source_trusted_subband_ci_lo_db=source_ci_lo,
+            source_trusted_subband_ci_hi_db=source_ci_hi,
+            source_trusted_subband_coverage_pass=source_coverage,
+            source_trusted_subband_power_pass=source_power,
+            source_trusted_subband_mean_pass=source_mean_pass,
+            source_trusted_subband_worst10_pass=source_worst10_pass,
+            source_trusted_subband_ci_pass=source_ci_pass,
+            source_trusted_subband_pass=source_pass_matrix,
+            g4_trusted_subband_schema_pass=np.asarray(True),
+            g4_trusted_subband_coverage_pass=np.asarray(np.all(source_coverage)),
+            g4_trusted_subband_power_pass=np.asarray(np.all(source_power)),
+            g4_trusted_subband_mean_pass=np.asarray(bool(np.all(source_mean_pass))),
+            g4_trusted_subband_worst10_pass=np.asarray(
+                bool(np.all(source_worst10_pass))
+            ),
+            g4_trusted_subband_ci_pass=np.asarray(bool(np.all(source_ci_pass))),
+            g4_trusted_subband_pass=np.asarray(bool(np.all(source_pass_matrix))),
+            g4_upper_trusted_subband_pass=np.asarray(
+                bool(np.all(source_pass_matrix[:, -1]))
+            ),
+        )
+        strict_hard_failure = bool(
+            np.any(np.isfinite(source_mean) & (source_mean >= 0.0))
+            or np.any(np.isfinite(source_worst10) & (source_worst10 >= 0.0))
+        )
+        strict_inconclusive = not bool(
+            np.all(source_coverage)
+            and np.all(source_power)
+            and np.all(source_ci_pass)
+        )
+    else:
+        strict_hard_failure = False
+        strict_inconclusive = True
+
+    expected_verdict = (
+        "FAIL"
+        if (
+            not bool(trusted_stats["mean"] < 0.0)
+            or not bool(fullband_stats["mean"] <= 0.0)
+            or not expected_source_pass
+            or not expected_do_no_harm_pass
+            or strict_hard_failure
+        )
+        else "INCONCLUSIVE"
+        if (not expected_ci_pass or strict_inconclusive)
+        else "PASS"
+    )
+    resolved_verdict = expected_verdict if verdict is None else verdict
     if include_modern_fields:
         # 2026-08-05 신설 판정. 이 필드들이 없는 산출물은 게이트가 거부해야 한다
         # (include_modern_fields=False 로 그 회귀를 검사한다).
         payload.update(
-            g4_verdict=np.asarray(verdict),
-            g4_do_no_harm_pass=np.asarray(bool(do_no_harm_pass)),
-            g4_power_pass=np.asarray(bool(power_pass)),
-            g4_ci_pass=np.asarray(bool(ci_pass)),
-            g4_worst_octave_center_hz=np.asarray(float(worst_octave_center_hz)),
-            g4_worst_octave_worst10_db=np.asarray(float(worst_octave_worst10_db)),
+            g4_verdict=np.asarray(resolved_verdict),
+            g4_do_no_harm_pass=np.asarray(expected_do_no_harm_pass),
+            g4_power_pass=np.asarray(True),
+            g4_ci_pass=np.asarray(expected_ci_pass),
+            g4_pass=np.asarray(resolved_verdict == "PASS"),
+            g4_worst_octave_center_hz=np.asarray(
+                float(octave_centers[worst_octave_index])
+            ),
+            g4_worst_octave_worst10_db=np.asarray(
+                float(octave_worst10[worst_octave_index])
+            ),
             g4_max_out_of_band_amplification_db=np.asarray(1.0),
-            source_trusted_ci_hi_db=np.full(len(FAMILIES), -0.5),
+            source_trusted_ci_hi_db=global_source_ci_hi,
             plant_fingerprint_json=np.asarray(
                 fingerprint if fingerprint is not None else _plant_fingerprint_payload()
             ),
@@ -1149,6 +1691,7 @@ def test_readiness_passes_only_with_official_paths_completed_init_and_full_recor
         # 그 결함을 다시 통과시키는 것이므로 테스트가 즉시 깨진다.
         "recorded_alignment_integrity",   # 결함 2: source→ERR 관계가 존재하는가
         "recorded_statistical_power",     # 결함 4 / D3: 계열당 그룹 ≥ 하한
+        "recorded_subband_coverage",      # G2d: family×150–1600Hz target 에너지
         "corpus_disjoint",                # D1: 합성 ∩ 실측 원본 = ∅
         "measured_source_delay_agreement",  # D2: 실측 지연 == P(z) 유도값
         "plant_confidence_ceiling",       # G1c: 목표가 달성 가능 상한 안인가
@@ -1239,8 +1782,43 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
     (source_root / "src" / "training.py").write_text("VALUE = 1\n")
     manifest = source_root / "data" / "manifests" / "recorded_regrouped.jsonl"
     manifest.parent.mkdir(parents=True)
-    manifest.write_text('{"split":"val"}\n{"split":"test"}\n')
-    (source_root / ".gitignore").write_text("/results/\n")
+    # canonical persisted G4 validator는 selected split의 모든 session/family/group를
+    # metrics raw metadata와 전단사로 결속한다. capability-chain fixture도 최소한의
+    # 유효한 canonical population을 제공해야 한다(실제 오디오 파일은 이 테스트에서
+    # 읽지 않는다).
+    manifest_entries = []
+    for split_name in ("val", "test"):
+        for family in sorted(FAMILIES):
+            for group in range(4):
+                session_id = f"{family}-{split_name}-{group}"
+                manifest_entries.append(
+                    {
+                        "path": str(source_root / "recorded" / session_id),
+                        "duration_s": 2.1,
+                        "sample_rate": 48_000,
+                        "session_id": session_id,
+                        "group_id": f"group-{family}-{split_name}-{group}",
+                        "source_family": family,
+                        "split": split_name,
+                    }
+                )
+    manifest.write_text(
+        "".join(json.dumps(entry) + "\n" for entry in manifest_entries)
+    )
+    # canonical config 로더는 RIR bank를 저장소 내부의 실제 regular NPZ로
+    # 검증한다. 임시 source commit에도 최소 유효 bank를 넣어, 제품 검증을
+    # 실제 workspace artifact로 우회하지 않게 한다.
+    rir_bank = source_root / "data" / "rir_bank" / "duct_rirs_v1.npz"
+    rir_bank.parent.mkdir(parents=True)
+    np.savez_compressed(
+        rir_bank,
+        p_ref=np.zeros((1, 1), dtype=np.float32),
+        p_err=np.zeros((1, 1), dtype=np.float32),
+        f_fb=np.zeros((1, 1), dtype=np.float32),
+        sample_rate=np.asarray(48_000, dtype=np.int64),
+        seed=np.asarray(20260802, dtype=np.int64),
+    )
+    (source_root / ".gitignore").write_text("/results/\n/recorded/\n")
     subprocess.run(["git", "init", "-q"], cwd=source_root, check=True)
     subprocess.run(
         ["git", "add", "src", "data", ".gitignore"], cwd=source_root, check=True
@@ -1256,7 +1834,15 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
     import deep_anc.config as config_module
     import deep_anc.data.transfer_contract as transfer_contract_module
 
+    original_resolve_path = config_module._resolve_path
+
+    def _resolve_fixture_rir(path):
+        if Path(path).as_posix() == "data/rir_bank/duct_rirs_v1.npz":
+            return rir_bank
+        return original_resolve_path(path)
+
     monkeypatch.setattr(config_module, "REPO_ROOT", source_root)
+    monkeypatch.setattr(config_module, "_resolve_path", _resolve_fixture_rir)
     monkeypatch.setattr(readiness, "REPO_ROOT", source_root)
     monkeypatch.setattr(
         transfer_contract_module,
@@ -1275,6 +1861,22 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
         ],
     )
     timing = TrainingTimingContract.from_data_config(cfg["data"])
+    for entry in manifest_entries:
+        session_dir = Path(entry["path"])
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "session.json").write_text(
+            json.dumps(
+                {
+                    "timeline": {
+                        "aligned_lag_median_samples": float(
+                            timing.primary_effective_delay_samples
+                        )
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     run = tmp_path / "canonical"
     best = run / "ckpt" / "best.pt"
     last = best.parent / "last.pt"
@@ -1319,15 +1921,21 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
         recorded_lead_samples=timing.digital_reference_lead_samples,
         recorded_delay_samples=timing.primary_effective_delay_samples,
     )
-    val_decision = classify_recorded_val_metrics(val_metrics.read_bytes())
+    val_decision = classify_recorded_val_metrics(
+        val_metrics.read_bytes(),
+        manifest_bytes=manifest.read_bytes(),
+        manifest_path=manifest,
+        checkpoint_cfg=cfg,
+    )
     selection_path = tmp_path / "selection.json"
+    campaign_sha = seed_neutral_campaign_sha256(cfg)
     selection = {
         "schema_version": 1,
         "selection_split": "val",
         "manifest": str(manifest),
         "manifest_sha256": sha256_file(manifest),
         "experiment_contract_sha256": contract_sha,
-        "seed_neutral_campaign_sha256": "c" * 64,
+        "seed_neutral_campaign_sha256": campaign_sha,
         "seed": 20260803,
         "decision": val_decision,
         "selected": {
@@ -1336,6 +1944,7 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
             "evaluation_dir": str(val_metrics.parent),
             "metrics_sha256": sha256_file(val_metrics),
             "seed": 20260803,
+            "seed_neutral_campaign_sha256": campaign_sha,
             "decision": val_decision,
         },
         "candidates": [],
@@ -2372,6 +2981,90 @@ def test_readiness_rejects_underpowered_val_and_test_groups(tmp_path):
     assert ("val", "machine") in weak and ("test", "speech") in weak
 
 
+def test_readiness_rejects_missing_recorded_subband_coverage_report(tmp_path):
+    cfg = _ready_config(tmp_path)
+    _coverage_report_path(cfg).unlink()
+
+    gate = _gate(audit_finetune_readiness(cfg, full_recorded_qa=False), "recorded_subband_coverage")
+    assert not gate["ok"]
+    assert "snapshot" in gate["message"] or "열 수 없습니다" in gate["message"]
+
+
+def test_readiness_rejects_stale_recorded_subband_coverage_manifest(tmp_path):
+    cfg = _ready_config(tmp_path)
+    manifest = Path(cfg["recorded_manifest"])
+    manifest.write_bytes(manifest.read_bytes() + b"\n")
+
+    gate = _gate(audit_finetune_readiness(cfg, full_recorded_qa=False), "recorded_subband_coverage")
+    assert not gate["ok"]
+    assert "snapshot" in gate["message"] or "열 수 없습니다" in gate["message"]
+
+
+def test_readiness_rejects_forged_recorded_subband_coverage_aggregate(tmp_path):
+    cfg = _ready_config(tmp_path, manifest=_recorded_manifest(tmp_path / "data", groups_per_family=2))
+    report_path = _coverage_report_path(cfg)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["splits"]["val"]["rows"][0]["group_power_pass"] = True
+    payload["splits"]["val"]["group_power_pass"] = True
+    payload["all_requested_splits_pass"] = True
+    payload = seal_recorded_subband_coverage_report(payload)
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    gate = _gate(audit_finetune_readiness(cfg, full_recorded_qa=False), "recorded_subband_coverage")
+    assert not gate["ok"]
+    assert "위조" in gate["message"]
+
+
+@pytest.mark.parametrize("role", ["canonical_finetune", "measured_probe"])
+def test_canonical_coverage_requires_external_bootstrap_receipt_binding(
+    tmp_path, role
+):
+    cfg = _ready_config(tmp_path)
+    cfg["experiment_role"] = role
+    audit = readiness._Audit("fixture")
+    readiness._audit_recorded_subband_coverage(
+        audit,
+        cfg,
+        cfg["readiness"],
+        manifest_path=Path(cfg["recorded_manifest"]),
+        transfer_snapshot=None,
+    )
+    assert not audit.checks[0]["ok"]
+    assert "bootstrap receipt" in audit.checks[0]["message"]
+
+
+@pytest.mark.parametrize("role", ["canonical_finetune", "measured_probe"])
+def test_recorded_trust_roles_require_transfer_and_canonical_lineage(
+    tmp_path, monkeypatch, role
+):
+    cfg = _ready_config(tmp_path)
+    cfg["experiment_role"] = role
+    calls = {"transfer": 0, "lineage": 0}
+
+    def reject_transfer(data_cfg, *, repo_root):
+        calls["transfer"] += 1
+        raise ValueError("fixture transfer sentinel")
+
+    def reject_lineage(manifest_path, data_cfg, transfer_snapshot=None):
+        calls["lineage"] += 1
+        raise ValueError("fixture lineage sentinel")
+
+    monkeypatch.setattr(readiness, "validate_recorded_training_snapshot", reject_transfer)
+    monkeypatch.setattr(readiness, "_canonical_recorded_lineage_snapshot", reject_lineage)
+
+    report = audit_finetune_readiness(cfg, full_recorded_qa=False)
+
+    assert calls == {"transfer": 1, "lineage": 1}
+    transfer_gate = _gate(report, "recorded_transfer_snapshot")
+    manifest_gate = _gate(report, "recorded_dataset_qa")
+    assert not transfer_gate["ok"] and "transfer sentinel" in transfer_gate["message"]
+    assert not manifest_gate["ok"] and "lineage sentinel" in manifest_gate["message"]
+
+
 # ---- D1 코퍼스 누수 -------------------------------------------------------------------
 def test_readiness_rejects_corpus_leak_between_synthetic_and_recorded(tmp_path):
     """합성 학습 스트림과 실측이 같은 원본 오디오를 쓰면 FAIL 한다.
@@ -2443,6 +3136,146 @@ def test_readiness_rejects_manifest_bytes_from_a_mixed_generation(tmp_path):
     gate = _gate(report, "corpus_disjoint")
     assert not gate["ok"]
     assert "speech SHA 불일치" in gate["message"]
+
+
+def test_corpus_gate_rechecks_external_addition_raw_sha_against_public_manifests(
+    tmp_path, monkeypatch
+):
+    """parent holdout 밖 external raw도 synthetic 6종과 직접 다시 비교한다."""
+
+    source_csv = tmp_path / "sources.csv"
+    source_csv.write_text(
+        "source_family,path,clips\n"
+        'machine,machine_000.wav,"[""parent-only.wav""]"\n',
+        encoding="utf-8",
+    )
+    manifest_dir = tmp_path / "manifests"
+    manifest_dir.mkdir()
+    (manifest_dir / "machine.jsonl").write_text("fixture\n", encoding="utf-8")
+    raw_sha = hashlib.sha256(b"external ESC raw").hexdigest()
+    synthetic_entry = {
+        "path": str(tmp_path / "raw/renamed-machine.wav"),
+        "content_sha256": raw_sha,
+        "lineage_keys": ["esc50:source:external"],
+        "group_id": "public-lineage-external",
+        "split": "train",
+    }
+    generation_exclusion = {
+        "schema_version": 1,
+        "generation_id": "highband-v1",
+        "generation": {
+            "path": "data/manifests/recorded_generations/highband-v1/generation.json",
+            "sha256": "1" * 64,
+            "size": 1,
+        },
+        "source_plan": {
+            "path": "data/source_plans/recorded_additions/highband-v1.csv",
+            "sha256": "2" * 64,
+            "size": 1,
+        },
+        "identity_count": 1,
+        "identities": [
+            {
+                "source_row_number": 2,
+                "source_kind": "external_exact_composite",
+                "source_family": "machine",
+                "source_path": "data/source_plans/recorded_additions/x.wav",
+                "source_file_sha256": hashlib.sha256(b"composite").hexdigest(),
+                "raw_member_path": "data/raw/noise/esc50/external.wav",
+                "raw_member_sha256": raw_sha,
+                "raw_member_lineage_key": "esc50:source:external",
+                "authority_components": [
+                    "clip_identity:external.wav",
+                    "esc50_identity:esc50:source:external",
+                ],
+            }
+        ],
+        "identities_sha256": "3" * 64,
+    }
+    monkeypatch.setattr(
+        readiness,
+        "validate_manifest_generation",
+        lambda *args, **kwargs: {
+            "build_id": "4" * 64,
+            "public_lineage": {},
+            "_validated_entries": {"machine": [synthetic_entry]},
+            "_validated_recorded_generation_exclusion": generation_exclusion,
+            "recorded_generation_exclusion": generation_exclusion,
+        },
+    )
+    audit = readiness._Audit("fixture")
+    readiness._audit_corpus_leak(
+        audit,
+        {"recorded_source_pool_csv": str(source_csv)},
+        {
+            "noise_manifest_dir": str(manifest_dir),
+            "source_mix_ratio": {"machine": 1.0},
+        },
+        entries=[],
+    )
+
+    assert len(audit.checks) == 1
+    assert not audit.checks[0]["ok"]
+    assert "recorded generation additions" in audit.checks[0]["message"]
+    assert "content_sha256" in audit.checks[0]["message"]
+
+
+def test_corpus_gate_requires_generation_exclusion_for_schema_v2_transfer(
+    tmp_path, monkeypatch
+):
+    source_csv = tmp_path / "sources.csv"
+    source_csv.write_text(
+        "source_family,path,clips\n"
+        'machine,machine_000.wav,"[""parent-only.wav""]"\n',
+        encoding="utf-8",
+    )
+    manifest_dir = tmp_path / "manifests"
+    manifest_dir.mkdir()
+    (manifest_dir / "machine.jsonl").write_text("fixture\n", encoding="utf-8")
+    synthetic_entry = {
+        "path": str(tmp_path / "raw/fresh.wav"),
+        "content_sha256": hashlib.sha256(b"fresh").hexdigest(),
+        "lineage_keys": ["fixture:fresh"],
+        "group_id": "public-lineage-fresh",
+        "split": "train",
+    }
+    monkeypatch.setattr(readiness, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        readiness,
+        "validate_manifest_generation",
+        lambda *args, **kwargs: {
+            "build_id": "4" * 64,
+            "public_lineage": {},
+            "_validated_entries": {"machine": [synthetic_entry]},
+            "_validated_recorded_generation_exclusion": None,
+        },
+    )
+    transfer_generation = tmp_path / "generation.json"
+    transfer_generation.write_text("{}\n", encoding="utf-8")
+    transfer = SimpleNamespace(
+        recorded_generation=SimpleNamespace(
+            path=transfer_generation,
+            sha256=hashlib.sha256(transfer_generation.read_bytes()).hexdigest(),
+            size=transfer_generation.stat().st_size,
+        ),
+        recorded_generation_summary={},
+    )
+    audit = readiness._Audit("fixture")
+    readiness._audit_corpus_leak(
+        audit,
+        {"recorded_source_pool_csv": str(source_csv)},
+        {
+            "noise_manifest_dir": str(manifest_dir),
+            "source_mix_ratio": {"machine": 1.0},
+        },
+        entries=[],
+        transfer_snapshot=transfer,
+    )
+
+    assert len(audit.checks) == 1
+    assert not audit.checks[0]["ok"]
+    assert "schema v2" in audit.checks[0]["message"]
+    assert "recorded_generation_exclusion" in audit.checks[0]["message"]
 
 
 # ---- G1c 달성 가능 상한 ---------------------------------------------------------------
@@ -2630,6 +3463,40 @@ def test_completion_rejects_metrics_from_an_evaluator_without_do_no_harm(tmp_pat
     assert "g4_do_no_harm_pass" in gate["message"]
 
 
+def test_completion_rejects_legacy_metrics_without_strict_trusted_subbands(tmp_path):
+    """구형 150–1600 평균-only metrics는 canonical completion 근거가 아니다."""
+
+    cfg, best, val_metrics, test_metrics = _g4_completion_setup(
+        tmp_path, include_strict_subband_fields=False
+    )
+
+    report = audit_finetune_completion(
+        cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
+    )
+
+    assert not report["ok"]
+    gate = _gate(report, "recorded_val_g4")
+    assert not gate["ok"]
+    assert "strict trusted 150–1600Hz" in gate["message"]
+
+
+def test_completion_rejects_aggregate_pass_when_upper_trusted_subband_fails(tmp_path):
+    """전체 trusted 평균/G4 bool을 위조해도 1000–1600 Hz raw가 양수면 실패한다."""
+
+    cfg, best, val_metrics, test_metrics = _g4_completion_setup(
+        tmp_path, strict_upper_subband_nmse_db=0.25
+    )
+
+    report = audit_finetune_completion(
+        cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
+    )
+
+    assert not report["ok"]
+    gate = _gate(report, "recorded_val_g4")
+    assert not gate["ok"]
+    assert "upper 1000–1600Hz" in gate["message"]
+
+
 def test_completion_rejects_out_of_band_amplification(tmp_path):
     """신뢰 대역이 좋아도 대역 밖을 키웠다면 완료가 아니다 (절대목표 1).
 
@@ -2669,7 +3536,9 @@ def test_completion_does_not_accept_an_inconclusive_g4(tmp_path):
     assert not report["ok"]
     gate = _gate(report, "recorded_val_g4")
     assert "INCONCLUSIVE" in gate["message"]
-    assert "통계적으로 성립하지 않습니다" in gate["message"]
+    # 새 raw strict 계약에서는 generic family group 수를 위조하지 않고, strict
+    # coverage 부족으로 판정 불가를 재현한다. 어느 경우든 완료로 승격되어서는 안 된다.
+    assert "trusted upper 1000–1600Hz" in gate["message"]
 
 
 def test_completion_rejects_val_and_test_from_different_plants(tmp_path):
@@ -2897,6 +3766,8 @@ def test_every_entry_gate_passes_at_its_declared_boundary(tmp_path):
       · 목표 + 여유 = 달성 가능 상한의 90%
     """
 
+    from deep_anc.ops.gate_registry import CANONICAL_FINETUNE_READINESS_GATE_IDS
+
     cfg = _boundary_config(tmp_path)
 
     report = audit_finetune_readiness(cfg)
@@ -2904,14 +3775,19 @@ def test_every_entry_gate_passes_at_its_declared_boundary(tmp_path):
     failed = [item for item in report["checks"] if not item["ok"]]
     assert failed == [], failed
     assert report["ok"], report
-    # 그리고 이것이 "게이트가 없어서 통과" 가 아님을 못박는다.
-    assert len(report["checks"]) >= 14
+    # canonical 분모는 정확히 17개다. 이 non-trust-role fixture는 외부 transfer
+    # snapshot gate 1개만 조건부로 제외하고 나머지 16개를 모두 실행한다.
+    authority = set(CANONICAL_FINETUNE_READINESS_GATE_IDS)
+    assert len(authority) == 17
+    assert {item["id"] for item in report["checks"]} == authority - {
+        "recorded_transfer_snapshot"
+    }
 
 
 def test_completion_gates_pass_at_the_minimum_sample_boundary(tmp_path):
     """완료 게이트 전부가 **최소 표본**의 정상 산출물에서 PASS 한다.
 
-    몰아본 경계: 세션 1개 / 세그먼트 1개(0 이면 FAIL 하는 하한 바로 위),
+    몰아본 경계: family×strict 부대역마다 독립 그룹 4개(통계 하한 정확히),
     최악 계열 −0.01 dB(개선이라 말할 수 있는 최소값), 최악 옥타브 0.01 dB.
     """
 
@@ -2920,13 +3796,6 @@ def test_completion_gates_pass_at_the_minimum_sample_boundary(tmp_path):
         worst_source_db=-0.01,
         worst_octave_worst10_db=0.01,
     )
-    for path in (val_metrics, test_metrics):
-        with np.load(path, allow_pickle=False) as data:
-            arrays = {key: data[key] for key in data.files}
-        arrays["n_sessions"] = np.asarray(1, dtype=np.int64)
-        arrays["n_segments"] = np.asarray(1, dtype=np.int64)
-        np.savez_compressed(path, **arrays)
-
     report = audit_finetune_completion(
         cfg, checkpoint=best, val_metrics=val_metrics, test_metrics=test_metrics
     )
