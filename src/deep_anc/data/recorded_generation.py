@@ -1753,10 +1753,13 @@ def _validate_session_artifacts(
             raise RecordedGenerationError("source plan verified bytes가 유효하지 않습니다")
         program = metadata.get("program")
         assert isinstance(program, dict)
-        from deep_anc.realtime.noise_gen import NoiseProgram
+        from deep_anc.realtime.noise_gen import (
+            NoiseProgram,
+            render_recording_file_window,
+        )
 
         try:
-            expected_source = NoiseProgram(
+            expected_program = NoiseProgram(
                 {
                     "type": "file",
                     "file": row["path"],
@@ -1765,7 +1768,12 @@ def _validate_session_artifacts(
                 },
                 48_000,
                 file_bytes=source_bytes,
-            ).generate(expected_frames)
+            )
+            expected_source = render_recording_file_window(
+                expected_program,
+                expected_frames,
+                sample_rate=48_000,
+            )
         except (KeyError, OSError, RuntimeError, ValueError) as exc:
             raise RecordedGenerationError(
                 f"추가 session deterministic playback을 source plan에서 재유도할 수 없습니다: "

@@ -267,6 +267,33 @@ Jetson의 장시간 scipy 회귀 도중 중단했으므로 새 exact commit의 E
 346파일 manifest와 두 meter 파일 전송 → 동일 venv에서 bootstrap 재개다. pytest와 canonical
 recorded coverage가 통과하기 전에는 pretrain/fine-tune을 시작하지 않는다.
 
+### 0.11 2026-08-30 추가 녹음 첫 행 fail-closed와 file playback 계약 수정
+
+Elice bootstrap/readiness 15/17 뒤 DNS speech 5개를 exact selector로 선택했고,
+`highband-coverage-v1` 17행 plan의 dry-run이 PASS했다. 사용자 승인 아래 첫 environment
+세션만 출력했으며, stream 종료 직후 분리 안내를 내고 batch QA가 실패하자 나머지 16개는
+자동 재생하지 않았다. 실패 session은
+`results/recording_failures/record_duct/batch_qa/highband-coverage-v1/`에 no-replace 보존했고,
+active addition session은 0개다.
+
+실패는 장비·gain 문제가 아니었다. 실제 amplitude/peak는 `0.15`, xrun/clip 0이고 timeline
+coherence도 150--600 Hz `0.086→0.906`으로 합격했다. 원인은 file producer가 1초 settle
+무음 중에도 cursor를 48,000샘플 진행시켜 계획 54.1초가 아니라 55.1초부터 출력한 반면,
+generation validator는 planned start에서 fade 없이 재유도한 코드 계약 불일치다. 실패
+`source.wav`는 `1초 advance + 양끝 0.1초 fade`를 적용하면 720,000샘플 bit-exact지만,
+그 파형은 plan window가 아니므로 재봉인·승격하지 않는다.
+
+복구 규칙은 다음과 같다.
+
+1. 공용 file renderer가 planned start에서 exact keep frame만 생성하고 0.1초 fade를 적용한다.
+2. duplex settle은 exact zero prefix이며 file cursor를 소비하지 않는다.
+3. producer와 generation validator는 같은 renderer를 사용하고 one-second shift/fade 누락을
+   회귀 테스트로 거부한다.
+4. 기존 `qa_failed` progress와 raw는 삭제하지 않는다. 수정 commit의 새 Elice bootstrap/DNS
+   receipt/plan을 다시 결속하고 무음 dry-run을 통과한 뒤 같은 generation의 row 2를 새
+   explicit attempt로 녹음한다.
+5. 수정·검증 전에 소리를 반복하지 않고, 재실행도 새 출력 창 보고와 승인 뒤에만 한다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.

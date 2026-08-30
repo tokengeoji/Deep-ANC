@@ -80,7 +80,10 @@ from deep_anc.audio_io import (                             # noqa: E402
 from deep_anc.dsp.measurement_level import (                 # noqa: E402
     assert_live_pcm_clock_preconditions,
 )
-from deep_anc.realtime.noise_gen import NoiseProgram         # noqa: E402
+from deep_anc.realtime.noise_gen import (                    # noqa: E402
+    NoiseProgram,
+    render_recording_file_window,
+)
 
 # 게이트 하한. CLI 는 이 값 **이상**만 받는다(강화 전용).
 # 0.90 의 근거: 선형 Wiener 하한 10·log10(1−coh²) 로 −10 dB. 재정렬이 성공한 실측
@@ -92,6 +95,30 @@ PROGRAM_PEAK_FACTORS = {
     "band": 4.0,
     "multitone": 1.5,
 }
+
+
+def _prepare_file_source_timeline(
+    program: NoiseProgram,
+    *,
+    settle_frames: int,
+    keep_frames: int,
+    sample_rate: int,
+) -> np.ndarray:
+    """settle zero prefix 뒤에 planned file window를 exact 배치한다."""
+
+    settle_frames = int(settle_frames)
+    keep_frames = int(keep_frames)
+    if settle_frames < 0 or keep_frames <= 0:
+        raise ValueError("settle_frames는 0 이상, keep_frames는 양수여야 합니다")
+    timeline = np.zeros(settle_frames + keep_frames, dtype=np.float32)
+    timeline[settle_frames:] = render_recording_file_window(
+        program,
+        keep_frames,
+        sample_rate=sample_rate,
+    )
+    return timeline
+
+
 # 자가진단 상한. QA 의 max_clip_ratio(0.005)와 같은 자리에서 판정하되, 재생 전에 본다.
 # 레일 게이트와 임계는 src/deep_anc/audio_io.py 가 단일 출처다.
 # 여기 두면 다른 도구가 sys.path 를 조작해 스크립트에서 import 해야 하고,
@@ -824,7 +851,16 @@ def main(argv: list[str] | None = None) -> int:
     settle = int(max(0.0, args.settle_seconds) * fs)
     keep = int(args.seconds * fs)
     total = keep + settle
-    source = np.zeros(total, dtype=np.float32)
+    source = (
+        _prepare_file_source_timeline(
+            program,
+            settle_frames=settle,
+            keep_frames=keep,
+            sample_rate=fs,
+        )
+        if args.program == "file"
+        else np.zeros(total, dtype=np.float32)
+    )
     recorded = np.zeros((total, 2), dtype=np.float32)
     cursor = {"in": 0, "out": 0}
     xrun_state: dict = {"count": 0, "flags": set()}
@@ -841,6 +877,10 @@ def main(argv: list[str] | None = None) -> int:
         envelope[settle : settle + ramp] = fade[:ramp]
         envelope[settle + keep - ramp : settle + keep] = fade[:ramp][::-1]
 
+    # file plan의 start_seconds는 audible 15초의 첫 샘플이다. 과거에는 settle
+    # 무음 중에도 program.generate()를 호출해 cursor가 1초 전진했고, 15초 composite의
+    # 끝은 처음으로 wrap됐다. file만은 planned window를 먼저 exact 렌더링하고 settle
+    # 앞에는 zero를 둔다. validator도 같은 공용 렌더러를 사용한다.
     # 콜백 타임스탬프는 **provenance 전용**이다. 실측(무음 40초 프로브): status 0회,
     # adc/cur rate +5.0 ppm, 그런데 dac−adc 는 0.010/0.020 s 두 값 사이를 16 샘플
     # 단위로만 튄다 → 실제 ±130 샘플 변조를 전혀 보여주지 않는다. 이 값으로 정렬을
@@ -873,14 +913,19 @@ def main(argv: list[str] | None = None) -> int:
         cursor["in"] = i + n
 
         o = cursor["out"]
-        blk = program.generate(frames)
-        # settle 구간은 무음으로 흘린다 — 프로그램 위상은 그대로 진행시켜 잘라낸 뒤에도
-        # source 배열과 재생 샘플이 같은 인덱스를 가리키게 한다.
-        # ⚠ 이 인덱스 동일성은 "재생 배열 안에서" 만 유효하다. 재생 샘플이 **언제
-        #   공기 중으로 나갔는가**는 여기서 알 수 없다 — 그것이 결함 2 의 본체였다.
-        blk *= envelope[o : o + frames]
-        m = min(frames, total - o)
-        source[o : o + m] = blk[:m]
+        m = max(0, min(frames, total - o))
+        if args.program == "file":
+            # settle은 pre-rendered source의 exact zero prefix다. callback block이
+            # settle 경계를 가로질러도 planned file cursor는 소비되지 않는다.
+            blk = np.zeros(frames, dtype=np.float32)
+            if m > 0:
+                blk[:m] = source[o : o + m]
+        else:
+            blk = program.generate(frames)
+            # 생성형 program은 기존 위상/settle 동작을 보존한다.
+            blk *= envelope[o : o + frames]
+            if m > 0:
+                source[o : o + m] = blk[:m]
         out = np.zeros((frames, 2), dtype=np.float32)
         out[:, 0] = blk                             # ch0 = 소음 스피커
         # ch1(상쇄 스피커)은 무음 유지

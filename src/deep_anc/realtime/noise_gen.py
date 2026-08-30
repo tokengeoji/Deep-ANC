@@ -14,6 +14,9 @@ import numpy as np
 from scipy import signal
 
 
+RECORDING_FILE_FADE_SECONDS = 0.1
+
+
 class DigitalReferenceBuffer:
     """자기생성 소스를 ``lead_samples`` 만큼 늦춰 미래 레퍼런스를 제공한다.
 
@@ -196,3 +199,38 @@ class NoiseProgram:
             return out
 
         raise RuntimeError(self.kind)
+
+
+def render_recording_file_window(
+    program: NoiseProgram,
+    frames: int,
+    *,
+    sample_rate: int,
+    fade_seconds: float = RECORDING_FILE_FADE_SECONDS,
+) -> np.ndarray:
+    """계획된 file 시작점부터 exact 길이를 렌더링하고 수집 fade를 적용한다.
+
+    input-only/duplex settle은 이 함수 밖의 무음 구간이다. 따라서 settle 동안
+    ``NoiseProgram`` cursor를 진행시키면 안 된다. producer와 recorded-generation
+    validator가 이 함수를 함께 사용해 계획 start, gain, fade를 bit-exact로 묶는다.
+    """
+
+    if program.kind != "file":
+        raise ValueError("recording file window에는 file NoiseProgram이 필요합니다")
+    frames = int(frames)
+    sample_rate = int(sample_rate)
+    fade_seconds = float(fade_seconds)
+    if frames <= 0 or sample_rate <= 0:
+        raise ValueError("frames와 sample_rate는 양수여야 합니다")
+    if not np.isfinite(fade_seconds) or fade_seconds < 0.0:
+        raise ValueError("fade_seconds는 0 이상 finite여야 합니다")
+
+    rendered = np.asarray(program.generate(frames), dtype=np.float32)
+    if rendered.shape != (frames,):
+        raise ValueError("file NoiseProgram 출력 shape가 요청 frame과 다릅니다")
+    ramp_frames = min(int(fade_seconds * sample_rate), frames // 2)
+    if ramp_frames > 0:
+        ramp = np.linspace(0.0, 1.0, ramp_frames, dtype=np.float32)
+        rendered[:ramp_frames] *= ramp
+        rendered[-ramp_frames:] *= ramp[::-1]
+    return rendered

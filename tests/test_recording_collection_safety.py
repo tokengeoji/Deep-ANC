@@ -15,7 +15,7 @@ import pytest
 import soundfile as sf
 
 from deep_anc.config import REPO_ROOT
-from deep_anc.realtime.noise_gen import NoiseProgram
+from deep_anc.realtime.noise_gen import NoiseProgram, render_recording_file_window
 
 
 def _load(relative: str, name: str):
@@ -635,3 +635,76 @@ def test_noise_program_file_window_starts_at_planned_offset(tmp_path):
     observed = program.generate(3)
     expected = samples[10:13] / np.max(np.abs(samples)) * 0.1
     np.testing.assert_allclose(observed, expected, atol=1e-6)
+
+
+def test_recording_file_window_does_not_consume_settle_and_binds_fade(tmp_path):
+    source = tmp_path / "nonperiodic.wav"
+    samples = np.linspace(-0.9, 0.7, 80, dtype=np.float32)
+    sf.write(source, samples, 10, subtype="FLOAT")
+    program = NoiseProgram(
+        {
+            "type": "file",
+            "file": str(source),
+            "file_start_seconds": 2.0,
+            "amplitude": 0.15,
+        },
+        10,
+    )
+
+    observed = render_recording_file_window(
+        program,
+        20,
+        sample_rate=10,
+        fade_seconds=0.2,
+    )
+    peak = np.max(np.abs(samples)) + 1e-9
+    expected = (samples[20:40] / peak * 0.15).astype(np.float32)
+    ramp = np.linspace(0.0, 1.0, 2, dtype=np.float32)
+    expected[:2] *= ramp
+    expected[-2:] *= ramp[::-1]
+
+    np.testing.assert_array_equal(observed, expected)
+    # settle 1초를 소비한 옛 동작이면 첫 audible 원본 index는 30이 된다.
+    shifted = (samples[30:50] / peak * 0.15).astype(np.float32)
+    shifted[:2] *= ramp
+    shifted[-2:] *= ramp[::-1]
+    assert not np.array_equal(observed, shifted)
+
+
+def test_record_duct_file_timeline_keeps_settle_exact_zero(tmp_path):
+    source = tmp_path / "timeline.wav"
+    samples = np.linspace(-1.0, 0.5, 80, dtype=np.float32)
+    sf.write(source, samples, 10, subtype="FLOAT")
+    program = NoiseProgram(
+        {
+            "type": "file",
+            "file": str(source),
+            "file_start_seconds": 2.0,
+            "amplitude": 0.15,
+        },
+        10,
+    )
+    timeline = RECORD._prepare_file_source_timeline(
+        program,
+        settle_frames=10,
+        keep_frames=20,
+        sample_rate=10,
+    )
+    assert timeline.shape == (30,)
+    np.testing.assert_array_equal(timeline[:10], np.zeros(10, dtype=np.float32))
+
+    fresh_program = NoiseProgram(
+        {
+            "type": "file",
+            "file": str(source),
+            "file_start_seconds": 2.0,
+            "amplitude": 0.15,
+        },
+        10,
+    )
+    expected = render_recording_file_window(
+        fresh_program,
+        20,
+        sample_rate=10,
+    )
+    np.testing.assert_array_equal(timeline[10:], expected)

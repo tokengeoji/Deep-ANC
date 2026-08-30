@@ -18,7 +18,7 @@ import deep_anc.data.recorded_generation as generation
 import deep_anc.data.transfer_contract as transfer_contract
 from deep_anc import config as config_module
 from deep_anc.data.holdout_contract import snapshot_regular_tree_metadata
-from deep_anc.realtime.noise_gen import NoiseProgram
+from deep_anc.realtime.noise_gen import NoiseProgram, render_recording_file_window
 
 
 GENERATION_ID = "highband-v1"
@@ -52,11 +52,16 @@ def _write_recorded_session_artifacts(
 ) -> None:
     frames = int(round(seconds * 48_000))
     program = metadata["program"]
-    expected_source = NoiseProgram(
+    program_instance = NoiseProgram(
         program,
         48_000,
         file_bytes=source_path.read_bytes(),
-    ).generate(frames)
+    )
+    expected_source = render_recording_file_window(
+        program_instance,
+        frames,
+        sample_rate=48_000,
+    )
     session.mkdir(parents=True, exist_ok=True)
     sf.write(
         session / "mics.wav",
