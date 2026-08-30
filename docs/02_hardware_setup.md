@@ -158,14 +158,19 @@ dry-run은 출력·입력 장치를 열지 않고 디렉터리나 progress 파�
 
 ```bash
 .venv/bin/python scripts/data/record_session_batch.py \
-    --sources data/<사전_split_계획>.csv --limit <이번_연결창_세션수> --dry-run
+    --sources data/<사전_split_계획>.csv --limit <이번_연결창_세션수> \
+    --amplitude 0.06 --dry-run
 
 # 위 계획을 그대로 실행할 때만 세 확인을 붙인다.
 .venv/bin/python scripts/data/record_session_batch.py \
     --sources data/<사전_split_계획>.csv --limit <이번_연결창_세션수> \
+    --amplitude 0.06 \
     --confirm-user-present --confirm-volume-minimum --confirm-routing-and-geometry
 ```
 
+file playback 기본 amplitude는 기존 82세션과 같은 **0.06**이다. canonical additions는
+이 값을 exact로 강제하여 실측 브랜치의 단일 레벨 계약을 보존한다. 일반 diagnostic batch만
+명시적으로 다른 값을 줄 수 있으며 공용 peak 안전 상한 0.15는 그대로 적용된다.
 기본값은 **재시도 없음**이다. 동일 소스를 다시 울려야 할 근거를 확인한 경우에만
 `--retry-once`를 명시한다. 각 자식 세션은 `seconds + settle +
 --session-timeout-overhead-seconds` hard timeout을 가지며 stdout/stderr가 터미널과
@@ -179,6 +184,9 @@ atomic no-replace 발행한다. 실패 staging은
 `results/recording_failures/record_duct/`의 새 no-replace 경로에 통째로 봉인한다. 다만 프로세스
 강제 종료·전원 손실·첫 callback 전 실패는 메모리 raw가 없어 metadata/log만 남을 수 있으므로,
 실패 직후 자동 재생하지 말고 해당 증거부터 오프라인 분석한다.
+`record_duct.py`가 durable `failure.json`을 발행한 실패는 배치가 기계 판독 포인터를 검증해
+`batch_progress.csv`의 `failure_stage`, `detail`, `failure_artifact`, `failure_receipt` 및 receipt
+SHA에 기록한다. 따라서 stdout 마지막 안내 문구를 실패 원인으로 사용하지 않는다.
 
 ### Official P/S 연결 창 순서
 

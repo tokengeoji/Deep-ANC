@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -21,10 +22,88 @@ SELECTOR_RUNTIME_SCHEMA = "isolated_dns_selector_runtime/v2"
 PROTECTED_IGNORED_ROOTS = ("src", "scripts", "configs")
 SELECTOR_PYCACHE_PREFIX = "/dev/null/deep-anc-selector"
 GIT_EXECUTABLE = "/usr/bin/git"
+_FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_PROJECT_REQUIREMENT_RE = re.compile(
+    r"^deep[-_.]anc(?:\s*@\s*\S+|==\S+)$",
+    re.IGNORECASE,
+)
 
 
 class SourceTrustError(ValueError):
     """현재 source가 clean exact commit으로 증명되지 않는다."""
+
+
+def validate_environment_freeze_source_commit(
+    raw: bytes,
+    *,
+    expected_commit: str,
+) -> str:
+    """``pip freeze``의 유일한 editable Deep-ANC가 exact commit인지 검증한다.
+
+    Editable 설치는 현재 checkout의 Python source를 즉시 따라가지만, 과거에 저장한
+    ``pip freeze`` 파일은 이전 checkout SHA를 계속 담을 수 있다. 따라서 freeze의
+    파일 SHA만 결속해서는 code/environment 조합을 재현했다고 볼 수 없다.
+
+    이 검증기는 축약 SHA, missing/duplicate project requirement, non-editable local
+    package와 stale VCS revision을 모두 거부한다. 다른 package의 editable requirement는
+    Deep-ANC identity로 오인하지 않는다. 반환값은 검증된 requirement 한 줄이다.
+    """
+
+    expected = str(expected_commit)
+    if _FULL_COMMIT_RE.fullmatch(expected) is None:
+        raise SourceTrustError(
+            "environment freeze expected commit은 소문자 전체 40자리 SHA여야 합니다"
+        )
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise SourceTrustError("environment freeze receipt가 UTF-8이 아닙니다") from exc
+
+    project_lines: list[str] = []
+    for original in lines:
+        line = original.strip()
+        if not line or line.startswith("#"):
+            continue
+        lowered = line.lower()
+        if "#egg=deep_anc" in lowered or "#egg=deep-anc" in lowered:
+            project_lines.append(line)
+            continue
+        if _PROJECT_REQUIREMENT_RE.fullmatch(line) is not None:
+            project_lines.append(line)
+
+    if len(project_lines) != 1:
+        raise SourceTrustError(
+            "environment freeze에는 Deep-ANC project requirement가 정확히 하나여야 "
+            f"합니다: count={len(project_lines)}"
+        )
+    requirement = project_lines[0]
+    if not requirement.startswith("-e git+"):
+        raise SourceTrustError(
+            "environment freeze의 Deep-ANC는 editable VCS requirement여야 합니다"
+        )
+    url, separator, fragment = requirement[3:].partition("#")
+    if not separator:
+        raise SourceTrustError("Deep-ANC editable VCS requirement에 egg fragment가 없습니다")
+    egg_values = []
+    for item in fragment.split("&"):
+        key, equals, value = item.partition("=")
+        if equals and key.lower() == "egg":
+            egg_values.append(value.lower().replace("_", "-").replace(".", "-"))
+    if egg_values != ["deep-anc"]:
+        raise SourceTrustError(
+            "Deep-ANC editable VCS requirement의 egg identity가 exact하지 않습니다"
+        )
+    _remote, revision_separator, revision = url.rpartition("@")
+    if not revision_separator or _FULL_COMMIT_RE.fullmatch(revision) is None:
+        raise SourceTrustError(
+            "Deep-ANC editable VCS requirement는 전체 40자리 revision을 가져야 합니다"
+        )
+    if revision != expected:
+        raise SourceTrustError(
+            "environment freeze Deep-ANC commit이 expected checkout과 다릅니다: "
+            f"freeze={revision}, expected={expected}"
+        )
+    return requirement
 
 
 def _canonical_json_sha256(value: object) -> str:

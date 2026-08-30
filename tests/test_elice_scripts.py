@@ -22,6 +22,10 @@ from deep_anc.data.holdout_contract import (
     snapshot_regular_tree_metadata,
 )
 from deep_anc.data.public_lineage import canonical_json_sha256
+from deep_anc.data.source_trust import (
+    SourceTrustError,
+    validate_environment_freeze_source_commit,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +126,8 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert 'ENVIRONMENT_RECEIPT="$REPO/.venv/environment-freeze.txt"' in text
     assert "pip freeze --all" in text
     assert "grep -Fxq 'torch==2.5.1+cu121'" in text
+    assert "validate_environment_freeze_source_commit" in text
+    assert "기존 exact 환경을 재사용하고 freeze를 expected commit에 갱신했습니다" in text
     assert 'BOOTSTRAP_RECEIPT="$REPO/data/manifests/elice_bootstrap_receipt.json"' in text
     assert '"recorded_aggregate_sha256": summary["recorded_aggregate_sha256"]' in text
     assert '"schema_version": 2' in text
@@ -134,9 +140,17 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
         "if ! verify_transfer_manifest_anchor || ! hardware_storage_preflight"
     )
     environment_stage = text.index('echo "=== [1/6] 환경 (venv + torch cu121 + 패키지) ==="')
+    freeze_refresh = text.index("if environment_probe; then", environment_stage)
     full_transfer_gate = text.index('! verify_transfer_bundle "$VENV_PYTHON"; then')
     download_stage = text.index('echo "=== [2/6] 데이터 다운로드 (병렬) ==="')
-    assert preflight_exit < anchor_preflight < environment_stage < full_transfer_gate < download_stage
+    assert (
+        preflight_exit
+        < anchor_preflight
+        < environment_stage
+        < freeze_refresh
+        < full_transfer_gate
+        < download_stage
+    )
     assert "verify_transfer_manifest_anchor()" in text
     assert "full transfer validator에는 완성된 venv Python이 필요합니다" in text
     assert "GIT_NO_REPLACE_OBJECTS=1" in text
@@ -408,9 +422,54 @@ def test_setup_env_requires_exact_torch_cuda_and_writes_freeze_receipt():
     assert 'str(torch.version.cuda) != "12.1"' in text
     assert 'ENVIRONMENT_RECEIPT="$PWD/.venv/environment-freeze.txt"' in text
     assert "pip freeze --all" in text
+    assert "validate_environment_freeze_source_commit" in text
     assert text.index('mv -f "${ENVIRONMENT_RECEIPT}.building"') < text.index(
         'touch "$SETUP_MARKER"'
     )
+
+
+def _freeze_with_source(commit: str) -> bytes:
+    return (
+        "numpy==2.1.0\n"
+        "-e git+https://github.com/Roka-jsj/Deep-ANC.git@"
+        f"{commit}#egg=deep_anc\n"
+        "torch==2.5.1+cu121\n"
+    ).encode("utf-8")
+
+
+def test_environment_freeze_source_commit_parser_rejects_stale_and_ambiguous_lines():
+    expected = "a" * 40
+    stale = "b" * 40
+
+    assert (
+        validate_environment_freeze_source_commit(
+            b"-e git+https://example.invalid/other.git@"
+            + b"c" * 40
+            + b"#egg=other_package\n"
+            + _freeze_with_source(expected),
+            expected_commit=expected,
+        )
+        == "-e git+https://github.com/Roka-jsj/Deep-ANC.git@"
+        f"{expected}#egg=deep_anc"
+    )
+    with pytest.raises(SourceTrustError, match="expected checkout과 다릅니다"):
+        validate_environment_freeze_source_commit(
+            _freeze_with_source(stale), expected_commit=expected
+        )
+    with pytest.raises(SourceTrustError, match="정확히 하나"):
+        validate_environment_freeze_source_commit(
+            b"torch==2.5.1+cu121\n", expected_commit=expected
+        )
+    with pytest.raises(SourceTrustError, match="정확히 하나"):
+        validate_environment_freeze_source_commit(
+            _freeze_with_source(expected) + _freeze_with_source(expected),
+            expected_commit=expected,
+        )
+    with pytest.raises(SourceTrustError, match="전체 40자리 revision"):
+        validate_environment_freeze_source_commit(
+            _freeze_with_source(expected).replace(expected.encode(), b"deadbeef"),
+            expected_commit=expected,
+        )
 
 
 def _make_bootstrap_git_repo(tmp_path: Path) -> tuple[Path, str]:

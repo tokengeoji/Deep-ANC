@@ -162,6 +162,41 @@ CANONICAL_DATA_DISTRIBUTION = {
     # timeline을 만든다. 이름만 보고 override를 허용하면 다른 학습분포가 된다.
     "closed_loop": CANONICAL_CLOSED_LOOP_DATA,
 }
+# measured 70:30 stream을 소비하는 ``measured_probe``와
+# ``canonical_finetune``은 init의 *완료 방식*만 다르다. P/S, recorded population,
+# coverage, lineage와 달성 가능 상한은 같은 Stage-1 admission을 통과해야 한다.
+# 이 21개 키를 role별로 복사해 두면 probe가 coverage/source-pool을 생략하거나 더 낮은
+# consistency로 실행될 수 있으므로 여기 한 벌만 권위로 둔다.
+CANONICAL_FINETUNE_READINESS_POLICY = {
+    "required_path_band_hz": [150, 1600],
+    "min_path_consistency": 0.9406,
+    "required_recorded_ratio": 0.7,
+    "min_recorded_sessions": 80,
+    "min_recorded_duration_seconds": 5400,
+    "required_source_families": ["speech", "music", "environment", "machine"],
+    "target_cancellation_db": 1.0,
+    "cancellation_ceiling_margin_db": 0.5,
+    "measured_design_ceiling_db": 2.15,
+    "measured_design_ceiling_band_hz": [150, 1600],
+    "min_groups_per_family_per_split": 4,
+    "recorded_subband_coverage_report_dir": (
+        "results/data_audit/recorded_subband_coverage"
+    ),
+    "min_source_err_coherence": 0.60,
+    "min_ref_err_coherence": 0.60,
+    "recorded_source_pool_csv": [
+        "data/source_pool_v2/sources.csv",
+        "data/source_pool/sources.csv",
+    ],
+    "max_measured_delay_mismatch_samples": 64,
+    "min_delay_crosscheck_sessions": 8,
+    "max_init_lead_mismatch_samples": 16,
+    "require_completed_init_checkpoint": True,
+    "max_init_best_metric_db": 0.0,
+    "allowed_init_physics_statuses": [
+        "secondary_surrogate_representation_pretrain"
+    ],
+}
 # ``measured_probe``는 surrogate pilot의 학습 곡선을 measured P에서 한 번 더
 # 보는 synthetic-only 진단이 아니다. 선택된 20k pilot의 weight를 시작점으로
 # canonical recorded train 70% + synthetic 30%를 정확히 5k step 학습하는 짧은
@@ -179,10 +214,7 @@ CANONICAL_MEASURED_PROBE_POLICY = {
     "require_init_eligible": False,
     "recorded_manifest": CANONICAL_RECORDED_MANIFEST,
     "recorded_ratio": CANONICAL_RECORDED_RATIO,
-    "readiness": {
-        "required_path_band_hz": [150, 1600],
-        "max_init_lead_mismatch_samples": 16,
-    },
+    "readiness": CANONICAL_FINETUNE_READINESS_POLICY,
 }
 CANONICAL_FINETUNE_POLICY = {
     "experiment_role": "canonical_finetune",
@@ -192,6 +224,7 @@ CANONICAL_FINETUNE_POLICY = {
     "require_recorded_manifest": True,
     "required_init_experiment_role": "canonical_pretrain",
     "require_init_eligible": True,
+    "require_init_completion_receipt": True,
     "contract_run_dir": True,
     "required_world_size": 1,
     "stage": "open_loop",
@@ -282,31 +315,6 @@ CANONICAL_PRETRAIN_POLICY = {
     "required_world_size": 1,
     "contract_run_dir": True,
 }
-CANONICAL_FINETUNE_READINESS_POLICY = {
-    "required_path_band_hz": [150, 1600],
-    "min_path_consistency": 0.9406,
-    "required_recorded_ratio": 0.7,
-    "min_recorded_sessions": 80,
-    "min_recorded_duration_seconds": 5400,
-    "required_source_families": ["speech", "music", "environment", "machine"],
-    "target_cancellation_db": 1.0,
-    "cancellation_ceiling_margin_db": 0.5,
-    "measured_design_ceiling_db": 2.15,
-    "measured_design_ceiling_band_hz": [150, 1600],
-    "min_groups_per_family_per_split": 4,
-    "min_source_err_coherence": 0.60,
-    "min_ref_err_coherence": 0.60,
-    "max_measured_delay_mismatch_samples": 64,
-    "min_delay_crosscheck_sessions": 8,
-    "max_init_lead_mismatch_samples": 16,
-    "require_completed_init_checkpoint": True,
-    "max_init_best_metric_db": 0.0,
-    "allowed_init_physics_statuses": [
-        "secondary_surrogate_representation_pretrain"
-    ],
-}
-
-
 def _resolve_path(path: str | Path) -> Path:
     """상대 경로는 저장소 루트 기준으로 해석한다 (실행 위치와 무관하게 동작)."""
     p = Path(path).expanduser()

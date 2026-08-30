@@ -830,22 +830,55 @@ write_environment_receipt() {
     rm -f "$building"
     return 1
   fi
+  if ! validate_environment_receipt "$building"; then
+    rm -f "$building"
+    return 1
+  fi
   mv -f "$building" "$ENVIRONMENT_RECEIPT"
+}
+
+validate_environment_receipt() {
+  local receipt_path=${1:-$ENVIRONMENT_RECEIPT}
+  [ -s "$receipt_path" ] || return 1
+  PYTHONDONTWRITEBYTECODE=1 "$VENV_PYTHON" -B - \
+      "$receipt_path" "$EXPECTED_COMMIT" <<'PY'
+import sys
+from pathlib import Path
+
+from deep_anc.data.source_trust import (
+    SourceTrustError,
+    validate_environment_freeze_source_commit,
+)
+
+try:
+    validate_environment_freeze_source_commit(
+        Path(sys.argv[1]).read_bytes(), expected_commit=sys.argv[2]
+    )
+except (OSError, SourceTrustError) as exc:
+    print(f"[오류] environment freeze source 결속 실패: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 environment_complete() {
   [ -f "$SETUP_MARKER" ] && [ -s "$ENVIRONMENT_RECEIPT" ] &&
-    grep -Fxq 'torch==2.5.1+cu121' "$ENVIRONMENT_RECEIPT" && environment_probe
+    grep -Fxq 'torch==2.5.1+cu121' "$ENVIRONMENT_RECEIPT" &&
+    validate_environment_receipt "$ENVIRONMENT_RECEIPT" && environment_probe
 }
 
 echo "=== [1/6] 환경 (venv + torch cu121 + 패키지) ==="
-# 완료 마커 도입 전부터 사용하던 인스턴스는 전체 요구 패키지와 CUDA probe를
-# 통과하는 경우에만 마커를 이관한다. 유효한 환경을 불필요하게 재설치하지 않는다.
-if [ ! -f "$SETUP_MARKER" ] && environment_probe; then
-  if write_environment_receipt; then
-    touch "$SETUP_MARKER"
-    echo "[setup] 기존 exact 환경에 freeze receipt와 완료 마커를 생성했습니다."
+# 완료 마커가 있더라도 editable install은 현재 checkout을 따라가는 반면 과거 freeze
+# bytes에는 이전 commit이 남을 수 있다. import/CUDA가 exact한 기존 venv는 재설치하지
+# 않고 매 bootstrap source commit에서 freeze만 atomic 갱신·검증한다.
+if environment_probe; then
+  if ! write_environment_receipt; then
+    echo "[오류] 기존 exact 환경의 freeze를 현재 expected commit에 결속하지 못했습니다." >&2
+    exit 1
   fi
+  if [ ! -f "$SETUP_MARKER" ]; then
+    touch "$SETUP_MARKER"
+  fi
+  echo "[setup] 기존 exact 환경을 재사용하고 freeze를 expected commit에 갱신했습니다."
 fi
 if ! environment_complete; then
   echo "[setup] 완료 마커/import/CUDA probe 중 하나가 유효하지 않아 환경을 구성합니다."
@@ -1615,6 +1648,10 @@ from deep_anc.data.recorded_subband_coverage import (
     recorded_subband_coverage_report_path,
     validate_recorded_subband_coverage_report,
 )
+from deep_anc.data.source_trust import (
+    SourceTrustError,
+    validate_environment_freeze_source_commit,
+)
 from deep_anc.data.transfer_contract import validate_transfer_manifest
 
 root = Path(os.path.abspath(sys.argv[1]))
@@ -1659,8 +1696,17 @@ environment = read_regular_file_snapshot(
     environment_path,
     root=root,
     label="Elice environment freeze receipt",
-    capture_bytes=False,
+    capture_bytes=True,
 )
+assert environment.data is not None
+try:
+    validate_environment_freeze_source_commit(
+        environment.data, expected_commit=expected_commit
+    )
+except SourceTrustError as exc:
+    raise SystemExit(
+        f"receipt 작성 시 environment freeze source 결속 실패: {exc}"
+    ) from exc
 coverage_cfg = load_train_config(
     root / "configs/train_pretrain_tiny.yaml",
     [

@@ -1,7 +1,7 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-29. 현행 통합 개발 브랜치: `dev`.
+> 최종 갱신: 2026-08-30. 현행 통합 개발 브랜치: `dev`.
 
 ## 0. 통합 상태와 절대 판정 (2026-08-29)
 
@@ -293,6 +293,75 @@ generation validator는 planned start에서 fade 없이 재유도한 코드 계�
    receipt/plan을 다시 결속하고 무음 dry-run을 통과한 뒤 같은 generation의 row 2를 새
    explicit attempt로 녹음한다.
 5. 수정·검증 전에 소리를 반복하지 않고, 재실행도 새 출력 창 보고와 승인 뒤에만 한다.
+
+### 0.12 2026-08-30 amplitude·capture gate·Elice freeze 후속 복구
+
+수정된 exact file renderer로 첫 행을 다시 확인했을 때 settle 48,000 frame 뒤의 15초
+source가 현재 계획에서 렌더한 bytes와 max error 0으로 일치했다. 그러나 당시 CLI amplitude가
+`0.15`였으므로 기존 82세션의 단일 레벨 `0.06` 계약과 달랐고, 다음 측정값으로 capture gate가
+실패했다.
+
+- 실패 raw: `results/recording_failures/record_duct/20260830_120721_461980_timeline_gate_9a157941/`
+- `failure.json` SHA-256:
+  `246281a690c201c05ab187f8b29152b86acfa533c79ecad3218be602720dbee8`
+- `mics.wav` SHA-256:
+  `fffa87bfd40542d27ea99ff3a3209c7f4648610e7e484092a173a3fadf98ccad`
+- 저역/고역/REF 코히런스: `0.859238 / 0.594673 / 0.857512`
+- raw valid-window ratio `0.915254`, 잔여 robust std `2.49684`, p95−p5 `11.8999`
+- xrun/clip 0, active additions session 0
+
+따라서 이 raw는 수정·승격하지 않고 실패 증거로 보존한다. canonical additions amplitude는
+기존 82세션과 같은 exact `0.06`으로 코드·batch·최종 generation에 모두 강제했다. 신규
+capture는 저역/고역/REF 코히런스, raw/aligned valid-window ratio, 잔여 지연 robust std와
+p95−p5의 일곱 조건을 공용 `RecordedCaptureGateContract`로 publish 전에 판정한다. durable
+`failure.json`은 symlink component를 거부하고 같은 file descriptor에서 snapshot/SHA를
+읽은 경우에만 batch progress 근거로 채택한다. resume과 최종 generation도 같은 계약을
+재계산한다.
+
+기존 82세션은 raw WAV 전체 reissue QA에서 `82/82 PASS`, 오류·경고 0, 95.67분, 61 group을
+재확인했다. 결과는
+`results/data_audit/recorded_qa_reissue/20260830_post_capture_gate/recorded_qa.json`
+(SHA-256 `484599c489c9c6d4daaf2e4cece1f327cfb44af777e5c02e077a6957d7f04db9`)에
+보존했다. 이는 82세션이 Stage-1 자료로 유효하다는 증거이며 2/4/8 kHz full-octave authority로
+승격하는 증거는 아니다.
+
+Elice의 기존 venv는 현재 checkout을 import했지만 저장된 `environment-freeze.txt`가 과거
+commit을 가리키고 있었다. bootstrap/setup은 venv를 재사용하더라도 freeze를 원자 재생성하고,
+유일한 Deep-ANC editable VCS requirement의 전체 40자리 SHA가 `--expected-commit`과 exact할
+때만 진행하도록 고쳤다. transfer/DNS receipt 소비측도 stale source commit을 새 외부 SHA로
+재봉인하는 우회를 거부한다. A100 80GB와 public raw/decoder audit는 보존하며 36 GB를 다시
+받지 않는다.
+
+현재 실제 다음 순서는 **전체 pytest 0 FAIL → clean exact dev commit/push → 같은 commit의
+Elice bootstrap/DNS selector 재결속 → 0.06 첫 15초 세션 1개 → 즉시 일곱 gate QA → PASS일
+때만 나머지 16개**다. dirty tree를 우회한 녹음, 0.15 재시도, 실패 세션 자동 반복은 금지한다.
+99세션 transfer/bootstrap 뒤 readiness가 init만 FAIL인 상태가 되기 전에는 GPU pilot을
+시작하지 않는다.
+
+### 0.13 파인튜닝 준비 완료 후 Git history 정리 예약
+
+사용자 지시에 따라 준비 과정의 미세한 수정 commit을 최종 history에 그대로 누적하지 않는다.
+다만 bootstrap/DNS selection/recording/transfer receipt가 exact commit SHA에 결속되는 동안에는
+rebase로 그 근거를 무효화하지 않는다. 현재 `dev` 고유 이력은 155개 commit과 3개 merge라
+직접 interactive rebase의 누락 위험이 크다. 따라서 **현재 코드·테스트 준비가 clean 상태로
+고정된 뒤, 성공 canonical 17세션과 checkpoint를 만들기 직전** 다음 절차로 한 번만 정리한다.
+이 시점이 사용자 지시의 “파인튜닝 준비 코드 완료 후”이며, 이미 녹음·pilot을 만든 뒤 SHA를
+다시 바꾸는 비용을 피하는 마지막 안전 창이다.
+
+1. 현재 `dev` tip을 remote backup ref로 보존하고 local/remote SHA를 기록한다.
+2. `main`은 변경하지 않는다. 별도 review worktree에서 최종 tree를 다음 7개 중요 단계로
+   재구성한다: timing/measurement 불변식, strict P/S·계보·Stage-1 readiness, exact-env·
+   checkpoint·학습 계약, full-octave source/loss/batch 계약, Jetson clock/witness/acquisition,
+   physical G4 fail-closed gate, 최종 Elice/recording 통합 복구.
+3. private key, token, raw corpus, run artifact가 commit에 들어오지 않았는지 전 history를 검사한다.
+4. old/new tree SHA가 byte-exact인지 먼저 확인하고, 정리된 새 `dev`에서 전체 pytest,
+   `git diff --check`, bootstrap/selector/transfer/readiness의 exact-SHA 검증을 다시 수행한다.
+   rebase 전 receipt를 새 SHA의 증거로 재사용하지 않는다.
+5. old/new merge-base와 backup ref를 출력해 검토한 뒤 `--force-with-lease`로만 `dev`를 갱신한다.
+6. canonical fine-tune과 현장 평가가 합격하기 전에는 `main`에 병합하지 않는다.
+
+즉 history 정리는 예약돼 있지만, 현재 유효 데이터 수집을 앞두고 SHA를 계속 바꾸는 식으로
+실행하지 않는다.
 
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선

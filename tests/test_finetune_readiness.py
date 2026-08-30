@@ -3919,6 +3919,47 @@ def test_init_checkpoint_band_exactly_equal_to_the_finetune_band_passes(tmp_path
     )["ok"]
 
 
+@pytest.mark.parametrize(
+    (
+        "role",
+        "required_init_role",
+        "require_receipt",
+        "expected_completion_step",
+    ),
+    [
+        ("measured_probe", "loss_pilot", False, 20_000),
+        ("canonical_finetune", "canonical_pretrain", True, None),
+    ],
+)
+def test_readiness_separates_operational_completion_from_completion_receipt(
+    tmp_path,
+    monkeypatch,
+    role,
+    required_init_role,
+    require_receipt,
+    expected_completion_step,
+):
+    cfg = _ready_config(tmp_path)
+    cfg.update(
+        experiment_role=role,
+        required_init_experiment_role=required_init_role,
+        require_init_completion_receipt=require_receipt,
+    )
+    observed = {}
+
+    def _audit_init(*_args, **kwargs):
+        observed.update(kwargs)
+        return {"fixture": True}
+
+    monkeypatch.setattr(readiness, "audit_init_checkpoint", _audit_init)
+    audit_finetune_readiness(cfg, full_recorded_qa=False)
+
+    assert observed["require_completed"] is True
+    assert observed["require_completion_receipt"] is require_receipt
+    assert observed["expected_completion_step"] == expected_completion_step
+    assert observed["required_experiment_role"] == required_init_role
+
+
 def test_the_shipped_init_checkpoints_are_high_frequency_amplifiers():
     """출하 상태 확인 — 배포 후보 init checkpoint 가 실제로 이 게이트에 걸린다.
 

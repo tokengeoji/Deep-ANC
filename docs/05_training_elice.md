@@ -15,6 +15,11 @@ canonical 데이터 계약과 환경만 준비하며 학습을 자동 시작하�
 | 공식 world size | 1 |
 
 bootstrap은 실제 GPU 이름/메모리, 가용 디스크, Python/torch/CUDA 환경 receipt를 검증한다.
+기존 `.venv`를 재사용할 때도 `.setup-complete`만 신뢰하지 않는다. editable 설치가 현재
+checkout을 가리키는지 확인한 뒤 `environment-freeze.txt`를 원자적으로 다시 만들고,
+그 안의 유일한 Deep-ANC VCS requirement가 `--expected-commit` 전체 40자리와 exact할 때만
+transfer 검증·public download·최종 bootstrap receipt 발행으로 진행한다. freeze 파일 SHA를
+새로 봉인하는 것만으로 과거 source SHA를 현재 commit으로 승격할 수 없다.
 200–500 step smoke에서 VRAM, 처리량과 ETA를 기록하기 전에는 장기 인스턴스를 방치하지 않는다.
 
 ## 2. Jetson에서 먼저 고정할 입력

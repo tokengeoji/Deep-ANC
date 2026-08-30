@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import importlib.util
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -802,8 +803,17 @@ def test_measured_probe_policy_uses_current_generation_manifest():
             "recorded_generation_sha256": "a" * 64,
         }
     }
-    probe_cfg = dict(campaign_evidence_module.CANONICAL_MEASURED_PROBE_POLICY)
+    probe_cfg = deepcopy(campaign_evidence_module.CANONICAL_MEASURED_PROBE_POLICY)
     probe_cfg["recorded_manifest"] = generation_manifest
+
+    assert len(probe_cfg["readiness"]) == 21
+    assert probe_cfg["readiness"]["recorded_subband_coverage_report_dir"] == (
+        "results/data_audit/recorded_subband_coverage"
+    )
+    assert probe_cfg["readiness"]["recorded_source_pool_csv"] == [
+        "data/source_pool_v2/sources.csv",
+        "data/source_pool/sources.csv",
+    ]
 
     campaign_evidence_module._validate_measured_probe_distribution_policy(
         probe_cfg, canonical_cfg, label="fixture probe"
@@ -813,6 +823,21 @@ def test_measured_probe_policy_uses_current_generation_manifest():
         campaign_evidence_module.CANONICAL_RECORDED_VAL_MANIFEST
     )
     with pytest.raises(ValueError, match="recorded_manifest"):
+        campaign_evidence_module._validate_measured_probe_distribution_policy(
+            probe_cfg, canonical_cfg, label="fixture probe"
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    ["recorded_subband_coverage_report_dir", "recorded_source_pool_csv"],
+)
+def test_campaign_rejects_measured_probe_without_shared_readiness_gate(missing_key):
+    canonical_cfg = {"data": {}}
+    probe_cfg = deepcopy(campaign_evidence_module.CANONICAL_MEASURED_PROBE_POLICY)
+    probe_cfg["readiness"].pop(missing_key)
+
+    with pytest.raises(ValueError, match="readiness"):
         campaign_evidence_module._validate_measured_probe_distribution_policy(
             probe_cfg, canonical_cfg, label="fixture probe"
         )

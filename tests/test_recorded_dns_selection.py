@@ -150,7 +150,10 @@ def _write_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     freeze_path = tmp_path / ".venv/environment-freeze.txt"
     freeze_path.parent.mkdir(parents=True)
     freeze_path.write_text(
-        "cffi==1.0\nnumpy==1.26.4\nscipy==1.11.4\nsoundfile==0.14.0\n"
+        "cffi==1.0\n"
+        "-e git+https://github.com/Roka-jsj/Deep-ANC.git@"
+        f"{commit}#egg=deep_anc\n"
+        "numpy==1.26.4\nscipy==1.11.4\nsoundfile==0.14.0\n"
     )
     freeze_sha = _sha(freeze_path.read_bytes())
     bootstrap_path = tmp_path / "data/manifests/elice_bootstrap_receipt.json"
@@ -1053,6 +1056,37 @@ def test_dns_receipt_rejects_runtime_or_freeze_rebinding_even_if_resealed(
         selection.validate_dns_selection_receipt(
             repo_root=freeze_root,
             receipt_path=receipt.relative_to(freeze_root).as_posix(),
+        )
+
+
+def test_dns_receipt_rejects_fully_resealed_stale_editable_freeze(
+    tmp_path, monkeypatch
+):
+    receipt, payload, _parent = _write_receipt_fixture(tmp_path, monkeypatch)
+    current = str(payload["source_commit"])
+    stale = ("0" if current[0] != "0" else "1") + current[1:]
+    freeze = tmp_path / payload["environment_freeze"]["path"]
+    freeze.write_bytes(freeze.read_bytes().replace(current.encode(), stale.encode()))
+    freeze_sha = _sha(freeze.read_bytes())
+    for key in ("environment_freeze_origin", "environment_freeze"):
+        payload[key]["sha256"] = freeze_sha
+        payload[key]["size"] = freeze.stat().st_size
+    payload["selector_runtime"]["environment_freeze_sha256"] = freeze_sha
+
+    bootstrap = tmp_path / payload["bootstrap_receipt"]["path"]
+    bootstrap_payload = json.loads(bootstrap.read_text(encoding="utf-8"))
+    bootstrap_payload["environment"]["freeze_receipt_sha256"] = freeze_sha
+    bootstrap.write_text(json.dumps(bootstrap_payload) + "\n", encoding="utf-8")
+    bootstrap_sha = _sha(bootstrap.read_bytes())
+    for key in ("bootstrap_receipt_origin", "bootstrap_receipt"):
+        payload[key]["sha256"] = bootstrap_sha
+        payload[key]["size"] = bootstrap.stat().st_size
+    _reseal(receipt, payload)
+
+    with pytest.raises(selection.DNSSelectionError, match="source 결속 실패"):
+        selection.validate_dns_selection_receipt(
+            repo_root=tmp_path,
+            receipt_path=receipt.relative_to(tmp_path).as_posix(),
         )
 
 

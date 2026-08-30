@@ -38,9 +38,14 @@ from deep_anc.data.manifest import (  # noqa: E402
     validate_group_id,
     validate_source_family,
 )
+from deep_anc.data.holdout_contract import (  # noqa: E402
+    read_regular_file_snapshot,
+    reject_symlink_components,
+)
 from deep_anc.data.recorded_generation import (  # noqa: E402
     ADDITION_SESSION_COUNT,
     ADDITIONS_ROOT,
+    CANONICAL_RECORDING_AMPLITUDE,
     RecordedGenerationError,
     SOURCE_PLAN_FIELDS,
     SOURCE_PLAN_ROOT,
@@ -55,6 +60,7 @@ from deep_anc.eval.artifacts import write_csv  # noqa: E402
 MAX_CLIP_RATIO = 0.0
 MIN_ERR_RMS_DBFS = -60.0
 MAX_ERR_PEAK = 0.95
+FAILURE_RECEIPT_MARKER = "DEEP_ANC_RECORD_DUCT_FAILURE_JSON="
 
 # record_duct의 input-only probe(앞 1초 settle + 뒤 2초 판정)와 CPU idle witness.
 # 실제 출력 시간과 혼동하지 않도록 dry-run에서 별도 항목으로 표시한다.
@@ -67,6 +73,15 @@ class ChildResult:
     stdout: str
     stderr: str
     timed_out: bool
+
+
+@dataclass(frozen=True)
+class ChildFailureEvidence:
+    stage: str
+    reason: str
+    artifact: Path
+    receipt: Path
+    receipt_sha256: str
 
 
 def _repo_path(value: str | Path) -> Path:
@@ -561,6 +576,104 @@ def run_child_live(command: list[str], *, timeout_seconds: float, log_path: Path
     )
 
 
+def _read_child_failure_evidence(
+    result: ChildResult, *, failed_root: Path
+) -> ChildFailureEvidence | None:
+    """record_duct가 발행한 durable failure receipt를 검증해 읽는다.
+
+    stderr marker 자체는 위치 힌트일 뿐 권위 자료가 아니다. 해당 경로가 이번 failure
+    root 내부의 non-symlink directory인지, ``failure.json``이 regular file인지, marker와
+    receipt의 stage/reason이 같은지까지 확인한 경우에만 progress 근거로 채택한다.
+    """
+
+    marker_lines = [
+        line[len(FAILURE_RECEIPT_MARKER) :]
+        for line in result.stderr.splitlines()
+        if line.startswith(FAILURE_RECEIPT_MARKER)
+    ]
+    expected_root = _lexical_repo_path(failed_root)
+    filesystem_root = Path(expected_root.anchor)
+    try:
+        expected_root = reject_symlink_components(
+            expected_root,
+            root=filesystem_root,
+        )
+    except (OSError, ValueError):
+        return None
+    for raw_marker in reversed(marker_lines):
+        try:
+            marker = json.loads(raw_marker)
+            required = {
+                "schema_version",
+                "failure_stage",
+                "failure_reason",
+                "failure_artifact",
+                "failure_receipt",
+            }
+            if not isinstance(marker, dict) or not required.issubset(marker):
+                continue
+            if marker["schema_version"] != 1:
+                continue
+            stage = marker["failure_stage"]
+            reason = marker["failure_reason"]
+            if (
+                not isinstance(stage, str)
+                or not stage
+                or not isinstance(reason, str)
+                or not reason
+            ):
+                continue
+            if not os.path.isabs(str(marker["failure_artifact"])):
+                continue
+            if not os.path.isabs(str(marker["failure_receipt"])):
+                continue
+            artifact = Path(os.path.abspath(str(marker["failure_artifact"])))
+            receipt = Path(os.path.abspath(str(marker["failure_receipt"])))
+            artifact.relative_to(expected_root)
+            artifact = reject_symlink_components(artifact, root=expected_root)
+            if not artifact.is_dir():
+                continue
+            if receipt != artifact / "failure.json":
+                continue
+            snapshot = read_regular_file_snapshot(
+                receipt,
+                root=expected_root,
+                label="record_duct failure receipt",
+                capture_bytes=True,
+            )
+            assert snapshot.data is not None
+            payload = json.loads(snapshot.data.decode("utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != 1
+                or payload.get("status") != "failed_capture"
+                or payload.get("failure_stage") != stage
+                or payload.get("failure_reason") != reason
+            ):
+                continue
+            return ChildFailureEvidence(
+                stage=stage,
+                reason=reason,
+                artifact=artifact,
+                receipt=receipt,
+                receipt_sha256=snapshot.sha256,
+            )
+        except (OSError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def _fallback_child_failure_detail(result: ChildResult) -> str:
+    """구형 record_duct/timeout을 위한 사람이 읽는 하위 호환 fallback."""
+
+    detail_lines = [
+        line
+        for line in (result.stderr + result.stdout).splitlines()
+        if line and not line.startswith(FAILURE_RECEIPT_MARKER)
+    ]
+    return detail_lines[-1] if detail_lines else "자식 산출물 없음"
+
+
 def _confirm_reconnect(reason: str) -> bool:
     """분리 안내 뒤 다음 출력 전에 현장 사용자의 재연결 확인을 다시 받는다."""
 
@@ -583,7 +696,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-root", default="data/recorded")
     parser.add_argument("--failed-root", default="results/recording_failures/record_duct")
     parser.add_argument("--log-root", default="results/recording_logs/record_session_batch")
-    parser.add_argument("--amplitude", type=float, default=0.15)
+    parser.add_argument(
+        "--amplitude",
+        type=float,
+        default=CANONICAL_RECORDING_AMPLITUDE,
+        help=(
+            "file 재생 진폭. 기본 0.06은 기존 82세션 단일 레벨 계약이며, "
+            "canonical additions에서도 exact 0.06을 강제합니다"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=None, help="이번 실행에서 녹음할 최대 세션 수")
     parser.add_argument("--families", nargs="+", default=None)
     parser.add_argument("--settle-seconds", type=float, default=1.0)
@@ -694,6 +815,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(
                 f"canonical additions source plan은 정확히 {ADDITION_SESSION_COUNT}행이어야 합니다"
             )
+        if args.amplitude != CANONICAL_RECORDING_AMPLITUDE:
+            parser.error(
+                "canonical additions 재생 진폭은 기존 82세션과 같은 exact "
+                f"{CANONICAL_RECORDING_AMPLITUDE:.2f}이어야 합니다"
+            )
         with sources_path.open(encoding="utf-8", newline="") as handle:
             fieldnames = tuple(csv.DictReader(handle).fieldnames or ())
         if fieldnames != SOURCE_PLAN_FIELDS:
@@ -755,6 +881,8 @@ def main(argv: list[str] | None = None) -> int:
         f"예상 audible: {audible_seconds:.1f}초 ({audible_seconds / 60.0:.2f}분)\n"
         f"예상 output-open: {output_open_seconds:.1f}초\n"
         f"예상 connected 상한(분석/저장 제외): {connected_upper_seconds:.1f}초\n"
+        f"재생 amplitude: {args.amplitude:.2f} "
+        f"(공용 peak 안전 상한 {MAX_RECORDING_OUTPUT_PEAK:.2f})\n"
         f"세션 hard timeout: 각 seconds + settle + {args.session_timeout_overhead_seconds:.1f}초\n"
         f"자동 재시도: {'실패당 1회(opt-in)' if args.retry_once else '없음'}"
     )
@@ -859,11 +987,22 @@ def main(argv: list[str] | None = None) -> int:
         }
         if result.returncode != 0 or len(created) != 1:
             row["verdict"] = "record_failed"
-            detail_lines = [line for line in (result.stderr + result.stdout).splitlines() if line]
-            detail = detail_lines[-1] if detail_lines else "자식 산출물 없음"
+            evidence = _read_child_failure_evidence(
+                result, failed_root=_repo_path(args.failed_root)
+            )
+            detail = (
+                evidence.reason
+                if evidence is not None
+                else _fallback_child_failure_detail(result)
+            )
             if len(created) > 1:
                 detail = f"자식이 session {len(created)}개를 발행함"
-            row["detail"] = detail[:200]
+            row["detail"] = detail
+            if evidence is not None:
+                row["failure_stage"] = evidence.stage
+                row["failure_artifact"] = str(evidence.artifact)
+                row["failure_receipt"] = str(evidence.receipt)
+                row["failure_receipt_sha256"] = evidence.receipt_sha256
             if canonical_rows is not None and created:
                 quarantined = []
                 for session_id in created:
@@ -876,7 +1015,11 @@ def main(argv: list[str] | None = None) -> int:
                             attempt=completed_attempt,
                         )
                     )
-                row["failure_artifact"] = ";".join(str(path) for path in quarantined)
+                quarantine_text = ";".join(str(path) for path in quarantined)
+                if row.get("failure_artifact"):
+                    row["failure_artifact"] += ";" + quarantine_text
+                else:
+                    row["failure_artifact"] = quarantine_text
             consecutive_failures += 1
             run_had_failure = True
             print(f"    [실패] {row['detail']}")

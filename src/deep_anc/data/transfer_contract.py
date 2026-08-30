@@ -27,7 +27,11 @@ from .recorded_generation import (
     RecordedGenerationError,
     validate_recorded_generation,
 )
-from .source_trust import SourceTrustError, exact_clean_source_evidence
+from .source_trust import (
+    SourceTrustError,
+    exact_clean_source_evidence,
+    validate_environment_freeze_source_commit,
+)
 
 
 TRANSFER_SCHEMA_VERSION = 1
@@ -1063,7 +1067,7 @@ def bind_recorded_transfer_config(
                 root / str(environment_receipt["freeze_receipt"]),
                 root=root,
                 label="bootstrap environment freeze receipt",
-                capture_bytes=False,
+                capture_bytes=True,
             )
         except HoldoutContractError as exc:
             raise TransferContractError(str(exc)) from exc
@@ -1071,6 +1075,16 @@ def bind_recorded_transfer_config(
             raise TransferContractError(
                 "bootstrap 이후 environment freeze receipt가 변경됐습니다"
             )
+        assert freeze_snapshot.data is not None
+        try:
+            validate_environment_freeze_source_commit(
+                freeze_snapshot.data,
+                expected_commit=str(receipt_payload["expected_commit"]),
+            )
+        except SourceTrustError as exc:
+            raise TransferContractError(
+                f"bootstrap environment freeze source 결속 실패: {exc}"
+            ) from exc
         configured_manifest = data_cfg.get("transfer_manifest")
         if configured_manifest is not None and configured_manifest != transfer_receipt["path"]:
             raise TransferContractError(

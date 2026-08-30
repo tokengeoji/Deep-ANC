@@ -23,6 +23,7 @@ import torch
 
 from ..audio_io import analyze_int32_input_probe
 from ..config import (
+    CANONICAL_LOSS_PILOT_STEPS,
     REPO_ROOT,
     loss_selection_sha256,
     validate_canonical_training_policy,
@@ -2115,6 +2116,8 @@ def audit_init_checkpoint(
     expected_optimize_band: FrequencyBand | None = None,
     max_lead_mismatch_samples: int = 0,
     require_completed: bool = True,
+    require_completion_receipt: bool | None = None,
+    expected_completion_step: int | None = None,
     max_best_metric_db: float = 0.0,
     allowed_physics_statuses: tuple[str, ...] = (
         "secondary_surrogate_representation_pretrain",
@@ -2123,7 +2126,18 @@ def audit_init_checkpoint(
     require_init_eligible: bool = False,
     expected_loss_selection_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """사전학습 best와 같은 run의 완료된 last를 함께 검증한다.
+    """init best와 같은 run의 완료된 last/receipt를 역할별로 검증한다.
+
+    ``require_completed``는 sibling ``last.pt``와 완료 step을 요구한다.
+    ``require_completion_receipt``는 그와 별개로 immutable ``completion.json``까지
+    요구한다. 값이 ``None``이면 기존 호출 호환을 위해 canonical role checkpoint에서만
+    receipt를 요구한다. 공식 호출부는 이 값을 명시한다.
+
+    ``expected_completion_step``이 있으면 schedule 전체가 아니라 그 exact operational
+    stop과 best/last의 ``run_until_step``을 함께 요구한다. 따라서 20k loss pilot은
+    completion receipt 없이 measured probe init이 될 수 있지만 19,999 step 또는
+    ``run_until_step``이 다른 checkpoint는 통과하지 못한다. 값이 없으면 기존처럼
+    ``schedule.total_steps`` 전체 완료를 요구한다.
 
     ``max_lead_mismatch_samples`` 는 **init checkpoint 에만** 적용되는 허용 오차다.
     기본 0(정확히 일치)이며, 늘리려면 설정에 명시적으로 적어야 한다.
@@ -2166,6 +2180,32 @@ def audit_init_checkpoint(
         raise ValueError("init checkpoint 모델 설정이 fine-tune 모델 설정과 다릅니다")
     experiment_role = str(saved_cfg.get("experiment_role", ""))
     strict_canonical_init = required_experiment_role is not None
+    if require_completion_receipt is not None and not isinstance(
+        require_completion_receipt, bool
+    ):
+        raise TypeError("require_completion_receipt는 bool 또는 None이어야 합니다")
+    completion_receipt_required = (
+        strict_canonical_init
+        if require_completion_receipt is None
+        else require_completion_receipt
+    )
+    if completion_receipt_required and not require_completed:
+        raise ValueError(
+            "completion receipt를 요구하려면 sibling last.pt 완료 검증도 필요합니다"
+        )
+    explicit_completion_step: int | None = None
+    if expected_completion_step is not None:
+        if isinstance(expected_completion_step, bool) or not isinstance(
+            expected_completion_step, int
+        ):
+            raise TypeError("expected_completion_step은 양의 정수여야 합니다")
+        explicit_completion_step = expected_completion_step
+        if explicit_completion_step <= 0:
+            raise ValueError("expected_completion_step은 양의 정수여야 합니다")
+        if not require_completed:
+            raise ValueError(
+                "expected_completion_step을 지정하려면 sibling last.pt 검증이 필요합니다"
+            )
     if strict_canonical_init:
         validate_embedded_experiment_contract(saved_cfg)
         validate_canonical_training_policy(saved_cfg)
@@ -2272,18 +2312,40 @@ def audit_init_checkpoint(
             )
         if strict_canonical_init:
             validate_embedded_experiment_contract(last_cfg)
-            validate_completion_receipt(
-                checkpoint.parent,
-                expected_role=str(required_experiment_role),
-                expected_init_eligible=True if require_init_eligible else None,
-            )
         schedule = last_cfg.get("schedule", {}) or {}
-        completion_target = int(schedule.get("total_steps", 0))
+        schedule_target = int(schedule.get("total_steps", 0))
+        if explicit_completion_step is None:
+            completion_target = schedule_target
+        else:
+            completion_target = explicit_completion_step
+            best_run_until = int(saved_cfg.get("run_until_step", -1))
+            last_run_until = int(last_cfg.get("run_until_step", -1))
+            if (
+                schedule_target <= 0
+                or completion_target > schedule_target
+                or best_run_until != completion_target
+                or last_run_until != completion_target
+            ):
+                raise ValueError(
+                    "init checkpoint operational completion 계약이 다릅니다: "
+                    f"expected={completion_target}, schedule={schedule_target}, "
+                    f"best run_until={best_run_until}, last run_until={last_run_until}"
+                )
         completion_step = int(last_state.get("step", -1))
         if completion_target <= 0 or completion_step != completion_target:
             raise ValueError(
                 "사전학습이 완료되지 않았습니다: "
                 f"last step={completion_step}, target={completion_target}"
+            )
+        if completion_receipt_required:
+            if not strict_canonical_init:
+                raise ValueError(
+                    "completion receipt 검증에는 required_experiment_role이 필요합니다"
+                )
+            validate_completion_receipt(
+                checkpoint.parent,
+                expected_role=str(required_experiment_role),
+                expected_init_eligible=True if require_init_eligible else None,
             )
 
     return {
@@ -2307,7 +2369,7 @@ def audit_init_checkpoint(
         "completion_target_step": completion_target,
         "completion_receipt": (
             str(checkpoint.parent / "completion.json")
-            if require_completed and strict_canonical_init
+            if require_completed and completion_receipt_required
             else None
         ),
     }
@@ -3950,6 +4012,7 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
                 "S(z) 신뢰 대역을 알 수 없어 init checkpoint 의 학습 대역을 검증할 수 "
                 "없습니다 — official_secondary_path 를 먼저 통과시키세요"
             )
+        required_init_role = cfg.get("required_init_experiment_role")
         init = audit_init_checkpoint(
             init_value,
             expected_model_cfg=cfg.get("model", {}),
@@ -3960,6 +4023,16 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
             ),
             require_completed=bool(
                 readiness_cfg.get("require_completed_init_checkpoint", True)
+            ),
+            require_completion_receipt=(
+                bool(cfg.get("require_init_completion_receipt", True))
+                if required_init_role is not None
+                else False
+            ),
+            expected_completion_step=(
+                CANONICAL_LOSS_PILOT_STEPS
+                if str(cfg.get("experiment_role", "")) == "measured_probe"
+                else None
             ),
             max_best_metric_db=float(
                 readiness_cfg.get("max_init_best_metric_db", 0.0)
@@ -3972,8 +4045,8 @@ def audit_finetune_readiness(cfg: dict, *, full_recorded_qa: bool = True) -> dic
                 )
             ),
             required_experiment_role=(
-                str(cfg["required_init_experiment_role"])
-                if cfg.get("required_init_experiment_role") is not None
+                str(required_init_role)
+                if required_init_role is not None
                 else None
             ),
             require_init_eligible=bool(cfg.get("require_init_eligible", False)),

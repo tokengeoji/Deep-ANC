@@ -38,6 +38,7 @@ from .source_trust import (
     SourceTrustError,
     exact_clean_source_evidence,
     exact_selector_runtime_evidence,
+    validate_environment_freeze_source_commit,
 )
 
 
@@ -811,6 +812,15 @@ def build_dns_selection_payload(
         raise DNSSelectionError(
             "Elice environment freeze bytes가 bootstrap receipt SHA와 다릅니다"
         )
+    assert freeze.data is not None
+    try:
+        validate_environment_freeze_source_commit(
+            freeze.data, expected_commit=commit
+        )
+    except SourceTrustError as exc:
+        raise DNSSelectionError(
+            f"Elice environment freeze source 결속 실패: {exc}"
+        ) from exc
     try:
         selector_runtime = exact_selector_runtime_evidence(
             root,
@@ -1354,6 +1364,14 @@ def validate_dns_selection_receipt(
         raise DNSSelectionError(
             "DNS environment freeze가 immutable bootstrap receipt와 다릅니다"
         )
+    try:
+        validate_environment_freeze_source_commit(
+            freeze.data, expected_commit=commit
+        )
+    except SourceTrustError as exc:
+        raise DNSSelectionError(
+            f"DNS environment freeze source 결속 실패: {exc}"
+        ) from exc
     _validate_selector_runtime_receipt(
         payload.get("selector_runtime"),
         freeze_raw=freeze.data,

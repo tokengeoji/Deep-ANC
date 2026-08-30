@@ -20,12 +20,15 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from deep_anc.config import (
     A100_PRETRAIN_SMOKE_POLICY_VERSION,
+    CANONICAL_FINETUNE_READINESS_POLICY,
+    CANONICAL_LOSS_PILOT_STEPS,
     REPO_ROOT,
     load_train_config,
     load_yaml,
 )
 import deep_anc.config as config_module
 from deep_anc.data.resumable_stream import indexed_rng, worker_global_item_indices
+from deep_anc.dsp.timing import FrequencyBand
 from deep_anc.train.checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -60,6 +63,7 @@ from deep_anc.train.experiment_contract import (
     stamp_experiment_contract,
     validate_resume_experiment,
 )
+from deep_anc.train.finetune_readiness import audit_init_checkpoint
 from deep_anc.train.reproducibility import _publish_or_validate
 from deep_anc.train.trainer import (
     cfg_snapshot,
@@ -638,10 +642,15 @@ def test_measured_primary_five_k_probe_is_an_explicit_distinct_contract():
     assert probe["require_init_eligible"] is False
     assert probe["recorded_manifest"] == "data/manifests/recorded_regrouped.jsonl"
     assert probe["recorded_ratio"] == 0.7
-    assert probe["readiness"] == {
-        "required_path_band_hz": [150, 1600],
-        "max_init_lead_mismatch_samples": 16,
-    }
+    assert probe["readiness"] == CANONICAL_FINETUNE_READINESS_POLICY
+    assert len(probe["readiness"]) == 21
+    assert probe["readiness"]["recorded_subband_coverage_report_dir"] == (
+        "results/data_audit/recorded_subband_coverage"
+    )
+    assert probe["readiness"]["recorded_source_pool_csv"] == [
+        "data/source_pool_v2/sources.csv",
+        "data/source_pool/sources.csv",
+    ]
     assert probe["experiment_contract"]["artifacts"]["recorded_manifest"][
         "exists"
     ]
@@ -718,6 +727,12 @@ def test_schema2_bootstrap_atomically_resolves_all_official_role_manifests(
         "required_init_experiment_role=canonical_pretrain",
         "require_init_eligible=true",
         "readiness.max_init_lead_mismatch_samples=0",
+        "readiness.min_path_consistency=0.9",
+        (
+            "readiness.recorded_subband_coverage_report_dir="
+            "results/data_audit/weakened"
+        ),
+        "readiness.recorded_source_pool_csv=data/source_pool_v2/sources.csv",
     ],
 )
 def test_measured_probe_cannot_weaken_recorded_70_30_or_selected_init_policy(
@@ -750,10 +765,20 @@ def _measured_probe_init_fixture(tmp_path: Path, *, last_step: int = 20_000):
     checkpoint_dir.mkdir(parents=True)
     best = checkpoint_dir / "best.pt"
     last = checkpoint_dir / "last.pt"
-    best_state = {"cfg": pilot, "model": {"weight": torch.ones(1)}, "step": 15_000}
+    best_state = {
+        "cfg": pilot,
+        "model": {"weight": torch.ones(1)},
+        "step": 15_000,
+        "best_metric": -1.0,
+    }
     torch.save(best_state, best)
     torch.save(
-        {"cfg": pilot, "model": {"weight": torch.ones(1)}, "step": last_step},
+        {
+            "cfg": pilot,
+            "model": {"weight": torch.ones(1)},
+            "step": last_step,
+            "best_metric": -1.0,
+        },
         last,
     )
     probe = _load_bound_canonical(
@@ -778,6 +803,92 @@ def test_measured_probe_requires_same_loss_completed_20k_pilot_before_gpu(tmp_pa
     torch.save(incomplete, best.with_name("last.pt"))
     with pytest.raises(ValueError, match="정확히 20k 완료"):
         validate_measured_probe_init_chain(best_state, probe, best)
+
+
+def test_readiness_accepts_exact_20k_pilot_without_completion_receipt(tmp_path):
+    best_state, probe, best = _measured_probe_init_fixture(tmp_path)
+    pilot = best_state["cfg"]
+    trusted_band = FrequencyBand.parse(pilot["trusted_band_hz"])
+
+    result = audit_init_checkpoint(
+        best,
+        expected_model_cfg=probe["model"],
+        expected_lead=int(probe["digital_reference_lead_samples"]),
+        expected_optimize_band=trusted_band,
+        max_lead_mismatch_samples=16,
+        require_completed=True,
+        require_completion_receipt=False,
+        expected_completion_step=CANONICAL_LOSS_PILOT_STEPS,
+        required_experiment_role="loss_pilot",
+        require_init_eligible=False,
+        expected_loss_selection_sha256=probe["loss_selection_sha256"],
+    )
+
+    assert not best.with_name("completion.json").exists()
+    assert result["completion_step"] == CANONICAL_LOSS_PILOT_STEPS
+    assert result["completion_target_step"] == CANONICAL_LOSS_PILOT_STEPS
+    assert result["completion_receipt"] is None
+
+
+def test_readiness_rejects_incomplete_20k_pilot_without_receipt_requirement(tmp_path):
+    best_state, probe, best = _measured_probe_init_fixture(
+        tmp_path, last_step=CANONICAL_LOSS_PILOT_STEPS - 1
+    )
+    pilot = best_state["cfg"]
+
+    with pytest.raises(ValueError, match="last step=19999, target=20000"):
+        audit_init_checkpoint(
+            best,
+            expected_model_cfg=probe["model"],
+            expected_lead=int(probe["digital_reference_lead_samples"]),
+            expected_optimize_band=FrequencyBand.parse(pilot["trusted_band_hz"]),
+            max_lead_mismatch_samples=16,
+            require_completed=True,
+            require_completion_receipt=False,
+            expected_completion_step=CANONICAL_LOSS_PILOT_STEPS,
+            required_experiment_role="loss_pilot",
+            require_init_eligible=False,
+            expected_loss_selection_sha256=probe["loss_selection_sha256"],
+        )
+
+
+def test_canonical_init_keeps_full_schedule_and_completion_receipt_requirement(
+    tmp_path,
+):
+    canonical = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml"
+    )
+    checkpoint_dir = tmp_path / "canonical" / "ckpt"
+    checkpoint_dir.mkdir(parents=True)
+    best = checkpoint_dir / "best.pt"
+    last = checkpoint_dir / "last.pt"
+    base_state = {
+        "cfg": canonical,
+        "model": {"weight": torch.ones(1)},
+        "best_metric": -1.0,
+    }
+    torch.save({**base_state, "step": 90_000}, best)
+    torch.save({**base_state, "step": 99_999}, last)
+    kwargs = {
+        "expected_model_cfg": canonical["model"],
+        "expected_lead": int(canonical["digital_reference_lead_samples"]),
+        "expected_optimize_band": FrequencyBand.parse(
+            canonical["trusted_band_hz"]
+        ),
+        "require_completed": True,
+        "require_completion_receipt": True,
+        "expected_completion_step": None,
+        "required_experiment_role": "canonical_pretrain",
+        "require_init_eligible": True,
+        "expected_loss_selection_sha256": canonical["loss_selection_sha256"],
+    }
+
+    with pytest.raises(ValueError, match="last step=99999, target=100000"):
+        audit_init_checkpoint(best, **kwargs)
+
+    torch.save({**base_state, "step": 100_000}, last)
+    with pytest.raises(ValueError, match="completion.json"):
+        audit_init_checkpoint(best, **kwargs)
 
 
 def test_measured_probe_rejects_different_alpha_before_gpu(tmp_path):
@@ -1096,6 +1207,7 @@ def test_official_finetune_cannot_override_contract_run_or_lineage_sampler(
         "require_init_checkpoint=false",
         "required_init_experiment_role=loss_pilot",
         "require_init_eligible=false",
+        "require_init_completion_receipt=false",
         "readiness.require_completed_init_checkpoint=false",
         "readiness.min_recorded_sessions=1",
     ],
