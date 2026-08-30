@@ -711,6 +711,12 @@ def _expected_meter_output_pcm(*, noise_channel: int) -> np.ndarray:
     return output
 
 
+def expected_meter_output_pcm(*, noise_channel: int) -> np.ndarray:
+    """공식 meter actual-int16 출력 recipe의 방어적 복사본을 반환한다."""
+
+    return _expected_meter_output_pcm(noise_channel=noise_channel).copy()
+
+
 def _load_npz_metadata_bytes(
     path: Path, payload: bytes
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
