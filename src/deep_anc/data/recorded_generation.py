@@ -34,7 +34,11 @@ from deep_anc.data.manifest import (
     validate_group_id,
     validate_source_family,
 )
-from deep_anc.data.timeline import TIMELINE_METHOD
+from deep_anc.data.recorded_qa import (
+    DEFAULT_RECORDED_CAPTURE_GATE,
+    evaluate_recorded_capture_gate,
+)
+from deep_anc.data.timeline import TIMELINE_METHOD, TimelineReport
 from deep_anc.dsp.invariants import REQUIRED_SOURCE_FAMILIES
 from deep_anc.data import public_lineage
 from deep_anc.data.recorded_dns_selection import (
@@ -114,6 +118,7 @@ EXTERNAL_OUTPUT_SECONDS = EXTERNAL_RAW_SECONDS * EXTERNAL_REPEAT_COUNT
 EXTERNAL_LIBRISPEECH_TRANSFORM = "identity_window/v1"
 EXTERNAL_LIBRISPEECH_SECONDS = 15.0
 CANONICAL_ADDITION_SECONDS = 15.0
+CANONICAL_RECORDING_AMPLITUDE = 0.06
 CANONICAL_ADDITION_SECONDS_BY_KIND = {
     SOURCE_KIND_POOL: CANONICAL_ADDITION_SECONDS,
     SOURCE_KIND_EXTERNAL: CANONICAL_ADDITION_SECONDS,
@@ -1651,6 +1656,52 @@ def _session_file_evidence(session_dir: Path, *, repo_root: Path) -> dict[str, o
     }
 
 
+def _validate_canonical_capture_timeline(
+    metadata: dict[str, Any], *, session_dir: Path
+) -> TimelineReport:
+    """게시·재개·최종 승격이 같은 신규 수집 게이트를 다시 계산한다."""
+
+    timeline = metadata.get("timeline")
+    if not isinstance(timeline, dict):
+        raise RecordedGenerationError(
+            f"추가 session timeline metadata가 없습니다: {session_dir}"
+        )
+    missing = sorted(set(TimelineReport.model_fields) - set(timeline))
+    if missing:
+        raise RecordedGenerationError(
+            f"추가 session TimelineReport 필드 누락: {session_dir}: {missing}"
+        )
+    try:
+        report = TimelineReport.model_validate(
+            {name: timeline[name] for name in TimelineReport.model_fields}
+        )
+    except (TypeError, ValueError) as exc:
+        raise RecordedGenerationError(
+            f"추가 session TimelineReport가 유효하지 않습니다: {session_dir}: {exc}"
+        ) from exc
+    result = evaluate_recorded_capture_gate(
+        report, DEFAULT_RECORDED_CAPTURE_GATE
+    )
+    if not result.ok:
+        raise RecordedGenerationError(
+            f"추가 session 공용 capture gate 실패: {session_dir}: "
+            f"{result.failure_text}"
+        )
+    if timeline.get("capture_gate") != result.as_metadata():
+        raise RecordedGenerationError(
+            f"추가 session capture_gate metadata/재계산 불일치: {session_dir}"
+        )
+    if timeline.get("usable_for_digital_reference") is not True:
+        raise RecordedGenerationError(
+            f"추가 session digital-reference 사용 가능 판정이 아닙니다: {session_dir}"
+        )
+    if not math.isfinite(float(report.aligned_lag_median_samples)):
+        raise RecordedGenerationError(
+            f"추가 session aligned lag median이 finite가 아닙니다: {session_dir}"
+        )
+    return report
+
+
 def _validate_session_artifacts(
     *,
     session_dir: Path,
@@ -1663,6 +1714,20 @@ def _validate_session_artifacts(
 
     import numpy as np
     import soundfile as sf
+
+    program = metadata.get("program")
+    amplitude = program.get("amplitude") if isinstance(program, dict) else None
+    if (
+        isinstance(amplitude, bool)
+        or not isinstance(amplitude, (int, float))
+        or not math.isfinite(float(amplitude))
+        or float(amplitude) != CANONICAL_RECORDING_AMPLITUDE
+    ):
+        raise RecordedGenerationError(
+            "추가 session amplitude가 기존 82세션과 같은 exact "
+            f"{CANONICAL_RECORDING_AMPLITUDE:.2f}가 아닙니다: {session_dir}"
+        )
+    _validate_canonical_capture_timeline(metadata, session_dir=session_dir)
 
     expected_names = {"mics.wav", "source.wav", "source_aligned.wav", "session.json"}
     observed_names = {path.name for path in session_dir.iterdir()}
@@ -1753,10 +1818,13 @@ def _validate_session_artifacts(
             raise RecordedGenerationError("source plan verified bytes가 유효하지 않습니다")
         program = metadata.get("program")
         assert isinstance(program, dict)
-        from deep_anc.realtime.noise_gen import NoiseProgram
+        from deep_anc.realtime.noise_gen import (
+            NoiseProgram,
+            render_recording_file_window,
+        )
 
         try:
-            expected_source = NoiseProgram(
+            expected_program = NoiseProgram(
                 {
                     "type": "file",
                     "file": row["path"],
@@ -1765,7 +1833,12 @@ def _validate_session_artifacts(
                 },
                 48_000,
                 file_bytes=source_bytes,
-            ).generate(expected_frames)
+            )
+            expected_source = render_recording_file_window(
+                expected_program,
+                expected_frames,
+                sample_rate=48_000,
+            )
         except (KeyError, OSError, RuntimeError, ValueError) as exc:
             raise RecordedGenerationError(
                 f"추가 session deterministic playback을 source plan에서 재유도할 수 없습니다: "
@@ -1956,7 +2029,7 @@ def _validate_additions(
             or isinstance(amplitude, bool)
             or not isinstance(amplitude, (int, float))
             or not math.isfinite(float(amplitude))
-            or not (0.0 < float(amplitude) <= 0.15)
+            or float(amplitude) != CANONICAL_RECORDING_AMPLITUDE
             or isinstance(file_start, bool)
             or not isinstance(file_start, (int, float))
             or not math.isclose(
@@ -2000,23 +2073,6 @@ def _validate_additions(
                 f"추가 session block/channel/safety/timeline provenance가 canonical이 아닙니다: "
                 f"{session_dir}"
             )
-        timeline_numbers = {
-            "valid_window_ratio": 0.90,
-            "aligned_lag_median_samples": None,
-            "aligned_lag_robust_std_samples": 0.0,
-            "coh2_150_600_after": 0.90,
-        }
-        for key, minimum in timeline_numbers.items():
-            value = timeline.get(key)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or (minimum is not None and float(value) < minimum)
-            ):
-                raise RecordedGenerationError(
-                    f"추가 session timeline.{key}가 유효하지 않습니다: {session_dir}"
-                )
         _validate_session_artifacts(
             session_dir=session_dir,
             metadata=metadata,

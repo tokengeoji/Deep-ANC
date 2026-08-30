@@ -10,6 +10,12 @@ python3 -m venv .venv 2>/dev/null || python3 -m venv --without-pip .venv
 VENV_PYTHON="$PWD/.venv/bin/python"
 SETUP_MARKER="$PWD/.venv/.setup-complete"
 ENVIRONMENT_RECEIPT="$PWD/.venv/environment-freeze.txt"
+SOURCE_COMMIT=$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'HEAD^{commit}')
+SOURCE_COMMIT=${SOURCE_COMMIT,,}
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "[오류] environment freeze에 결속할 전체 40자리 source commit을 읽지 못했습니다." >&2
+  exit 1
+fi
 rm -f "$SETUP_MARKER"
 rm -f "$ENVIRONMENT_RECEIPT" "${ENVIRONMENT_RECEIPT}.building"
 
@@ -55,6 +61,28 @@ if [ ! -s "${ENVIRONMENT_RECEIPT}.building" ] || \
    ! grep -Fxq 'torch==2.5.1+cu121' "${ENVIRONMENT_RECEIPT}.building"; then
   rm -f "${ENVIRONMENT_RECEIPT}.building"
   echo "[오류] freeze receipt에 exact torch wheel이 없어 완료 marker를 쓰지 않습니다." >&2
+  exit 1
+fi
+if ! PYTHONDONTWRITEBYTECODE=1 "$VENV_PYTHON" -B - \
+    "${ENVIRONMENT_RECEIPT}.building" "$SOURCE_COMMIT" <<'PY'
+import sys
+from pathlib import Path
+
+from deep_anc.data.source_trust import (
+    SourceTrustError,
+    validate_environment_freeze_source_commit,
+)
+
+try:
+    validate_environment_freeze_source_commit(
+        Path(sys.argv[1]).read_bytes(), expected_commit=sys.argv[2]
+    )
+except (OSError, SourceTrustError) as exc:
+    print(f"[오류] environment freeze source 결속 실패: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  rm -f "${ENVIRONMENT_RECEIPT}.building"
   exit 1
 fi
 mv -f "${ENVIRONMENT_RECEIPT}.building" "$ENVIRONMENT_RECEIPT"

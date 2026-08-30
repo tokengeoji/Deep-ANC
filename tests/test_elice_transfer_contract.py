@@ -318,6 +318,13 @@ def _write_bootstrap_receipt(
         capture_output=True,
         text=True,
     ).stdout.strip()
+    freeze.write_bytes(
+        (
+            "-e git+https://github.com/Roka-jsj/Deep-ANC.git@"
+            f"{commit}#egg=deep_anc\n"
+            "torch==2.5.1+cu121\n"
+        ).encode("utf-8")
+    )
     payload = {
         "schema_version": 1,
         "expected_commit": commit,
@@ -532,6 +539,38 @@ def test_recorded_config_binder_rejects_receipt_chain_tampering(
 
     with pytest.raises(TransferContractError, match="environment freeze receipt"):
         bind_recorded_transfer_config(data_cfg, repo_root=tmp_path)
+
+
+def test_recorded_config_binder_rejects_resealed_stale_editable_freeze(
+    tmp_path: Path,
+) -> None:
+    _manifest, transfer_sha, _files = _write_transfer_bundle(tmp_path)
+    receipt, _receipt_sha, _summary = _write_bootstrap_receipt(
+        tmp_path,
+        transfer_sha256=transfer_sha,
+    )
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    current = str(payload["expected_commit"])
+    stale = ("0" if current[0] != "0" else "1") + current[1:]
+    freeze = tmp_path / ".venv/environment-freeze.txt"
+    freeze.write_bytes(freeze.read_bytes().replace(current.encode(), stale.encode()))
+    payload["environment"]["freeze_receipt_sha256"] = hashlib.sha256(
+        freeze.read_bytes()
+    ).hexdigest()
+    receipt.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    resealed_sha = hashlib.sha256(receipt.read_bytes()).hexdigest()
+
+    with pytest.raises(TransferContractError, match="source 결속 실패"):
+        bind_recorded_transfer_config(
+            {
+                "bootstrap_receipt": receipt.relative_to(tmp_path).as_posix(),
+                "bootstrap_receipt_sha256": resealed_sha,
+            },
+            repo_root=tmp_path,
+        )
 
 
 def test_bootstrap_binder_rejects_dirty_source_after_clean_receipt(

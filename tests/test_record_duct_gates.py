@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import sys
 from pathlib import Path
@@ -14,7 +15,18 @@ import numpy as np
 import pytest
 
 from deep_anc.config import REPO_ROOT
+from deep_anc.data.recorded_qa import (
+    CAPTURE_MIN_LOW_BAND_COHERENCE,
+    CAPTURE_MIN_RAW_VALID_WINDOW_RATIO,
+    MIN_REF_ERR_COHERENCE,
+)
 from deep_anc.data.timeline import TimelineReport
+from deep_anc.dsp.invariants import (
+    MAX_STREAM_DELAY_P95_P5_SAMPLES,
+    MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+    MIN_STREAM_COHERENCE,
+    MIN_STREAM_DELAY_VALID_WINDOW_RATIO,
+)
 
 
 def _load_record_duct():
@@ -129,21 +141,197 @@ def test_timeline_gate_accepts_a_recovered_session():
     )
 
 
-# ------------------------------------------------------- 게이트 완화 금지
 @pytest.mark.parametrize(
-    "argv",
+    ("overrides", "failed_label"),
     [
-        ["--min-timeline-coherence", "0.10"],
-        ["--min-valid-window-ratio", "0.20"],
+        (
+            {"coh2_150_600_after": CAPTURE_MIN_LOW_BAND_COHERENCE - 0.001},
+            "source_aligned→ERR,150-600Hz",
+        ),
+        (
+            {"coh2_600_1600_after": MIN_STREAM_COHERENCE - 0.001},
+            "source_aligned→ERR,600-1600Hz",
+        ),
+        (
+            {"coh2_ref_err_150_600": MIN_REF_ERR_COHERENCE - 0.001},
+            "REF→ERR,150-600Hz",
+        ),
+        (
+            {"valid_window_ratio": CAPTURE_MIN_RAW_VALID_WINDOW_RATIO - 0.001},
+            "raw valid-window ratio",
+        ),
+        (
+            {
+                "aligned_valid_window_ratio": (
+                    MIN_STREAM_DELAY_VALID_WINDOW_RATIO - 0.001
+                )
+            },
+            "source_aligned→ERR valid-window ratio",
+        ),
+        (
+            {
+                "aligned_lag_robust_std_samples": (
+                    MAX_STREAM_DELAY_ROBUST_STD_SAMPLES + 0.001
+                )
+            },
+            "residual robust-std",
+        ),
+        (
+            {
+                "aligned_lag_p95_p5_samples": (
+                    MAX_STREAM_DELAY_P95_P5_SAMPLES + 0.001
+                )
+            },
+            "residual p95-p5",
+        ),
     ],
 )
-def test_cli_refuses_to_loosen_the_gates(argv, monkeypatch, capsys):
-    """게이트를 인자로 풀 수 있으면 그것은 게이트가 아니라 제안이다."""
+def test_capture_gate_rejects_each_downstream_condition_before_publish(
+    overrides, failed_label
+):
+    """수집기는 downstream QA에서 떨어질 세션을 active tree에 먼저 발행하지 않는다."""
 
-    monkeypatch.setattr(sys, "argv", ["record_duct.py", *argv])
+    report = _report(**overrides)
+    metadata, result = RECORD_DUCT._timeline_metadata_with_capture_gate(
+        report,
+        min_coherence=CAPTURE_MIN_LOW_BAND_COHERENCE,
+        min_valid_window_ratio=CAPTURE_MIN_RAW_VALID_WINDOW_RATIO,
+    )
+
+    assert not result.ok
+    assert len(result.failed_conditions) == 1
+    assert failed_label in result.failure_text
+    assert metadata["usable_for_digital_reference"] is False
+    assert metadata["capture_gate"]["failed_conditions"] == list(
+        result.failed_conditions
+    )
+
+
+def test_capture_gate_error_lists_only_conditions_that_failed():
+    """통과한 저역/원시 추적률을 ``<`` 오류로 출력하던 과거 오진을 막는다."""
+
+    report = _report(
+        coh2_600_1600_after=MIN_STREAM_COHERENCE - 0.01,
+        aligned_lag_p95_p5_samples=MAX_STREAM_DELAY_P95_P5_SAMPLES + 1.0,
+    )
+    result = RECORD_DUCT.timeline_gate_result(
+        report,
+        min_coherence=CAPTURE_MIN_LOW_BAND_COHERENCE,
+        min_valid_window_ratio=CAPTURE_MIN_RAW_VALID_WINDOW_RATIO,
+    )
+
+    assert len(result.failed_conditions) == 2
+    assert "600-1600Hz" in result.failure_text
+    assert "residual p95-p5" in result.failure_text
+    assert "150-600Hz" not in result.failure_text
+    assert "raw valid-window" not in result.failure_text
+    assert "REF→ERR" not in result.failure_text
+
+
+def test_capture_gate_exact_boundaries_pass_and_mark_timeline_usable():
+    """각 비교는 계약대로 하한 포함(≥), 상한 포함(≤)이다."""
+
+    report = _report(
+        coh2_150_600_after=CAPTURE_MIN_LOW_BAND_COHERENCE,
+        coh2_600_1600_after=MIN_STREAM_COHERENCE,
+        coh2_ref_err_150_600=MIN_REF_ERR_COHERENCE,
+        valid_window_ratio=CAPTURE_MIN_RAW_VALID_WINDOW_RATIO,
+        aligned_valid_window_ratio=MIN_STREAM_DELAY_VALID_WINDOW_RATIO,
+        aligned_lag_robust_std_samples=MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+        aligned_lag_p95_p5_samples=MAX_STREAM_DELAY_P95_P5_SAMPLES,
+    )
+    metadata, result = RECORD_DUCT._timeline_metadata_with_capture_gate(
+        report,
+        min_coherence=CAPTURE_MIN_LOW_BAND_COHERENCE,
+        min_valid_window_ratio=CAPTURE_MIN_RAW_VALID_WINDOW_RATIO,
+    )
+
+    assert result.ok
+    assert result.failed_conditions == ()
+    assert result.failure_text == ""
+    assert metadata["usable_for_digital_reference"] is True
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["aligned_lag_robust_std_samples", "aligned_lag_p95_p5_samples"],
+)
+def test_capture_gate_nonfinite_residual_is_measurement_failure(field):
+    """NaN 비교가 False라서 조용히 통과하는 fail-open 경로를 닫는다."""
+
+    metadata, result = RECORD_DUCT._timeline_metadata_with_capture_gate(
+        _report(**{field: float("nan")}),
+        min_coherence=CAPTURE_MIN_LOW_BAND_COHERENCE,
+        min_valid_window_ratio=CAPTURE_MIN_RAW_VALID_WINDOW_RATIO,
+    )
+
+    assert not result.ok
+    assert result.failed_conditions == (
+        (
+            "source_aligned→ERR residual robust-std(samples) 측정 불가(non-finite)"
+            if field == "aligned_lag_robust_std_samples"
+            else "source_aligned→ERR residual p95-p5(samples) 측정 불가(non-finite)"
+        ),
+    )
+    assert metadata["usable_for_digital_reference"] is False
+
+
+_INVALID_GATE_ARGUMENTS = tuple(
+    (option, value)
+    for option, floor in (
+        ("--min-timeline-coherence", CAPTURE_MIN_LOW_BAND_COHERENCE),
+        ("--min-valid-window-ratio", CAPTURE_MIN_RAW_VALID_WINDOW_RATIO),
+    )
+    for value in ("nan", "inf", str(floor - 0.01), "1.000001")
+)
+
+
+# ------------------------------------------------------- 게이트 완화 금지
+@pytest.mark.parametrize(
+    ("option", "value"),
+    _INVALID_GATE_ARGUMENTS,
+)
+def test_cli_rejects_nonfinite_loose_or_above_one_gates_in_dry_run(
+    option, value, capsys
+):
+    """dry-run도 유효하지 않은 계약을 PASS로 표시하면 안 된다."""
+
     with pytest.raises(SystemExit) as excinfo:
-        RECORD_DUCT.main()
+        RECORD_DUCT.main([option, value, "--dry-run"])
     assert excinfo.value.code == 2
+    output = capsys.readouterr()
+    assert "게이트는 강화만 합니다" in output.err
+    assert "[DRY-RUN PASS]" not in output.out
+
+
+@pytest.mark.parametrize(("option", "value"), _INVALID_GATE_ARGUMENTS)
+def test_cli_rejects_invalid_gates_before_live_audio_import(
+    option, value, monkeypatch, capsys
+):
+    """live 호출에서도 sounddevice import 전에 같은 계약을 거부한다."""
+
+    original_import = builtins.__import__
+    audio_imports: list[str] = []
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "sounddevice":
+            audio_imports.append(name)
+            raise AssertionError("유효하지 않은 게이트가 오디오 import에 도달함")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    with pytest.raises(SystemExit) as excinfo:
+        RECORD_DUCT.main(
+            [
+                option,
+                value,
+                "--confirm-user-present",
+                "--confirm-volume-minimum",
+                "--confirm-routing-and-geometry",
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert audio_imports == []
     assert "게이트는 강화만 합니다" in capsys.readouterr().err
 
 

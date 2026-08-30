@@ -18,7 +18,12 @@ import deep_anc.data.recorded_generation as generation
 import deep_anc.data.transfer_contract as transfer_contract
 from deep_anc import config as config_module
 from deep_anc.data.holdout_contract import snapshot_regular_tree_metadata
-from deep_anc.realtime.noise_gen import NoiseProgram
+from deep_anc.data.recorded_qa import (
+    DEFAULT_RECORDED_CAPTURE_GATE,
+    evaluate_recorded_capture_gate,
+)
+from deep_anc.data.timeline import TimelineReport
+from deep_anc.realtime.noise_gen import NoiseProgram, render_recording_file_window
 
 
 GENERATION_ID = "highband-v1"
@@ -31,6 +36,37 @@ def _sha(raw: bytes) -> str:
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _valid_capture_timeline() -> dict:
+    report = TimelineReport(
+        track_band_hz=(150.0, 700.0),
+        track_window_s=0.25,
+        track_hop_s=0.0625,
+        valid_window_ratio=0.99,
+        raw_lag_median_samples=1518.0,
+        raw_lag_ptp_samples=220.0,
+        raw_lag_std_samples=60.0,
+        aligned_lag_median_samples=143.0,
+        aligned_lag_std_samples=2.0,
+        aligned_lag_robust_std_samples=1.0,
+        aligned_lag_p95_p5_samples=10.0,
+        aligned_valid_window_ratio=0.99,
+        coh2_150_600_before=0.10,
+        coh2_150_600_after=0.95,
+        coh2_600_1600_before=0.10,
+        coh2_600_1600_after=0.80,
+        coh2_ref_err_150_600=0.98,
+    )
+    result = evaluate_recorded_capture_gate(
+        report, DEFAULT_RECORDED_CAPTURE_GATE
+    )
+    assert result.ok
+    return {
+        **report.as_metadata(),
+        "capture_gate": result.as_metadata(),
+        "usable_for_digital_reference": True,
+    }
 
 
 def _rewrite_progress_seconds(path: Path, *, row_number: int, seconds: float) -> None:
@@ -52,11 +88,16 @@ def _write_recorded_session_artifacts(
 ) -> None:
     frames = int(round(seconds * 48_000))
     program = metadata["program"]
-    expected_source = NoiseProgram(
+    program_instance = NoiseProgram(
         program,
         48_000,
         file_bytes=source_path.read_bytes(),
-    ).generate(frames)
+    )
+    expected_source = render_recording_file_window(
+        program_instance,
+        frames,
+        sample_rate=48_000,
+    )
     session.mkdir(parents=True, exist_ok=True)
     sf.write(
         session / "mics.wav",
@@ -293,7 +334,7 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
             "program": {
                 "type": "file",
                 "frequency": 300.0,
-                "amplitude": 0.1,
+                "amplitude": generation.CANONICAL_RECORDING_AMPLITUDE,
                 "band": [80.0, 1000.0],
                 "file": row["path"],
                 "file_start_seconds": float(row["start_seconds"]),
@@ -314,15 +355,7 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
                 "volume_minimum": True,
                 "routing_and_geometry": True,
             },
-            "timeline": {
-                "method": "ref_witness_warp_v1",
-                "witness_channel": 1,
-                "usable_for_digital_reference": True,
-                "valid_window_ratio": 0.99,
-                "aligned_lag_median_samples": 143.0,
-                "aligned_lag_robust_std_samples": 1.0,
-                "coh2_150_600_after": 0.95,
-            },
+            "timeline": _valid_capture_timeline(),
             "preassigned_split": row["split"],
             "collection_plan": {
                 "status": "exact",
@@ -461,6 +494,90 @@ def test_generation_preserves_parent82_and_binds_exact_additions17(tmp_path, mon
     assert summary["addition_session_count"] == 17
     assert summary["recorded_session_count"] == 99
     assert summary["recorded_manifest"]["path"].endswith("/recorded.jsonl")
+
+
+def test_generation_rejects_addition_recorded_above_exact_006_level(
+    tmp_path, monkeypatch
+):
+    report, _holdout = _fixture(tmp_path, monkeypatch)
+    additions = tmp_path / generation.ADDITIONS_ROOT / GENERATION_ID
+    session_json = sorted(additions.glob("*/session.json"))[0]
+    metadata = json.loads(session_json.read_text(encoding="utf-8"))
+    metadata["program"]["amplitude"] = 0.15
+    _write_json(session_json, metadata)
+
+    with pytest.raises(
+        generation.RecordedGenerationError,
+        match="top-level metadata/CSV",
+    ):
+        generation._validate_additions(
+            repo_root=tmp_path,
+            generation_id=GENERATION_ID,
+            additions_root=f"{generation.ADDITIONS_ROOT}/{GENERATION_ID}",
+            source_plan=f"{generation.SOURCE_PLAN_ROOT}/{GENERATION_ID}.csv",
+            combined_manifest_path=report.parent / "recorded.jsonl",
+            require_source_files=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("coh2_150_600_after", 0.89),
+        ("coh2_600_1600_after", 0.59),
+        ("coh2_ref_err_150_600", 0.59),
+        ("valid_window_ratio", 0.89),
+        ("aligned_valid_window_ratio", 0.76),
+        ("aligned_lag_robust_std_samples", 3.5),
+        ("aligned_lag_p95_p5_samples", 49.0),
+    ],
+)
+def test_generation_recomputes_every_capture_gate_before_promotion(
+    tmp_path, monkeypatch, field, value
+):
+    report, _holdout = _fixture(tmp_path, monkeypatch)
+    additions = tmp_path / generation.ADDITIONS_ROOT / GENERATION_ID
+    session_json = sorted(additions.glob("*/session.json"))[0]
+    metadata = json.loads(session_json.read_text(encoding="utf-8"))
+    metadata["timeline"][field] = value
+    _write_json(session_json, metadata)
+
+    with pytest.raises(
+        generation.RecordedGenerationError,
+        match="공용 capture gate 실패",
+    ):
+        generation._validate_additions(
+            repo_root=tmp_path,
+            generation_id=GENERATION_ID,
+            additions_root=f"{generation.ADDITIONS_ROOT}/{GENERATION_ID}",
+            source_plan=f"{generation.SOURCE_PLAN_ROOT}/{GENERATION_ID}.csv",
+            combined_manifest_path=report.parent / "recorded.jsonl",
+            require_source_files=True,
+        )
+
+
+def test_generation_rejects_resealed_capture_gate_metadata(tmp_path, monkeypatch):
+    report, _holdout = _fixture(tmp_path, monkeypatch)
+    additions = tmp_path / generation.ADDITIONS_ROOT / GENERATION_ID
+    session_json = sorted(additions.glob("*/session.json"))[0]
+    metadata = json.loads(session_json.read_text(encoding="utf-8"))
+    metadata["timeline"]["capture_gate"]["thresholds"][
+        "min_high_band_coherence"
+    ] = 0.01
+    _write_json(session_json, metadata)
+
+    with pytest.raises(
+        generation.RecordedGenerationError,
+        match="capture_gate metadata/재계산 불일치",
+    ):
+        generation._validate_additions(
+            repo_root=tmp_path,
+            generation_id=GENERATION_ID,
+            additions_root=f"{generation.ADDITIONS_ROOT}/{GENERATION_ID}",
+            source_plan=f"{generation.SOURCE_PLAN_ROOT}/{GENERATION_ID}.csv",
+            combined_manifest_path=report.parent / "recorded.jsonl",
+            require_source_files=True,
+        )
 
 
 def test_canonical_config_accepts_only_matching_generation_manifest_path_and_sha():
@@ -934,10 +1051,16 @@ def test_schema_v2_generation_survives_official_config_campaign_chain(
     )
     assert transfer_summary["recorded_session_count"] == 99
 
+    commit = "c" * 40
     freeze = tmp_path / ".venv/environment-freeze.txt"
     freeze.parent.mkdir(parents=True)
-    freeze.write_bytes(b"torch==2.5.1+cu121\n")
-    commit = "c" * 40
+    freeze.write_bytes(
+        (
+            "-e git+https://github.com/Roka-jsj/Deep-ANC.git@"
+            f"{commit}#egg=deep_anc\n"
+            "torch==2.5.1+cu121\n"
+        ).encode("utf-8")
+    )
     monkeypatch.setattr(
         transfer_contract, "_no_replace_head_commit", lambda _root: commit
     )

@@ -1,7 +1,7 @@
 #!/bin/bash
 # 새 Elice 인스턴스 부트스트랩 — exact code + canonical holdout + 환경 + 데이터 검증.
 # 사용 (새 인스턴스의 홈에서):
-#   git clone https://github.com/Roka-jsj/Deep-ANC.git Deep_ANC && cd Deep_ANC
+#   git clone https://github.com/tokengeoji/Deep-ANC.git Deep_ANC && cd Deep_ANC
 #   bash scripts/elice/bootstrap_all.sh \
 #     --expected-commit "$EXPECTED_COMMIT" \
 #     --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
@@ -17,7 +17,9 @@
 # EXPECTED_COMMIT은 실행 전에 신뢰한 출처에서 확인한 **전체 40자리 SHA**여야 한다.
 # EXPECTED_HOLDOUT_SHA256도 Jetson에서 확인한 canonical 파일의 64자리 SHA여야 한다.
 # 일반 Elice 실행은 canonical provenance/recorded/RIR/strict P·S 전부를 포함한 transfer
-# manifest의 외부 전달 SHA-256도 요구한다. --preflight-only는 code+holdout bundle만 본다.
+# manifest의 외부 전달 SHA-256도 요구한다. venv 전에는 manifest 자체의 immutable SHA
+# anchor만 확인하고, 환경이 완성된 직후 공개 raw 다운로드 전에 전체 semantic 검증을 한다.
+# --preflight-only는 code+holdout bundle만 본다.
 # 이 스크립트는 환경/데이터 준비 전용이며 어떤 학습 프로세스도 시작하지 않는다.
 # 이미 실행한 적이 있으면 완전성이 검증된 단계만 건너뛴다 (재실행 안전).
 #
@@ -344,6 +346,7 @@ fi
 
 HOLDOUT_MANIFEST="$REPO/data/manifests/recorded_holdout.json"
 HOLDOUT_VALIDATOR="$REPO/src/deep_anc/data/holdout_contract.py"
+STATIC_REFERENCE_CHECKER="$REPO/scripts/ci/check_static_contract_references.py"
 TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"
 # Canonical 학습은 raw 전수 decoder audit과 한 세대로 발행한 v4 manifest만 읽는다.
 # audit 원본은 결과 증거로 보존하고, prepare transaction이 같은 bytes를 canonical
@@ -470,15 +473,80 @@ verify_canonical_bundle() {
   fi
 }
 
-verify_transfer_bundle() {
-  local resolved schema_version selected_manifest selected_manifest_sha256
-  local session_count validated_transfer_sha256 file_count generation_path
-  local generation_sha256 extra
+verify_transfer_manifest_anchor() {
+  # 새 인스턴스의 system Python에는 NumPy/soundfile이 없다. 여기서는 외부에서 받은
+  # exact SHA와 regular-file/symlink 경계만 표준 라이브러리로 확인한다. manifest가
+  # 가리키는 모든 파일·generation·DNS 음향 의미 검증은 venv 직후의
+  # verify_transfer_bundle에서 반드시 다시 수행하며, 그 전에는 raw 다운로드나
+  # manifest/QA/학습을 절대 시작하지 않는다.
+  local resolved manifest_sha256 manifest_size extra
   if [ ! -s "$TRANSFER_MANIFEST" ]; then
     echo "[오류] Jetson immutable transfer manifest가 없습니다: $TRANSFER_MANIFEST" >&2
     return 1
   fi
   if ! resolved=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO/src" python3 -B - \
+      "$TRANSFER_MANIFEST" "$REPO" "$EXPECTED_TRANSFER_MANIFEST_SHA256" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from deep_anc.data.holdout_contract import HoldoutContractError, read_regular_file_snapshot
+
+manifest_path = Path(os.path.abspath(sys.argv[1]))
+root = Path(os.path.abspath(sys.argv[2]))
+expected_sha256 = sys.argv[3]
+try:
+    snapshot = read_regular_file_snapshot(
+        manifest_path,
+        root=root,
+        label="Jetson immutable transfer manifest anchor",
+        capture_bytes=False,
+    )
+except (OSError, HoldoutContractError) as exc:
+    print(f"[오류] {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if snapshot.sha256 != expected_sha256:
+    print(
+        "[오류] transfer manifest 외부 SHA-256 anchor 불일치: "
+        f"expected={expected_sha256}, actual={snapshot.sha256}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(f"{snapshot.sha256}\t{snapshot.size}")
+PY
+  ); then
+    echo "[오류] transfer manifest SHA anchor/경로 검증 실패." >&2
+    return 1
+  fi
+  if [[ "$resolved" == *$'\n'* ]]; then
+    echo "[오류] transfer manifest anchor 결과가 단일 행이 아닙니다." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r manifest_sha256 manifest_size extra <<<"$resolved"
+  if [ "$manifest_sha256" != "$EXPECTED_TRANSFER_MANIFEST_SHA256" ] || \
+     [[ ! "$manifest_size" =~ ^[1-9][0-9]*$ ]] || [ -n "$extra" ]; then
+    echo "[오류] transfer manifest anchor 출력이 유효하지 않습니다." >&2
+    return 1
+  fi
+  echo "[transfer anchor] immutable manifest SHA 확인: sha256=$manifest_sha256, bytes=$manifest_size"
+}
+
+verify_transfer_bundle() {
+  # full semantic validator는 NumPy/soundfile까지 포함한 exact venv에서만 실행한다.
+  # 이 함수는 setup 전 호출하면 안 된다.
+  local verifier_python=${1:-}
+  local resolved schema_version selected_manifest selected_manifest_sha256
+  local session_count validated_transfer_sha256 file_count generation_path
+  local generation_sha256 extra
+  if [ -z "$verifier_python" ] || [ ! -x "$verifier_python" ]; then
+    echo "[오류] full transfer validator에는 완성된 venv Python이 필요합니다." >&2
+    return 1
+  fi
+  if [ ! -s "$TRANSFER_MANIFEST" ]; then
+    echo "[오류] Jetson immutable transfer manifest가 없습니다: $TRANSFER_MANIFEST" >&2
+    return 1
+  fi
+  if ! resolved=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO/src" "$verifier_python" -B - \
       "$TRANSFER_MANIFEST" "$REPO" "$EXPECTED_TRANSFER_MANIFEST_SHA256" <<'PY'
 import os
 import sys
@@ -694,7 +762,21 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "[오류] venv 생성 전 exact tree/bundle을 검증할 system python3가 없습니다." >&2
   exit 1
 fi
-if ! verify_exact_checkout || ! verify_canonical_bundle; then
+if ! verify_exact_checkout; then
+  echo "환경 설치나 데이터 다운로드를 시작하지 않습니다." >&2
+  exit 1
+fi
+if [ ! -f "$STATIC_REFERENCE_CHECKER" ]; then
+  echo "[오류] static contract reference checker가 없습니다: $STATIC_REFERENCE_CHECKER" >&2
+  echo "환경 설치나 데이터 다운로드를 시작하지 않습니다." >&2
+  exit 1
+fi
+if ! python3 -I -B "$STATIC_REFERENCE_CHECKER" --repo-root "$REPO"; then
+  echo "[오류] stale pytest node/Git SHA static contract reference 검증 실패." >&2
+  echo "환경 설치나 데이터 다운로드를 시작하지 않습니다." >&2
+  exit 1
+fi
+if ! verify_canonical_bundle; then
   echo "환경 설치나 데이터 다운로드를 시작하지 않습니다." >&2
   exit 1
 fi
@@ -705,14 +787,15 @@ if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
 fi
 
 # 로컬 Jetson에서도 쓸 수 있는 --preflight-only 경계 뒤에서만 Elice 자원/대용량
-# transfer bundle을 요구한다. 아래 검사는 setup/download보다 먼저 실행돼 side effect가 없다.
+# transfer manifest를 요구한다. system Python에서는 external SHA anchor만 확인한다.
+# 전체 파일/계보/음향 의미 검증은 venv 완료 직후, 공개 raw 다운로드보다 먼저 실행된다.
 if [[ ! "$EXPECTED_TRANSFER_MANIFEST_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
   echo "[오류] 일반 Elice 실행에는 --expected-transfer-manifest-sha256 64자리가 필수입니다." >&2
   exit 2
 fi
 EXPECTED_TRANSFER_MANIFEST_SHA256=${EXPECTED_TRANSFER_MANIFEST_SHA256,,}
-if ! verify_transfer_bundle || ! hardware_storage_preflight; then
-  echo "[오류] Elice immutable input/hardware/storage preflight 실패. setup/download를 시작하지 않습니다." >&2
+if ! verify_transfer_manifest_anchor || ! hardware_storage_preflight; then
+  echo "[오류] Elice transfer SHA anchor/hardware/storage preflight 실패. setup/download를 시작하지 않습니다." >&2
   exit 1
 fi
 
@@ -762,22 +845,55 @@ write_environment_receipt() {
     rm -f "$building"
     return 1
   fi
+  if ! validate_environment_receipt "$building"; then
+    rm -f "$building"
+    return 1
+  fi
   mv -f "$building" "$ENVIRONMENT_RECEIPT"
+}
+
+validate_environment_receipt() {
+  local receipt_path=${1:-$ENVIRONMENT_RECEIPT}
+  [ -s "$receipt_path" ] || return 1
+  PYTHONDONTWRITEBYTECODE=1 "$VENV_PYTHON" -B - \
+      "$receipt_path" "$EXPECTED_COMMIT" <<'PY'
+import sys
+from pathlib import Path
+
+from deep_anc.data.source_trust import (
+    SourceTrustError,
+    validate_environment_freeze_source_commit,
+)
+
+try:
+    validate_environment_freeze_source_commit(
+        Path(sys.argv[1]).read_bytes(), expected_commit=sys.argv[2]
+    )
+except (OSError, SourceTrustError) as exc:
+    print(f"[오류] environment freeze source 결속 실패: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 environment_complete() {
   [ -f "$SETUP_MARKER" ] && [ -s "$ENVIRONMENT_RECEIPT" ] &&
-    grep -Fxq 'torch==2.5.1+cu121' "$ENVIRONMENT_RECEIPT" && environment_probe
+    grep -Fxq 'torch==2.5.1+cu121' "$ENVIRONMENT_RECEIPT" &&
+    validate_environment_receipt "$ENVIRONMENT_RECEIPT" && environment_probe
 }
 
 echo "=== [1/6] 환경 (venv + torch cu121 + 패키지) ==="
-# 완료 마커 도입 전부터 사용하던 인스턴스는 전체 요구 패키지와 CUDA probe를
-# 통과하는 경우에만 마커를 이관한다. 유효한 환경을 불필요하게 재설치하지 않는다.
-if [ ! -f "$SETUP_MARKER" ] && environment_probe; then
-  if write_environment_receipt; then
-    touch "$SETUP_MARKER"
-    echo "[setup] 기존 exact 환경에 freeze receipt와 완료 마커를 생성했습니다."
+# 완료 마커가 있더라도 editable install은 현재 checkout을 따라가는 반면 과거 freeze
+# bytes에는 이전 commit이 남을 수 있다. import/CUDA가 exact한 기존 venv는 재설치하지
+# 않고 매 bootstrap source commit에서 freeze만 atomic 갱신·검증한다.
+if environment_probe; then
+  if ! write_environment_receipt; then
+    echo "[오류] 기존 exact 환경의 freeze를 현재 expected commit에 결속하지 못했습니다." >&2
+    exit 1
   fi
+  if [ ! -f "$SETUP_MARKER" ]; then
+    touch "$SETUP_MARKER"
+  fi
+  echo "[setup] 기존 exact 환경을 재사용하고 freeze를 expected commit에 갱신했습니다."
 fi
 if ! environment_complete; then
   echo "[setup] 완료 마커/import/CUDA probe 중 하나가 유효하지 않아 환경을 구성합니다."
@@ -786,6 +902,15 @@ fi
 echo "[setup] reproducibility receipt: $ENVIRONMENT_RECEIPT"
 if ! environment_complete; then
   echo "[오류] setup_env.sh 이후에도 Python/CUDA 환경 검증에 실패했습니다." >&2
+  exit 1
+fi
+
+# 외부 SHA로 고정한 manifest에 열거된 모든 transferred file의 exact SHA, schema,
+# recorded generation/DNS receipt와 canonical holdout 결속을 여기서 완전 검증한다.
+# 이 gate 전에는 public raw 다운로드·manifest 생성·QA·학습이 시작되지 않는다.
+if ! verify_exact_checkout || ! verify_canonical_bundle || \
+   ! verify_transfer_bundle "$VENV_PYTHON"; then
+  echo "[오류] 환경 완료 뒤 immutable transfer bundle full 검증 실패. public raw 다운로드를 시작하지 않습니다." >&2
   exit 1
 fi
 
@@ -1414,7 +1539,7 @@ cd "$REPO"
 echo "=== [4/6] manifest + RIR 뱅크 + 데이터셋 QA ==="
 # 긴 다운로드 동안 tracked code나 별도 채널로 전달한 canonical bundle이 바뀌지
 # 않았는지 manifest 생성 직전에 다시 확인한다. prepare에도 같은 외부 SHA를 전달한다.
-if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle; then
+if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle "$VENV_PYTHON"; then
   echo "[오류] 다운로드 후 manifest 준비 시작 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
 fi
@@ -1456,7 +1581,7 @@ fi
   --out "$CANONICAL_MANIFEST_DIR" \
   --decoder-audit "$DECODER_AUDIT_REPORT" \
   --hash-workers "$RAW_HASH_WORKERS"
-if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle; then
+if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle "$VENV_PYTHON"; then
   echo "[오류] manifest 준비 종료 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
 fi
@@ -1538,6 +1663,10 @@ from deep_anc.data.recorded_subband_coverage import (
     recorded_subband_coverage_report_path,
     validate_recorded_subband_coverage_report,
 )
+from deep_anc.data.source_trust import (
+    SourceTrustError,
+    validate_environment_freeze_source_commit,
+)
 from deep_anc.data.transfer_contract import validate_transfer_manifest
 
 root = Path(os.path.abspath(sys.argv[1]))
@@ -1582,8 +1711,17 @@ environment = read_regular_file_snapshot(
     environment_path,
     root=root,
     label="Elice environment freeze receipt",
-    capture_bytes=False,
+    capture_bytes=True,
 )
+assert environment.data is not None
+try:
+    validate_environment_freeze_source_commit(
+        environment.data, expected_commit=expected_commit
+    )
+except SourceTrustError as exc:
+    raise SystemExit(
+        f"receipt 작성 시 environment freeze source 결속 실패: {exc}"
+    ) from exc
 coverage_cfg = load_train_config(
     root / "configs/train_pretrain_tiny.yaml",
     [

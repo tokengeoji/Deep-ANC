@@ -10,7 +10,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 import numpy as np
 import soundfile as sf
@@ -24,6 +24,212 @@ from ..dsp.invariants import (
     MIN_STREAM_DELAY_VALID_WINDOWS,
 )
 from .manifest import VALID_SPLITS, validate_group_id, validate_source_family
+
+if TYPE_CHECKING:
+    from .timeline import TimelineReport
+
+
+CAPTURE_MIN_LOW_BAND_COHERENCE = 0.90
+"""신규 수집 세션의 150–600 Hz 코히런스 하한.
+
+기존 corpus를 사후 감사하는 downstream QA의 0.60보다 엄격하다. 새 캡처는 이미
+REF 증인 재정렬을 수행하므로 Wiener 하한 약 −10 dB에 해당하는 0.90을 요구한다.
+"""
+
+CAPTURE_MIN_RAW_VALID_WINDOW_RATIO = 0.90
+"""source→REF 원시 지연 궤적이 실제로 추적돼야 하는 창 비율의 수집 하한."""
+
+MIN_REF_ERR_COHERENCE = MIN_STREAM_COHERENCE
+"""REF→ERR 음향 대조군 코히런스 하한. downstream QA와 수집기가 함께 쓴다."""
+
+
+@dataclass(frozen=True)
+class RecordedCaptureGateContract:
+    """신규 녹음을 active corpus에 발행하기 전 적용하는 단일 계약.
+
+    저역의 0.90과 원시 추적률 0.90은 **신규 수집 전용 강화값**이다. 고역·REF 대조군·
+    잔여 지연 상한은 downstream :class:`RecordedQASettings`와 같은 canonical 선언에서
+    직접 가져온다. 따라서 수집기는 약한 두 조건만 통과한 뒤 QA에서 다시 탈락하는
+    세션을 발행하지 않는다.
+    """
+
+    min_low_band_coherence: float = CAPTURE_MIN_LOW_BAND_COHERENCE
+    min_high_band_coherence: float = MIN_STREAM_COHERENCE
+    min_ref_err_coherence: float = MIN_REF_ERR_COHERENCE
+    min_raw_valid_window_ratio: float = CAPTURE_MIN_RAW_VALID_WINDOW_RATIO
+    min_aligned_valid_window_ratio: float = MIN_STREAM_DELAY_VALID_WINDOW_RATIO
+    max_residual_robust_std_samples: float = MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
+    max_residual_p95_p5_samples: float = MAX_STREAM_DELAY_P95_P5_SAMPLES
+
+    def __post_init__(self) -> None:
+        minimums = (
+            (
+                self.min_low_band_coherence,
+                CAPTURE_MIN_LOW_BAND_COHERENCE,
+                "min_low_band_coherence",
+            ),
+            (
+                self.min_high_band_coherence,
+                MIN_STREAM_COHERENCE,
+                "min_high_band_coherence",
+            ),
+            (
+                self.min_ref_err_coherence,
+                MIN_REF_ERR_COHERENCE,
+                "min_ref_err_coherence",
+            ),
+            (
+                self.min_raw_valid_window_ratio,
+                CAPTURE_MIN_RAW_VALID_WINDOW_RATIO,
+                "min_raw_valid_window_ratio",
+            ),
+            (
+                self.min_aligned_valid_window_ratio,
+                MIN_STREAM_DELAY_VALID_WINDOW_RATIO,
+                "min_aligned_valid_window_ratio",
+            ),
+        )
+        for value, floor, name in minimums:
+            number = float(value)
+            if not math.isfinite(number) or not 0.0 < number <= 1.0:
+                raise ValueError(f"{name}는 유한한 (0, 1] 값이어야 합니다: {value!r}")
+            if number < float(floor):
+                raise ValueError(
+                    f"{name}({number})는 canonical 하한 {floor}보다 작을 수 없습니다 — "
+                    "게이트는 강화 방향으로만 조정합니다"
+                )
+        maximums = (
+            (
+                self.max_residual_robust_std_samples,
+                MAX_STREAM_DELAY_ROBUST_STD_SAMPLES,
+                "max_residual_robust_std_samples",
+            ),
+            (
+                self.max_residual_p95_p5_samples,
+                MAX_STREAM_DELAY_P95_P5_SAMPLES,
+                "max_residual_p95_p5_samples",
+            ),
+        )
+        for value, ceiling, name in maximums:
+            number = float(value)
+            if not math.isfinite(number) or number <= 0.0:
+                raise ValueError(f"{name}는 유한한 양수여야 합니다: {value!r}")
+            if number > float(ceiling):
+                raise ValueError(
+                    f"{name}({number})는 canonical 상한 {ceiling}보다 클 수 없습니다 — "
+                    "게이트는 강화 방향으로만 조정합니다"
+                )
+
+    def as_metadata(self) -> dict[str, float]:
+        return {
+            "min_low_band_coherence": float(self.min_low_band_coherence),
+            "min_high_band_coherence": float(self.min_high_band_coherence),
+            "min_ref_err_coherence": float(self.min_ref_err_coherence),
+            "min_raw_valid_window_ratio": float(self.min_raw_valid_window_ratio),
+            "min_aligned_valid_window_ratio": float(
+                self.min_aligned_valid_window_ratio
+            ),
+            "max_residual_robust_std_samples": float(
+                self.max_residual_robust_std_samples
+            ),
+            "max_residual_p95_p5_samples": float(
+                self.max_residual_p95_p5_samples
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class RecordedCaptureGateResult:
+    """수집 게이트의 판정과 실제로 실패한 조건만 담는 결과."""
+
+    contract: RecordedCaptureGateContract
+    failed_conditions: tuple[str, ...]
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed_conditions
+
+    @property
+    def failure_text(self) -> str:
+        return "; ".join(self.failed_conditions)
+
+    def as_metadata(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "ok": self.ok,
+            "thresholds": self.contract.as_metadata(),
+            "failed_conditions": list(self.failed_conditions),
+        }
+
+
+DEFAULT_RECORDED_CAPTURE_GATE = RecordedCaptureGateContract()
+
+
+def evaluate_recorded_capture_gate(
+    report: "TimelineReport",
+    contract: RecordedCaptureGateContract = DEFAULT_RECORDED_CAPTURE_GATE,
+) -> RecordedCaptureGateResult:
+    """``TimelineReport`` 하나를 downstream QA와 정합한 수집 계약으로 판정한다.
+
+    NaN은 비교식에서 조용히 통과할 수 있으므로 잔여 지연 통계가 유한하지 않은 경우도
+    명시적인 실패다. 반환 문자열은 **실제로 실패한 조건만** 포함한다.
+    """
+
+    failures: list[str] = []
+
+    def require_min(label: str, value: float, minimum: float) -> None:
+        measured = float(value)
+        if not math.isfinite(measured):
+            failures.append(f"{label} 측정 불가(non-finite)")
+        elif measured < float(minimum):
+            failures.append(f"{label} {measured:.6f} < {float(minimum):.6f}")
+
+    def require_max(label: str, value: float, maximum: float) -> None:
+        measured = float(value)
+        if not math.isfinite(measured):
+            failures.append(f"{label} 측정 불가(non-finite)")
+        elif measured > float(maximum):
+            failures.append(f"{label} {measured:.6f} > {float(maximum):.6f}")
+
+    require_min(
+        "coh²(source_aligned→ERR,150-600Hz)",
+        report.coh2_150_600_after,
+        contract.min_low_band_coherence,
+    )
+    require_min(
+        "coh²(source_aligned→ERR,600-1600Hz)",
+        report.coh2_600_1600_after,
+        contract.min_high_band_coherence,
+    )
+    require_min(
+        "coh²(REF→ERR,150-600Hz)",
+        report.coh2_ref_err_150_600,
+        contract.min_ref_err_coherence,
+    )
+    require_min(
+        "source→REF raw valid-window ratio",
+        report.valid_window_ratio,
+        contract.min_raw_valid_window_ratio,
+    )
+    # 15초 canonical additions는 TimelineSettings의 고정 window/hop을 사용하므로 이
+    # 비율을 통과하면 downstream 최소 유효창 개수도 함께 충족한다. 개수를 metadata에
+    # 없는 값으로 추정해 쓰지 않고, 저장된 ratio 자체를 공용 invariant에 결속한다.
+    require_min(
+        "source_aligned→ERR valid-window ratio",
+        report.aligned_valid_window_ratio,
+        contract.min_aligned_valid_window_ratio,
+    )
+    require_max(
+        "source_aligned→ERR residual robust-std(samples)",
+        report.aligned_lag_robust_std_samples,
+        contract.max_residual_robust_std_samples,
+    )
+    require_max(
+        "source_aligned→ERR residual p95-p5(samples)",
+        report.aligned_lag_p95_p5_samples,
+        contract.max_residual_p95_p5_samples,
+    )
+    return RecordedCaptureGateResult(contract=contract, failed_conditions=tuple(failures))
 
 
 @dataclass(frozen=True)
@@ -71,7 +277,9 @@ class RecordedQASettings:
     p50 0.824**. 즉 학습 데이터의 고역 정렬 품질이 저역보다 체계적으로 0.12 낮은데
     아무도 그것을 보지 않았다."""
 
-    min_source_err_coherence_high: float = MIN_STREAM_COHERENCE
+    min_source_err_coherence_high: float = (
+        DEFAULT_RECORDED_CAPTURE_GATE.min_high_band_coherence
+    )
     """고역에도 **같은 하한**을 건다. 별도 숫자를 만들지 않는 것이 요점이다.
 
     저역만 0.60 을 요구하고 고역을 안 보면, "제어를 주장하는 대역" 과 "품질을 검사하는
@@ -79,11 +287,13 @@ class RecordedQASettings:
     :data:`deep_anc.dsp.invariants.MAX_STREAM_DELAY_ROBUST_STD_SAMPLES` 는 같은 선언
     (:data:`MIN_STREAM_COHERENCE`)에서 함께 유도된다."""
 
-    min_ref_err_coherence: float = 0.60
+    min_ref_err_coherence: float = DEFAULT_RECORDED_CAPTURE_GATE.min_ref_err_coherence
     """음향 대조군. 이 값이 살아 있는데 source→ERR 만 죽으면 원인은 음향이 아니라
     녹음 소프트웨어의 타임베이스다 — 진단이 자동으로 갈린다."""
 
-    max_source_err_delay_robust_std_samples: float = MAX_STREAM_DELAY_ROBUST_STD_SAMPLES
+    max_source_err_delay_robust_std_samples: float = (
+        DEFAULT_RECORDED_CAPTURE_GATE.max_residual_robust_std_samples
+    )
     """지연 궤적 산포(1.4826×MAD)의 상한. **원시 std 가 아니다.**
 
     2026-08-06 반증 #14/#18: 원시 std/range 로 판정하던 옛 게이트는 제대로 재정렬된
@@ -93,7 +303,9 @@ class RecordedQASettings:
     임계 근거(전수 실측)는 :data:`deep_anc.dsp.invariants.MAX_STREAM_DELAY_ROBUST_STD_SAMPLES`.
     """
 
-    max_source_err_delay_p95_p5_samples: float = MAX_STREAM_DELAY_P95_P5_SAMPLES
+    max_source_err_delay_p95_p5_samples: float = (
+        DEFAULT_RECORDED_CAPTURE_GATE.max_residual_p95_p5_samples
+    )
     """지연 궤적 변동폭(p95−p5)의 상한. min/max range 가 아니다 — 이유는 위와 같다."""
 
     min_source_err_delay_windows: int = MIN_STREAM_DELAY_VALID_WINDOWS

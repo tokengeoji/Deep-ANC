@@ -1,7 +1,7 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-29. 현행 통합 개발 브랜치: `dev`.
+> 최종 갱신: 2026-08-30. 현행 통합 개발 브랜치: `dev`.
 
 ## 0. 통합 상태와 절대 판정 (2026-08-29)
 
@@ -210,6 +210,194 @@ bundle이다. 현 `dev`의 docs-only 변경은 bundle bytes를 무효화하지 �
 canonical_v4/DNS selection에는 쓸 수 있다. 그러나 이 bundle을 canonical 학습 입력으로
 재사용하지 않는다. DNS receipt를 받아 17세션을 수집한 뒤에는 99세션 schema v2 transfer를
 no-replace 재발행·검증 전송하고 새 receipt로 다시 결속해야 한다.
+
+### 0.9 2026-08-30 새 Elice bootstrap의 실제 pre-venv 경계 복구
+
+새 Elice clone에서 82세션 transfer manifest SHA와 recorded tree byte count는 실제로
+관측됐지만, 파일별 SHA/full semantic 검증은 아직 통과 전이었다. 종전
+`bootstrap_all.sh`는 venv를 만들기 전에 system `python3`로 full transfer validator를
+import했다. 이 import graph가 `soundfile`뿐 아니라 NumPy/Pydantic 경로까지 끌어와 fresh
+환경에서 `ModuleNotFoundError`로 실패했다. 이것은 data 부족이나 GPU 문제가 아니라
+**bootstrap 순서 결함**이며, 실패를 무시하고 다운로드·학습으로 진행하지 않는다.
+
+복구된 경계는 다음과 같다.
+
+1. system Python은 canonical holdout과 transfer manifest의 regular-file/no-symlink,
+   외부 SHA-256 anchor만 확인한다.
+2. exact A100 CUDA venv를 만든다.
+3. public raw 다운로드, manifest 생성, QA, DNS selection, 학습보다 **먼저** 그 venv에서
+   기존 full transfer validator를 실행한다. 따라서 모든 transferred file SHA, strict P/S,
+   generation/DNS receipt, recorded lineage 의미 검증은 약화되지 않는다.
+
+새 exact commit을 push한 뒤 remote checkout을 그 commit으로 바꾸고, 먼저 `--preflight-only`,
+그 다음 일반 Stage-1 bootstrap을 tmux log로 한 번 실행한다. full validator가 실패하면 raw와
+log를 보존한 채 원인을 분석하며 자동 재실행하지 않는다. 이 절은 high-band/quiet-zone
+hardware blocker를 해제하지 않으며, Stage-1 82세션 bootstrap과 추가 17세션 수집 전에는
+pretrain/fine-tune을 시작하지 않는다.
+
+### 0.10 2026-08-30 Elice bootstrap pytest 중단 및 재개 경계
+
+`560d44b1b4c7b2a47db4d273054bd20402d889d2`로 같은 Elice 인스턴스에서 Stage-1
+bootstrap을 실행했다. A100 80GB, exact torch `2.5.1+cu121`, public raw 다운로드/decoder
+감사(`candidate=37761`, `accept=36868`)와 transfer full semantic 검증은 통과했지만,
+마지막 pytest에서 5개 실패로 exit 1했다. 따라서 bootstrap receipt·readiness·checkpoint·학습
+디렉터리는 생성되지 않았고, 기존 venv/raw는 보존돼 있다. 원본 로그는
+`/home/elicer/deep_anc_logs/stage1_bootstrap_560d44b.log`에 남아 있다.
+
+실패는 다음처럼 분리했다.
+
+1. Torch 2.5.1에서 causal P/S 독립 oracle의 FP32 누적 순서가 기본 `allclose`보다 작은
+   오차를 냈다. adapter 내부 composition은 `torch.equal`로 유지하고 독립 oracle 비교에
+   기존 crop 검증과 같은 `atol=2e-7, rtol=2e-6`을 적용했다.
+2. `fullband_v5_meter` portable static loader가 오디오 없는 Elice의 `/proc/asound`를
+   읽던 결함을 수정했다. 기본 static 검증은 tracked attestation의 physical snapshot만
+   사용하며, 실제 Jetson live 경계는 현재 ALSA fingerprint를 명시적으로 수집해 두 번째
+   결속 호출을 한다. live hardware gate를 제거한 것이 아니다.
+3. `set_amp_level.py`는 fullband-v5의 다섯 operator confirmation을 raw/evidence preflight
+   전에 검사하도록 순서를 고쳤다.
+4. tracked `measurement_level_evidence.json`이 참조하는 historical meter raw/receipt가
+   transfer bundle에 없던 계보 결함을 고쳤다. `transfer_contract`에
+   `level_meter_raw/level_meter_receipt` role과 pointer/SHA/receipt exact 검증을 추가했고,
+   builder가 evidence에서 두 파일을 자동 발견한다. 새 로컬 manifest는 346파일,
+   SHA-256 `7881262a574b8ad793e43879fcab0bcb297831213496195ae0877b9807ccf261`이다.
+
+로컬 변경 실패군 pytest는 통과했고 `git diff --check`/`bash -n`도 통과했다. 전체 pytest는
+Jetson의 장시간 scipy 회귀 도중 중단했으므로 새 exact commit의 Elice 전체 pytest가 최종
+게이트다. 다음 순서는 새 커밋 push → 기존 Elice checkout fast-forward/clean 확인 → 새
+346파일 manifest와 두 meter 파일 전송 → 동일 venv에서 bootstrap 재개다. pytest와 canonical
+recorded coverage가 통과하기 전에는 pretrain/fine-tune을 시작하지 않는다.
+
+### 0.11 2026-08-30 추가 녹음 첫 행 fail-closed와 file playback 계약 수정
+
+Elice bootstrap/readiness 15/17 뒤 DNS speech 5개를 exact selector로 선택했고,
+`highband-coverage-v1` 17행 plan의 dry-run이 PASS했다. 사용자 승인 아래 첫 environment
+세션만 출력했으며, stream 종료 직후 분리 안내를 내고 batch QA가 실패하자 나머지 16개는
+자동 재생하지 않았다. 실패 session은
+`results/recording_failures/record_duct/batch_qa/highband-coverage-v1/`에 no-replace 보존했고,
+active addition session은 0개다.
+
+실패는 장비·gain 문제가 아니었다. 실제 amplitude/peak는 `0.15`, xrun/clip 0이고 timeline
+coherence도 150--600 Hz `0.086→0.906`으로 합격했다. 원인은 file producer가 1초 settle
+무음 중에도 cursor를 48,000샘플 진행시켜 계획 54.1초가 아니라 55.1초부터 출력한 반면,
+generation validator는 planned start에서 fade 없이 재유도한 코드 계약 불일치다. 실패
+`source.wav`는 `1초 advance + 양끝 0.1초 fade`를 적용하면 720,000샘플 bit-exact지만,
+그 파형은 plan window가 아니므로 재봉인·승격하지 않는다.
+
+복구 규칙은 다음과 같다.
+
+1. 공용 file renderer가 planned start에서 exact keep frame만 생성하고 0.1초 fade를 적용한다.
+2. duplex settle은 exact zero prefix이며 file cursor를 소비하지 않는다.
+3. producer와 generation validator는 같은 renderer를 사용하고 one-second shift/fade 누락을
+   회귀 테스트로 거부한다.
+4. 기존 `qa_failed` progress와 raw는 삭제하지 않는다. 수정 commit의 새 Elice bootstrap/DNS
+   receipt/plan을 다시 결속하고 무음 dry-run을 통과한 뒤 같은 generation의 row 2를 새
+   explicit attempt로 녹음한다.
+5. 수정·검증 전에 소리를 반복하지 않고, 재실행도 새 출력 창 보고와 승인 뒤에만 한다.
+
+### 0.12 2026-08-30 amplitude·capture gate·Elice freeze 후속 복구
+
+수정된 exact file renderer로 첫 행을 다시 확인했을 때 settle 48,000 frame 뒤의 15초
+source가 현재 계획에서 렌더한 bytes와 max error 0으로 일치했다. 그러나 당시 CLI amplitude가
+`0.15`였으므로 기존 82세션의 단일 레벨 `0.06` 계약과 달랐고, 다음 측정값으로 capture gate가
+실패했다.
+
+- 실패 raw: `results/recording_failures/record_duct/20260830_120721_461980_timeline_gate_9a157941/`
+- `failure.json` SHA-256:
+  `246281a690c201c05ab187f8b29152b86acfa533c79ecad3218be602720dbee8`
+- `mics.wav` SHA-256:
+  `fffa87bfd40542d27ea99ff3a3209c7f4648610e7e484092a173a3fadf98ccad`
+- 저역/고역/REF 코히런스: `0.859238 / 0.594673 / 0.857512`
+- raw valid-window ratio `0.915254`, 잔여 robust std `2.49684`, p95−p5 `11.8999`
+- xrun/clip 0, active additions session 0
+
+따라서 이 raw는 수정·승격하지 않고 실패 증거로 보존한다. canonical additions amplitude는
+기존 82세션과 같은 exact `0.06`으로 코드·batch·최종 generation에 모두 강제했다. 신규
+capture는 저역/고역/REF 코히런스, raw/aligned valid-window ratio, 잔여 지연 robust std와
+p95−p5의 일곱 조건을 공용 `RecordedCaptureGateContract`로 publish 전에 판정한다. durable
+`failure.json`은 symlink component를 거부하고 같은 file descriptor에서 snapshot/SHA를
+읽은 경우에만 batch progress 근거로 채택한다. resume과 최종 generation도 같은 계약을
+재계산한다.
+
+기존 82세션은 raw WAV 전체 reissue QA에서 `82/82 PASS`, 오류·경고 0, 95.67분, 61 group을
+재확인했다. 결과는
+`results/data_audit/recorded_qa_reissue/20260830_post_capture_gate/recorded_qa.json`
+(SHA-256 `484599c489c9c6d4daaf2e4cece1f327cfb44af777e5c02e077a6957d7f04db9`)에
+보존했다. 이는 82세션이 Stage-1 자료로 유효하다는 증거이며 2/4/8 kHz full-octave authority로
+승격하는 증거는 아니다.
+
+Elice의 기존 venv는 현재 checkout을 import했지만 저장된 `environment-freeze.txt`가 과거
+commit을 가리키고 있었다. bootstrap/setup은 venv를 재사용하더라도 freeze를 원자 재생성하고,
+유일한 Deep-ANC editable VCS requirement의 전체 40자리 SHA가 `--expected-commit`과 exact할
+때만 진행하도록 고쳤다. transfer/DNS receipt 소비측도 stale source commit을 새 외부 SHA로
+재봉인하는 우회를 거부한다. A100 80GB와 public raw/decoder audit는 보존하며 36 GB를 다시
+받지 않는다.
+
+현재 실제 다음 순서는 **전체 pytest 0 FAIL → clean exact dev commit/push → 같은 commit의
+Elice bootstrap/DNS selector 재결속 → 0.06 첫 15초 세션 1개 → 즉시 일곱 gate QA → PASS일
+때만 나머지 16개**다. dirty tree를 우회한 녹음, 0.15 재시도, 실패 세션 자동 반복은 금지한다.
+99세션 transfer/bootstrap 뒤 readiness가 init만 FAIL인 상태가 되기 전에는 GPU pilot을
+시작하지 않는다.
+
+### 0.13 파인튜닝 준비 완료 후 Git history 정리 예약
+
+사용자 지시에 따라 준비 과정의 미세한 수정 commit을 최종 history에 그대로 누적하지 않는다.
+다만 bootstrap/DNS selection/recording/transfer receipt가 exact commit SHA에 결속되는 동안에는
+rebase로 그 근거를 무효화하지 않는다. 현재 `dev` 고유 이력은 155개 commit과 3개 merge라
+직접 interactive rebase의 누락 위험이 크다. 따라서 **현재 코드·테스트 준비가 clean 상태로
+고정된 뒤, 성공 canonical 17세션과 checkpoint를 만들기 직전** 다음 절차로 한 번만 정리한다.
+이 시점이 사용자 지시의 “파인튜닝 준비 코드 완료 후”이며, 이미 녹음·pilot을 만든 뒤 SHA를
+다시 바꾸는 비용을 피하는 마지막 안전 창이다.
+
+1. 현재 `dev` tip을 remote backup ref로 보존하고 local/remote SHA를 기록한다.
+2. `main`은 변경하지 않는다. 별도 review worktree에서 최종 tree를 다음 7개 중요 단계로
+   재구성한다: timing/measurement 불변식, strict P/S·계보·Stage-1 readiness, exact-env·
+   checkpoint·학습 계약, full-octave source/loss/batch 계약, Jetson clock/witness/acquisition,
+   physical G4 fail-closed gate, 최종 Elice/recording 통합 복구.
+3. private key, token, raw corpus, run artifact가 commit에 들어오지 않았는지 전 history를 검사한다.
+4. old/new tree SHA가 byte-exact인지 먼저 확인하고, 정리된 새 `dev`에서 전체 pytest,
+   `git diff --check`, bootstrap/selector/transfer/readiness의 exact-SHA 검증을 다시 수행한다.
+   rebase 전 receipt를 새 SHA의 증거로 재사용하지 않는다.
+5. old/new merge-base와 backup ref를 출력해 검토한 뒤 `--force-with-lease`로만 `dev`를 갱신한다.
+6. canonical fine-tune과 현장 평가가 합격하기 전에는 `main`에 병합하지 않는다.
+
+즉 history 정리는 예약돼 있지만, 현재 유효 데이터 수집을 앞두고 SHA를 계속 바꾸는 식으로
+실행하지 않는다.
+
+### 0.14 Elice stale reference를 비용 발생 전에 차단하는 정적 게이트
+
+7개 milestone history 후보에서 전체 pytest를 Jetson과 Elice에 병렬 실행했을 때 양쪽 모두
+`tests/test_gate_registry.py::test_every_declared_gate_has_a_failing_fixture` 한 건만 실패했다.
+원인은 `recording_timeline_fail_closed` registry가 이미 개명된
+`test_cli_refuses_to_loosen_the_gates`를 계속 가리킨 것이었다. 모델·데이터·오디오 결함은
+아니었지만, 기존 메타 테스트가 전체 회귀 중간에 있어서 Jetson 약 19분과 Elice bootstrap
+scan을 낭비했다. Elice log는
+`/home/elicer/deep_anc_logs/bootstrap_full_a7d75d050e55256d0e587cdaddabf7e14d919eab.log`에
+보존했고 bootstrap receipt·selector·학습은 발행하지 않았다.
+
+옛 node 한 줄만 바꾸고 끝내지 않고 다음 조기 경계를 추가했다.
+
+1. `scripts/ci/check_static_contract_references.py`는 프로젝트 의존성을 import하지 않는
+   pure-stdlib 검사다. 현재 운영 Python source 149개에서 static pytest node 172개와 test
+   file 23개를 AST로 검증한다.
+2. 파일/함수 개명·누락, malformed/parameter node, duplicate test definition, symlink target을
+   fail-closed한다. 여러 gate가 같은 fixture를 공유하는 것은 정상으로 허용한다.
+3. `src/scripts/configs`의 새 40자리 Git SHA literal은 대소문자 모두 거부한다. source-pool
+   v1/v2 byte-exact 재현을 위한 지정 파일 네 위치의 historical builder SHA만 exact
+   allowlist이며, 64자리 SHA-256과 docs/runs/results의 역사 증거는 current commit으로
+   오인하지 않는다.
+4. `tests/conftest.py`가 pytest collection 전에 같은 API를 호출한다. 따라서 stale node는
+   전체 회귀 중간이 아니라 시작 시점에 종료된다.
+5. `bootstrap_all.sh`는 exact checkout을 확인한 직후 이 checker를 `python3 -I -B`로
+   실행한다. holdout/transfer/hardware/venv/raw/manifest/pytest보다 앞이며, stale fixture에서
+   뒤 단계와 `.venv` 생성이 모두 0회임을 shell regression이 강제한다.
+6. Elice-only hotfix를 금지하고, 원격 실패는 local 코드·negative fixture·문서·GitHub exact
+   commit 한 세트로만 복구하도록 `AGENTS.md`와 `docs/05_training_elice.md`에 고정했다.
+
+focused 결과는 static checker 18/18, Elice script 52/52, renamed registry 9개 fixture PASS다.
+현재 Elice의 raw `36,403,604,715` bytes와 venv `5,639,428,687` bytes는 보존됐고 관련
+bootstrap/selector/train process는 0이다. 다음 순서는 최종 milestone tip의 정적 검사·전체
+pytest 0 FAIL → `dev` force-with-lease → Elice exact preflight/full bootstrap → 새 DNS selector
+receipt → Jetson 무음 dry-run → amplitude `0.06` 첫 15초 세션이다.
 
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선

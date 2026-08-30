@@ -1188,11 +1188,6 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    try:
-        args._validated_followup_contract = validate_followup_contract(args)
-    except (FileNotFoundError, FileExistsError, OSError, RuntimeError, ValueError) as exc:
-        print(f"[중단] 후속 측정 preflight 실패: {exc}", file=sys.stderr)
-        return 2
     if not args.confirm_speaker:
         print(
             f"스피커에서 {args.seconds:.0f}초 동안 소리가 납니다. "
@@ -1200,6 +1195,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    # live preflight/raw/PortAudio보다 operator safety confirmation을 먼저 닫는다.
+    # 특히 fullband-v5에서 누락된 confirmation이 있으면 tracked raw나 host 장치
+    # 상태를 읽지도 않고 즉시 중단해야 한다.
     if not (args.confirm_user_present and args.confirm_volume_minimum):
         print(
             "[중단] 모든 live meter는 사용자 입회와 시작 전 볼륨 최저 확인이 "
@@ -1215,6 +1213,11 @@ def main(argv: list[str] | None = None) -> int:
             "--confirm-routing-and-geometry --confirm-same-amplifier-setting",
             file=sys.stderr,
         )
+        return 2
+    try:
+        args._validated_followup_contract = validate_followup_contract(args)
+    except (FileNotFoundError, FileExistsError, OSError, RuntimeError, ValueError) as exc:
+        print(f"[중단] 후속 측정 preflight 실패: {exc}", file=sys.stderr)
         return 2
     return measure(args)
 

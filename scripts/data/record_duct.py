@@ -66,6 +66,14 @@ from deep_anc.data.manifest import (                         # noqa: E402
     validate_session_id,
     validate_source_family,
 )
+from deep_anc.data.recorded_qa import (                      # noqa: E402
+    CAPTURE_MIN_LOW_BAND_COHERENCE,
+    CAPTURE_MIN_RAW_VALID_WINDOW_RATIO,
+    DEFAULT_RECORDED_CAPTURE_GATE,
+    RecordedCaptureGateContract,
+    RecordedCaptureGateResult,
+    evaluate_recorded_capture_gate,
+)
 from deep_anc.data.holdout_contract import (                 # noqa: E402
     read_regular_file_snapshot,
 )
@@ -80,18 +88,50 @@ from deep_anc.audio_io import (                             # noqa: E402
 from deep_anc.dsp.measurement_level import (                 # noqa: E402
     assert_live_pcm_clock_preconditions,
 )
-from deep_anc.realtime.noise_gen import NoiseProgram         # noqa: E402
+from deep_anc.realtime.noise_gen import (                    # noqa: E402
+    NoiseProgram,
+    render_recording_file_window,
+)
 
 # 게이트 하한. CLI 는 이 값 **이상**만 받는다(강화 전용).
 # 0.90 의 근거: 선형 Wiener 하한 10·log10(1−coh²) 로 −10 dB. 재정렬이 성공한 실측
 # 세션은 0.87~0.96 이고 붕괴 세션은 0.02~0.13 이라 그 사이 골짜기가 넓다.
-DEFAULT_MIN_TIMELINE_COHERENCE = 0.90
-DEFAULT_MIN_VALID_WINDOW_RATIO = 0.90
+DEFAULT_MIN_TIMELINE_COHERENCE = CAPTURE_MIN_LOW_BAND_COHERENCE
+DEFAULT_MIN_VALID_WINDOW_RATIO = CAPTURE_MIN_RAW_VALID_WINDOW_RATIO
 PROGRAM_PEAK_FACTORS = {
     "white": 4.0,
     "band": 4.0,
     "multitone": 1.5,
 }
+
+# 부모 오케스트레이터가 사람이 읽는 마지막 stdout 줄을 실패 원인으로 오인하지 않도록,
+# durable ``failure.json``이 발행된 **뒤에만** 이 한 줄짜리 기계 판독 포인터를 stderr로
+# 내보낸다. 기존 한국어 안내 줄은 현장 운용/로그 하위 호환성을 위해 그대로 유지한다.
+FAILURE_RECEIPT_MARKER = "DEEP_ANC_RECORD_DUCT_FAILURE_JSON="
+
+
+def _prepare_file_source_timeline(
+    program: NoiseProgram,
+    *,
+    settle_frames: int,
+    keep_frames: int,
+    sample_rate: int,
+) -> np.ndarray:
+    """settle zero prefix 뒤에 planned file window를 exact 배치한다."""
+
+    settle_frames = int(settle_frames)
+    keep_frames = int(keep_frames)
+    if settle_frames < 0 or keep_frames <= 0:
+        raise ValueError("settle_frames는 0 이상, keep_frames는 양수여야 합니다")
+    timeline = np.zeros(settle_frames + keep_frames, dtype=np.float32)
+    timeline[settle_frames:] = render_recording_file_window(
+        program,
+        keep_frames,
+        sample_rate=sample_rate,
+    )
+    return timeline
+
+
 # 자가진단 상한. QA 의 max_clip_ratio(0.005)와 같은 자리에서 판정하되, 재생 전에 본다.
 # 레일 게이트와 임계는 src/deep_anc/audio_io.py 가 단일 출처다.
 # 여기 두면 다른 도구가 sys.path 를 조작해 스크립트에서 import 해야 하고,
@@ -170,6 +210,27 @@ def _write_json_exclusive(path: Path, payload: dict) -> None:
         os.fsync(handle.fileno())
 
 
+def _announce_failure_receipt(
+    *, failure_dir: Path, stage: str, reason: str
+) -> None:
+    """durable failure evidence의 기계 판독 포인터를 한 줄로 알린다."""
+
+    receipt = failure_dir / "failure.json"
+    marker = {
+        "schema_version": 1,
+        "failure_stage": str(stage),
+        "failure_reason": str(reason),
+        "failure_artifact": os.path.abspath(failure_dir),
+        "failure_receipt": os.path.abspath(receipt),
+    }
+    print(
+        FAILURE_RECEIPT_MARKER
+        + json.dumps(marker, ensure_ascii=False, separators=(",", ":")),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _seal_staging_failure(
     *, staging_dir: Path, failed_root: Path, stage: str, reason: str, metadata: dict
 ) -> Path:
@@ -182,13 +243,13 @@ def _seal_staging_failure(
     _write_json_exclusive(
         staging_dir / "failure.json",
         {
+            **metadata,
             "schema_version": 1,
             "status": "failed_capture",
             "failure_stage": stage,
             "failure_reason": reason,
             "raw_available": any(item["path"].endswith(".wav") for item in artifacts),
             "artifacts": artifacts,
-            **metadata,
         },
     )
     _fsync_directory(staging_dir)
@@ -198,6 +259,7 @@ def _seal_staging_failure(
     _fsync_directory(staging_dir.parent)
     _fsync_directory(failed_root)
     print(f"[보존] 실패 staging 전체: {final}", file=sys.stderr)
+    _announce_failure_receipt(failure_dir=final, stage=stage, reason=reason)
     return final
 
 
@@ -355,6 +417,7 @@ def _preserve_failed_capture(
         raw_paths.append(path)
     artifacts = _artifact_evidence(raw_paths, base=staging_dir)
     payload = {
+        **metadata,
         "schema_version": 1,
         "status": "failed_capture",
         "failure_stage": stage,
@@ -362,7 +425,6 @@ def _preserve_failed_capture(
         "raw_available": bool(raw_paths),
         "sample_rate": int(sample_rate),
         "artifacts": artifacts,
-        **metadata,
     }
     _write_json_exclusive(staging_dir / "failure.json", payload)
     _fsync_directory(staging_dir)
@@ -370,6 +432,7 @@ def _preserve_failed_capture(
     _atomic_rename_noreplace(staging_dir, failure_dir)
     _fsync_directory(failed_root)
     print(f"[보존] 실패 raw/metadata: {failure_dir}", file=sys.stderr)
+    _announce_failure_receipt(failure_dir=failure_dir, stage=stage, reason=reason)
     return failure_dir
 
 
@@ -425,18 +488,54 @@ def _publish_session(
         raise
 
 
-def timeline_gate(report, *, min_coherence: float, min_valid_window_ratio: float) -> bool:
-    """gate: ``recording_timeline_fail_closed`` — 재정렬이 실제로 성공했는가.
+def timeline_gate_result(
+    report, *, min_coherence: float, min_valid_window_ratio: float
+) -> RecordedCaptureGateResult:
+    """gate: ``recording_timeline_fail_closed`` — active corpus 발행 전 단일 판정.
 
-    ``coh²(source_aligned→ERR, 150-600Hz)`` 와 유효창 비율을 **저장 전에** 본다.
-    실패하면 세션을 쓰지 않는다. 이 판정을 저장 뒤로 미루면 결함 2 가 그대로 재발한다 —
-    80 세션이 정확히 그렇게 만들어졌다.
+    저역·고역·REF 대조군·원시 추적률·잔여 지연 안정성을 공용 계약으로 함께 본다.
+    호출부가 조건을 다시 조립하지 않도록 판정 결과와 실패 조건을 그대로 반환한다.
     """
 
-    return bool(
-        report.coh2_150_600_after >= float(min_coherence)
-        and report.valid_window_ratio >= float(min_valid_window_ratio)
+    contract = RecordedCaptureGateContract(
+        min_low_band_coherence=float(min_coherence),
+        min_high_band_coherence=DEFAULT_RECORDED_CAPTURE_GATE.min_high_band_coherence,
+        min_ref_err_coherence=DEFAULT_RECORDED_CAPTURE_GATE.min_ref_err_coherence,
+        min_raw_valid_window_ratio=float(min_valid_window_ratio),
+        max_residual_robust_std_samples=(
+            DEFAULT_RECORDED_CAPTURE_GATE.max_residual_robust_std_samples
+        ),
+        max_residual_p95_p5_samples=(
+            DEFAULT_RECORDED_CAPTURE_GATE.max_residual_p95_p5_samples
+        ),
     )
+    return evaluate_recorded_capture_gate(report, contract)
+
+
+def timeline_gate(report, *, min_coherence: float, min_valid_window_ratio: float) -> bool:
+    """기존 bool 호출자를 위한 얇은 호환 경로. 판정식은 공용 계약에만 있다."""
+
+    return timeline_gate_result(
+        report,
+        min_coherence=min_coherence,
+        min_valid_window_ratio=min_valid_window_ratio,
+    ).ok
+
+
+def _timeline_metadata_with_capture_gate(
+    report, *, min_coherence: float, min_valid_window_ratio: float
+) -> tuple[dict, RecordedCaptureGateResult]:
+    """판정 metadata를 만들고 실패 시 digital-reference 사용 가능성을 닫는다."""
+
+    result = timeline_gate_result(
+        report,
+        min_coherence=min_coherence,
+        min_valid_window_ratio=min_valid_window_ratio,
+    )
+    metadata = report.as_metadata()
+    metadata["capture_gate"] = result.as_metadata()
+    metadata["usable_for_digital_reference"] = result.ok
+    return metadata, result
 
 
 def _summarise_io_timestamps(stamps: np.ndarray, fs: int) -> dict:
@@ -571,18 +670,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # 게이트 인자는 **강화 방향으로만** 열려 있다. 완화 값을 주면 그 자리에서 거부한다 —
-    # 게이트를 인자로 풀 수 있으면 그것은 게이트가 아니라 제안이다.
-    if args.min_timeline_coherence < DEFAULT_MIN_TIMELINE_COHERENCE:
-        parser.error(
-            f"--min-timeline-coherence 는 {DEFAULT_MIN_TIMELINE_COHERENCE} 이상이어야 "
-            f"합니다 (받은 값 {args.min_timeline_coherence}) — 게이트는 강화만 합니다"
-        )
-    if args.min_valid_window_ratio < DEFAULT_MIN_VALID_WINDOW_RATIO:
-        parser.error(
-            f"--min-valid-window-ratio 는 {DEFAULT_MIN_VALID_WINDOW_RATIO} 이상이어야 "
-            f"합니다 (받은 값 {args.min_valid_window_ratio}) — 게이트는 강화만 합니다"
-        )
+    # 게이트 인자는 **강화 방향으로만** 열려 있다. NaN은 하한 비교가
+    # False이며 1 초과값은 녹음 뒤 계약 생성에서야 예외가 나므로, 둘 다 오디오
+    # primitive에 닿기 전에 finite 구간과 canonical 하한을 함께 검사한다.
+    for option, value, floor in (
+        (
+            "--min-timeline-coherence",
+            args.min_timeline_coherence,
+            DEFAULT_MIN_TIMELINE_COHERENCE,
+        ),
+        (
+            "--min-valid-window-ratio",
+            args.min_valid_window_ratio,
+            DEFAULT_MIN_VALID_WINDOW_RATIO,
+        ),
+    ):
+        if not np.isfinite(value) or not (floor <= value <= 1.0):
+            parser.error(
+                f"{option} 는 finite이며 {floor} 이상 1.0 이하여야 합니다 "
+                f"(받은 값 {value}) — 게이트는 강화만 합니다"
+            )
     if args.force:
         parser.error("--force는 입력 무신호/rail 안전 게이트를 우회하므로 더 이상 허용하지 않습니다")
     if args.ref_check_dbfs < MIN_PROBE_DBFS:
@@ -824,7 +931,16 @@ def main(argv: list[str] | None = None) -> int:
     settle = int(max(0.0, args.settle_seconds) * fs)
     keep = int(args.seconds * fs)
     total = keep + settle
-    source = np.zeros(total, dtype=np.float32)
+    source = (
+        _prepare_file_source_timeline(
+            program,
+            settle_frames=settle,
+            keep_frames=keep,
+            sample_rate=fs,
+        )
+        if args.program == "file"
+        else np.zeros(total, dtype=np.float32)
+    )
     recorded = np.zeros((total, 2), dtype=np.float32)
     cursor = {"in": 0, "out": 0}
     xrun_state: dict = {"count": 0, "flags": set()}
@@ -841,6 +957,10 @@ def main(argv: list[str] | None = None) -> int:
         envelope[settle : settle + ramp] = fade[:ramp]
         envelope[settle + keep - ramp : settle + keep] = fade[:ramp][::-1]
 
+    # file plan의 start_seconds는 audible 15초의 첫 샘플이다. 과거에는 settle
+    # 무음 중에도 program.generate()를 호출해 cursor가 1초 전진했고, 15초 composite의
+    # 끝은 처음으로 wrap됐다. file만은 planned window를 먼저 exact 렌더링하고 settle
+    # 앞에는 zero를 둔다. validator도 같은 공용 렌더러를 사용한다.
     # 콜백 타임스탬프는 **provenance 전용**이다. 실측(무음 40초 프로브): status 0회,
     # adc/cur rate +5.0 ppm, 그런데 dac−adc 는 0.010/0.020 s 두 값 사이를 16 샘플
     # 단위로만 튄다 → 실제 ±130 샘플 변조를 전혀 보여주지 않는다. 이 값으로 정렬을
@@ -873,14 +993,19 @@ def main(argv: list[str] | None = None) -> int:
         cursor["in"] = i + n
 
         o = cursor["out"]
-        blk = program.generate(frames)
-        # settle 구간은 무음으로 흘린다 — 프로그램 위상은 그대로 진행시켜 잘라낸 뒤에도
-        # source 배열과 재생 샘플이 같은 인덱스를 가리키게 한다.
-        # ⚠ 이 인덱스 동일성은 "재생 배열 안에서" 만 유효하다. 재생 샘플이 **언제
-        #   공기 중으로 나갔는가**는 여기서 알 수 없다 — 그것이 결함 2 의 본체였다.
-        blk *= envelope[o : o + frames]
-        m = min(frames, total - o)
-        source[o : o + m] = blk[:m]
+        m = max(0, min(frames, total - o))
+        if args.program == "file":
+            # settle은 pre-rendered source의 exact zero prefix다. callback block이
+            # settle 경계를 가로질러도 planned file cursor는 소비되지 않는다.
+            blk = np.zeros(frames, dtype=np.float32)
+            if m > 0:
+                blk[:m] = source[o : o + m]
+        else:
+            blk = program.generate(frames)
+            # 생성형 program은 기존 위상/settle 동작을 보존한다.
+            blk *= envelope[o : o + frames]
+            if m > 0:
+                source[o : o + m] = blk[:m]
         out = np.zeros((frames, 2), dtype=np.float32)
         out[:, 0] = blk                             # ch0 = 소음 스피커
         # ch1(상쇄 스피커)은 무음 유지
@@ -1038,8 +1163,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"[중단] 시간축 재정렬 예외: {exc}", file=sys.stderr)
             return 1
-        timeline_meta = report.as_metadata()
-        timeline_meta["usable_for_digital_reference"] = True
+        timeline_meta, capture_gate = _timeline_metadata_with_capture_gate(
+            report,
+            min_coherence=args.min_timeline_coherence,
+            min_valid_window_ratio=args.min_valid_window_ratio,
+        )
         print(
             f"  coh²(source→ERR,150-600Hz) {report.coh2_150_600_before:.3f} → "
             f"{report.coh2_150_600_after:.3f} | 600-1600Hz "
@@ -1052,18 +1180,11 @@ def main(argv: list[str] | None = None) -> int:
             f"robust-std {report.aligned_lag_robust_std_samples:.2f} "
             f"p95-p5 {report.aligned_lag_p95_p5_samples:.2f}"
         )
-        if not timeline_gate(
-            report,
-            min_coherence=args.min_timeline_coherence,
-            min_valid_window_ratio=args.min_valid_window_ratio,
-        ):
+        if not capture_gate.ok:
             _preserve_failed_capture(
                 failed_root=_repo_path(args.failed_root),
                 stage="timeline_gate",
-                reason=(
-                    f"coh2={report.coh2_150_600_after:.6f}, "
-                    f"valid_window_ratio={report.valid_window_ratio:.6f}"
-                ),
+                reason=capture_gate.failure_text,
                 sample_rate=fs,
                 metadata={
                     **failure_meta,
@@ -1078,11 +1199,8 @@ def main(argv: list[str] | None = None) -> int:
                 source_raw=raw_source,
             )
             print(
-                "[중단] 시간축 재정렬 실패 — 세션을 저장하지 않습니다 "
-                f"(coh² {report.coh2_150_600_after:.3f} < {args.min_timeline_coherence}, "
-                f"유효창 {report.valid_window_ratio:.3f} < {args.min_valid_window_ratio}). "
-                f"음향 대조군 coh²(REF→ERR)={report.coh2_ref_err_150_600:.3f} — 이 값이 "
-                "높으면 배선/음향이 아니라 재생-캡처 타임베이스 문제입니다.",
+                "[중단] 시간축 capture gate 실패 — 세션을 저장하지 않습니다: "
+                + capture_gate.failure_text,
                 file=sys.stderr,
             )
             return 1

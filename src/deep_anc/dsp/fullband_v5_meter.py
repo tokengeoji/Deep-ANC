@@ -38,7 +38,6 @@ from deep_anc.dsp.measurement_level import (
     MEASUREMENT_LEVEL_EVIDENCE_SCHEMA,
     OFFICIAL_MEASUREMENT_CHANNEL_MAP,
     OFFICIAL_MEASUREMENT_LEVEL,
-    collect_alsa_physical_fingerprint,
     measurement_hardware_identity,
     meter_receipt_path,
     require_physical_hardware_identity,
@@ -584,12 +583,20 @@ def load_fullband_v5_static_contract(
     level_evidence: str | Path = DEFAULT_LEVEL_EVIDENCE_PATH,
     raw_target: str | Path = DEFAULT_RAW_TARGET_PATH,
     require_sealed_raw_fresh: bool,
+    physical_fingerprint: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """PortAudio import 전에 tracked attestation과 현재 hardware를 검증한다.
+    """PortAudio import 전에 tracked attestation과 hardware 계약을 검증한다.
 
     과거 paired raw를 요구하는 strict forensic loader를 약화하지 않는다. 이 live-v5
     경로는 exact tracked evidence bytes에서 좁은 historical attestation만 읽고,
     fresh 20초 v5 meter가 뒤이어 현재 레벨을 다시 증명하도록 한다.
+
+    ``physical_fingerprint``를 주면 호출자가 이미 수집한 현재 ALSA fingerprint와
+    tracked attestation을 비교한다. 생략하면 이 함수는 의도적으로 호스트 ALSA를
+    열지 않고, attestation에 봉인된 fingerprint를 portable static 값으로 사용한다.
+    따라서 Elice 같은 오디오 장치가 없는 학습 노드에서도 파일·계약 검증을 수행할
+    수 있으며, 실제 live capture 경로는 반드시 현재 fingerprint를 명시적으로
+    전달해야 한다.
     """
 
     root = _repository_root(repository_root)
@@ -719,7 +726,15 @@ def load_fullband_v5_static_contract(
             evidence_guard.bytes,
             relative_path=str(DEFAULT_MEASUREMENT_LEVEL_EVIDENCE_PATH),
         )
-        physical_fingerprint = collect_alsa_physical_fingerprint(hardware_config)
+        if physical_fingerprint is None:
+            # static-only/portable 검증은 호스트의 /proc/asound·/sysfs를 읽지 않는다.
+            # tracked attestation 자체가 physical identity의 canonical snapshot이다.
+            physical_fingerprint = attestation["hardware_identity"].get(
+                "physical_fingerprint"
+            )
+        if not isinstance(physical_fingerprint, Mapping):
+            raise ValueError("v5 physical fingerprint mapping이 필요합니다")
+        physical_fingerprint = json.loads(_canonical_json(physical_fingerprint))
         hardware_identity = measurement_hardware_identity(
             hardware_config,
             physical_fingerprint=physical_fingerprint,
@@ -795,18 +810,24 @@ def validate_fullband_v5_static_contract(
     hardware_path: str | Path = DEFAULT_HARDWARE_PATH,
     raw_target_path: str | Path = DEFAULT_RAW_TARGET_PATH,
     require_sealed_raw_fresh: bool,
+    physical_fingerprint: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """live adapter용 명시적 static-only public wrapper (PortAudio 접근 없음)."""
 
-    return load_fullband_v5_static_contract(
-        repository_root=repository_root,
-        plan_envelope=plan_envelope_path,
-        live_authority=live_authority_path,
-        hardware=hardware_path,
-        level_evidence=level_evidence_path,
-        raw_target=raw_target_path,
-        require_sealed_raw_fresh=require_sealed_raw_fresh,
-    )
+    kwargs: dict[str, Any] = {
+        "repository_root": repository_root,
+        "plan_envelope": plan_envelope_path,
+        "live_authority": live_authority_path,
+        "hardware": hardware_path,
+        "level_evidence": level_evidence_path,
+        "raw_target": raw_target_path,
+        "require_sealed_raw_fresh": require_sealed_raw_fresh,
+    }
+    # None은 의도적으로 전달하지 않아 기존 static wrapper의 exact forwarding과
+    # portable 호출 의미를 유지한다.
+    if physical_fingerprint is not None:
+        kwargs["physical_fingerprint"] = physical_fingerprint
+    return load_fullband_v5_static_contract(**kwargs)
 
 
 def resolve_fullband_v5_devices(

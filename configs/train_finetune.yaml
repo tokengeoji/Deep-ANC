@@ -24,6 +24,10 @@ require_init_checkpoint: true
 require_recorded_manifest: true
 required_init_experiment_role: canonical_pretrain
 require_init_eligible: true
+# canonical 100k init은 같은 run의 completion.json까지 필요하다. 20k loss pilot을
+# 시작점으로 쓰는 measured_probe만 false이며, 양쪽 모두 sibling last.pt의 exact step은
+# readiness에서 별도로 검증한다.
+require_init_completion_receipt: true
 
 # scripts/train/check_finetune.py와 train.py가 공용하는 실패-폐쇄 진입 기준.
 # 실제 official P/S와 recorded 데이터가 없으면 어떤 항목도 우회하지 않는다.

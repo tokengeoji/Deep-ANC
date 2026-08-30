@@ -27,7 +27,11 @@ from .recorded_generation import (
     RecordedGenerationError,
     validate_recorded_generation,
 )
-from .source_trust import SourceTrustError, exact_clean_source_evidence
+from .source_trust import (
+    SourceTrustError,
+    exact_clean_source_evidence,
+    validate_environment_freeze_source_commit,
+)
 
 
 TRANSFER_SCHEMA_VERSION = 1
@@ -43,6 +47,8 @@ _ROLES = frozenset(
         "strict_ps_analysis",
         "strict_primary_npz",
         "strict_secondary_npz",
+        "level_meter_raw",
+        "level_meter_receipt",
         "recorded_manifest",
         "parent_recorded_manifest",
         "recorded_generation",
@@ -64,6 +70,8 @@ _ROLE_PREFIXES = {
     "strict_ps_analysis": "results/",
     "strict_primary_npz": "assets/measured/",
     "strict_secondary_npz": "assets/measured/",
+    "level_meter_raw": "results/",
+    "level_meter_receipt": "results/",
     "recorded_manifest": "data/manifests/",
     "parent_recorded_manifest": "data/manifests/",
     "recorded_generation": "data/manifests/recorded_generations/",
@@ -397,7 +405,7 @@ def validate_transfer_manifest(
                 root / relative,
                 root=root,
                 label=f"transfer file #{index}",
-                capture_bytes=role == "recorded_manifest",
+                capture_bytes=role in {"recorded_manifest", "level_meter_receipt"},
             )
         except HoldoutContractError as exc:
             raise TransferContractError(str(exc)) from exc
@@ -510,6 +518,54 @@ def validate_transfer_manifest(
     }
     if actual_strict != expected_strict:
         raise TransferContractError("strict_ps pointer와 files role exact 집합이 다릅니다")
+
+    entry_by_path = {str(entry["path"]): entry for entry in entries}
+    # tracked measurement_level_evidence.json이 참조하는 큰 meter raw와 sibling
+    # receipt는 strict P/S capture_root와 다른 경로에 있으므로 별도 role로
+    # 봉인한다. pointer가 있는 manifest에서는 두 role의 path/SHA 관계를 반드시
+    # 검증하고, fixture/구형 manifest처럼 pointer가 없는 경우에는 기존 계약을
+    # 유지한다.
+    level_meter = payload.get("level_meter")
+    level_roles_present = bool(
+        by_role["level_meter_raw"] or by_role["level_meter_receipt"]
+    )
+    if level_meter is None:
+        if level_roles_present:
+            raise TransferContractError(
+                "level_meter role이 있지만 top-level level_meter pointer가 없습니다"
+            )
+    else:
+        if not isinstance(level_meter, dict) or set(level_meter) != {"raw", "receipt"}:
+            raise TransferContractError("level_meter pointer 구조가 불완전합니다")
+        if len(by_role["level_meter_raw"]) != 1 or len(
+            by_role["level_meter_receipt"]
+        ) != 1:
+            raise TransferContractError(
+                "level_meter raw/receipt role은 각각 정확히 1개여야 합니다"
+            )
+        expected_level = {
+            "raw": by_role["level_meter_raw"][0],
+            "receipt": by_role["level_meter_receipt"][0],
+        }
+        if level_meter != expected_level:
+            raise TransferContractError("level_meter pointer와 role이 다릅니다")
+        try:
+            receipt_bytes = validated_file_snapshots[expected_level["receipt"]].data
+            if receipt_bytes is None:
+                raise ValueError("receipt bytes snapshot이 없습니다")
+            receipt_payload = json.loads(receipt_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise TransferContractError("level meter receipt JSON을 읽을 수 없습니다") from exc
+        raw_entry = entry_by_path[expected_level["raw"]]
+        expected_receipt = {
+            "raw_path": expected_level["raw"],
+            "raw_sha256": raw_entry["sha256"],
+            "schema": "measurement_level_meter_raw_receipt_v1",
+        }
+        if receipt_payload != expected_receipt:
+            raise TransferContractError(
+                "level meter receipt가 transfer raw path/SHA/schema와 다릅니다"
+            )
 
     if payload.get("recorded_manifest") != by_role["recorded_manifest"][0]:
         raise TransferContractError("recorded_manifest pointer와 role이 다릅니다")
@@ -626,7 +682,6 @@ def validate_transfer_manifest(
         or lineage_tree_file_count <= 0
     ):
         raise TransferContractError("canonical recorded-tree metadata 증거가 유효하지 않습니다")
-    entry_by_path = {str(entry["path"]): entry for entry in entries}
     lineage_manifest_path = (
         by_role["recorded_manifest"][0]
         if schema_version == TRANSFER_SCHEMA_VERSION
@@ -1012,7 +1067,7 @@ def bind_recorded_transfer_config(
                 root / str(environment_receipt["freeze_receipt"]),
                 root=root,
                 label="bootstrap environment freeze receipt",
-                capture_bytes=False,
+                capture_bytes=True,
             )
         except HoldoutContractError as exc:
             raise TransferContractError(str(exc)) from exc
@@ -1020,6 +1075,16 @@ def bind_recorded_transfer_config(
             raise TransferContractError(
                 "bootstrap 이후 environment freeze receipt가 변경됐습니다"
             )
+        assert freeze_snapshot.data is not None
+        try:
+            validate_environment_freeze_source_commit(
+                freeze_snapshot.data,
+                expected_commit=str(receipt_payload["expected_commit"]),
+            )
+        except SourceTrustError as exc:
+            raise TransferContractError(
+                f"bootstrap environment freeze source 결속 실패: {exc}"
+            ) from exc
         configured_manifest = data_cfg.get("transfer_manifest")
         if configured_manifest is not None and configured_manifest != transfer_receipt["path"]:
             raise TransferContractError(

@@ -52,6 +52,12 @@ v2 결과를 125 Hz 옥타브 PASS로 승격하지 않는다.
    `.gitignore`의 앵커 패턴(`/data/` 등)을 비앵커로 바꾸지 말 것 (과거 사고: `data/`가 `src/deep_anc/data/`까지 무시).
 7. **커밋 메시지에 AI 표기 금지.** Co-Authored-By: Claude/Codex 등 붙이지 말 것 (사용자 요청).
 8. **소통은 한국어.** 문서도 한국어로 작성.
+9. **Elice 원격 전용 hotfix 금지.** Elice working tree에서만 코드를 고쳐 학습을 재개하지
+   않는다. 실패 원인은 이 저장소에서 코드·회귀 테스트·운영 문서로 먼저 복구하고 GitHub의
+   exact commit으로 push한 뒤, Elice는 그 40자리 SHA를 detached checkout한다. stale test
+   node, stale commit/freeze/receipt, dirty tree 검사는 corpus scan·manifest 생성·GPU 학습보다
+   앞에서 fail-closed해야 한다. Elice 실패를 고쳤다면 재현 fixture와 재개 지점을
+   `docs/05_training_elice.md` 및 `HANDOFF.md`에 남기기 전에는 완료로 보지 않는다.
 
 ## 환경 요약
 
@@ -60,8 +66,8 @@ v2 결과를 125 Hz 옥타브 PASS로 승격하지 않는다.
 | 이 PC | Jetson AGX Orin (JetPack 6/R36.4.4) = **추론 타깃이자 개발 머신** |
 | venv | `.venv` — torch 2.5.0a0(NVIDIA JP6.1 wheel) + CUDA 동작. **onnxruntime==1.18.1 고정**(1.19+는 Tegra 크래시). venv 재생성 시 `bash scripts/jetson/setup_jetson.sh` (lib preload 훅 포함 — 필수) |
 | 학습 | Elice Cloud A100 (SSH 접속 — HANDOFF.md 참조), torch 2.5.1+cu121 |
-| GitHub | https://github.com/Roka-jsj/Deep-ANC (공개). push 인증: 이 PC의 `~/.ssh/id_ed25519` |
-| 실행 | 모든 파이썬 실행은 `.venv/bin/python`. 테스트: `.venv/bin/python -m pytest -q` (전부 통과 유지) |
+| GitHub | https://github.com/tokengeoji/Deep-ANC (공개, 현재 `origin`). push 인증: 이 PC의 `~/.ssh/id_ed25519` |
+| 실행 | 모든 프로젝트 파이썬 실행은 `.venv/bin/python`. 조기 정적 게이트: `python3 -I -B scripts/ci/check_static_contract_references.py --repo-root .`; 전체 테스트: `.venv/bin/python -m pytest -q` (둘 다 통과 유지) |
 
 ## 프로젝트 이해에 필요한 문서 (우선순위순)
 

@@ -22,6 +22,10 @@ from deep_anc.data.holdout_contract import (
     snapshot_regular_tree_metadata,
 )
 from deep_anc.data.public_lineage import canonical_json_sha256
+from deep_anc.data.source_trust import (
+    SourceTrustError,
+    validate_environment_freeze_source_commit,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +35,9 @@ ELICE_SCRIPTS = (
     REPO_ROOT / "scripts/elice/run_parallel_models.sh",
     REPO_ROOT / "scripts/elice/run_pretrain.sh",
     REPO_ROOT / "scripts/elice/run_structure_search.sh",
+)
+STATIC_REFERENCE_CHECKER = (
+    REPO_ROOT / "scripts/ci/check_static_contract_references.py"
 )
 FIXTURE_FMA_TRACKS = b",artist,album\ntrack_id,id,id\n1,artist-10,album-20\n"
 FIXTURE_FMA_TRACKS_SHA256 = hashlib.sha256(FIXTURE_FMA_TRACKS).hexdigest()
@@ -122,6 +129,8 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert 'ENVIRONMENT_RECEIPT="$REPO/.venv/environment-freeze.txt"' in text
     assert "pip freeze --all" in text
     assert "grep -Fxq 'torch==2.5.1+cu121'" in text
+    assert "validate_environment_freeze_source_commit" in text
+    assert "기존 exact 환경을 재사용하고 freeze를 expected commit에 갱신했습니다" in text
     assert 'BOOTSTRAP_RECEIPT="$REPO/data/manifests/elice_bootstrap_receipt.json"' in text
     assert '"recorded_aggregate_sha256": summary["recorded_aggregate_sha256"]' in text
     assert '"schema_version": 2' in text
@@ -129,9 +138,36 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert '"coverage_contract_sha256": coverage_payload[' in text
     assert '"freeze_receipt_sha256": environment.sha256' in text
     assert "data.bootstrap_receipt" in text
-    preflight_exit = text.index('if [ "$PREFLIGHT_ONLY" -eq 1 ]')
-    elice_hardware_call = text.index("if ! verify_transfer_bundle || ! hardware_storage_preflight")
-    assert preflight_exit < elice_hardware_call
+    exact_checkout_gate = text.index("if ! verify_exact_checkout; then")
+    static_reference_gate = text.index(
+        'python3 -I -B "$STATIC_REFERENCE_CHECKER" --repo-root "$REPO"'
+    )
+    canonical_bundle_gate = text.index(
+        "if ! verify_canonical_bundle; then", static_reference_gate
+    )
+    preflight_exit = text.index(
+        'if [ "$PREFLIGHT_ONLY" -eq 1 ]', canonical_bundle_gate
+    )
+    anchor_preflight = text.index(
+        "if ! verify_transfer_manifest_anchor || ! hardware_storage_preflight"
+    )
+    environment_stage = text.index('echo "=== [1/6] 환경 (venv + torch cu121 + 패키지) ==="')
+    freeze_refresh = text.index("if environment_probe; then", environment_stage)
+    full_transfer_gate = text.index('! verify_transfer_bundle "$VENV_PYTHON"; then')
+    download_stage = text.index('echo "=== [2/6] 데이터 다운로드 (병렬) ==="')
+    assert (
+        exact_checkout_gate
+        < static_reference_gate
+        < canonical_bundle_gate
+        < preflight_exit
+        < anchor_preflight
+        < environment_stage
+        < freeze_refresh
+        < full_transfer_gate
+        < download_stage
+    )
+    assert "verify_transfer_manifest_anchor()" in text
+    assert "full transfer validator에는 완성된 venv Python이 필요합니다" in text
     assert "GIT_NO_REPLACE_OBJECTS=1" in text
 
     runner = ELICE_SCRIPTS[2].read_text(encoding="utf-8")
@@ -322,6 +358,52 @@ def validate_transfer_manifest(path, *, repo_root, expected_sha256):
         assert "recorded schema/session 수가 일치하지 않습니다" in result.stderr
 
 
+def test_bootstrap_transfer_anchor_runs_without_site_packages(tmp_path: Path):
+    """새 Elice system Python은 optional audio/ML wheel 없이 SHA anchor만 검증한다."""
+
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    anchor = text[
+        text.index("verify_transfer_manifest_anchor() {") : text.index(
+            "verify_transfer_bundle() {"
+        )
+    ]
+    program_start = anchor.index("<<'PY'\n") + len("<<'PY'\n")
+    program_end = anchor.index("\nPY\n", program_start)
+    program = anchor[program_start:program_end]
+
+    # fixture package가 아니라 현재 tracked source를 직접 import해야, 향후
+    # ``deep_anc`` package initializer에 optional dependency가 새로 생겨도 이
+    # pre-venv 경계가 즉시 깨진다.
+    root = tmp_path / "repo"
+    manifest = root / "data/manifests/elice_transfer_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b'{"schema_version":1,"files":[]}\n')
+    expected_sha256 = _sha256(manifest)
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(REPO_ROOT / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-B",
+            "-c",
+            program,
+            str(manifest),
+            str(root),
+            expected_sha256,
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"{expected_sha256}\t{manifest.stat().st_size}"
+
+
 def test_bootstrap_binds_full_decoder_audit_to_canonical_v4_manifest_generation():
     """기존 manifest가 있어도 canonical 학습이 audit 결속 세대만 읽어야 한다."""
 
@@ -355,9 +437,54 @@ def test_setup_env_requires_exact_torch_cuda_and_writes_freeze_receipt():
     assert 'str(torch.version.cuda) != "12.1"' in text
     assert 'ENVIRONMENT_RECEIPT="$PWD/.venv/environment-freeze.txt"' in text
     assert "pip freeze --all" in text
+    assert "validate_environment_freeze_source_commit" in text
     assert text.index('mv -f "${ENVIRONMENT_RECEIPT}.building"') < text.index(
         'touch "$SETUP_MARKER"'
     )
+
+
+def _freeze_with_source(commit: str) -> bytes:
+    return (
+        "numpy==2.1.0\n"
+        "-e git+https://github.com/Roka-jsj/Deep-ANC.git@"
+        f"{commit}#egg=deep_anc\n"
+        "torch==2.5.1+cu121\n"
+    ).encode("utf-8")
+
+
+def test_environment_freeze_source_commit_parser_rejects_stale_and_ambiguous_lines():
+    expected = "a" * 40
+    stale = "b" * 40
+
+    assert (
+        validate_environment_freeze_source_commit(
+            b"-e git+https://example.invalid/other.git@"
+            + b"c" * 40
+            + b"#egg=other_package\n"
+            + _freeze_with_source(expected),
+            expected_commit=expected,
+        )
+        == "-e git+https://github.com/Roka-jsj/Deep-ANC.git@"
+        f"{expected}#egg=deep_anc"
+    )
+    with pytest.raises(SourceTrustError, match="expected checkout과 다릅니다"):
+        validate_environment_freeze_source_commit(
+            _freeze_with_source(stale), expected_commit=expected
+        )
+    with pytest.raises(SourceTrustError, match="정확히 하나"):
+        validate_environment_freeze_source_commit(
+            b"torch==2.5.1+cu121\n", expected_commit=expected
+        )
+    with pytest.raises(SourceTrustError, match="정확히 하나"):
+        validate_environment_freeze_source_commit(
+            _freeze_with_source(expected) + _freeze_with_source(expected),
+            expected_commit=expected,
+        )
+    with pytest.raises(SourceTrustError, match="전체 40자리 revision"):
+        validate_environment_freeze_source_commit(
+            _freeze_with_source(expected).replace(expected.encode(), b"deadbeef"),
+            expected_commit=expected,
+        )
 
 
 def _make_bootstrap_git_repo(tmp_path: Path) -> tuple[Path, str]:
@@ -381,6 +508,23 @@ def _make_bootstrap_git_repo(tmp_path: Path) -> tuple[Path, str]:
     shutil.copy2(REPO_ROOT / "src/deep_anc/data/holdout_contract.py", validator)
     lineage_validator = validator.parent / "public_lineage.py"
     shutil.copy2(REPO_ROOT / "src/deep_anc/data/public_lineage.py", lineage_validator)
+    static_reference_checker = (
+        root / "scripts/ci/check_static_contract_references.py"
+    )
+    static_reference_checker.parent.mkdir(parents=True)
+    shutil.copy2(STATIC_REFERENCE_CHECKER, static_reference_checker)
+    (root / "configs").mkdir()
+    static_registry = root / "src/bootstrap_static_registry.py"
+    static_registry.write_text(
+        'POSITIVE = "tests/test_bootstrap_positive.py::test_bootstrap_positive"\n',
+        encoding="utf-8",
+    )
+    static_target = root / "tests/test_bootstrap_positive.py"
+    static_target.parent.mkdir(parents=True)
+    static_target.write_text(
+        "def test_bootstrap_positive():\n    pass\n",
+        encoding="utf-8",
+    )
     validator.write_text(
         validator.read_text(encoding="utf-8").replace(
             "f73260fd112b8cd42bcd4f7c8918fc66b19d9d4c7b97f4faedce524b59e95d6b",
@@ -396,6 +540,9 @@ def _make_bootstrap_git_repo(tmp_path: Path) -> tuple[Path, str]:
             "marker.txt",
             str(validator.relative_to(root)),
             str(lineage_validator.relative_to(root)),
+            str(static_reference_checker.relative_to(root)),
+            str(static_registry.relative_to(root)),
+            str(static_target.relative_to(root)),
         ],
         cwd=root,
         check=True,
@@ -1276,6 +1423,57 @@ def test_bootstrap_valid_preflight_never_starts_training_or_setup(tmp_path: Path
     assert not (root / ".git/bootstrap_all.lock").exists()
 
 
+def test_bootstrap_rejects_stale_static_node_before_bundle_or_raw_scan(
+    tmp_path: Path,
+):
+    root, _old_commit = _make_bootstrap_git_repo(tmp_path)
+    registry = root / "src/example_registry.py"
+    registry.write_text(
+        'NEGATIVE = "tests/test_example.py::test_renamed"\n',
+        encoding="utf-8",
+    )
+    target = root / "tests/test_example.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("def test_current_name():\n    pass\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", str(registry.relative_to(root)), str(target.relative_to(root))],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "stale static node fixture"],
+        cwd=root,
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--no-update",
+    )
+
+    assert result.returncode == 1
+    assert "[FAIL] static pytest node reference audit" in result.stderr
+    assert "test function not found: test_renamed" in result.stderr
+    assert "[holdout] canonical 계약 확인" not in result.stdout
+    assert "[transfer anchor]" not in result.stdout
+    assert "[hardware]" not in result.stdout
+    assert "raw scan" not in result.stdout
+    assert "=== [1/6]" not in result.stdout
+    assert not (root / ".venv").exists()
+
+
 def test_normal_bootstrap_requires_transfer_manifest_before_hardware_or_setup(
     tmp_path: Path,
 ):
@@ -1291,6 +1489,35 @@ def test_normal_bootstrap_requires_transfer_manifest_before_hardware_or_setup(
     )
     assert result.returncode == 2
     assert "--expected-transfer-manifest-sha256" in result.stderr
+    assert not (root / ".venv").exists()
+
+
+def test_normal_bootstrap_rejects_transfer_anchor_before_hardware_or_setup(
+    tmp_path: Path,
+):
+    """fresh system Python은 full audio stack 없이 bad anchor를 먼저 막아야 한다."""
+
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    transfer = root / "data/manifests/elice_transfer_manifest.json"
+    transfer.write_bytes(b'{"schema_version":1,"files":[]}\n')
+    actual_sha = _sha256(transfer)
+    wrong_sha = ("0" if actual_sha[0] != "0" else "1") + actual_sha[1:]
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--expected-transfer-manifest-sha256",
+        wrong_sha,
+        "--no-update",
+    )
+
+    assert result.returncode == 1
+    assert "transfer manifest 외부 SHA-256 anchor 불일치" in result.stderr
+    assert "nvidia-smi" not in result.stderr
     assert not (root / ".venv").exists()
 
 

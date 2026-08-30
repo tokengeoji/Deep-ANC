@@ -893,7 +893,7 @@ GATES: tuple[GateDeclaration, ...] = (
         gate_id="recording_gate_tightening_only",
         owner=_RECORD,
         what_it_asserts="CLI 로 수집 게이트를 완화할 수 없다 (강화만 허용)",
-        negative_fixture="tests/test_record_duct_gates.py::test_cli_refuses_to_loosen_the_gates",
+        negative_fixture="tests/test_record_duct_gates.py::test_cli_rejects_nonfinite_loose_or_above_one_gates_in_dry_run",
         discoverable_id=False,
         positive_fixture=(
             "tests/test_gate_positive_fixtures.py::test_recording_gate_cli_accepts_the_default_and_tightened_values"

@@ -15,6 +15,11 @@ canonical 데이터 계약과 환경만 준비하며 학습을 자동 시작하�
 | 공식 world size | 1 |
 
 bootstrap은 실제 GPU 이름/메모리, 가용 디스크, Python/torch/CUDA 환경 receipt를 검증한다.
+기존 `.venv`를 재사용할 때도 `.setup-complete`만 신뢰하지 않는다. editable 설치가 현재
+checkout을 가리키는지 확인한 뒤 `environment-freeze.txt`를 원자적으로 다시 만들고,
+그 안의 유일한 Deep-ANC VCS requirement가 `--expected-commit` 전체 40자리와 exact할 때만
+transfer 검증·public download·최종 bootstrap receipt 발행으로 진행한다. freeze 파일 SHA를
+새로 봉인하는 것만으로 과거 source SHA를 현재 commit으로 승격할 수 없다.
 200–500 step smoke에서 VRAM, 처리량과 ETA를 기록하기 전에는 장기 인스턴스를 방치하지 않는다.
 
 ## 2. Jetson에서 먼저 고정할 입력
@@ -68,7 +73,7 @@ GitHub에서 받은 전체 40자리 commit SHA와 두 data SHA를 서로 다른 
 전달한다. branch name이나 축약 SHA를 쓰지 않는다.
 
 ```bash
-git clone https://github.com/Roka-jsj/Deep-ANC.git
+git clone https://github.com/tokengeoji/Deep-ANC.git
 cd Deep-ANC
 git checkout --detach "$EXPECTED_COMMIT"
 
@@ -96,6 +101,45 @@ bash scripts/elice/bootstrap_all.sh \
 - symlink·비정규 파일·검증 도중 파일 변경
 - recorded 82세션 aggregate, strict P/S, RIR, lineage metadata 누락
 - A100 80GB/가용 128GiB/torch·CUDA 환경 계약 불일치
+
+### 3.0.1 Elice 실패 복구와 재발 방지
+
+Elice working tree만 고치는 hotfix는 금지한다. 원격에서 발견한 결함은 Jetson의 이
+저장소에서 코드·negative regression fixture·문서를 함께 수정하고 GitHub에 push한 뒤,
+Elice가 새 40자리 SHA를 detached checkout하는 방식으로만 복구한다. 이전 checkout에서
+만든 freeze/bootstrap/DNS selection receipt를 새 commit의 증거로 다시 봉인하지 않는다.
+
+긴 data scan보다 먼저 다음 pure-stdlib 검사를 로컬과 Elice에서 모두 실행한다.
+
+```bash
+python3 -I -B scripts/ci/check_static_contract_references.py --repo-root .
+```
+
+이 검사는 운영 코드가 참조하는 `tests/...::test_*` node의 파일·함수 존재 여부를 AST로
+확인한다. 또한 실행 commit을 코드에 40자리 literal로 고정하는 것을 금지한다. 예외는
+source-pool v1/v2를 byte-exact하게 재현하기 위한 네 개의 명시적
+`historical_builder_commit` 위치뿐이다. 역사적 builder SHA, SHA-256 digest, docs와
+diagnostic artifact를 현재 HEAD로 바꾸는 검사가 아니다. `tests/conftest.py`도 같은 검사를
+pytest collection 전에 실행하므로, stale test 이름이 전체 회귀 중간에서 늦게 발견되어서는
+안 된다.
+
+bootstrap 단계와 실패 시 행동은 다음처럼 고정한다.
+
+| 순서 | 단계 | 실패 시 행동 |
+|---:|---|---|
+| 0 | exact HEAD/clean tree + static contract reference | venv·raw·GPU를 열기 전에 종료 |
+| 1 | holdout/transfer 외부 SHA preflight | bundle을 수정하지 않고 로그 보존 |
+| 2 | venv 재사용 또는 생성 + environment freeze 재발행 | stale freeze를 재봉인하지 않고 종료 |
+| 3 | public raw count/SHA + decoder audit | 원본과 transaction을 보존하고 자동 재다운로드 금지 |
+| 4 | manifest transaction + lineage/QA | published old manifest를 current로 승격하지 않음 |
+| 5 | 전체 pytest | 첫 실패 node와 전체 log를 보존하고 학습·selector 금지 |
+| 6 | bootstrap receipt + readiness | receipt가 없으면 selector·G0·학습 금지 |
+
+실패 뒤 재개할 때는 기존 raw/venv를 삭제하는 것으로 문제를 숨기지 않는다. 새 exact commit의
+preflight가 PASS한 경우에만 verified count와 외부 decoder SHA를 사용해 cache를 재사용한다.
+각 실행 log에는 commit을 파일명으로 넣고, `HANDOFF.md`에 실패 단계·node·log 경로·재사용한
+bytes·다음 명령을 기록한다. bootstrap receipt가 발행된 뒤에만 같은 SHA로 DNS selector를
+발행하고, 그 receipt를 Jetson source plan의 외부 anchor로 전달한다.
 
 긴 다운로드의 직전과 직후에도 code와 transfer bundle을 다시 검증한다. bootstrap 잠금은 동시
 데이터 준비를 차단하며, 실행 중인 `train.py`가 있으면 manifest를 건드리지 않는다.

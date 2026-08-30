@@ -15,7 +15,7 @@ import pytest
 import soundfile as sf
 
 from deep_anc.config import REPO_ROOT
-from deep_anc.realtime.noise_gen import NoiseProgram
+from deep_anc.realtime.noise_gen import NoiseProgram, render_recording_file_window
 
 
 def _load(relative: str, name: str):
@@ -58,6 +58,7 @@ def test_batch_retry_is_explicit_opt_in():
     args = BATCH.build_parser().parse_args([])
     assert args.retry_once is False
     assert args.no_retry is False
+    assert args.amplitude == BATCH.CANONICAL_RECORDING_AMPLITUDE == 0.06
     assert BATCH.build_parser().parse_args(["--retry-once"]).retry_once is True
 
 
@@ -77,10 +78,22 @@ def test_batch_dry_run_does_not_create_files_or_spawn_child(tmp_path, monkeypatc
     output = capsys.readouterr().out
     assert "예상 audible: 15.0초" in output
     assert "예상 connected 상한" in output
+    assert "재생 amplitude: 0.06" in output
+    assert "공용 peak 안전 상한 0.15" in output
     assert "자동 재시도: 없음" in output
     assert "source-list SHA256" in output
     assert "lineage=speaker-book-001" in output
     assert "split=train" in output
+
+
+def test_noncanonical_diagnostic_batch_keeps_explicit_level_override(
+    tmp_path, capsys
+):
+    _, plan = _source_plan(tmp_path)
+    assert BATCH.main(
+        ["--sources", str(plan), "--amplitude", "0.15", "--dry-run"]
+    ) == 0
+    assert "재생 amplitude: 0.15" in capsys.readouterr().out
 
 
 def test_batch_requires_preassigned_split_before_any_output(tmp_path, monkeypatch):
@@ -305,6 +318,10 @@ def test_canonical_additions_mode_requires_exact_generation_paths_and_header(
             True,
         )
     ]
+
+    with pytest.raises(SystemExit) as excinfo:
+        BATCH.main([*common, "--amplitude", "0.15"])
+    assert excinfo.value.code == 2
 
     outside = tmp_path / "outside-recorded-additions"
     outside.mkdir()
@@ -556,6 +573,362 @@ def test_failed_raw_and_metadata_are_no_replace(tmp_path):
     assert all(len(item["sha256"]) == 64 and item["size_bytes"] > 0 for item in payload["artifacts"])
 
 
+def test_record_duct_emits_machine_readable_durable_failure_pointer(
+    tmp_path, capsys
+):
+    assert BATCH.FAILURE_RECEIPT_MARKER == RECORD.FAILURE_RECEIPT_MARKER
+    failure_dir = RECORD._preserve_failed_capture(
+        failed_root=tmp_path / "failed",
+        stage="timeline_gate",
+        reason="high_band_coherence=0.812345 < 0.90",
+        sample_rate=48_000,
+        metadata={"collection_plan": {"status": "exact"}},
+    )
+    stderr = capsys.readouterr().err
+    marker_line = next(
+        line
+        for line in stderr.splitlines()
+        if line.startswith(RECORD.FAILURE_RECEIPT_MARKER)
+    )
+    marker = json.loads(marker_line[len(RECORD.FAILURE_RECEIPT_MARKER) :])
+    assert marker == {
+        "schema_version": 1,
+        "failure_stage": "timeline_gate",
+        "failure_reason": "high_band_coherence=0.812345 < 0.90",
+        "failure_artifact": str(failure_dir.resolve()),
+        "failure_receipt": str((failure_dir / "failure.json").resolve()),
+    }
+
+
+def test_failed_capture_reserved_metadata_cannot_override_receipt_contract(
+    tmp_path, capsys
+):
+    failure_dir = RECORD._preserve_failed_capture(
+        failed_root=tmp_path / "failed",
+        stage="timeline_gate",
+        reason="authoritative reason",
+        sample_rate=48_000,
+        metadata={
+            "schema_version": 999,
+            "status": "passed",
+            "failure_stage": "forged_stage",
+            "failure_reason": "forged reason",
+            "raw_available": True,
+            "artifacts": [{"path": "forged"}],
+        },
+    )
+    capsys.readouterr()
+    payload = json.loads((failure_dir / "failure.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["status"] == "failed_capture"
+    assert payload["failure_stage"] == "timeline_gate"
+    assert payload["failure_reason"] == "authoritative reason"
+    assert payload["raw_available"] is False
+    assert payload["artifacts"] == []
+
+
+def test_staging_failure_reserved_metadata_cannot_override_receipt_contract(
+    tmp_path, capsys
+):
+    staging = tmp_path / "staging" / ".staging_fixture"
+    staging.mkdir(parents=True)
+    failure_dir = RECORD._seal_staging_failure(
+        staging_dir=staging,
+        failed_root=tmp_path / "failed",
+        stage="canonical_publish",
+        reason="authoritative publish reason",
+        metadata={
+            "schema_version": 999,
+            "status": "passed",
+            "failure_stage": "forged_stage",
+            "failure_reason": "forged reason",
+            "raw_available": True,
+            "artifacts": [{"path": "forged"}],
+        },
+    )
+    capsys.readouterr()
+    payload = json.loads((failure_dir / "failure.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["status"] == "failed_capture"
+    assert payload["failure_stage"] == "canonical_publish"
+    assert payload["failure_reason"] == "authoritative publish reason"
+    assert payload["raw_available"] is False
+    assert payload["artifacts"] == []
+
+
+def test_batch_progress_uses_structured_child_failure_receipt(
+    tmp_path, monkeypatch
+):
+    _, plan = _source_plan(tmp_path)
+    out_root = tmp_path / "recorded"
+    failed_root = tmp_path / "failed"
+    seen_amplitudes: list[str] = []
+
+    def fake_child(command, *, timeout_seconds, log_path):
+        del timeout_seconds, log_path
+        seen_amplitudes.append(command[command.index("--amplitude") + 1])
+        artifact = failed_root / "capture_timeline_gate"
+        artifact.mkdir(parents=True)
+        receipt = artifact / "failure.json"
+        reason = "high_band_coherence=0.812345 < 0.90"
+        receipt.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "failed_capture",
+                    "failure_stage": "timeline_gate",
+                    "failure_reason": reason,
+                    "raw_available": True,
+                    "artifacts": [],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        marker = {
+            "schema_version": 1,
+            "failure_stage": "timeline_gate",
+            "failure_reason": reason,
+            "failure_artifact": str(artifact.resolve()),
+            "failure_receipt": str(receipt.resolve()),
+        }
+        stderr = (
+            BATCH.FAILURE_RECEIPT_MARKER
+            + json.dumps(marker, separators=(",", ":"))
+            + "\n[중단] 사람이 읽는 후속 안내\n"
+        )
+        return BATCH.ChildResult(
+            1,
+            "출력 종료 — 지금 스피커를 분리하세요.\n",
+            stderr,
+            False,
+        )
+
+    monkeypatch.setattr(BATCH, "run_child_live", fake_child)
+    result = BATCH.main(
+        [
+            "--sources", str(plan),
+            "--out-root", str(out_root),
+            "--failed-root", str(failed_root),
+            "--settle-seconds", "0",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+            "--confirm-routing-and-geometry",
+        ]
+    )
+    assert result == 1
+    assert seen_amplitudes == ["0.06"]
+    progress = list(
+        csv.DictReader((out_root / "batch_progress.csv").open(encoding="utf-8"))
+    )
+    assert len(progress) == 1
+    row = progress[0]
+    assert row["verdict"] == "record_failed"
+    assert row["failure_stage"] == "timeline_gate"
+    assert row["detail"] == "high_band_coherence=0.812345 < 0.90"
+    assert row["failure_artifact"] == str(
+        (failed_root / "capture_timeline_gate").resolve()
+    )
+    receipt = failed_root / "capture_timeline_gate/failure.json"
+    assert row["failure_receipt"] == str(receipt.resolve())
+    assert row["failure_receipt_sha256"] == hashlib.sha256(
+        receipt.read_bytes()
+    ).hexdigest()
+
+
+def test_batch_progress_migrates_existing_narrow_failure_rows_without_loss(
+    tmp_path, monkeypatch
+):
+    _, plan = _source_plan(tmp_path)
+    out_root = tmp_path / "recorded"
+    out_root.mkdir()
+    legacy_row = {
+        "source_family": "speech",
+        "group_id": "speaker-book-001",
+        "lineage_key": "speaker-book-001",
+        "preassigned_split": "train",
+        "start_seconds": "0.0",
+        "seconds": "15.0",
+        "source_path": str(tmp_path / "source.wav"),
+        "source_file_sha256": "0" * 64,
+        "source_list_sha256": "1" * 64,
+        "source_row_number": "2",
+        "returncode": "1",
+        "timed_out": "0",
+        "session_id": "",
+        "verdict": "record_failed",
+        "detail": "legacy 마지막 stdout 줄",
+    }
+    with (out_root / "batch_progress.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=tuple(legacy_row))
+        writer.writeheader()
+        writer.writerow(legacy_row)
+
+    failed_root = tmp_path / "failed"
+
+    def fake_child(command, *, timeout_seconds, log_path):
+        del command, timeout_seconds, log_path
+        artifact = failed_root / "capture_timeline_gate"
+        artifact.mkdir(parents=True)
+        receipt = artifact / "failure.json"
+        reason = "coh²(source_aligned→ERR,600-1600Hz) 0.590000 < 0.600000"
+        receipt.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "failed_capture",
+                    "failure_stage": "timeline_gate",
+                    "failure_reason": reason,
+                }
+            ),
+            encoding="utf-8",
+        )
+        marker = {
+            "schema_version": 1,
+            "failure_stage": "timeline_gate",
+            "failure_reason": reason,
+            "failure_artifact": str(artifact.absolute()),
+            "failure_receipt": str(receipt.absolute()),
+        }
+        return BATCH.ChildResult(
+            1,
+            "",
+            BATCH.FAILURE_RECEIPT_MARKER + json.dumps(marker) + "\n",
+            False,
+        )
+
+    monkeypatch.setattr(BATCH, "run_child_live", fake_child)
+    assert BATCH.main(
+        [
+            "--sources",
+            str(plan),
+            "--out-root",
+            str(out_root),
+            "--failed-root",
+            str(failed_root),
+            "--settle-seconds",
+            "0",
+            "--confirm-user-present",
+            "--confirm-volume-minimum",
+            "--confirm-routing-and-geometry",
+        ]
+    ) == 1
+
+    with (out_root / "batch_progress.csv").open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        progress = list(reader)
+        fields = tuple(reader.fieldnames or ())
+    assert len(progress) == 2
+    assert progress[0]["detail"] == legacy_row["detail"]
+    assert progress[0]["failure_stage"] == ""
+    assert progress[0]["failure_receipt_sha256"] == ""
+    assert progress[1]["failure_stage"] == "timeline_gate"
+    assert len(progress[1]["failure_receipt_sha256"]) == 64
+    assert fields[: len(legacy_row)] == tuple(legacy_row)
+    assert fields[-4:] == (
+        "failure_stage",
+        "failure_artifact",
+        "failure_receipt",
+        "failure_receipt_sha256",
+    )
+
+
+def test_batch_rejects_failure_marker_outside_declared_failure_root(tmp_path):
+    failed_root = tmp_path / "failed"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    receipt = outside / "failure.json"
+    payload = {
+        "schema_version": 1,
+        "status": "failed_capture",
+        "failure_stage": "timeline_gate",
+        "failure_reason": "fixture",
+    }
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+    marker = {
+        "schema_version": 1,
+        "failure_stage": "timeline_gate",
+        "failure_reason": "fixture",
+        "failure_artifact": str(outside.resolve()),
+        "failure_receipt": str(receipt.resolve()),
+    }
+    result = BATCH.ChildResult(
+        1,
+        "legacy final line\n",
+        BATCH.FAILURE_RECEIPT_MARKER + json.dumps(marker) + "\n",
+        False,
+    )
+    assert BATCH._read_child_failure_evidence(result, failed_root=failed_root) is None
+    assert BATCH._fallback_child_failure_detail(result) == "legacy final line"
+
+
+@pytest.mark.parametrize("symlink_kind", ["root", "intermediate", "artifact", "receipt"])
+def test_batch_rejects_failure_receipt_through_any_symlink_component(
+    tmp_path, symlink_kind
+):
+    failed_root = tmp_path / "failed"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    if symlink_kind == "root":
+        real_root = tmp_path / "real_failed"
+        real_root.mkdir()
+        failed_root.symlink_to(real_root, target_is_directory=True)
+        artifact = real_root / "capture"
+        marker_artifact = failed_root / "capture"
+    elif symlink_kind == "intermediate":
+        failed_root.mkdir()
+        redirect = failed_root / "redirect"
+        redirect.symlink_to(outside, target_is_directory=True)
+        artifact = outside / "capture"
+        marker_artifact = redirect / "capture"
+    elif symlink_kind == "artifact":
+        failed_root.mkdir()
+        artifact = outside / "capture"
+        marker_artifact = failed_root / "capture"
+    else:
+        failed_root.mkdir()
+        artifact = failed_root / "capture"
+        marker_artifact = artifact
+
+    artifact.mkdir()
+    real_receipt = artifact / "real_failure.json"
+    payload = {
+        "schema_version": 1,
+        "status": "failed_capture",
+        "failure_stage": "timeline_gate",
+        "failure_reason": "fixture",
+    }
+    real_receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    marker_receipt = marker_artifact / "failure.json"
+    if symlink_kind == "artifact":
+        marker_artifact.symlink_to(artifact, target_is_directory=True)
+        (artifact / "failure.json").write_text(json.dumps(payload), encoding="utf-8")
+    elif symlink_kind == "receipt":
+        marker_receipt.symlink_to(real_receipt)
+    else:
+        (artifact / "failure.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    marker = {
+        "schema_version": 1,
+        "failure_stage": "timeline_gate",
+        "failure_reason": "fixture",
+        "failure_artifact": str(marker_artifact.absolute()),
+        "failure_receipt": str(marker_receipt.absolute()),
+    }
+    result = BATCH.ChildResult(
+        1,
+        "legacy final line\n",
+        BATCH.FAILURE_RECEIPT_MARKER + json.dumps(marker) + "\n",
+        False,
+    )
+    assert BATCH._read_child_failure_evidence(result, failed_root=failed_root) is None
+    assert BATCH._fallback_child_failure_detail(result) == "legacy final line"
+
+
 def test_force_cannot_bypass_input_safety_gate():
     with pytest.raises(SystemExit) as excinfo:
         RECORD.main(["--force", "--dry-run"])
@@ -635,3 +1008,76 @@ def test_noise_program_file_window_starts_at_planned_offset(tmp_path):
     observed = program.generate(3)
     expected = samples[10:13] / np.max(np.abs(samples)) * 0.1
     np.testing.assert_allclose(observed, expected, atol=1e-6)
+
+
+def test_recording_file_window_does_not_consume_settle_and_binds_fade(tmp_path):
+    source = tmp_path / "nonperiodic.wav"
+    samples = np.linspace(-0.9, 0.7, 80, dtype=np.float32)
+    sf.write(source, samples, 10, subtype="FLOAT")
+    program = NoiseProgram(
+        {
+            "type": "file",
+            "file": str(source),
+            "file_start_seconds": 2.0,
+            "amplitude": 0.15,
+        },
+        10,
+    )
+
+    observed = render_recording_file_window(
+        program,
+        20,
+        sample_rate=10,
+        fade_seconds=0.2,
+    )
+    peak = np.max(np.abs(samples)) + 1e-9
+    expected = (samples[20:40] / peak * 0.15).astype(np.float32)
+    ramp = np.linspace(0.0, 1.0, 2, dtype=np.float32)
+    expected[:2] *= ramp
+    expected[-2:] *= ramp[::-1]
+
+    np.testing.assert_array_equal(observed, expected)
+    # settle 1초를 소비한 옛 동작이면 첫 audible 원본 index는 30이 된다.
+    shifted = (samples[30:50] / peak * 0.15).astype(np.float32)
+    shifted[:2] *= ramp
+    shifted[-2:] *= ramp[::-1]
+    assert not np.array_equal(observed, shifted)
+
+
+def test_record_duct_file_timeline_keeps_settle_exact_zero(tmp_path):
+    source = tmp_path / "timeline.wav"
+    samples = np.linspace(-1.0, 0.5, 80, dtype=np.float32)
+    sf.write(source, samples, 10, subtype="FLOAT")
+    program = NoiseProgram(
+        {
+            "type": "file",
+            "file": str(source),
+            "file_start_seconds": 2.0,
+            "amplitude": 0.15,
+        },
+        10,
+    )
+    timeline = RECORD._prepare_file_source_timeline(
+        program,
+        settle_frames=10,
+        keep_frames=20,
+        sample_rate=10,
+    )
+    assert timeline.shape == (30,)
+    np.testing.assert_array_equal(timeline[:10], np.zeros(10, dtype=np.float32))
+
+    fresh_program = NoiseProgram(
+        {
+            "type": "file",
+            "file": str(source),
+            "file_start_seconds": 2.0,
+            "amplitude": 0.15,
+        },
+        10,
+    )
+    expected = render_recording_file_window(
+        fresh_program,
+        20,
+        sample_rate=10,
+    )
+    np.testing.assert_array_equal(timeline[10:], expected)

@@ -302,7 +302,10 @@ def _static_contract_before_backend_import(args: argparse.Namespace) -> dict[str
         assert_repository_target_fresh_nofollow,
         external_post_receipt_relative_path,
     )
-    from deep_anc.dsp.measurement_level import assert_live_pcm_clock_preconditions
+    from deep_anc.dsp.measurement_level import (
+        assert_live_pcm_clock_preconditions,
+        collect_alsa_physical_fingerprint,
+    )
 
     raw_relative = _repository_relative(args.raw_target, label="raw target")
     if raw_relative != SEALED_RAW_RELATIVE_PATH:
@@ -311,6 +314,22 @@ def _static_contract_before_backend_import(args: argparse.Namespace) -> dict[str
     assert_repository_target_fresh_nofollow(REPO_ROOT, raw_relative)
     assert_repository_target_fresh_nofollow(REPO_ROOT, receipt_relative)
     meter_contract = _meter_contract_module()
+    # 첫 호출은 portable file contract를 닫고 hardware YAML을 얻는다. 실제 Jetson
+    # live 경계에서는 그 exact YAML을 기준으로 현재 ALSA fingerprint를 수집한 뒤,
+    # 두 번째 호출에서 tracked attestation과 결속한다. 이 함수 자체의 기본 호출은
+    # Elice처럼 오디오 장치가 없는 노드에서도 안전하게 동작한다.
+    portable = meter_contract.validate_fullband_v5_static_contract(
+        repository_root=REPO_ROOT,
+        plan_envelope_path=args.plan_envelope,
+        live_authority_path=args.live_authority,
+        level_evidence_path=args.level_evidence,
+        hardware_path=args.hardware,
+        raw_target_path=args.raw_target,
+        require_sealed_raw_fresh=True,
+    )
+    current_physical_fingerprint = collect_alsa_physical_fingerprint(
+        portable["hardware_config"]
+    )
     static = meter_contract.validate_fullband_v5_static_contract(
         repository_root=REPO_ROOT,
         plan_envelope_path=args.plan_envelope,
@@ -319,6 +338,7 @@ def _static_contract_before_backend_import(args: argparse.Namespace) -> dict[str
         hardware_path=args.hardware,
         raw_target_path=args.raw_target,
         require_sealed_raw_fresh=True,
+        physical_fingerprint=current_physical_fingerprint,
     )
     if not isinstance(static, Mapping):
         raise RuntimeError("fullband-v5 static contract 반환이 mapping이 아닙니다")

@@ -230,6 +230,7 @@ source plan은 다음 무음 dry-run으로 검사한다. 이 명령은 파일을
   --sources data/source_plans/recorded_additions/highband-coverage-v1.csv \
   --out-root data/recorded_additions/highband-coverage-v1 \
   --canonical-additions-generation highband-coverage-v1 \
+  --amplitude 0.06 \
   --dry-run
 ```
 
@@ -237,6 +238,37 @@ source plan은 다음 무음 dry-run으로 검사한다. 이 명령은 파일을
 출력한 input-only preflight·settle 포함 상한을 따른다. 실제 실행은 사용자 입회,
 볼륨 최소, 배선/덕트 geometry 확인, 오디오 장치 무점유 확인 뒤 별도 승인된 연결
 창에서만 한다. 실패 세션은 자동 재시도하지 않고 failure evidence를 먼저 분석한다.
+canonical additions의 file playback amplitude는 기존 82세션과 동일한 **exact 0.06**이며,
+CLI 기본값뿐 아니라 최종 generation validator도 이 값을 강제한다. 0.15는 안전 상한일 뿐
+canonical 수집 레벨이 아니다.
+
+신규 세션은 publish 전에 다음 일곱 조건을 하나의 공용 capture-gate 계약으로 모두
+통과해야 한다. 저역 코히런스 하나만으로 성공 처리하지 않는다.
+
+1. `coh²(source_aligned→ERR, 150--600 Hz) >= 0.90`
+2. `coh²(source_aligned→ERR, 600--1600 Hz) >= 0.60`
+3. `coh²(REF→ERR, 150--600 Hz) >= 0.60`
+4. source→REF raw valid-window ratio `>= 0.90`
+5. source_aligned→ERR valid-window ratio `>= 0.77`
+6. 잔여 지연 robust standard deviation `<= 3.41254 samples`
+7. 잔여 지연 p95−p5 `<= 48 samples`
+
+실패 조건은 durable `failure.json`에 실제 측정값과 함께 저장되고 active additions에는
+발행되지 않는다. batch resume과 최종 99세션 generation도 저장된 `TimelineReport`에서
+같은 공용 계약을 다시 계산하여, 수집 시점과 최종 승격 시점의 판정식이 갈라지지 않게 한다.
+
+승인된 연결 창의 실제 실행도 dry-run과 같은 amplitude를 명시한다.
+
+```bash
+.venv/bin/python scripts/data/record_session_batch.py \
+  --sources data/source_plans/recorded_additions/highband-coverage-v1.csv \
+  --out-root data/recorded_additions/highband-coverage-v1 \
+  --canonical-additions-generation highband-coverage-v1 \
+  --amplitude 0.06 \
+  --confirm-user-present \
+  --confirm-volume-minimum \
+  --confirm-routing-and-geometry
+```
 
 각 성공 session은 다음 exact 집합이어야 한다.
 
