@@ -500,6 +500,95 @@ selection authority로 사용하지 않는다. 정상 DNS bundle도 source commi
 하지 않는다. 수정 commit의 전체 pytest와 clean exact bootstrap 뒤 DNS/DEMAND를 모두 새로
 발행·검증한 경우에만 Jetson으로 이관한다.
 
+### 0.17 2026-08-30 Stage-1 수집 첫 행 fail-closed와 사용자 요청 중단 지점
+
+사용자 요청에 따라 **추가 출력·녹음·학습·Drive 업로드를 모두 중단**했다. Jetson의 모든
+PCM status는 `closed`이고 PulseAudio는 control node만 열고 있다. `record_duct`, batch
+recorder, realtime, calibration, trainer, `rclone` 프로세스는 없다. Elice도 exact detached
+HEAD `b9138e395505ad5507547738a8d1e8a2c3c384e5`이며 bootstrap/selector/trainer/GPU process가
+0임을 read-only SSH로 확인했다. 따라서 중단 중에는 스피커·앰프·마이크를 분리해도 된다.
+
+중단 전 완료한 소프트웨어·Elice 경계는 다음과 같다.
+
+- `b9138e395505ad5507547738a8d1e8a2c3c384e5`에서 focused 78개와 전체 pytest가 0 FAIL,
+  `git diff --check`가 PASS했다. Elice full bootstrap도 같은 clean exact source에서 0 FAIL로
+  끝났고 receipt SHA-256은
+  `d5a668957c63e7c66aa25e319f83f42c92a1651723043517efdc3e9f9e28b54b`이다.
+- 같은 commit의 DNS 14-file/25,505,331-byte selector와 DEMAND
+  8-file/45,355,946-byte selector를 Elice에서 각각 write+verify한 뒤 별도 임시 staging으로
+  Jetson에 전송했다. DNS receipt SHA-256은
+  `5c2bc946300bfffb924dad4a78dba0c4f6ab7d1a8678e58b631ffeddfa3b0db0`, DEMAND receipt
+  SHA-256은 `bcf3395b823b4d15e3fd02e3fa317d86bfac6f68a8e3ce7026dac38df62d9aaf`이며 로컬
+  immutable verifier도 PASS했다. 구 474 DNS와 invalid DEMAND는 삭제·덮어쓰기 없이
+  Elice의 `.superseded` forensic 경로로 분리했다.
+- old-82 level calibration receipt
+  `data/manifests/recorded_level_calibration/b9138e395505ad5507547738a8d1e8a2c3c384e5.json`
+  (SHA-256 `77c3690ee4ba06d082bdf521ce89337a1e74b8a1e3a2904097cf8f4bd7794bd2`)은
+  82/82 `source_aligned.wav`/`mics.wav` path·size·SHA 결속을 검증했다.
+- 19행 plan `data/source_plans/recorded_additions/stage1-coverage-v2.csv`는 check-only,
+  no-replace write, verify를 모두 통과했다. SHA-256은
+  `f1b3d63fa1e455bac723a7a323aede0b602486c955bcb945281dc129cc7bc574`다. batch dry-run은
+  파일 변경과 audio open 0으로 PASS했고, 공식 출력은 19×15초=285초, output-open 304초,
+  분석을 제외한 연결 상한 388.5초, amplitude exact `0.06`, 자동 retry 없음으로 계산됐다.
+
+실제 수집 직전 기존 level evidence를 사용하는 fresh 20초 meter가 PASS했다. raw는
+`results/calibration_interleaved/level_bootstrap/20260830_201645_fe5f40a9/meter_raw.npz`
+(SHA-256 `490cf6a85c0eaadf7ad9674dc946f66d7dbf8820173ad757078d43b7c05ed0db`), receipt는 같은
+경로의 `meter_raw.receipt.json`(SHA-256
+`de1ab8488806fc7a0c86a9f085013d87893a0ac6bcda1b341d256c4c8a283285`)이다. 중앙값
+`-48.192936 dBFS`는 목표 `-50.1 ± 2 dBFS` 안이었다. 이 meter에 결속한 campaign
+`recording-level-3427c7690fbc8ece8fa593487f149580b9aa372aa8b82caecfd1f6c3201fc35c`도 발행·검증했다.
+중단으로 600초 freshness가 만료됐으므로 **재개 때 이 campaign을 재사용하지 않는다.**
+
+19행 실제 batch는 첫 행만 실행한 뒤 정상적으로 fail-closed했다. 나머지 18개 source는
+재생하지 않았고 자동 retry도 없었다. 첫 행은 environment `water-drops`,
+`data/source_pool/environment/environment_006.wav`, start `25.75초`, amplitude `0.06`,
+15초였다. active session을 발행하지 않았으므로 현재 추가 수집은 **0/19**이고 82세션
+generation 상태는 바뀌지 않았다.
+
+- immutable failure root:
+  `results/recording_failures/record_duct/20260830_201833_757643_timeline_gate_e61aad3e/`
+- `failure.json` SHA-256:
+  `0a902a0dc5ec06baf2092e35a8f06cf3c64628803b551a5bbcc824c26fbef9bd`
+- `mics_raw.wav` SHA-256:
+  `ab989f15ed2990353a067dc14843aeb6da341c46d537548e3f2ac359d914cfb5`
+- `source_raw.wav` SHA-256:
+  `886c1ecd3495807e1ca4e15cae5f87a670f2da82f823753d7b9418dc06cebc2f`
+- batch progress는
+  `data/recorded_additions/stage1-coverage-v2/batch_progress.csv`의 단 한 행
+  `record_failed/timeline_gate`뿐이다.
+
+실패값은 source-aligned→ERR coherence²가 150–600 Hz `0.465841`(<`0.9`),
+600–1600 Hz `0.433336`(<`0.6`), source→REF raw valid-window ratio `0.737288`(<`0.9`),
+aligned valid-window ratio `0.762712`(<`0.77`)이었다. 반면 REF↔ERR 저역 coherence²
+`0.807587`, residual robust std `1.944` samples, p95−p5 `8.927` samples는 통과했고,
+768,000 frames/3,000 callbacks가 모두 exact 256 frames였다. raw의 active mic peak도
+ERR/REF 약 `0.620/0.728`로 경로 무출력은 아니다. 첫 15초 water-drop window에 긴
+저활성 구간이 있다는 점은 확인했지만, 이것만으로 source-window 문제라고 확정하지 않는다.
+**xrun/clip, 시간축 구현, source 선택의 기여를 immutable raw로 분리하기 전에는 gate를
+낮추거나 재녹음하지 않는다.**
+
+재개 순서는 다음과 같다.
+
+1. 스피커 없이 위 failure raw를 오프라인 재검산해 source-window/capture-timing/code 중
+   원인을 분리한다.
+2. 1행 source/window 교체가 필요하면 lineage-clean plan을 새 exact commit으로 다시 발행한다.
+   코드·plan이 그대로여도 이 중단 기록 commit 때문에 HEAD가 `b9138e3`에서 바뀌므로,
+   current-HEAD 실행 전에 Elice bootstrap/selector/plan의 exact-source binding을 새로 만든다.
+3. 모든 PCM 점유를 다시 확인한 뒤 기존 evidence mode로 fresh 20초 meter와 새 campaign을
+   발행한다. `--bootstrap-level-evidence`를 다시 주지 않는다.
+4. 원인이 해결됐다는 무출력 증거가 있을 때만 실패 행부터 한 번 실행한다. 통과한 뒤에만
+   나머지 18행을 계속하고, 임계값 완화·자동 retry는 하지 않는다.
+5. 19/19 뒤 101세션 generation/transfer/readiness 16/17을 만들고서야 G0/pilot/probe/
+   resume smoke와 canonical 100k pretrain→50k fine-tune으로 진행한다. 현재 학습은 시작하지
+   않았고 checkpoint·감쇠 dB도 없다.
+
+Elice 삭제 전 Drive snapshot은 10개 archive part 중 6개만 성공하고 part 0/1/3/5의
+rate-limit retry가 남은 상태에서 함께 중단했다. full size/MD5 검증은 아직 완료되지 않았으며
+원본은 삭제하지 않았다. 재개용 로컬 기록은
+`results/elice_snapshots/predelete_917aa25a0315247f/BACKUP_README.md`와
+`retry_failed_parts_remote.sh`다. 이 백업은 학습 admission의 대체가 아니다.
+
 V10--V14의 구현·검증 경계는 `docs/42_rt5640_j511_connection_gate.md`,
 `docs/45_s32_capture_admission.md`부터 `docs/51_causal_ps_prefix_adapter.md`까지를 우선
 참조한다. 아래 내용은 보존된 역사·진단 기록이다.
