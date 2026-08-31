@@ -20,6 +20,11 @@ from typing import Any, Mapping, Sequence
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = REPOSITORY_ROOT / "src"
+if str(REPOSITORY_ROOT) not in sys.path:
+    # 직접 ``python scripts/data/...``로 실행해도 ``scripts.data``의 tracked
+    # diagnostic adapter를 같은 checkout에서만 import하게 한다. 이 경로는
+    # sounddevice/PCM을 열기 전에 설정된다.
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 

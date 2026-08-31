@@ -5,6 +5,7 @@ import importlib.util
 import json
 import math
 from pathlib import Path
+import subprocess
 import sys
 
 import numpy as np
@@ -826,6 +827,27 @@ def test_cli_default_is_dry_run_and_never_imports_audio_backend(
     assert "무음 dry-run" in output
     assert "legacy combined authority=false" in output
     assert "sounddevice import/open=0; P/S output=0; raw write=0" in output
+
+
+def test_cli_subprocess_dry_run_resolves_tracked_repository_imports() -> None:
+    """문서의 실제 CLI 형식도 audio import 없이 시작되어야 한다."""
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "scripts/data/measure_paths_stage2_2khz_v3.py",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "Stage-2 output-master P/S v3 무음 dry-run" in completed.stdout
+    assert "sounddevice import/open=0; P/S output=0; raw write=0" in completed.stdout
 
 
 def test_cli_execute_live_is_blocked_after_clean_identity_without_backend(
