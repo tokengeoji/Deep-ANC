@@ -1,7 +1,32 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-31. 현행 통합 개발 브랜치: `dev`.
+> 최종 갱신: 2026-09-01. 현행 통합 개발 브랜치: `dev`.
+
+## 긴급 현장 갱신 (2026-09-01, Stage-2 2 kHz)
+
+실제 output-master diagnostic을 exact clean `dev`
+`6034fe12227b82778793a6fe6e34450b5f6442ca`에서 한 번 실행했다. fresh meter는
+`-48.4205 dBFS`로 PASS했지만, USB AB13X DAC output과 APE input은 같은 stream 안에서
+하나의 global affine clock을 공유하지 않았다. global q `-886.863 ppm`, coherence
+`0.460704 < 0.995`, 8/8 slot FAIL이며 xrun/clip은 모두 0이었다. 따라서 이는 gain이나
+callback miss가 아니라 current clock path의 실제 high-frequency phase-risk evidence다.
+
+- diagnostic raw:
+  `results/stage2_2khz_output_master_diagnostic/20260831T163906_937061Z_011514f5b0f3f856/diagnostic_raw.npz`
+  SHA-256 `e9d8c3520d8ea3bb0ade9d64fca7c26baf7170b880806ba34236c3546882ab47`
+- receipt:
+  같은 directory의 `clock_receipt.json`, SHA-256
+  `97924107bc990ec2c1dc92df23facaf04315dca277a3f2e5941bf487c570d9d0`
+- meter raw:
+  `results/stage2_2khz_output_master_level_20260901/20260901_013819_64e83d37/meter_raw.npz`
+  SHA-256 `6119fe0c2ede41fbf62aaadff356691e09cf96080fa8fc4c67af254f29ba1f23`
+
+raw와 receipt는 Drive `DeepANC/jetson_measurements_20260901/`에도 file-size readback으로
+백업했다. P/S, plant binding, canonical pretrain은 **BLOCKED**다. 다음 live 출력은 USB
+DAC를 다시 시도하지 않고 `ADMAIF1 ↔ I2S1 ↔ RT5640/J511` common-clock 후보를 실제로
+연결·무음 검증한 뒤 fresh meter부터 시작한다. 상세 분석과 재측정 금지 경계는
+[`docs/75_20260901_stage2_output_master_clock_failure.md`](docs/75_20260901_stage2_output_master_clock_failure.md)를 따른다.
 
 ## 현재 권위 상태 (2026-08-31)
 
