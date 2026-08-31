@@ -286,6 +286,7 @@ def test_cli_dry_run_never_imports_sounddevice(monkeypatch, capsys) -> None:
     monkeypatch.setattr(module.importlib, "import_module", forbidden_import)
     assert module.main(["--dry-run"]) == 0
     stdout = capsys.readouterr().out
-    assert "audible_stream=11.605333s" in stdout
+    assert "output_stream=11.605333s" in stdout
+    assert "nonzero_output=5.537417s frames=265796 peak_pcm=98" in stdout
     assert "sounddevice import/open=0" in stdout
     assert imports == []

@@ -156,6 +156,9 @@ def _execute_live(arguments: argparse.Namespace) -> int:
         plan, full_submitted = build_stage2_v2_live_safe_fallback_plan()
         boundary = int(plan["live_phase_contract"]["diagnostic_phase_stop_frame"])
         diagnostic_seconds = boundary / 48_000.0
+        nonzero_frames = int(
+            np.count_nonzero(np.any(full_submitted[:boundary] != 0, axis=1))
+        )
         hardware, hardware_sha = _load_hardware(arguments.hardware)
         session = _new_session_relative_path()
         targets = output_master_session_targets(session)
@@ -195,7 +198,8 @@ def _execute_live(arguments: argparse.Namespace) -> int:
             )
         print(
             "[Stage-2 output-master 실제 출력] diagnostic-only signal "
-            f"{diagnostic_seconds:.6f}초를 한 번 출력합니다. "
+            f"stream {diagnostic_seconds:.6f}초(실제 nonzero PCM "
+            f"{nonzero_frames / 48_000.0:.6f}초)를 한 번 출력합니다. "
             f"input-only pre-roll={PRE_ROLL_FRAMES / 48_000:.6f}초, "
             f"post-roll={POST_ROLL_FRAMES / 48_000:.6f}초이며 두 구간은 무출력입니다. "
             "raw 저장·재로딩·clock 분석 후에도 P/S는 자동 실행하지 않습니다.",
@@ -320,8 +324,15 @@ def _dry_run() -> int:
         print("[실패] output-master signal numerical preflight 실패", file=sys.stderr)
         return 2
     boundary = int(plan["live_phase_contract"]["diagnostic_phase_stop_frame"])
+    nonzero_frames = int(
+        np.count_nonzero(np.any(submitted[:boundary] != 0, axis=1))
+    )
     print("Stage-2 output-master diagnostic-only 무음 dry-run PASS")
-    print(f"audible_stream={boundary / 48_000.0:.6f}s frames={boundary}")
+    print(f"output_stream={boundary / 48_000.0:.6f}s frames={boundary}")
+    print(
+        f"nonzero_output={nonzero_frames / 48_000.0:.6f}s "
+        f"frames={nonzero_frames} peak_pcm={int(np.max(np.abs(submitted[:boundary])))}"
+    )
     print(
         f"input_pre_roll={PRE_ROLL_FRAMES / 48_000.0:.6f}s "
         f"input_post_roll={POST_ROLL_FRAMES / 48_000.0:.6f}s"

@@ -163,4 +163,3 @@ legacy P/S·checkpoint를 자동 승격하는 경로도 열리지 않았다.
 split transport 실측 PASS → Stage-2 P/S/plant binding → final clean commit →
 18.23 GB cache manifest-last Drive publish/readback → Elice exact restore/decoder/lineage/
 frequency manifest → criterion/external contract → 200/500-step A100 smoke 순서를 지킨다.
-
