@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import runpy
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -527,6 +528,189 @@ def test_100k_is_blocked_before_cuda_without_raw_smoke_acceptance(
     assert tuple((tmp_path / "runs").glob("stage2_pretrain_*")) == before
 
 
+@pytest.mark.parametrize(
+    ("run_until_step", "run_label", "resume", "message"),
+    (
+        (200, None, None, "200-step"),
+        (200, "uninterrupted", None, "200-step"),
+        (500, "resumed", None, "resumed 500-step"),
+        (500, "uninterrupted", "runs/not-a-resume.pt", "uninterrupted 500-step"),
+        (100_000, "resumed", None, "canonical 100k"),
+        (100_000, None, "runs/not-a-resume.pt", "canonical 100k"),
+        (300, "resumed", None, "200, 500 또는 canonical"),
+    ),
+)
+def test_production_run_labels_fail_closed_before_gpu_or_run_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_until_step: int,
+    run_label: str | None,
+    resume: str | None,
+    message: str,
+) -> None:
+    """smoke label은 CLI 편의값이 아니라 production namespace admission이다."""
+
+    admission, profile, anchors = _launch_material(tmp_path)
+    monkeypatch.setattr(
+        runner_module,
+        "load_ready_stage2_pretrain_launch",
+        lambda *_args, **_kwargs: (admission, profile, anchors),
+    )
+    monkeypatch.setattr(
+        runner_module, "_preverify_campaign_checkout", lambda *_args: "a" * 40
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "configure_and_collect_stage2_a100_environment",
+        lambda *_args, **_kwargs: pytest.fail("invalid smoke run이 GPU를 열면 안 됩니다"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        runner_module.Stage2ScratchPretrainRunner(
+            repository_root=tmp_path,
+            campaign={},
+            run_until_step=run_until_step,
+            run_label=run_label,
+            resume=resume,
+        )
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    ("run_until_step", "run_label", "requires_smoke_acceptance"),
+    (
+        (200, "resumed", False),
+        (500, "uninterrupted", False),
+        (100_000, None, True),
+    ),
+)
+def test_existing_fresh_run_directory_fails_before_cuda_model_or_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_until_step: int,
+    run_label: str | None,
+    requires_smoke_acceptance: bool,
+) -> None:
+    """fresh arm collision은 no-replace일 뿐 아니라 GPU 비용 전 경계다."""
+
+    admission, profile, anchors = _launch_material(tmp_path)
+    profile = {
+        **profile,
+        "execution": {
+            **profile["execution"],
+            "data_pipeline": {
+                "loader_workers": 1,
+                "bounded_prefetch_batches": 1,
+                "source_cache_items": 8,
+                "valid_start_candidates_per_source": 64,
+                "pin_memory": True,
+                "non_blocking_h2d": True,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        runner_module,
+        "load_ready_stage2_pretrain_launch",
+        lambda *_args, **_kwargs: (admission, profile, anchors),
+    )
+    monkeypatch.setattr(
+        runner_module, "_preverify_campaign_checkout", lambda *_args: "a" * 40
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "configure_and_collect_stage2_a100_environment",
+        lambda *_args, **_kwargs: pytest.fail(
+            "existing fresh run directory collision 전에 CUDA를 열면 안 됩니다"
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "build_model",
+        lambda *_args, **_kwargs: pytest.fail(
+            "existing fresh run directory collision 전에 model을 만들면 안 됩니다"
+        ),
+    )
+
+    run_dir = runner_module.stage2_pretrain_run_directory(
+        tmp_path,
+        external_experiment_contract_sha256="e" * 64,
+        seed=20260803,
+        run_label=run_label,
+    )
+    run_dir.mkdir(parents=True)
+    smoke_acceptance: Path | None = None
+    if requires_smoke_acceptance:
+        smoke_acceptance = tmp_path / "smoke_acceptance.json"
+        smoke_acceptance.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="기존 Stage-2 fresh .* run directory"):
+        runner_module.Stage2ScratchPretrainRunner(
+            repository_root=tmp_path,
+            campaign={},
+            run_until_step=run_until_step,
+            run_label=run_label,
+            smoke_acceptance=smoke_acceptance,
+        )
+    assert tuple(run_dir.iterdir()) == ()
+
+
+def test_resumed_500_keeps_existing_resumed_namespace_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """resumed arm은 immutable 200-step namespace를 새 run collision으로 오인하지 않는다."""
+
+    admission, profile, anchors = _launch_material(tmp_path)
+    profile = {
+        **profile,
+        "execution": {
+            **profile["execution"],
+            "data_pipeline": {
+                "loader_workers": 1,
+                "bounded_prefetch_batches": 1,
+                "source_cache_items": 8,
+                "valid_start_candidates_per_source": 64,
+                "pin_memory": True,
+                "non_blocking_h2d": True,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        runner_module,
+        "load_ready_stage2_pretrain_launch",
+        lambda *_args, **_kwargs: (admission, profile, anchors),
+    )
+    monkeypatch.setattr(
+        runner_module, "_preverify_campaign_checkout", lambda *_args: "a" * 40
+    )
+    monkeypatch.setattr(runner_module, "_nvidia_smi_l_snapshot", lambda *_args: "A100")
+
+    def expected_environment_probe(*_args, **_kwargs):
+        raise RuntimeError("resumed 500 reached environment admission")
+
+    monkeypatch.setattr(
+        runner_module,
+        "configure_and_collect_stage2_a100_environment",
+        expected_environment_probe,
+    )
+    run_dir = runner_module.stage2_pretrain_run_directory(
+        tmp_path,
+        external_experiment_contract_sha256="e" * 64,
+        seed=20260803,
+        run_label="resumed",
+    )
+    run_dir.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="resumed 500 reached environment admission"):
+        runner_module.Stage2ScratchPretrainRunner(
+            repository_root=tmp_path,
+            campaign={},
+            run_until_step=500,
+            run_label="resumed",
+            resume=run_dir / "step_000200.pt",
+        )
+    assert tuple(run_dir.iterdir()) == ()
+
+
 def test_raw_smoke_acceptance_recomputes_chain_and_binds_100k_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -534,7 +718,7 @@ def test_raw_smoke_acceptance_recomputes_chain_and_binds_100k_checkpoint(
     environment = {"schema": "actual-a100-fixture", "device": "A100 80GB"}
     environment_sha = runner_module.stage2_a100_environment_sha256(environment)
     contract = Stage2TwoKilohertzContract.canonical()
-    bindings = {
+    common_bindings = {
         "runner_schema": runner_module.STAGE2_PRETRAIN_RUNNER_SCHEMA,
         "repository_commit_sha": "a" * 40,
         "stage2_contract_id": contract.contract_id,
@@ -557,6 +741,16 @@ def test_raw_smoke_acceptance_recomputes_chain_and_binds_100k_checkpoint(
         "a100_environment_sha256": environment_sha,
         "smoke_acceptance_sha256": None,
     }
+    resumed_bindings = {
+        **common_bindings,
+        "run_kind": "smoke",
+        "run_label": "resumed",
+    }
+    uninterrupted_bindings = {
+        **common_bindings,
+        "run_kind": "smoke",
+        "run_label": "uninterrupted",
+    }
     profile = {
         "seed": 20260803,
         "execution": {
@@ -569,36 +763,42 @@ def test_raw_smoke_acceptance_recomputes_chain_and_binds_100k_checkpoint(
             "telemetry": {"nvidia_smi_sample_every_steps": 10},
         },
     }
-    run_dir = tmp_path / "runs/stage2_pretrain_eeeeeeeeeeee_20260803"
-    independent_dir = tmp_path / "runs/stage2_pretrain_uninterrupted_fixture"
+    run_dir = runner_module.stage2_pretrain_run_directory(
+        tmp_path,
+        external_experiment_contract_sha256=external_sha,
+        seed=20260803,
+        run_label="resumed",
+    )
+    independent_dir = runner_module.stage2_pretrain_run_directory(
+        tmp_path,
+        external_experiment_contract_sha256=external_sha,
+        seed=20260803,
+        run_label="uninterrupted",
+    )
     run_dir.mkdir(parents=True)
     independent_dir.mkdir(parents=True)
-    identity = {
-        "schema": runner_module.STAGE2_PRETRAIN_RUN_SCHEMA,
-        "runner_schema": runner_module.STAGE2_PRETRAIN_RUNNER_SCHEMA,
-        "repository_commit_sha": "a" * 40,
-        "external_experiment_contract_sha256": external_sha,
-        "seed": 20260803,
-        "scratch_pretrain": True,
-        "automatic_resume_allowed": False,
-        "run_until_step": 200,
-        "a100_environment_sha256": environment_sha,
-        "production_batch_size": 96,
-        "loader_workers": 14,
-        "bounded_prefetch_batches": 56,
-    }
+    identity = runner_module._stage2_smoke_run_identity(
+        repository_commit_sha="a" * 40,
+        external_sha256=external_sha,
+        seed=20260803,
+        run_label="resumed",
+        run_until_step=200,
+        environment_sha256=environment_sha,
+        loader_workers=14,
+        bounded_prefetch_batches=56,
+    )
     identity_path = run_dir / "run_identity.json"
     environment_path = run_dir / "environment.json"
     identity_path.write_text(json.dumps(identity, sort_keys=True), encoding="utf-8")
     environment_path.write_text(json.dumps(environment, sort_keys=True), encoding="utf-8")
     step_200_path, _ = _acceptance_checkpoint(
-        tmp_path, run_dir, step=200, bindings=bindings
+        tmp_path, run_dir, step=200, bindings=resumed_bindings
     )
     step_500_path, step_500 = _acceptance_checkpoint(
-        tmp_path, run_dir, step=500, bindings=bindings
+        tmp_path, run_dir, step=500, bindings=resumed_bindings
     )
     uninterrupted_path, _ = _acceptance_checkpoint(
-        tmp_path, independent_dir, step=500, bindings=bindings
+        tmp_path, independent_dir, step=500, bindings=uninterrupted_bindings
     )
     telemetry_path = run_dir / "step_telemetry.jsonl"
     rows = _acceptance_telemetry(
@@ -612,8 +812,23 @@ def test_raw_smoke_acceptance_recomputes_chain_and_binds_100k_checkpoint(
     )
     independent_identity_path = independent_dir / "run_identity.json"
     independent_identity_path.write_text(
-        json.dumps({**identity, "run_until_step": 500}, sort_keys=True),
+        json.dumps(
+            runner_module._stage2_smoke_run_identity(
+                repository_commit_sha="a" * 40,
+                external_sha256=external_sha,
+                seed=20260803,
+                run_label="uninterrupted",
+                run_until_step=500,
+                environment_sha256=environment_sha,
+                loader_workers=14,
+                bounded_prefetch_batches=56,
+            ),
+            sort_keys=True,
+        ),
         encoding="utf-8",
+    )
+    (independent_dir / "environment.json").write_text(
+        json.dumps(environment, sort_keys=True), encoding="utf-8"
     )
 
     telemetry_bytes = telemetry_path.read_bytes()
@@ -651,93 +866,64 @@ def test_raw_smoke_acceptance_recomputes_chain_and_binds_100k_checkpoint(
         encoding="utf-8",
     )
 
-    evidence_dir = tmp_path / "evidence"
-    evidence_dir.mkdir()
-    equivalence_path = evidence_dir / "resume-equivalence.json"
-    equivalence = {
-        "schema": runner_module.STAGE2_PRETRAIN_RESUME_EQUIVALENCE_SCHEMA,
-        "status": "PASS",
-        "external_experiment_contract_sha256": external_sha,
-        "a100_environment_sha256": environment_sha,
-        "completed_step": 500,
-        "comparison_algorithm": "exact_recursive_torch_state_v1",
-        "resumed_checkpoint_sha256": _file_sha(step_500_path),
-        "uninterrupted_checkpoint": _artifact_ref(tmp_path, uninterrupted_path),
-        "uninterrupted_binding": _artifact_ref(
-            tmp_path, uninterrupted_path.with_suffix(".binding.json")
-        ),
-        "uninterrupted_run_identity": _artifact_ref(
-            tmp_path, independent_identity_path
-        ),
-        "uninterrupted_raw_step_telemetry": _artifact_ref(
-            tmp_path, independent_telemetry_path
-        ),
-        "uninterrupted_failure_receipt_absent": True,
-        "model_exact": True,
-        "optimizer_exact": True,
-        "scheduler_exact": True,
-        "rng_exact": True,
-        "last_metrics_exact": True,
-    }
-    equivalence_path.write_text(
-        json.dumps(equivalence, sort_keys=True), encoding="utf-8"
-    )
-    acceptance_path = evidence_dir / "smoke-acceptance.json"
-    acceptance = {
-        "schema": runner_module.STAGE2_PRETRAIN_SMOKE_ACCEPTANCE_SCHEMA,
-        "status": "PASS",
-        "canonical_100k_start_eligible": True,
-        "external_experiment_contract_sha256": external_sha,
-        "a100_environment_sha256": environment_sha,
-        "production_batch_size": 96,
-        "run_identity": _artifact_ref(tmp_path, identity_path),
-        "environment": _artifact_ref(tmp_path, environment_path),
-        "step_200_checkpoint": _artifact_ref(tmp_path, step_200_path),
-        "step_200_binding": _artifact_ref(
-            tmp_path, step_200_path.with_suffix(".binding.json")
-        ),
-        "step_500_checkpoint": _artifact_ref(tmp_path, step_500_path),
-        "step_500_binding": _artifact_ref(
-            tmp_path, step_500_path.with_suffix(".binding.json")
-        ),
-        "smoke_step_200": _artifact_ref(tmp_path, smoke_200_path),
-        "smoke_step_500": _artifact_ref(tmp_path, smoke_500_path),
-        "raw_step_telemetry": _artifact_ref(tmp_path, telemetry_path),
-        "failure_receipt_absent": True,
-        "resume_chain": {
-            "scratch_run_until_step": 200,
-            "explicit_resume_from_step": 200,
-            "explicit_resume_checkpoint_sha256": _file_sha(step_200_path),
-            "resumed_until_step": 500,
-            "resumed_checkpoint_sha256": _file_sha(step_500_path),
-        },
-        "uninterrupted_vs_resume_evidence": _artifact_ref(
-            tmp_path, equivalence_path
-        ),
-    }
-    acceptance_path.write_text(
-        json.dumps(acceptance, sort_keys=True), encoding="utf-8"
-    )
-    acceptance_sha = runner_module._validate_stage2_smoke_acceptance(
+    acceptance_path, acceptance_sha = runner_module.issue_stage2_smoke_acceptance_no_replace(
         tmp_path,
-        acceptance_path=acceptance_path,
-        run_dir=run_dir,
+        resumed_run_dir=run_dir,
+        uninterrupted_run_dir=independent_dir,
         external_sha256=external_sha,
         environment=environment,
         environment_sha256=environment_sha,
         profile=profile,
-        expected_bindings=bindings,
+        resumed_expected_bindings=resumed_bindings,
+        uninterrupted_expected_bindings=uninterrupted_bindings,
     )
     assert acceptance_sha == _file_sha(acceptance_path)
+    assert acceptance_path == run_dir / "smoke_acceptance.json"
+    assert (run_dir / "uninterrupted_vs_resume_equivalence.json").is_file()
+    with pytest.raises(FileExistsError, match="덮어쓸 수 없습니다"):
+        runner_module.issue_stage2_smoke_acceptance_no_replace(
+            tmp_path,
+            resumed_run_dir=run_dir,
+            uninterrupted_run_dir=independent_dir,
+            external_sha256=external_sha,
+            environment=environment,
+            environment_sha256=environment_sha,
+            profile=profile,
+            resumed_expected_bindings=resumed_bindings,
+            uninterrupted_expected_bindings=uninterrupted_bindings,
+        )
+
+    # acceptance JSON의 PASS scalar만 믿지 않는다. 실제 weights bytes가 변하면
+    # existing no-replace receipt를 다시 읽을 때 즉시 실패해야 한다.
+    with step_500_path.open("ab") as stream:
+        stream.write(b"tampered")
+    with pytest.raises(ValueError, match="SHA|checkpoint"):
+        runner_module._validate_stage2_smoke_acceptance(
+            tmp_path,
+            acceptance_path=acceptance_path,
+            resumed_run_dir=run_dir,
+            uninterrupted_run_dir=independent_dir,
+            external_sha256=external_sha,
+            environment=environment,
+            environment_sha256=environment_sha,
+            profile=profile,
+            resumed_expected_bindings=resumed_bindings,
+            uninterrupted_expected_bindings=uninterrupted_bindings,
+        )
 
     with pytest.raises(ValueError, match="smoke acceptance SHA"):
         runner_module.stage2_checkpoint_binding_payload(
             checkpoint_sha256="d" * 64,
-            bindings=bindings,
+            bindings=resumed_bindings,
             completed_steps=100_000,
             production_execution=True,
         )
-    final_bindings = {**bindings, "smoke_acceptance_sha256": acceptance_sha}
+    final_bindings = {
+        **resumed_bindings,
+        "run_kind": "canonical",
+        "run_label": None,
+        "smoke_acceptance_sha256": acceptance_sha,
+    }
     sidecar = runner_module.stage2_checkpoint_binding_payload(
         checkpoint_sha256="d" * 64,
         bindings=final_bindings,
@@ -751,10 +937,121 @@ def test_raw_smoke_acceptance_recomputes_chain_and_binds_100k_checkpoint(
     with pytest.raises(ValueError, match="key 집합"):
         runner_module._validate_production_checkpoint_state(
             incomplete,
-            expected_bindings=bindings,
+            expected_bindings=resumed_bindings,
             completed_steps=500,
             label="tampered",
         )
+
+
+def test_smoke_launchers_keep_canonical_and_independent_runs_separate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI가 smoke arm을 canonical 100k namespace와 섞지 않는지 고정한다."""
+
+    scripts_root = Path(__file__).resolve().parents[1] / "scripts" / "train"
+    campaign_path = tmp_path / "configs" / "stage2_2khz_campaign.yaml"
+    campaign_path.parent.mkdir(parents=True)
+    campaign_path.write_text("{}\n", encoding="utf-8")
+    calls: list[dict[str, object]] = []
+    issued: list[dict[str, object]] = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(dict(kwargs))
+            self.root = Path(str(kwargs["repository_root"])).resolve()
+            self.profile = {"fixture": "shared"}
+            self.a100_environment = {"fixture": "A100"}
+            self.a100_environment_sha256 = "a" * 64
+            self.execution_repository_commit_sha = "b" * 40
+            self.anchors = {"external_experiment_contract_sha256": "c" * 64}
+            self.run_label = kwargs.get("run_label")
+            label = str(self.run_label or "canonical")
+            self.run_dir = self.root / "runs" / f"fixture_{label}"
+            self.run_until_step = int(kwargs["run_until_step"])
+
+        def train(self) -> Path:
+            return self.run_dir / f"step_{self.run_until_step:06d}.pt"
+
+        def _binding_metadata(self, **kwargs: object) -> dict[str, object]:
+            return {
+                "fixture": "binding",
+                "run_label": self.run_label,
+                "include_smoke_acceptance": kwargs.get("include_smoke_acceptance"),
+            }
+
+    def fake_issue(repository_root: Path, **kwargs: object) -> tuple[Path, str]:
+        assert Path(repository_root).resolve() == tmp_path.resolve()
+        issued.append(dict(kwargs))
+        resumed_dir = Path(str(kwargs["resumed_run_dir"]))
+        return resumed_dir / "smoke_acceptance.json", "d" * 64
+
+    smoke_module = runpy.run_path(
+        str(scripts_root / "run_stage2_2khz_pretrain_smoke.py")
+    )
+    smoke_main = smoke_module["main"]
+    smoke_main.__globals__["REPO_ROOT"] = tmp_path
+    smoke_main.__globals__["Stage2ScratchPretrainRunner"] = FakeRunner
+    smoke_main.__globals__["issue_stage2_smoke_acceptance_no_replace"] = fake_issue
+    assert smoke_main(["--campaign", "configs/stage2_2khz_campaign.yaml"]) == 0
+
+    assert [call["run_until_step"] for call in calls] == [200, 500, 500]
+    assert [call["run_label"] for call in calls] == [
+        "resumed",
+        "resumed",
+        "uninterrupted",
+    ]
+    assert calls[0].get("resume") is None
+    assert calls[1]["resume"] == tmp_path / "runs" / "fixture_resumed" / "step_000200.pt"
+    assert calls[2].get("resume") is None
+    assert len(issued) == 1
+    assert issued[0]["resumed_run_dir"] == tmp_path / "runs" / "fixture_resumed"
+    assert issued[0]["uninterrupted_run_dir"] == tmp_path / "runs" / "fixture_uninterrupted"
+    smoke_output = capsys.readouterr().out
+    assert "--run-until-step 100000" in smoke_output
+    assert "--resume" not in smoke_output
+    assert "--run-label" not in smoke_output
+
+    # generic launcher도 label을 runner에 그대로 넘기며 canonical 위치를 추론하지 않는다.
+    calls.clear()
+    generic_module = runpy.run_path(str(scripts_root / "train_stage2_2khz.py"))
+    generic_main = generic_module["main"]
+    generic_main.__globals__["REPO_ROOT"] = tmp_path
+    generic_main.__globals__["Stage2ScratchPretrainRunner"] = FakeRunner
+    assert generic_main(
+        [
+            "--campaign",
+            "configs/stage2_2khz_campaign.yaml",
+            "--run-until-step",
+            "500",
+            "--run-label",
+            "uninterrupted",
+        ]
+    ) == 0
+    assert len(calls) == 1
+    assert calls[0]["run_label"] == "uninterrupted"
+    assert calls[0].get("resume") is None
+
+    canonical = runner_module.stage2_pretrain_run_directory(
+        tmp_path,
+        external_experiment_contract_sha256="c" * 64,
+        seed=20260803,
+    )
+    resumed = runner_module.stage2_pretrain_run_directory(
+        tmp_path,
+        external_experiment_contract_sha256="c" * 64,
+        seed=20260803,
+        run_label="resumed",
+    )
+    uninterrupted = runner_module.stage2_pretrain_run_directory(
+        tmp_path,
+        external_experiment_contract_sha256="c" * 64,
+        seed=20260803,
+        run_label="uninterrupted",
+    )
+    assert len({canonical, resumed, uninterrupted}) == 3
+    assert canonical.name.startswith("stage2_pretrain_")
+    assert resumed.name.startswith("stage2_pretrain_smoke_")
+    assert uninterrupted.name.startswith("stage2_pretrain_smoke_")
 
 
 def test_bounded_prefetch_order_is_worker_count_and_resume_independent(

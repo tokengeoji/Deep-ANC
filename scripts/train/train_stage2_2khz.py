@@ -3,9 +3,9 @@
 
 기본 campaign은 실제 새 P/S·public manifest·criterion calibration·external contract가
 없으므로 GPU와 run directory 전에 실패한다. 모든 typed admission이 PASS한 뒤에만
-``--run-until-step 200``, 500, 100000 순서로 같은 external-contract run을 연다.
-자동 재개나 Stage-1/legacy init은 없고, 재개는 ``--resume``으로 exact Stage-2
-checkpoint를 명시할 때만 허용한다.
+``--run-until-step 200``, 500, 100000 순서로 실행한다. 200→resume→500 smoke는
+canonical 100k와 별도 immutable namespace를 쓰며, canonical 100k는 smoke checkpoint를
+resume하지 않는 fresh scratch run이다. 자동 재개나 Stage-1/legacy init은 없다.
 """
 
 from __future__ import annotations
@@ -64,6 +64,15 @@ def main(argv: list[str] | None = None) -> int:
             "acceptance JSON 상대경로"
         ),
     )
+    parser.add_argument(
+        "--run-label",
+        choices=("resumed", "uninterrupted"),
+        default=None,
+        help=(
+            "200/500 smoke 전용 immutable namespace label. 200은 resumed, "
+            "500은 resumed(명시적 step_000200.pt resume) 또는 uninterrupted만 허용"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         campaign_path = _repository_path(
@@ -88,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
             run_until_step=int(args.run_until_step),
             resume=resume,
             smoke_acceptance=smoke_acceptance,
+            run_label=args.run_label,
         )
         checkpoint = runner.train()
     except (OSError, RuntimeError, ValueError) as exc:

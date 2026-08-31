@@ -81,6 +81,39 @@ STAGE2_PRETRAIN_RESUME_EQUIVALENCE_SCHEMA = (
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_STAGE2_SMOKE_RUN_LABELS = frozenset({"resumed", "uninterrupted"})
+
+
+def stage2_pretrain_run_directory(
+    repository_root: str | Path,
+    *,
+    external_experiment_contract_sha256: str,
+    seed: int,
+    run_label: str | None = None,
+) -> Path:
+    """Stage-2 canonical/smoke run root를 서로 겹치지 않게 계산한다.
+
+    ``run_label=None``은 canonical 100k scratch run만을 뜻한다. 실제 smoke는
+    ``resumed``와 ``uninterrupted`` 두 label만 허용하며, canonical 이름 공간에
+    checkpoint를 만들거나 resume할 수 없다.
+    """
+
+    root = Path(repository_root).resolve(strict=True)
+    external_sha = _require_sha256(
+        external_experiment_contract_sha256,
+        label="Stage-2 external experiment contract SHA",
+    )
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("Stage-2 run seed는 nonnegative integer여야 합니다")
+    if run_label is None:
+        name = f"stage2_pretrain_{external_sha[:12]}_{seed}"
+    else:
+        if run_label not in _STAGE2_SMOKE_RUN_LABELS:
+            raise ValueError(
+                "Stage-2 smoke run label은 resumed 또는 uninterrupted만 허용합니다"
+            )
+        name = f"stage2_pretrain_smoke_{external_sha[:12]}_{seed}_{run_label}"
+    return root / "runs" / name
 
 
 def _canonical_json(value: object) -> bytes:
@@ -790,133 +823,240 @@ def _load_bound_checkpoint(
     return checkpoint, checkpoint_sha, checkpoint_path
 
 
-def _validate_stage2_smoke_acceptance(
+def _artifact_ref_from_path(root: Path, path: Path, *, label: str) -> dict[str, str]:
+    """repository 내부 regular file을 raw bytes SHA reference로 만든다."""
+
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label}가 repository 밖에 있습니다: {path}") from exc
+    checked = _inside_repository(root, relative.as_posix(), label=label)
+    _, digest = _snapshot_regular_file(checked)
+    return {"path": relative.as_posix(), "sha256": digest}
+
+
+def _stage2_smoke_run_identity(
+    *,
+    repository_commit_sha: str,
+    external_sha256: str,
+    seed: int,
+    run_label: str,
+    run_until_step: int,
+    environment_sha256: str,
+    loader_workers: int,
+    bounded_prefetch_batches: int,
+) -> dict[str, Any]:
+    if not _COMMIT_SHA_RE.fullmatch(repository_commit_sha):
+        raise ValueError("Stage-2 smoke repository commit SHA가 40-hex가 아닙니다")
+    if run_label not in _STAGE2_SMOKE_RUN_LABELS:
+        raise ValueError("Stage-2 smoke run label이 승인 목록에 없습니다")
+    return {
+        "schema": STAGE2_PRETRAIN_RUN_SCHEMA,
+        "runner_schema": STAGE2_PRETRAIN_RUNNER_SCHEMA,
+        "repository_commit_sha": repository_commit_sha,
+        "external_experiment_contract_sha256": external_sha256,
+        "seed": int(seed),
+        "scratch_pretrain": True,
+        "automatic_resume_allowed": False,
+        "run_kind": "smoke",
+        "run_label": run_label,
+        "run_until_step": int(run_until_step),
+        "a100_environment_sha256": environment_sha256,
+        "production_batch_size": 96,
+        "loader_workers": int(loader_workers),
+        "bounded_prefetch_batches": int(bounded_prefetch_batches),
+    }
+
+
+def _validate_smoke_binding_scope(
+    bindings: Mapping[str, Any],
+    *,
+    label: str,
+    external_sha256: str,
+    environment_sha256: str,
+) -> None:
+    """smoke checkpoint를 canonical run/checkpoint로 바꿔치기하지 못하게 한다."""
+
+    if not isinstance(bindings, Mapping):
+        raise ValueError(f"Stage-2 {label} smoke bindings가 mapping이 아닙니다")
+    if (
+        bindings.get("runner_schema") != STAGE2_PRETRAIN_RUNNER_SCHEMA
+        or bindings.get("external_experiment_contract_sha256") != external_sha256
+        or bindings.get("a100_environment_sha256") != environment_sha256
+        or bindings.get("scratch_pretrain") is not True
+        or bindings.get("legacy_origin") is not False
+        or bindings.get("automatic_resume_allowed") is not False
+        or bindings.get("smoke_acceptance_sha256") is not None
+        or bindings.get("run_kind") != "smoke"
+        or bindings.get("run_label") != label
+    ):
+        raise ValueError(
+            f"Stage-2 {label} smoke checkpoint가 canonical/smoke namespace 계약과 다릅니다"
+        )
+    commit = str(bindings.get("repository_commit_sha", ""))
+    if not _COMMIT_SHA_RE.fullmatch(commit):
+        raise ValueError(f"Stage-2 {label} smoke repository commit SHA가 40-hex가 아닙니다")
+
+
+def _stage2_output_absent(path: Path, *, label: str) -> None:
+    """broken symlink까지 포함해 no-replace output collision을 닫는다."""
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise FileExistsError(f"기존 {label}를 덮어쓸 수 없습니다: {path}")
+
+
+def _collect_stage2_smoke_raw_evidence(
     root: Path,
     *,
-    acceptance_path: Path,
-    run_dir: Path,
+    resumed_run_dir: Path,
+    uninterrupted_run_dir: Path,
     external_sha256: str,
     environment: Mapping[str, Any],
     environment_sha256: str,
     profile: Mapping[str, Any],
-    expected_bindings: Mapping[str, Any],
-) -> str:
-    """actual 200→explicit-resume→500 bytes와 독립 등가 evidence만 100k를 연다."""
+    resumed_expected_bindings: Mapping[str, Any],
+    uninterrupted_expected_bindings: Mapping[str, Any],
+) -> dict[str, Any]:
+    """receipt 주장보다 먼저 actual raw files를 decode/recompute한다."""
 
-    acceptance_content, acceptance_sha = _snapshot_regular_file(acceptance_path)
-    try:
-        acceptance = json.loads(acceptance_content.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("Stage-2 smoke acceptance는 UTF-8 JSON이어야 합니다") from exc
-    keys = {
-        "schema",
-        "status",
-        "canonical_100k_start_eligible",
-        "external_experiment_contract_sha256",
-        "a100_environment_sha256",
-        "production_batch_size",
-        "run_identity",
-        "environment",
-        "step_200_checkpoint",
-        "step_200_binding",
-        "step_500_checkpoint",
-        "step_500_binding",
-        "smoke_step_200",
-        "smoke_step_500",
-        "raw_step_telemetry",
-        "failure_receipt_absent",
-        "resume_chain",
-        "uninterrupted_vs_resume_evidence",
-    }
-    if not isinstance(acceptance, dict) or set(acceptance) != keys:
-        raise ValueError("Stage-2 smoke acceptance key 집합이 exact하지 않습니다")
-    if (
-        acceptance["schema"] != STAGE2_PRETRAIN_SMOKE_ACCEPTANCE_SCHEMA
-        or acceptance["status"] != "PASS"
-        or acceptance["canonical_100k_start_eligible"] is not True
-        or acceptance["external_experiment_contract_sha256"] != external_sha256
-        or acceptance["a100_environment_sha256"] != environment_sha256
-        or acceptance["production_batch_size"] != 96
-        or acceptance["failure_receipt_absent"] is not True
-    ):
-        raise ValueError("Stage-2 smoke acceptance semantic이 canonical 100k 계약이 아닙니다")
-    execution = profile["execution"]
-    pipeline = execution["data_pipeline"]
-    if int(execution["batch_size"]) != 96:
+    external_sha256 = _require_sha256(
+        external_sha256, label="Stage-2 smoke external contract SHA"
+    )
+    execution = profile.get("execution")
+    if not isinstance(execution, Mapping):
+        raise ValueError("Stage-2 smoke profile execution이 없습니다")
+    pipeline = execution.get("data_pipeline")
+    telemetry = execution.get("telemetry")
+    if not isinstance(pipeline, Mapping) or not isinstance(telemetry, Mapping):
+        raise ValueError("Stage-2 smoke profile pipeline/telemetry가 없습니다")
+    if int(execution.get("batch_size", -1)) != 96:
         raise ValueError("Stage-2 100k acceptance는 actual B96 smoke만 허용합니다")
+    seed = int(profile.get("seed", -1))
+    if seed < 0:
+        raise ValueError("Stage-2 smoke profile seed가 없습니다")
+    expected_resumed_dir = stage2_pretrain_run_directory(
+        root,
+        external_experiment_contract_sha256=external_sha256,
+        seed=seed,
+        run_label="resumed",
+    )
+    expected_uninterrupted_dir = stage2_pretrain_run_directory(
+        root,
+        external_experiment_contract_sha256=external_sha256,
+        seed=seed,
+        run_label="uninterrupted",
+    )
+    if resumed_run_dir != expected_resumed_dir:
+        raise ValueError("Stage-2 resumed smoke run directory가 deterministic layout과 다릅니다")
+    if uninterrupted_run_dir != expected_uninterrupted_dir:
+        raise ValueError("Stage-2 uninterrupted smoke run directory가 deterministic layout과 다릅니다")
+    if resumed_run_dir == uninterrupted_run_dir:
+        raise ValueError("Stage-2 resumed/uninterrupted smoke directory가 같습니다")
+    _validate_smoke_binding_scope(
+        resumed_expected_bindings,
+        label="resumed",
+        external_sha256=external_sha256,
+        environment_sha256=environment_sha256,
+    )
+    _validate_smoke_binding_scope(
+        uninterrupted_expected_bindings,
+        label="uninterrupted",
+        external_sha256=external_sha256,
+        environment_sha256=environment_sha256,
+    )
+    expected_common = {
+        key: value
+        for key, value in resumed_expected_bindings.items()
+        if key not in {"run_kind", "run_label"}
+    }
+    if expected_common != {
+        key: value
+        for key, value in uninterrupted_expected_bindings.items()
+        if key not in {"run_kind", "run_label"}
+    }:
+        raise ValueError("Stage-2 resumed/uninterrupted smoke의 semantic binding이 다릅니다")
 
+    paths = {
+        "run_identity": resumed_run_dir / "run_identity.json",
+        "environment": resumed_run_dir / "environment.json",
+        "step_200_checkpoint": resumed_run_dir / "step_000200.pt",
+        "step_200_binding": resumed_run_dir / "step_000200.binding.json",
+        "step_500_checkpoint": resumed_run_dir / "step_000500.pt",
+        "step_500_binding": resumed_run_dir / "step_000500.binding.json",
+        "smoke_step_200": resumed_run_dir / "smoke_performance_step_000200.json",
+        "smoke_step_500": resumed_run_dir / "smoke_performance_step_000500.json",
+        "raw_step_telemetry": resumed_run_dir / "step_telemetry.jsonl",
+        "uninterrupted_checkpoint": uninterrupted_run_dir / "step_000500.pt",
+        "uninterrupted_binding": uninterrupted_run_dir / "step_000500.binding.json",
+        "uninterrupted_run_identity": uninterrupted_run_dir / "run_identity.json",
+        "uninterrupted_environment": uninterrupted_run_dir / "environment.json",
+        "uninterrupted_raw_step_telemetry": uninterrupted_run_dir / "step_telemetry.jsonl",
+    }
+    refs = {
+        key: _artifact_ref_from_path(root, path, label=f"Stage-2 smoke {key}")
+        for key, path in paths.items()
+    }
     identity, _, _, _ = _load_json_ref(
         root,
-        acceptance["run_identity"],
-        label="Stage-2 smoke run identity",
-        expected_path=run_dir / "run_identity.json",
+        refs["run_identity"],
+        label="Stage-2 resumed smoke run identity",
+        expected_path=paths["run_identity"],
     )
-    expected_identity = {
-        "schema": STAGE2_PRETRAIN_RUN_SCHEMA,
-        "runner_schema": STAGE2_PRETRAIN_RUNNER_SCHEMA,
-        "repository_commit_sha": str(expected_bindings["repository_commit_sha"]),
-        "external_experiment_contract_sha256": external_sha256,
-        "seed": int(profile["seed"]),
-        "scratch_pretrain": True,
-        "automatic_resume_allowed": False,
-        "run_until_step": 200,
-        "a100_environment_sha256": environment_sha256,
-        "production_batch_size": 96,
-        "loader_workers": int(pipeline["loader_workers"]),
-        "bounded_prefetch_batches": int(pipeline["bounded_prefetch_batches"]),
-    }
+    expected_identity = _stage2_smoke_run_identity(
+        repository_commit_sha=str(resumed_expected_bindings["repository_commit_sha"]),
+        external_sha256=external_sha256,
+        seed=seed,
+        run_label="resumed",
+        run_until_step=200,
+        environment_sha256=environment_sha256,
+        loader_workers=int(pipeline["loader_workers"]),
+        bounded_prefetch_batches=int(pipeline["bounded_prefetch_batches"]),
+    )
     if identity != expected_identity:
-        raise ValueError("Stage-2 smoke run identity가 200 scratch 시작을 증명하지 않습니다")
+        raise ValueError("Stage-2 resumed smoke identity가 fresh 200-step을 증명하지 않습니다")
     persisted_environment, _, _, _ = _load_json_ref(
         root,
-        acceptance["environment"],
-        label="Stage-2 smoke environment",
-        expected_path=run_dir / "environment.json",
+        refs["environment"],
+        label="Stage-2 resumed smoke environment",
+        expected_path=paths["environment"],
     )
     if (
         persisted_environment != dict(environment)
         or stage2_a100_environment_sha256(persisted_environment)
         != environment_sha256
     ):
-        raise ValueError("Stage-2 smoke environment가 current A100과 다릅니다")
+        raise ValueError("Stage-2 resumed smoke environment가 current A100과 다릅니다")
 
     step_200, step_200_sha, _ = _load_bound_checkpoint(
         root,
-        checkpoint_ref=acceptance["step_200_checkpoint"],
-        binding_ref=acceptance["step_200_binding"],
-        expected_checkpoint_path=run_dir / "step_000200.pt",
-        expected_binding_path=run_dir / "step_000200.binding.json",
-        expected_bindings=expected_bindings,
+        checkpoint_ref=refs["step_200_checkpoint"],
+        binding_ref=refs["step_200_binding"],
+        expected_checkpoint_path=paths["step_200_checkpoint"],
+        expected_binding_path=paths["step_200_binding"],
+        expected_bindings=resumed_expected_bindings,
         completed_steps=200,
-        label="Stage-2 step 200",
+        label="Stage-2 resumed smoke step 200",
     )
     step_500, step_500_sha, _ = _load_bound_checkpoint(
         root,
-        checkpoint_ref=acceptance["step_500_checkpoint"],
-        binding_ref=acceptance["step_500_binding"],
-        expected_checkpoint_path=run_dir / "step_000500.pt",
-        expected_binding_path=run_dir / "step_000500.binding.json",
-        expected_bindings=expected_bindings,
+        checkpoint_ref=refs["step_500_checkpoint"],
+        binding_ref=refs["step_500_binding"],
+        expected_checkpoint_path=paths["step_500_checkpoint"],
+        expected_binding_path=paths["step_500_binding"],
+        expected_bindings=resumed_expected_bindings,
         completed_steps=500,
-        label="Stage-2 step 500",
+        label="Stage-2 resumed smoke step 500",
     )
-    resume_chain = acceptance["resume_chain"]
-    if resume_chain != {
-        "scratch_run_until_step": 200,
-        "explicit_resume_from_step": 200,
-        "explicit_resume_checkpoint_sha256": step_200_sha,
-        "resumed_until_step": 500,
-        "resumed_checkpoint_sha256": step_500_sha,
-    }:
-        raise ValueError("Stage-2 smoke acceptance가 200→explicit resume→500 chain과 다릅니다")
-
     telemetry_content, telemetry_sha, _ = _load_binary_ref(
         root,
-        acceptance["raw_step_telemetry"],
-        label="Stage-2 smoke raw telemetry",
-        expected_path=run_dir / "step_telemetry.jsonl",
+        refs["raw_step_telemetry"],
+        label="Stage-2 resumed smoke raw telemetry",
+        expected_path=paths["raw_step_telemetry"],
     )
-    utilization_every = int(execution["telemetry"]["nvidia_smi_sample_every_steps"])
+    utilization_every = int(telemetry["nvidia_smi_sample_every_steps"])
     rows = _telemetry_rows(
         telemetry_content,
         expected_steps=500,
@@ -925,19 +1065,20 @@ def _validate_stage2_smoke_acceptance(
         utilization_every=utilization_every,
         label="Stage-2 resumed smoke telemetry",
     )
-    lines = telemetry_content.splitlines(keepends=True)
-    prefix_200_sha = hashlib.sha256(b"".join(lines[:200])).hexdigest()
+    prefix_200_sha = hashlib.sha256(
+        b"".join(telemetry_content.splitlines(keepends=True)[:200])
+    ).hexdigest()
     smoke_200, _, _, _ = _load_json_ref(
         root,
-        acceptance["smoke_step_200"],
-        label="Stage-2 smoke step 200 receipt",
-        expected_path=run_dir / "smoke_performance_step_000200.json",
+        refs["smoke_step_200"],
+        label="Stage-2 resumed smoke step 200 receipt",
+        expected_path=paths["smoke_step_200"],
     )
     smoke_500, _, _, _ = _load_json_ref(
         root,
-        acceptance["smoke_step_500"],
-        label="Stage-2 smoke step 500 receipt",
-        expected_path=run_dir / "smoke_performance_step_000500.json",
+        refs["smoke_step_500"],
+        label="Stage-2 resumed smoke step 500 receipt",
+        expected_path=paths["smoke_step_500"],
     )
     smoke_args = {
         "rows": rows,
@@ -955,78 +1096,57 @@ def _validate_stage2_smoke_acceptance(
         telemetry_sha256=telemetry_sha,
     ):
         raise ValueError("Stage-2 smoke receipt가 actual raw telemetry 통계와 다릅니다")
-    if (run_dir / "failure.json").exists():
-        raise ValueError("Stage-2 smoke run에 OOM/runtime failure receipt가 있습니다")
+    if (resumed_run_dir / "failure.json").exists() or (
+        resumed_run_dir / "failure.json"
+    ).is_symlink():
+        raise ValueError("Stage-2 resumed smoke run에 OOM/runtime failure receipt가 있습니다")
 
-    equivalence, _, _, equivalence_path = _load_json_ref(
+    uninterrupted, uninterrupted_sha, _ = _load_bound_checkpoint(
         root,
-        acceptance["uninterrupted_vs_resume_evidence"],
-        label="Stage-2 uninterrupted/resume equivalence",
-    )
-    equivalence_keys = {
-        "schema",
-        "status",
-        "external_experiment_contract_sha256",
-        "a100_environment_sha256",
-        "completed_step",
-        "comparison_algorithm",
-        "resumed_checkpoint_sha256",
-        "uninterrupted_checkpoint",
-        "uninterrupted_binding",
-        "uninterrupted_run_identity",
-        "uninterrupted_raw_step_telemetry",
-        "uninterrupted_failure_receipt_absent",
-        "model_exact",
-        "optimizer_exact",
-        "scheduler_exact",
-        "rng_exact",
-        "last_metrics_exact",
-    }
-    if not isinstance(equivalence, dict) or set(equivalence) != equivalence_keys:
-        raise ValueError("Stage-2 resume equivalence key 집합이 exact하지 않습니다")
-    if (
-        equivalence["schema"] != STAGE2_PRETRAIN_RESUME_EQUIVALENCE_SCHEMA
-        or equivalence["status"] != "PASS"
-        or equivalence["external_experiment_contract_sha256"] != external_sha256
-        or equivalence["a100_environment_sha256"] != environment_sha256
-        or equivalence["completed_step"] != 500
-        or equivalence["comparison_algorithm"] != "exact_recursive_torch_state_v1"
-        or equivalence["resumed_checkpoint_sha256"] != step_500_sha
-        or equivalence["uninterrupted_failure_receipt_absent"] is not True
-    ):
-        raise ValueError("Stage-2 resume equivalence semantic이 current smoke와 다릅니다")
-    uninterrupted, _, uninterrupted_path = _load_bound_checkpoint(
-        root,
-        checkpoint_ref=equivalence["uninterrupted_checkpoint"],
-        binding_ref=equivalence["uninterrupted_binding"],
-        expected_checkpoint_path=None,
-        expected_binding_path=None,
-        expected_bindings=expected_bindings,
+        checkpoint_ref=refs["uninterrupted_checkpoint"],
+        binding_ref=refs["uninterrupted_binding"],
+        expected_checkpoint_path=paths["uninterrupted_checkpoint"],
+        expected_binding_path=paths["uninterrupted_binding"],
+        expected_bindings=uninterrupted_expected_bindings,
         completed_steps=500,
-        label="Stage-2 uninterrupted step 500",
+        label="Stage-2 uninterrupted smoke step 500",
     )
-    uninterrupted_dir = uninterrupted_path.parent
-    if uninterrupted_dir == run_dir or equivalence_path.parent == run_dir:
-        raise ValueError("Stage-2 uninterrupted evidence가 resumed run에서 재사용됐습니다")
-    uninterrupted_identity, _, _, uninterrupted_identity_path = _load_json_ref(
+    uninterrupted_identity, _, _, _ = _load_json_ref(
         root,
-        equivalence["uninterrupted_run_identity"],
-        label="Stage-2 uninterrupted run identity",
+        refs["uninterrupted_run_identity"],
+        label="Stage-2 uninterrupted smoke run identity",
+        expected_path=paths["uninterrupted_run_identity"],
     )
-    if uninterrupted_identity_path.parent != uninterrupted_dir:
-        raise ValueError("Stage-2 uninterrupted identity/checkpoint directory가 다릅니다")
-    expected_uninterrupted_identity = {**expected_identity, "run_until_step": 500}
+    expected_uninterrupted_identity = _stage2_smoke_run_identity(
+        repository_commit_sha=str(uninterrupted_expected_bindings["repository_commit_sha"]),
+        external_sha256=external_sha256,
+        seed=seed,
+        run_label="uninterrupted",
+        run_until_step=500,
+        environment_sha256=environment_sha256,
+        loader_workers=int(pipeline["loader_workers"]),
+        bounded_prefetch_batches=int(pipeline["bounded_prefetch_batches"]),
+    )
     if uninterrupted_identity != expected_uninterrupted_identity:
-        raise ValueError("Stage-2 uninterrupted run identity가 fresh 500-step이 아닙니다")
-    uninterrupted_telemetry, uninterrupted_telemetry_sha, uninterrupted_telemetry_path = (
-        _load_binary_ref(
-            root,
-            equivalence["uninterrupted_raw_step_telemetry"],
-            label="Stage-2 uninterrupted raw telemetry",
-        )
+        raise ValueError("Stage-2 uninterrupted smoke identity가 fresh 500-step이 아닙니다")
+    uninterrupted_environment, _, _, _ = _load_json_ref(
+        root,
+        refs["uninterrupted_environment"],
+        label="Stage-2 uninterrupted smoke environment",
+        expected_path=paths["uninterrupted_environment"],
     )
-    if uninterrupted_telemetry_path.parent != uninterrupted_dir:
-        raise ValueError("Stage-2 uninterrupted telemetry/checkpoint directory가 다릅니다")
+    if (
+        uninterrupted_environment != dict(environment)
+        or stage2_a100_environment_sha256(uninterrupted_environment)
+        != environment_sha256
+    ):
+        raise ValueError("Stage-2 uninterrupted smoke environment가 current A100과 다릅니다")
+    uninterrupted_telemetry, uninterrupted_telemetry_sha, _ = _load_binary_ref(
+        root,
+        refs["uninterrupted_raw_step_telemetry"],
+        label="Stage-2 uninterrupted smoke raw telemetry",
+        expected_path=paths["uninterrupted_raw_step_telemetry"],
+    )
     if uninterrupted_telemetry_sha == telemetry_sha:
         raise ValueError("Stage-2 uninterrupted telemetry가 resumed telemetry 복사본입니다")
     _telemetry_rows(
@@ -1037,8 +1157,10 @@ def _validate_stage2_smoke_acceptance(
         utilization_every=utilization_every,
         label="Stage-2 uninterrupted smoke telemetry",
     )
-    if (uninterrupted_dir / "failure.json").exists():
-        raise ValueError("Stage-2 uninterrupted run에 OOM/runtime failure receipt가 있습니다")
+    if (uninterrupted_run_dir / "failure.json").exists() or (
+        uninterrupted_run_dir / "failure.json"
+    ).is_symlink():
+        raise ValueError("Stage-2 uninterrupted smoke run에 OOM/runtime failure receipt가 있습니다")
 
     comparisons = {
         "model_exact": _state_exact_equal(uninterrupted.get("model"), step_500.get("model")),
@@ -1061,16 +1183,196 @@ def _validate_stage2_smoke_acceptance(
             uninterrupted.get("last_metrics"), step_500.get("last_metrics")
         ),
     }
-    if any(equivalence[key] is not value for key, value in comparisons.items()) or not all(
-        comparisons.values()
-    ):
+    if not all(comparisons.values()):
         raise ValueError("Stage-2 uninterrupted/resume checkpoint가 수치 동등하지 않습니다")
-    # step 200이 actual resumed chain의 prefix checkpoint였음을 checkpoint
-    # semantic에서도 다시 확인한다. 값을 사용해 linter와 감사에서
-    # 누락된 decode로 오인하지 않게 한다.
     if step_200.get("completed_steps") != 200:
         raise ValueError("Stage-2 explicit resume prefix checkpoint step이 200이 아닙니다")
+    return {
+        "refs": refs,
+        "external_sha256": external_sha256,
+        "environment_sha256": environment_sha256,
+        "step_200_sha": step_200_sha,
+        "step_500_sha": step_500_sha,
+        "uninterrupted_sha": uninterrupted_sha,
+        "comparisons": comparisons,
+    }
+
+
+def _stage2_resume_equivalence_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    refs = evidence["refs"]
+    return {
+        "schema": STAGE2_PRETRAIN_RESUME_EQUIVALENCE_SCHEMA,
+        "status": "PASS",
+        "external_experiment_contract_sha256": evidence["external_sha256"],
+        "a100_environment_sha256": evidence["environment_sha256"],
+        "completed_step": 500,
+        "comparison_algorithm": "exact_recursive_torch_state_v1",
+        "resumed_checkpoint_sha256": evidence["step_500_sha"],
+        "uninterrupted_checkpoint": refs["uninterrupted_checkpoint"],
+        "uninterrupted_binding": refs["uninterrupted_binding"],
+        "uninterrupted_run_identity": refs["uninterrupted_run_identity"],
+        "uninterrupted_environment": refs["uninterrupted_environment"],
+        "uninterrupted_raw_step_telemetry": refs["uninterrupted_raw_step_telemetry"],
+        "uninterrupted_failure_receipt_absent": True,
+        **dict(evidence["comparisons"]),
+    }
+
+
+def _stage2_smoke_acceptance_payload(
+    evidence: Mapping[str, Any], *, equivalence_ref: Mapping[str, str]
+) -> dict[str, Any]:
+    refs = evidence["refs"]
+    return {
+        "schema": STAGE2_PRETRAIN_SMOKE_ACCEPTANCE_SCHEMA,
+        "status": "PASS",
+        "canonical_100k_start_eligible": True,
+        "external_experiment_contract_sha256": evidence["external_sha256"],
+        "a100_environment_sha256": evidence["environment_sha256"],
+        "production_batch_size": 96,
+        "run_identity": refs["run_identity"],
+        "environment": refs["environment"],
+        "step_200_checkpoint": refs["step_200_checkpoint"],
+        "step_200_binding": refs["step_200_binding"],
+        "step_500_checkpoint": refs["step_500_checkpoint"],
+        "step_500_binding": refs["step_500_binding"],
+        "smoke_step_200": refs["smoke_step_200"],
+        "smoke_step_500": refs["smoke_step_500"],
+        "raw_step_telemetry": refs["raw_step_telemetry"],
+        "failure_receipt_absent": True,
+        "resume_chain": {
+            "scratch_run_until_step": 200,
+            "explicit_resume_from_step": 200,
+            "explicit_resume_checkpoint_sha256": evidence["step_200_sha"],
+            "resumed_until_step": 500,
+            "resumed_checkpoint_sha256": evidence["step_500_sha"],
+        },
+        "uninterrupted_vs_resume_evidence": dict(equivalence_ref),
+    }
+
+
+def _validate_stage2_smoke_acceptance(
+    root: Path,
+    *,
+    acceptance_path: Path,
+    resumed_run_dir: Path,
+    uninterrupted_run_dir: Path,
+    external_sha256: str,
+    environment: Mapping[str, Any],
+    environment_sha256: str,
+    profile: Mapping[str, Any],
+    resumed_expected_bindings: Mapping[str, Any],
+    uninterrupted_expected_bindings: Mapping[str, Any],
+) -> str:
+    """actual 200→explicit-resume→500 bytes와 독립 500만 100k를 연다."""
+
+    expected_acceptance_path = resumed_run_dir / "smoke_acceptance.json"
+    if acceptance_path != expected_acceptance_path:
+        raise ValueError("Stage-2 smoke acceptance가 resumed smoke directory에 있지 않습니다")
+    acceptance_content, acceptance_sha = _snapshot_regular_file(acceptance_path)
+    try:
+        acceptance = json.loads(acceptance_content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Stage-2 smoke acceptance는 UTF-8 JSON이어야 합니다") from exc
+    if not isinstance(acceptance, dict):
+        raise ValueError("Stage-2 smoke acceptance root가 mapping이 아닙니다")
+    evidence = _collect_stage2_smoke_raw_evidence(
+        root,
+        resumed_run_dir=resumed_run_dir,
+        uninterrupted_run_dir=uninterrupted_run_dir,
+        external_sha256=external_sha256,
+        environment=environment,
+        environment_sha256=environment_sha256,
+        profile=profile,
+        resumed_expected_bindings=resumed_expected_bindings,
+        uninterrupted_expected_bindings=uninterrupted_expected_bindings,
+    )
+    equivalence_path = resumed_run_dir / "uninterrupted_vs_resume_equivalence.json"
+    equivalence, _, equivalence_sha, _ = _load_json_ref(
+        root,
+        acceptance.get("uninterrupted_vs_resume_evidence"),
+        label="Stage-2 uninterrupted/resume equivalence",
+        expected_path=equivalence_path,
+    )
+    expected_equivalence = _stage2_resume_equivalence_payload(evidence)
+    if equivalence != expected_equivalence:
+        raise ValueError("Stage-2 resume equivalence가 raw checkpoint/telemetry 재계산과 다릅니다")
+    expected_acceptance = _stage2_smoke_acceptance_payload(
+        evidence,
+        equivalence_ref={
+            "path": equivalence_path.relative_to(root).as_posix(),
+            "sha256": equivalence_sha,
+        },
+    )
+    if acceptance != expected_acceptance:
+        raise ValueError("Stage-2 smoke acceptance가 raw evidence 재계산과 다릅니다")
     return acceptance_sha
+
+
+def issue_stage2_smoke_acceptance_no_replace(
+    repository_root: str | Path,
+    *,
+    resumed_run_dir: str | Path,
+    uninterrupted_run_dir: str | Path,
+    external_sha256: str,
+    environment: Mapping[str, Any],
+    environment_sha256: str,
+    profile: Mapping[str, Any],
+    resumed_expected_bindings: Mapping[str, Any],
+    uninterrupted_expected_bindings: Mapping[str, Any],
+) -> tuple[Path, str]:
+    """actual smoke raw를 재검산해 no-replace acceptance를 발행한다.
+
+    이 함수는 fixture boolean을 PASS로 바꾸지 않는다. production checkpoint의
+    sidecar/weights-only decode, telemetry, smoke performance, 두 environment와
+    recursive model/optimizer/scheduler/RNG bytes를 모두 다시 읽은 뒤에만 두
+    receipt를 O_EXCL로 쓴다.
+    """
+
+    root = Path(repository_root).resolve(strict=True)
+    resumed = Path(resumed_run_dir)
+    uninterrupted = Path(uninterrupted_run_dir)
+    if not resumed.is_absolute():
+        resumed = root / resumed
+    if not uninterrupted.is_absolute():
+        uninterrupted = root / uninterrupted
+    evidence = _collect_stage2_smoke_raw_evidence(
+        root,
+        resumed_run_dir=resumed,
+        uninterrupted_run_dir=uninterrupted,
+        external_sha256=external_sha256,
+        environment=environment,
+        environment_sha256=environment_sha256,
+        profile=profile,
+        resumed_expected_bindings=resumed_expected_bindings,
+        uninterrupted_expected_bindings=uninterrupted_expected_bindings,
+    )
+    equivalence_path = resumed / "uninterrupted_vs_resume_equivalence.json"
+    acceptance_path = resumed / "smoke_acceptance.json"
+    _stage2_output_absent(
+        equivalence_path, label="Stage-2 uninterrupted/resume equivalence receipt"
+    )
+    _stage2_output_absent(acceptance_path, label="Stage-2 smoke acceptance receipt")
+    _write_json_exclusive(equivalence_path, _stage2_resume_equivalence_payload(evidence))
+    equivalence_ref = _artifact_ref_from_path(
+        root, equivalence_path, label="Stage-2 uninterrupted/resume equivalence receipt"
+    )
+    _write_json_exclusive(
+        acceptance_path,
+        _stage2_smoke_acceptance_payload(evidence, equivalence_ref=equivalence_ref),
+    )
+    acceptance_sha = _validate_stage2_smoke_acceptance(
+        root,
+        acceptance_path=acceptance_path,
+        resumed_run_dir=resumed,
+        uninterrupted_run_dir=uninterrupted,
+        external_sha256=external_sha256,
+        environment=environment,
+        environment_sha256=environment_sha256,
+        profile=profile,
+        resumed_expected_bindings=resumed_expected_bindings,
+        uninterrupted_expected_bindings=uninterrupted_expected_bindings,
+    )
+    return acceptance_path, acceptance_sha
 
 
 @dataclass(frozen=True)
@@ -1499,6 +1801,7 @@ class Stage2ScratchPretrainRunner:
         run_until_step: int,
         resume: str | Path | None = None,
         smoke_acceptance: str | Path | None = None,
+        run_label: str | None = None,
         _allow_cpu_test: bool = False,
     ) -> None:
         self.root = Path(repository_root).resolve(strict=True)
@@ -1511,11 +1814,47 @@ class Stage2ScratchPretrainRunner:
         self.run_until_step = int(run_until_step)
         if not 1 <= self.run_until_step <= total_steps:
             raise ValueError(f"run_until_step은 1..{total_steps} 범위여야 합니다")
+        self.diagnostic_cpu_test = bool(_allow_cpu_test)
+        self.run_label = run_label
+        if self.diagnostic_cpu_test:
+            if run_label is not None and run_label not in _STAGE2_SMOKE_RUN_LABELS:
+                raise ValueError("CPU diagnostic run label이 승인 목록에 없습니다")
+            self.run_kind = "diagnostic"
+        elif self.run_until_step == 200:
+            if run_label != "resumed" or resume is not None:
+                raise ValueError(
+                    "Stage-2 200-step smoke는 --run-label resumed와 resume 없는 fresh scratch만 허용합니다"
+                )
+            self.run_kind = "smoke"
+        elif self.run_until_step == 500:
+            if run_label == "resumed":
+                if resume is None:
+                    raise ValueError(
+                        "Stage-2 resumed 500-step smoke는 step 200 explicit --resume이 필요합니다"
+                    )
+            elif run_label == "uninterrupted":
+                if resume is not None:
+                    raise ValueError(
+                        "Stage-2 uninterrupted 500-step smoke는 --resume을 허용하지 않습니다"
+                    )
+            else:
+                raise ValueError(
+                    "Stage-2 500-step smoke는 --run-label resumed 또는 uninterrupted가 필요합니다"
+                )
+            self.run_kind = "smoke"
+        elif self.run_until_step == total_steps:
+            if run_label is not None or resume is not None:
+                raise ValueError(
+                    "Stage-2 canonical 100k는 smoke label/resume 없이 fresh scratch만 허용합니다"
+                )
+            self.run_kind = "canonical"
+        else:
+            raise ValueError("Stage-2 production은 200, 500 또는 canonical total step만 허용합니다")
         # 실제 A100 200→명시적 resume→500 및 별도 uninterrupted 500의 raw
         # 수치등가 evidence 없이는 CUDA/environment 조회조차 시작하지 않는다.
         # 단순 JSON status=true는 아래 verifier가 실제 checkpoint/telemetry bytes를
         # 다시 계산하므로 admission이 아니다.
-        if self.run_until_step > 500 and smoke_acceptance is None:
+        if not self.diagnostic_cpu_test and self.run_kind == "canonical" and smoke_acceptance is None:
             raise ValueError(
                 "Stage-2 500-step 이후는 raw-bound smoke acceptance가 필요합니다"
             )
@@ -1550,19 +1889,29 @@ class Stage2ScratchPretrainRunner:
             self.resume = candidate.parent.resolve(strict=True) / candidate.name
         external_sha = str(self.anchors["external_experiment_contract_sha256"])
         seed = int(self.profile["seed"])
-        self.run_dir = self.root / "runs" / f"stage2_pretrain_{external_sha[:12]}_{seed}"
+        self.run_dir = stage2_pretrain_run_directory(
+            self.root,
+            external_experiment_contract_sha256=external_sha,
+            seed=seed,
+            run_label=(self.run_label if self.run_kind == "smoke" else None),
+        )
         if self.resume is not None and self.resume.parent != self.run_dir:
             raise ValueError("explicit resume checkpoint가 exact Stage-2 contract run directory 밖입니다")
-        if self.run_until_step > 500:
-            resume_match = (
-                re.fullmatch(r"step_([0-9]{6})\.pt", self.resume.name)
-                if self.resume is not None
-                else None
-            )
-            if resume_match is None or int(resume_match.group(1)) < 500:
+        if not self.diagnostic_cpu_test and self.run_kind == "smoke" and self.run_label == "resumed" and self.run_until_step == 500:
+            assert self.resume is not None
+            if self.resume.name != "step_000200.pt":
                 raise ValueError(
-                    "Stage-2 100k는 step 500 이상 checkpoint의 명시적 resume만 허용합니다"
+                    "Stage-2 resumed 500-step smoke는 exact step_000200.pt만 resume할 수 있습니다"
                 )
+        # fresh canonical/200/uninterrupted arm은 exact namespace collision을 GPU
+        # context/model/loader보다 먼저 막는다. 반대로 resumed 500은 200-step
+        # artifact가 있는 동일 namespace를 의도적으로 이어야 하므로 제외한다.
+        if not self.diagnostic_cpu_test and self.resume is None:
+            _stage2_output_absent(
+                self.run_dir,
+                label=f"Stage-2 fresh {self.run_kind} run directory",
+            )
+        if not self.diagnostic_cpu_test and self.run_kind == "canonical":
             acceptance_candidate = Path(smoke_acceptance)  # type: ignore[arg-type]
             if acceptance_candidate.is_absolute():
                 resolved_acceptance = (
@@ -1610,18 +1959,38 @@ class Stage2ScratchPretrainRunner:
             self.a100_environment
         )
         self.smoke_acceptance_sha256: str | None = None
-        if self.run_until_step > 500:
+        if not self.diagnostic_cpu_test and self.run_kind == "canonical":
             assert self.smoke_acceptance_path is not None
+            resumed_smoke_dir = stage2_pretrain_run_directory(
+                self.root,
+                external_experiment_contract_sha256=external_sha,
+                seed=seed,
+                run_label="resumed",
+            )
+            uninterrupted_smoke_dir = stage2_pretrain_run_directory(
+                self.root,
+                external_experiment_contract_sha256=external_sha,
+                seed=seed,
+                run_label="uninterrupted",
+            )
             self.smoke_acceptance_sha256 = _validate_stage2_smoke_acceptance(
                 self.root,
                 acceptance_path=self.smoke_acceptance_path,
-                run_dir=self.run_dir,
+                resumed_run_dir=resumed_smoke_dir,
+                uninterrupted_run_dir=uninterrupted_smoke_dir,
                 external_sha256=external_sha,
                 environment=self.a100_environment,
                 environment_sha256=self.a100_environment_sha256,
                 profile=self.profile,
-                expected_bindings=self._binding_metadata(
-                    include_smoke_acceptance=False
+                resumed_expected_bindings=self._binding_metadata(
+                    include_smoke_acceptance=False,
+                    run_kind="smoke",
+                    run_label="resumed",
+                ),
+                uninterrupted_expected_bindings=self._binding_metadata(
+                    include_smoke_acceptance=False,
+                    run_kind="smoke",
+                    run_label="uninterrupted",
                 ),
             )
         # 모델 parameter 초기화보다 먼저 seed를 고정해야 fresh scratch run끼리도
@@ -1680,7 +2049,6 @@ class Stage2ScratchPretrainRunner:
         self.grad_clip = float(execution["grad_clip_norm"])
         self.checkpoint_every = int(execution["checkpoint_every_steps"])
         self.smoke_milestones = frozenset(int(value) for value in execution["smoke_milestones"])
-        self.diagnostic_cpu_test = bool(_allow_cpu_test)
         if self.diagnostic_cpu_test and self.run_until_step > max(self.smoke_milestones):
             raise ValueError("CPU diagnostic runner는 smoke milestone 이후를 실행할 수 없습니다")
         self.start_step = 0
@@ -1695,20 +2063,7 @@ class Stage2ScratchPretrainRunner:
             )
             _write_json_exclusive(
                 self.run_dir / "run_identity.json",
-                {
-                    "schema": STAGE2_PRETRAIN_RUN_SCHEMA,
-                    "runner_schema": STAGE2_PRETRAIN_RUNNER_SCHEMA,
-                    "repository_commit_sha": self.execution_repository_commit_sha,
-                    "external_experiment_contract_sha256": external_sha,
-                    "seed": seed,
-                    "scratch_pretrain": True,
-                    "automatic_resume_allowed": False,
-                    "run_until_step": self.run_until_step,
-                    "a100_environment_sha256": self.a100_environment_sha256,
-                    "production_batch_size": int(execution["batch_size"]),
-                    "loader_workers": self.loader_workers,
-                    "bounded_prefetch_batches": self.prefetch_batches,
-                },
+                self._run_identity_payload(),
             )
 
     def _seed_all(self, seed: int) -> None:
@@ -1718,9 +2073,42 @@ class Stage2ScratchPretrainRunner:
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
 
+    def _run_identity_payload(self) -> dict[str, Any]:
+        return {
+            "schema": STAGE2_PRETRAIN_RUN_SCHEMA,
+            "runner_schema": STAGE2_PRETRAIN_RUNNER_SCHEMA,
+            "repository_commit_sha": self.execution_repository_commit_sha,
+            "external_experiment_contract_sha256": self.anchors[
+                "external_experiment_contract_sha256"
+            ],
+            "seed": int(self.profile["seed"]),
+            "scratch_pretrain": True,
+            "automatic_resume_allowed": False,
+            "run_kind": self.run_kind,
+            "run_label": self.run_label if self.run_kind == "smoke" else None,
+            "run_until_step": self.run_until_step,
+            "a100_environment_sha256": self.a100_environment_sha256,
+            "production_batch_size": int(self.profile["execution"]["batch_size"]),
+            "loader_workers": self.loader_workers,
+            "bounded_prefetch_batches": self.prefetch_batches,
+        }
+
     def _binding_metadata(
-        self, *, include_smoke_acceptance: bool = True
+        self,
+        *,
+        include_smoke_acceptance: bool = True,
+        run_kind: str | None = None,
+        run_label: str | None = None,
     ) -> dict[str, Any]:
+        resolved_run_kind = self.run_kind if run_kind is None else run_kind
+        resolved_run_label = (
+            self.run_label if run_label is None and resolved_run_kind == self.run_kind else run_label
+        )
+        if resolved_run_kind == "smoke":
+            if resolved_run_label not in _STAGE2_SMOKE_RUN_LABELS:
+                raise ValueError("Stage-2 smoke checkpoint binding의 run label이 없습니다")
+        elif resolved_run_label is not None:
+            raise ValueError("Stage-2 non-smoke checkpoint에는 run label이 없어야 합니다")
         return {
             "runner_schema": STAGE2_PRETRAIN_RUNNER_SCHEMA,
             "repository_commit_sha": self.execution_repository_commit_sha,
@@ -1745,6 +2133,8 @@ class Stage2ScratchPretrainRunner:
             "scratch_pretrain": True,
             "legacy_origin": False,
             "automatic_resume_allowed": False,
+            "run_kind": resolved_run_kind,
+            "run_label": resolved_run_label,
             "a100_environment_sha256": self.a100_environment_sha256,
             "smoke_acceptance_sha256": (
                 self.smoke_acceptance_sha256
@@ -1781,6 +2171,8 @@ class Stage2ScratchPretrainRunner:
             "seed",
             "scratch_pretrain",
             "automatic_resume_allowed",
+            "run_kind",
+            "run_label",
             "run_until_step",
             "a100_environment_sha256",
             "production_batch_size",
@@ -1789,23 +2181,18 @@ class Stage2ScratchPretrainRunner:
         }
         if not isinstance(identity, dict) or set(identity) != expected_identity_keys:
             raise ValueError("Stage-2 resume run identity key 집합이 exact하지 않습니다")
-        expected_identity = {
-            "schema": STAGE2_PRETRAIN_RUN_SCHEMA,
-            "runner_schema": STAGE2_PRETRAIN_RUNNER_SCHEMA,
-            "repository_commit_sha": self.execution_repository_commit_sha,
-            "external_experiment_contract_sha256": self.anchors[
-                "external_experiment_contract_sha256"
-            ],
-            "seed": int(self.profile["seed"]),
-            "scratch_pretrain": True,
-            "automatic_resume_allowed": False,
-            "a100_environment_sha256": self.a100_environment_sha256,
-            "production_batch_size": int(self.profile["execution"]["batch_size"]),
-            "loader_workers": self.loader_workers,
-            "bounded_prefetch_batches": self.prefetch_batches,
-        }
+        expected_identity = self._run_identity_payload()
+        expected_identity.pop("run_until_step")
         if any(identity[key] != value for key, value in expected_identity.items()):
             raise ValueError("Stage-2 resume run identity가 current external contract와 다릅니다")
+        if (
+            not self.diagnostic_cpu_test
+            and self.run_kind == "smoke"
+            and identity["run_until_step"] != 200
+        ):
+            raise ValueError(
+                "Stage-2 resumed smoke는 fresh 200-step run identity에서만 이어갈 수 있습니다"
+            )
         # pickle decoder보다 먼저 held regular file SHA와 flattened sidecar의 전체
         # contract binding을 검증한다. sidecar가 없거나 재서명됐으면 torch.load 자체를
         # 호출하지 않는다.
@@ -2234,5 +2621,7 @@ __all__ = [
     "STAGE2_PRETRAIN_RESUME_EQUIVALENCE_SCHEMA",
     "Stage2PublicTensorLoader",
     "Stage2ScratchPretrainRunner",
+    "issue_stage2_smoke_acceptance_no_replace",
+    "stage2_pretrain_run_directory",
     "stage2_checkpoint_binding_payload",
 ]
