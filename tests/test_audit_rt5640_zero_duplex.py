@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,7 @@ import pytest
 
 
 SCRIPT = Path("scripts/jetson/audit_rt5640_zero_duplex.py")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_script(name: str):
@@ -151,13 +153,56 @@ def test_live_requires_every_exact_confirmation_before_claim(missing: str) -> No
         module._require_live_flags(_args(**kwargs))
 
 
-def test_current_worktree_binding_rejects_wrong_pythonpath(tmp_path, monkeypatch) -> None:
-    module = _load_script("rt5640_adapter_wrong_pythonpath")
+def test_current_worktree_binding_bootstraps_repo_src_without_pythonpath(tmp_path, monkeypatch) -> None:
+    module = _load_script("rt5640_adapter_no_pythonpath")
     wrong = tmp_path / "src"
     wrong.mkdir()
-    monkeypatch.setenv("PYTHONPATH", str(wrong))
-    with pytest.raises(RuntimeError, match="PYTHONPATH 첫 항목"):
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(module.sys, "path", [str(wrong), *module.sys.path])
+
+    binding = module._assert_current_worktree_binding()
+
+    assert binding["expected_src"] == str(REPO_ROOT / "src")
+    assert binding["pythonpath"] == ""
+    assert module._resolve_pythonpath_entry(module.sys.path[0]) == REPO_ROOT / "src"
+
+
+def test_current_worktree_binding_rejects_preloaded_foreign_package(tmp_path, monkeypatch) -> None:
+    module = _load_script("rt5640_adapter_preloaded_foreign_package")
+    foreign_package = tmp_path / "foreign_deep_anc"
+    foreign_package.mkdir()
+    foreign_init = foreign_package / "__init__.py"
+    foreign_init.write_text("__version__ = 'foreign'\n", encoding="utf-8")
+    fake_module = type(sys)("deep_anc")
+    fake_module.__file__ = str(foreign_init)
+    monkeypatch.setitem(module.sys.modules, "deep_anc", fake_module)
+
+    with pytest.raises(RuntimeError, match="preload된 deep_anc import가 current worktree 밖"):
         module._assert_current_worktree_binding()
+
+
+def test_cli_dry_run_from_repo_root_needs_no_pythonpath(monkeypatch) -> None:
+    """실제 operator 명령은 source bootstrap 뒤 backend 없이 성공해야 한다."""
+
+    python = REPO_ROOT / ".venv/bin/python"
+    assert python.is_file(), "Jetson project venv가 필요합니다"
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    environment["PYTHONPROFILEIMPORTTIME"] = "1"
+    result = subprocess.run(
+        [str(python), "-B", str(SCRIPT), "--dry-run"],
+        cwd=REPO_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[DRY-RUN PASS]" in result.stdout
+    assert "sounddevice import/장치 open/system mutation 없음" in result.stdout
+    assert "sounddevice" not in result.stderr.lower(), result.stderr
 
 
 def test_parse_hw_params_requires_s32_48k_two_channel_block_256() -> None:

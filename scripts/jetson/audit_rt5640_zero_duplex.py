@@ -2,7 +2,7 @@
 """RT5640/APE exact-zero duplex의 read-only 현장 어댑터.
 
 기본 동작은 장치를 열지 않는 dry-run이다. ``--execute-live``는 clean exact commit,
-현재 worktree ``PYTHONPATH``, 다섯 개 물리 확인, Pulse APE profile off, 모든 APE PCM
+현재 worktree ``src`` binding, 다섯 개 물리 확인, Pulse APE profile off, 모든 APE PCM
 무점유를 확인한 뒤에만 APE pcm1(input)/pcm0(output)을 동시에 연다. 출력 callback은
 ``deep_anc.audio_zero_duplex``가 제공하는 bitwise zero 이외의 값을 받을 수 없다.
 
@@ -337,17 +337,42 @@ def _resolve_pythonpath_entry(entry: str) -> Path:
     return candidate.resolve(strict=True)
 
 
-def _assert_current_worktree_binding() -> dict[str, Any]:
+def _bind_script_to_current_worktree_src() -> Path:
+    """직접 CLI 실행도 같은 checkout ``src``를 최우선 import 경로로 묶는다.
+
+    이 함수는 package/backend를 import하지 않고 ``sys.path``만 정렬한다. 따라서
+    dry-run은 ``PYTHONPATH=src``라는 셸 환경 설정에 의존하지 않으면서도, 이어지는
+    static 계약 import가 설치본이나 다른 checkout을 보지 않게 한다. 이미 다른
+    ``deep_anc``가 preload된 경우에는 경로를 덮어써 숨기지 않고 fail-closed한다.
+    """
+
     expected_src = (REPO_ROOT / "src").resolve(strict=True)
+    package = sys.modules.get("deep_anc")
+    if package is not None:
+        package_file_raw = getattr(package, "__file__", None)
+        if not isinstance(package_file_raw, str) or not package_file_raw:
+            raise RuntimeError("preload된 deep_anc package file을 확인할 수 없습니다")
+        package_file = Path(package_file_raw).resolve(strict=True)
+        try:
+            package_file.relative_to(expected_src)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"preload된 deep_anc import가 current worktree 밖입니다: {package_file}"
+            ) from exc
+
+    # ``python scripts/jetson/...``는 scripts/jetson만 sys.path[0]에 놓는다.
+    # 직접 CLI도 source checkout이 첫 항목이어야 static import boundary가 유지된다.
+    source_text = str(expected_src)
+    if not sys.path or _resolve_pythonpath_entry(sys.path[0]) != expected_src:
+        sys.path.insert(0, source_text)
+    if _resolve_pythonpath_entry(sys.path[0]) != expected_src:
+        raise RuntimeError("current worktree src를 sys.path 첫 항목으로 결속하지 못했습니다")
+    return expected_src
+
+
+def _assert_current_worktree_binding() -> dict[str, Any]:
+    expected_src = _bind_script_to_current_worktree_src()
     raw_pythonpath = os.environ.get("PYTHONPATH", "")
-    entries = [item for item in raw_pythonpath.split(os.pathsep) if item]
-    if not entries:
-        raise RuntimeError("PYTHONPATH가 비어 있습니다; current worktree src를 명시해야 합니다")
-    resolved = [_resolve_pythonpath_entry(item) for item in entries]
-    if resolved[0] != expected_src:
-        raise RuntimeError(
-            f"PYTHONPATH 첫 항목이 current worktree src가 아닙니다: {resolved[0]} != {expected_src}"
-        )
     package = importlib.import_module("deep_anc")
     package_file = Path(str(package.__file__)).resolve(strict=True)
     try:

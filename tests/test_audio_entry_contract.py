@@ -80,6 +80,24 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
         "source-gain v3 gainprobe006 bounded ESS/IMD 실측. public int32 input-only "
         "preflight와 exact plan/SHA/hardware pre-open gate 뒤 0.006까지만 출력한다",
     ),
+    "scripts/data/measure_paths_stage2_2khz.py": (
+        True,
+        True,
+        "legacy combined Stage-2 진입점. 현재는 backend import 전 fail-closed지만, "
+        "잠재 live 경로도 exact clock/PCM pre-open gate를 보존한다",
+    ),
+    "scripts/data/capture_stage2_output_master_diagnostic.py": (
+        True,
+        True,
+        "Stage-2 output-master diagnostic 실제 캡처. fresh meter 뒤 exact clock/PCM "
+        "pre-open gate를 callback 직전에 다시 실행한다",
+    ),
+    "scripts/data/measure_paths_stage2_2khz_v3.py": (
+        True,
+        True,
+        "Stage-2 output-master P/S v3 실제 캡처. diagnostic/fresh-meter continuity와 "
+        "exact clock/PCM pre-open gate를 callback 직전에 다시 실행한다",
+    ),
     "scripts/data/calibrate_wideband.py": (True, True, "채널별 ESS 측정"),
     "scripts/data/set_amp_level.py": (True, True, "앰프 레벨 교정 미터"),
     # 벤치·진단 (실기 필요, 학습 산출물에 직접 들어가지 않음)
