@@ -1,4 +1,4 @@
-"""녹음 source gain v2의 bounded physical probe와 immutable receipt.
+"""녹음 source gain v3의 bounded physical probe와 immutable receipt.
 
 이 모듈은 signal/분석만 담당하며 오디오 백엔드를 import하거나 장치를 열지 않는다.
 live publisher는 ``scripts/data/measure_recording_gain_linearity.py``에 있고, 여기서
@@ -19,7 +19,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import yaml
-from scipy import linalg, signal
+from scipy import interpolate, linalg, signal
 
 from deep_anc.audio_io import (
     analyze_int32_input_probe,
@@ -30,13 +30,19 @@ from deep_anc.data.holdout_contract import read_regular_file_snapshot
 from deep_anc.data.repository_fd import repository_execution_identity
 
 
-GAIN_LINEARITY_PLAN_SCHEMA = "recording_gain_linearity_plan/v2"
-GAIN_LINEARITY_RAW_SCHEMA = "recording_gain_linearity_raw/v2"
-GAIN_LINEARITY_RECEIPT_SCHEMA = "recording_gain_linearity_receipt/v2"
+GAIN_LINEARITY_PLAN_SCHEMA = "recording_gain_linearity_plan/v3_gainprobe006"
+GAIN_LINEARITY_RAW_SCHEMA = "recording_gain_linearity_raw/v3_gainprobe006"
+GAIN_LINEARITY_PUBLICATION_SCHEMA = (
+    "recording_gain_linearity_capture_publication/v1_gainprobe006"
+)
+GAIN_LINEARITY_RECEIPT_SCHEMA = "recording_gain_linearity_receipt/v4_gainprobe006"
+GAIN_LINEARITY_AUTHORITY_SCOPE = (
+    "tested_range_adc_peak_safety_only_not_global_nonlinearity"
+)
 SAMPLE_RATE = 48_000
 BLOCK_SIZE = 256
 LATENCY = "low"
-LEVELS_MILLIONTHS = (3_000, 6_000, 9_000, 12_000)
+LEVELS_MILLIONTHS = (3_000, 4_000, 5_000, 6_000)
 ESS_BAND_HZ = (80.0, 12_000.0)
 ESS_SLOT_SECONDS = 2.25
 ESS_ACTIVE_LIMIT_SECONDS = 1.5
@@ -52,10 +58,14 @@ PREDICTIVE_STOP_PEAK = 0.45
 PREDICTIVE_UNCERTAINTY_FACTOR = 1.25
 COMPRESSION_GATE_DB = 1.0
 THD_IMD_GATE_DBC = -30.0
+DISTORTION_MIN_FUNDAMENTAL_SNR_DB = 40.0
+DISTORTION_MIN_NOISE_MARGIN_DB = 10.0
+DISTORTION_COHERENT_SUBWINDOW_SECONDS = 0.125
 MAX_DELAY_SAMPLES = 4_800
 OPERATOR_FIR_LENGTH = 2_048
-OPERATOR_FIT_LEVELS_MILLIONTHS = (3_000, 6_000, 9_000)
-OPERATOR_HOLDOUT_LEVEL_MILLIONTHS = 12_000
+OPERATOR_PEAK_PRE_ROLL_SAMPLES = 256
+OPERATOR_FIT_LEVELS_MILLIONTHS = (3_000, 4_000, 5_000)
+OPERATOR_HOLDOUT_LEVEL_MILLIONTHS = 6_000
 OPERATOR_SUBBANDS_HZ = (
     (80.0, 150.0),
     (150.0, 1_600.0),
@@ -65,10 +75,26 @@ OPERATOR_SUBBANDS_HZ = (
 )
 OPERATOR_MIN_COMPLEX_AGREEMENT = 0.995
 OPERATOR_MAX_RELATIVE_ERROR = 0.10
+OPERATOR_RELATIVE_SUBBAND_MIN_NORM_RATIO = 0.01
 OPERATOR_RIDGE_RELATIVE = 1.0e-8
 INPUT_PREFLIGHT_SECONDS = 3.0
 STREAM_WATCHDOG_GRACE_SECONDS = 1.0
 STREAM_TRANSITION_BUDGET_SECONDS = 1.0
+GROUP_SETTLE_SECONDS = 0.5
+CLOCK_PILOT_FRAMES = 2_048
+CLOCK_PILOT_OFFSETS_SECONDS = (0.0, 2.0, 3.25, 4.5, 5.65)
+CLOCK_PILOT_MIN_NORMALISED_CORRELATION = 0.90
+CLOCK_MAX_ABS_PPM = 1_000.0
+CLOCK_CHANNEL_MAX_DIFFERENCE_PPM = 100.0
+CLOCK_TRAJECTORY_MAX_RESIDUAL_SAMPLES = 0.25
+RELATIVE_DELAY_MAX_SPREAD_SAMPLES = 3.0
+CALLBACK_TIME_INFO_FIELDS = (
+    "callback_start_frames",
+    "callback_frame_counts",
+    "input_buffer_adc_time",
+    "output_buffer_dac_time",
+    "callback_current_time",
+)
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 GAIN_LINEARITY_SCRIPT_PATH = "scripts/data/measure_recording_gain_linearity.py"
@@ -106,10 +132,26 @@ _EXECUTION_KEYS = frozenset(
         "script_file_sha256",
     }
 )
+_PUBLICATION_REF_KEYS = frozenset(
+    {"path", "size", "sha256", "capture_device", "capture_inode"}
+)
+_PUBLICATION_KEYS = frozenset(
+    {
+        "schema",
+        "role",
+        "canonical_session_path",
+        "source_commit",
+        "repository_execution",
+        "plan",
+        "raw",
+        "metadata",
+        "publication_payload_sha256",
+    }
+)
 
 
 class RecordingGainLinearityError(ValueError):
-    """v2 gain/linearity plan, raw 또는 receipt 계약 위반."""
+    """v3 gain/linearity plan, raw 또는 receipt 계약 위반."""
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -176,6 +218,93 @@ def _file_ref(relative: str, snapshot: Any) -> dict[str, Any]:
     }
 
 
+def _portable_publication_ref(
+    value: Mapping[str, Any], *, expected_path: str, label: str
+) -> dict[str, Any]:
+    """Held-dir publisher ref를 portable capture witness로 정규화한다.
+
+    ``capture_device``/``capture_inode``는 Jetson에서 같은 held descriptor로 발행했다는
+    provenance다. 전송 뒤 inode가 달라지는 것은 정상이라 offline 현재 inode와 비교하지
+    않고, path/size/SHA와 외부 publication SHA를 다시 검증한다.
+    """
+
+    if not isinstance(value, Mapping):
+        raise RecordingGainLinearityError(f"{label} publication ref가 mapping이 아닙니다")
+    path = _relative(str(value.get("path", "")), label=f"{label} publication path")
+    size = value.get("size")
+    device = value.get("device", value.get("capture_device"))
+    inode = value.get("inode", value.get("capture_inode"))
+    if (
+        path != expected_path
+        or type(size) is not int
+        or size < 0
+        or _SHA_RE.fullmatch(str(value.get("sha256", "")).lower()) is None
+        or type(device) is not int
+        or device < 0
+        or type(inode) is not int
+        or inode <= 0
+    ):
+        raise RecordingGainLinearityError(f"{label} publication ref 계약 불일치")
+    return {
+        "path": path,
+        "size": int(size),
+        "sha256": str(value["sha256"]).lower(),
+        "capture_device": int(device),
+        "capture_inode": int(inode),
+    }
+
+
+def build_gain_linearity_capture_publication_payload(
+    *,
+    canonical_session_path: str,
+    raw_ref: Mapping[str, Any],
+    metadata_ref: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Raw+sidecar의 held-dir no-replace 발행 결과를 self-seal한다."""
+
+    session = _relative(
+        canonical_session_path, label="gain-linearity canonical session path"
+    )
+    session_parts = Path(session).parts
+    if len(session_parts) < 2 or session_parts[0] != "results":
+        raise RecordingGainLinearityError(
+            "gain-linearity canonical session은 results/ 아래 directory여야 합니다"
+        )
+    raw_path = f"{session}/raw_measurement.npz"
+    metadata_path = f"{session}/metadata.json"
+    execution = metadata.get("repository_execution")
+    plan = metadata.get("plan")
+    source_commit = metadata.get("source_commit")
+    if (
+        not isinstance(execution, Mapping)
+        or set(execution) != _EXECUTION_KEYS
+        or not isinstance(plan, Mapping)
+        or _COMMIT_RE.fullmatch(str(source_commit).lower()) is None
+    ):
+        raise RecordingGainLinearityError(
+            "capture publication의 raw metadata authority가 불완전합니다"
+        )
+    payload: dict[str, Any] = {
+        "schema": GAIN_LINEARITY_PUBLICATION_SCHEMA,
+        "role": "held_directory_noreplace_raw_sidecar_binding",
+        "canonical_session_path": session,
+        "source_commit": str(source_commit).lower(),
+        "repository_execution": json.loads(
+            json.dumps(dict(execution), sort_keys=True, allow_nan=False)
+        ),
+        "plan": json.loads(json.dumps(dict(plan), sort_keys=True, allow_nan=False)),
+        "raw": _portable_publication_ref(
+            raw_ref, expected_path=raw_path, label="raw"
+        ),
+        "metadata": _portable_publication_ref(
+            metadata_ref, expected_path=metadata_path, label="metadata"
+        ),
+    }
+    payload["publication_payload_sha256"] = _seal(payload)
+    return payload
+
+
 def _safe_peak(value: float) -> np.float32:
     requested = float(value)
     peak = np.float32(requested)
@@ -220,6 +349,25 @@ def _imd(pair: tuple[float, float], peak: float) -> np.ndarray:
     fade = int(round(IMD_FADE_SECONDS * SAMPLE_RATE))
     phase = np.arange(fade, dtype=np.float64) / fade
     ramp = 0.5 - 0.5 * np.cos(math.pi * phase)
+    values[:fade] *= ramp
+    values[-fade:] *= ramp[::-1]
+    return _peak_normalise(values, peak)
+
+
+def _clock_pilot(peak: float) -> np.ndarray:
+    """그룹 처음/끝에 똑같이 넣는 deterministic wideband clock pilot."""
+
+    time = np.arange(CLOCK_PILOT_FRAMES, dtype=np.float64) / SAMPLE_RATE
+    duration = CLOCK_PILOT_FRAMES / SAMPLE_RATE
+    phase = 2.0 * math.pi * (
+        300.0 * time
+        + 0.5 * (9_000.0 - 300.0) / duration * np.square(time)
+    )
+    values = np.sin(phase)
+    fade = min(256, CLOCK_PILOT_FRAMES // 8)
+    ramp = np.sin(
+        0.5 * math.pi * np.arange(fade, dtype=np.float64) / max(1, fade)
+    ) ** 2
     values[:fade] *= ramp
     values[-fade:] *= ramp[::-1]
     return _peak_normalise(values, peak)
@@ -290,62 +438,102 @@ def build_gain_linearity_plan(
     commit = _require_commit(source_commit)
     ess_slot_frames = int(round(ESS_SLOT_SECONDS * SAMPLE_RATE))
     imd_slot_frames = int(round((IMD_ACTIVE_SECONDS + IMD_GUARD_SECONDS) * SAMPLE_RATE))
-    segments: list[np.ndarray] = []
     layout: list[dict[str, Any]] = []
+    clock_pilot_layout: list[dict[str, Any]] = []
     capture_groups: list[dict[str, Any]] = []
-    cursor = 0
+    group_stimulus_frames = 6 * SAMPLE_RATE
+    group_settle_frames = int(round(GROUP_SETTLE_SECONDS * SAMPLE_RATE))
+    group_frames = group_settle_frames + group_stimulus_frames
+    output_float = np.zeros(
+        (len(LEVELS_MILLIONTHS) * group_frames, 2), dtype=np.float32
+    )
     ess_metadata: dict[str, Any] | None = None
 
-    for level in LEVELS_MILLIONTHS:
-        group_start = cursor
+    for group_index, level in enumerate(LEVELS_MILLIONTHS):
+        group_start = group_index * group_frames
+        stimulus_start = group_start + group_settle_frames
+        group_stop = group_start + group_frames
         first_layout_index = len(layout)
         peak = level / 1_000_000.0
+        pilot = _clock_pilot(peak)
+        pilot_starts = [
+            stimulus_start + int(round(offset * SAMPLE_RATE))
+            for offset in CLOCK_PILOT_OFFSETS_SECONDS
+        ]
+        pilot_pcm = _float_to_pcm16(pilot)
+        for pilot_repeat_index, pilot_start in enumerate(pilot_starts):
+            pilot_stop = pilot_start + pilot.size
+            if pilot_start < stimulus_start or pilot_stop > group_stop:
+                raise RecordingGainLinearityError("clock pilot가 group 밖입니다")
+            output_float[pilot_start:pilot_stop, 0] = pilot
+            clock_pilot_layout.append(
+                {
+                    "kind": "CLOCK_PILOT",
+                    "level_millionths": level,
+                    "repeat_index": pilot_repeat_index,
+                    "start_frame": pilot_start,
+                    "stop_frame": pilot_stop,
+                    "active_frames": CLOCK_PILOT_FRAMES,
+                    "noise_ch0_pcm_sha256": _sha256_bytes(
+                        pilot_pcm.tobytes(order="C")
+                    ),
+                }
+            )
+
         ess, metadata = _synchronised_ess(peak)
         ess_metadata = metadata
-        stereo = np.zeros((ess_slot_frames, 2), dtype=np.float32)
-        stereo[: ess.size, 0] = ess
+        ess_start = stimulus_start + int(round(0.25 * SAMPLE_RATE))
+        ess_stop = stimulus_start + ess_slot_frames
+        if ess_start + ess.size > ess_stop:
+            raise RecordingGainLinearityError("ESS가 clock pilot guard를 침범합니다")
+        output_float[ess_start : ess_start + ess.size, 0] = ess
         layout.append(
             {
                 "kind": "ESS",
                 "level_millionths": level,
-                "start_frame": cursor,
-                "active_stop_frame": cursor + int(ess.size),
-                "stop_frame": cursor + ess_slot_frames,
+                "start_frame": ess_start,
+                "active_stop_frame": ess_start + int(ess.size),
+                "stop_frame": ess_stop,
                 "active_frames": int(ess.size),
             }
         )
-        segments.append(stereo)
-        cursor += ess_slot_frames
-        for pair in IMD_PAIRS_HZ:
+        rotated_pairs = tuple(
+            IMD_PAIRS_HZ[(group_index + offset) % len(IMD_PAIRS_HZ)]
+            for offset in range(len(IMD_PAIRS_HZ))
+        )
+        for pair_index, pair in enumerate(rotated_pairs):
             tone = _imd(pair, peak)
-            stereo = np.zeros((imd_slot_frames, 2), dtype=np.float32)
-            stereo[: tone.size, 0] = tone
+            tone_start = stimulus_start + ess_slot_frames + pair_index * imd_slot_frames
+            tone_stop = tone_start + imd_slot_frames
+            output_float[tone_start : tone_start + tone.size, 0] = tone
             layout.append(
                 {
                     "kind": "IMD",
                     "level_millionths": level,
                     "pair_hz": [pair[0], pair[1]],
-                    "start_frame": cursor,
-                    "active_stop_frame": cursor + int(tone.size),
-                    "stop_frame": cursor + imd_slot_frames,
+                    "start_frame": tone_start,
+                    "active_stop_frame": tone_start + int(tone.size),
+                    "stop_frame": tone_stop,
                     "active_frames": int(tone.size),
                 }
             )
-            segments.append(stereo)
-            cursor += imd_slot_frames
         capture_groups.append(
             {
                 "level_millionths": level,
                 "start_frame": group_start,
-                "stop_frame": cursor,
+                "settle_frames": group_settle_frames,
+                "stimulus_start_frame": stimulus_start,
+                "stop_frame": group_stop,
+                "clock_pilot_start_frames": pilot_starts,
+                "clock_pilot_active_frames": CLOCK_PILOT_FRAMES,
+                "imd_pair_order_hz": [list(pair) for pair in rotated_pairs],
                 "first_layout_index": first_layout_index,
                 "layout_count": 1 + len(IMD_PAIRS_HZ),
             }
         )
 
-    output_float = np.concatenate(segments, axis=0)
-    if output_float.shape != (24 * SAMPLE_RATE, 2):
-        raise RecordingGainLinearityError("gain-linearity output duration이 24초가 아닙니다")
+    if output_float.shape != (26 * SAMPLE_RATE, 2):
+        raise RecordingGainLinearityError("gain-linearity output duration이 26초가 아닙니다")
     if np.any(output_float[:, 1] != 0.0):
         raise RecordingGainLinearityError("CS ch1은 exact zero여야 합니다")
     pcm = _float_to_pcm16(output_float)
@@ -355,7 +543,12 @@ def build_gain_linearity_plan(
     active_seconds = (
         len(LEVELS_MILLIONTHS) * ess_metadata["active_seconds"]
         + len(LEVELS_MILLIONTHS) * len(IMD_PAIRS_HZ) * IMD_ACTIVE_SECONDS
+        + len(LEVELS_MILLIONTHS)
+        * len(CLOCK_PILOT_OFFSETS_SECONDS)
+        * CLOCK_PILOT_FRAMES
+        / SAMPLE_RATE
     )
+    exact_nonzero_pcm_seconds = float(np.count_nonzero(pcm[:, 0])) / SAMPLE_RATE
     payload: dict[str, Any] = {
         "schema": GAIN_LINEARITY_PLAN_SCHEMA,
         "role": "bounded_gain_linearity_exact_pcm_no_audio",
@@ -368,38 +561,76 @@ def build_gain_linearity_plan(
             "ess": ess_metadata,
             "ess_slot_seconds": ESS_SLOT_SECONDS,
             "imd_pairs_hz": [list(pair) for pair in IMD_PAIRS_HZ],
+            "imd_pair_order": "cyclic_rotation_by_level_index",
             "imd_active_seconds": IMD_ACTIVE_SECONDS,
             "imd_guard_seconds": IMD_GUARD_SECONDS,
+            "group_settle_seconds": GROUP_SETTLE_SECONDS,
+            "group_settle_exact_zero": True,
+            "clock_pilot": {
+                "role": "repeated_group_affine_clock_and_common_offset_witness",
+                "active_frames": CLOCK_PILOT_FRAMES,
+                "offset_seconds": list(CLOCK_PILOT_OFFSETS_SECONDS),
+                "minimum_repeat_response_normalised_correlation": (
+                    CLOCK_PILOT_MIN_NORMALISED_CORRELATION
+                ),
+                "maximum_abs_ppm": CLOCK_MAX_ABS_PPM,
+                "maximum_channel_difference_ppm": (
+                    CLOCK_CHANNEL_MAX_DIFFERENCE_PPM
+                ),
+                "maximum_trajectory_residual_samples": (
+                    CLOCK_TRAJECTORY_MAX_RESIDUAL_SAMPLES
+                ),
+                "maximum_relative_delay_spread_samples": (
+                    RELATIVE_DELAY_MAX_SPREAD_SAMPLES
+                ),
+            },
             "adc_certification_peak": ADC_CERTIFICATION_PEAK,
             "adc_absolute_peak_ceiling": ADC_ABSOLUTE_PEAK_CEILING,
             "predictive_stop_peak": PREDICTIVE_STOP_PEAK,
             "predictive_uncertainty_factor": PREDICTIVE_UNCERTAINTY_FACTOR,
             "compression_gate_db": COMPRESSION_GATE_DB,
             "thd_imd_gate_dbc": THD_IMD_GATE_DBC,
+            "distortion_observability": {
+                "coherent_subwindow_seconds": (
+                    DISTORTION_COHERENT_SUBWINDOW_SECONDS
+                ),
+                "minimum_fundamental_snr_db": (
+                    DISTORTION_MIN_FUNDAMENTAL_SNR_DB
+                ),
+                "minimum_noise_margin_below_gate_db": (
+                    DISTORTION_MIN_NOISE_MARGIN_DB
+                ),
+            },
             "safety_operator": {
                 "role": "source_gain_prediction_only_not_anc_plant_authority",
                 "band_hz": list(ESS_BAND_HZ),
                 "fir_length": OPERATOR_FIR_LENGTH,
+                "peak_pre_roll_samples": OPERATOR_PEAK_PRE_ROLL_SAMPLES,
                 "fit_levels_millionths": list(OPERATOR_FIT_LEVELS_MILLIONTHS),
                 "holdout_level_millionths": OPERATOR_HOLDOUT_LEVEL_MILLIONTHS,
                 "subbands_hz": [list(value) for value in OPERATOR_SUBBANDS_HZ],
                 "minimum_complex_agreement": OPERATOR_MIN_COMPLEX_AGREEMENT,
                 "maximum_relative_error": OPERATOR_MAX_RELATIVE_ERROR,
+                "relative_subband_minimum_target_norm_ratio": (
+                    OPERATOR_RELATIVE_SUBBAND_MIN_NORM_RATIO
+                ),
                 "residual_uncertainty_factor": PREDICTIVE_UNCERTAINTY_FACTOR,
             },
         },
         "layout": layout,
+        "clock_pilot_layout": clock_pilot_layout,
         "capture_groups": capture_groups,
         "duration": {
-            "audible_nonzero_seconds": active_seconds,
+            "nominal_active_seconds": active_seconds,
+            "exact_nonzero_pcm_seconds": exact_nonzero_pcm_seconds,
             "output_open_seconds": output_float.shape[0] / SAMPLE_RATE,
             "input_preflight_seconds": INPUT_PREFLIGHT_SECONDS,
-            # level당 한 6초 stream + 1초 watchdog/1초 fingerprint·전환 예산.
+            # level당 한 6.5초 stream + 1초 watchdog/1초 fingerprint·전환 예산.
             # 16 slot별 open/close가 아니라 정확히 네 stream만 연다.
             "stream_open_count": len(capture_groups),
             "per_stream_watchdog_grace_seconds": STREAM_WATCHDOG_GRACE_SECONDS,
             "per_stream_transition_budget_seconds": STREAM_TRANSITION_BUDGET_SECONDS,
-            "connected_upper_seconds": (
+            "live_campaign_hard_deadline_seconds": (
                 INPUT_PREFLIGHT_SECONDS
                 + output_float.shape[0] / SAMPLE_RATE
                 + len(capture_groups)
@@ -439,6 +670,7 @@ def validate_gain_linearity_plan_payload(value: Any) -> np.ndarray:
     contract = value.get("contract")
     output = value.get("output")
     layout = value.get("layout")
+    clock_pilot_layout = value.get("clock_pilot_layout")
     capture_groups = value.get("capture_groups")
     if (
         not isinstance(contract, Mapping)
@@ -448,16 +680,20 @@ def validate_gain_linearity_plan_payload(value: Any) -> np.ndarray:
         or not isinstance(output, Mapping)
         or not isinstance(layout, list)
         or len(layout) != len(LEVELS_MILLIONTHS) * (1 + len(IMD_PAIRS_HZ))
+        or not isinstance(clock_pilot_layout, list)
+        or len(clock_pilot_layout)
+        != len(LEVELS_MILLIONTHS) * len(CLOCK_PILOT_OFFSETS_SECONDS)
         or not isinstance(capture_groups, list)
         or len(capture_groups) != len(LEVELS_MILLIONTHS)
     ):
         raise RecordingGainLinearityError("gain-linearity plan 고정 계약 불일치")
-    segments: list[np.ndarray] = []
+    frames_total = int(output.get("frames", -1))
+    if frames_total != 26 * SAMPLE_RATE:
+        raise RecordingGainLinearityError("gain-linearity v3 frame 수 불일치")
+    reconstructed = np.zeros((frames_total, 2), dtype=np.float32)
     for row in layout:
         level = int(row["level_millionths"])
         peak = level / 1_000_000.0
-        frames = int(row["stop_frame"]) - int(row["start_frame"])
-        stereo = np.zeros((frames, 2), dtype=np.float32)
         if row["kind"] == "ESS":
             source, _ = _synchronised_ess(peak)
         elif row["kind"] == "IMD":
@@ -466,9 +702,84 @@ def validate_gain_linearity_plan_payload(value: Any) -> np.ndarray:
             raise RecordingGainLinearityError("gain-linearity layout kind 불일치")
         if int(row["active_frames"]) != source.size:
             raise RecordingGainLinearityError("gain-linearity active frame 불일치")
-        stereo[: source.size, 0] = source
-        segments.append(stereo)
-    pcm = _float_to_pcm16(np.concatenate(segments, axis=0))
+        start = int(row["start_frame"])
+        reconstructed[start : start + source.size, 0] = source
+    for group_index, group in enumerate(capture_groups):
+        level = int(group["level_millionths"])
+        pilot = _clock_pilot(level / 1_000_000.0)
+        expected_order = [
+            list(IMD_PAIRS_HZ[(group_index + offset) % len(IMD_PAIRS_HZ)])
+            for offset in range(len(IMD_PAIRS_HZ))
+        ]
+        if (
+            group.get("settle_frames")
+            != int(round(GROUP_SETTLE_SECONDS * SAMPLE_RATE))
+            or group.get("stimulus_start_frame")
+            != int(group["start_frame"]) + int(group["settle_frames"])
+            or group.get("clock_pilot_active_frames") != CLOCK_PILOT_FRAMES
+            or group.get("imd_pair_order_hz") != expected_order
+        ):
+            raise RecordingGainLinearityError("gain-linearity group settle/rotation 불일치")
+        settle = reconstructed[
+            int(group["start_frame"]) : int(group["stimulus_start_frame"])
+        ]
+        if np.any(settle != 0.0):
+            raise RecordingGainLinearityError("gain-linearity group settle이 exact zero가 아닙니다")
+        pilot_count = len(CLOCK_PILOT_OFFSETS_SECONDS)
+        group_pilot_rows = clock_pilot_layout[
+            group_index * pilot_count : (group_index + 1) * pilot_count
+        ]
+        if [row.get("start_frame") for row in group_pilot_rows] != group.get(
+            "clock_pilot_start_frames"
+        ):
+            raise RecordingGainLinearityError("clock pilot layout/group 불일치")
+        active_intervals = [
+            (
+                int(row["start_frame"]),
+                int(row["active_stop_frame"]),
+                str(row["kind"]),
+            )
+            for row in layout[
+                group_index * (1 + len(IMD_PAIRS_HZ)) :
+                (group_index + 1) * (1 + len(IMD_PAIRS_HZ))
+            ]
+        ]
+        for pilot_row in group_pilot_rows:
+            pilot_start = int(pilot_row["start_frame"])
+            pilot_stop = int(pilot_row["stop_frame"])
+            expected_pilot_pcm = _float_to_pcm16(pilot)
+            if (
+                pilot_row.get("kind") != "CLOCK_PILOT"
+                or pilot_row.get("level_millionths") != level
+                or pilot_row.get("active_frames") != CLOCK_PILOT_FRAMES
+                or pilot_stop - pilot_start != CLOCK_PILOT_FRAMES
+                or pilot_row.get("noise_ch0_pcm_sha256")
+                != _sha256_bytes(expected_pilot_pcm.tobytes(order="C"))
+                or any(
+                    pilot_start < active_stop and active_start < pilot_stop
+                    for active_start, active_stop, _kind in active_intervals
+                )
+            ):
+                raise RecordingGainLinearityError("clock pilot overlap/SHA 계약 불일치")
+        for pilot_start in group.get("clock_pilot_start_frames", []):
+            start = int(pilot_start)
+            reconstructed[start : start + pilot.size, 0] = pilot
+        response_intervals = [
+            *active_intervals,
+            *[
+                (int(row["start_frame"]), int(row["stop_frame"]), "CLOCK_PILOT")
+                for row in group_pilot_rows
+            ],
+        ]
+        response_intervals.sort(key=lambda item: item[0])
+        for current, following in zip(response_intervals, response_intervals[1:]):
+            if current[1] + MAX_DELAY_SAMPLES > following[0]:
+                raise RecordingGainLinearityError(
+                    f"{current[2]} response guard가 {following[2]}를 침범합니다"
+                )
+        if response_intervals[-1][1] + MAX_DELAY_SAMPLES > int(group["stop_frame"]):
+            raise RecordingGainLinearityError("마지막 clock pilot response guard가 부족합니다")
+    pcm = _float_to_pcm16(reconstructed)
     if (
         pcm.shape != (int(output.get("frames", -1)), 2)
         or _sha256_bytes(pcm.tobytes(order="C")) != output.get("pcm_sha256")
@@ -476,6 +787,7 @@ def validate_gain_linearity_plan_payload(value: Any) -> np.ndarray:
     ):
         raise RecordingGainLinearityError("gain-linearity plan PCM 재구성 불일치")
     expected_groups = []
+    group_frames = int(round((6.0 + GROUP_SETTLE_SECONDS) * SAMPLE_RATE))
     for group_index, level in enumerate(LEVELS_MILLIONTHS):
         rows = layout[
             group_index * (1 + len(IMD_PAIRS_HZ)) :
@@ -484,14 +796,59 @@ def validate_gain_linearity_plan_payload(value: Any) -> np.ndarray:
         expected_groups.append(
             {
                 "level_millionths": level,
-                "start_frame": int(rows[0]["start_frame"]),
-                "stop_frame": int(rows[-1]["stop_frame"]),
+                "start_frame": group_index * group_frames,
+                "settle_frames": int(round(GROUP_SETTLE_SECONDS * SAMPLE_RATE)),
+                "stimulus_start_frame": (
+                    group_index * group_frames
+                    + int(round(GROUP_SETTLE_SECONDS * SAMPLE_RATE))
+                ),
+                "stop_frame": (group_index + 1) * group_frames,
+                "clock_pilot_start_frames": [
+                    group_index * group_frames
+                    + int(round(GROUP_SETTLE_SECONDS * SAMPLE_RATE))
+                    + int(round(offset * SAMPLE_RATE))
+                    for offset in CLOCK_PILOT_OFFSETS_SECONDS
+                ],
+                "clock_pilot_active_frames": CLOCK_PILOT_FRAMES,
+                "imd_pair_order_hz": [
+                    list(IMD_PAIRS_HZ[(group_index + offset) % len(IMD_PAIRS_HZ)])
+                    for offset in range(len(IMD_PAIRS_HZ))
+                ],
                 "first_layout_index": group_index * (1 + len(IMD_PAIRS_HZ)),
                 "layout_count": 1 + len(IMD_PAIRS_HZ),
             }
         )
     if capture_groups != expected_groups:
         raise RecordingGainLinearityError("gain-linearity capture group 계약 불일치")
+    nominal_active_seconds = (
+        len(LEVELS_MILLIONTHS) * float(contract["ess"]["active_seconds"])
+        + len(LEVELS_MILLIONTHS) * len(IMD_PAIRS_HZ) * IMD_ACTIVE_SECONDS
+        + len(LEVELS_MILLIONTHS)
+        * len(CLOCK_PILOT_OFFSETS_SECONDS)
+        * CLOCK_PILOT_FRAMES
+        / SAMPLE_RATE
+    )
+    expected_duration = {
+        "nominal_active_seconds": nominal_active_seconds,
+        "exact_nonzero_pcm_seconds": float(np.count_nonzero(pcm[:, 0]))
+        / SAMPLE_RATE,
+        "output_open_seconds": pcm.shape[0] / SAMPLE_RATE,
+        "input_preflight_seconds": INPUT_PREFLIGHT_SECONDS,
+        "stream_open_count": len(capture_groups),
+        "per_stream_watchdog_grace_seconds": STREAM_WATCHDOG_GRACE_SECONDS,
+        "per_stream_transition_budget_seconds": STREAM_TRANSITION_BUDGET_SECONDS,
+        "live_campaign_hard_deadline_seconds": (
+            INPUT_PREFLIGHT_SECONDS
+            + pcm.shape[0] / SAMPLE_RATE
+            + len(capture_groups)
+            * (
+                STREAM_WATCHDOG_GRACE_SECONDS
+                + STREAM_TRANSITION_BUDGET_SECONDS
+            )
+        ),
+    }
+    if value.get("duration") != expected_duration:
+        raise RecordingGainLinearityError("gain-linearity duration exact 계약 불일치")
     _require_commit(value.get("source_commit"))
     return pcm
 
@@ -570,23 +927,409 @@ def _delay_samples(source: np.ndarray, target: np.ndarray) -> int:
     return int(np.argmax(np.abs(window)))
 
 
-def _bin_power(spectrum: np.ndarray, bins: set[int]) -> float:
+def _fractional_delay_and_correlation(
+    source: np.ndarray, target: np.ndarray
+) -> tuple[float, float]:
+    """Bounded correlation peak를 quadratic 보간해 fractional delay를 낸다."""
+
+    x = np.asarray(source, dtype=np.float64)
+    y = np.asarray(target, dtype=np.float64)
+    correlation = signal.fftconvolve(y, x[::-1], mode="full")
+    start = x.size - 1
+    window = correlation[start : start + MAX_DELAY_SAMPLES + 1]
+    if window.size != MAX_DELAY_SAMPLES + 1:
+        raise RecordingGainLinearityError("clock pilot delay 탐색 window가 짧습니다")
+    magnitude = np.abs(window)
+    index = int(np.argmax(magnitude))
+    fraction = 0.0
+    if 0 < index < magnitude.size - 1:
+        left, centre, right = (
+            float(magnitude[index - 1]),
+            float(magnitude[index]),
+            float(magnitude[index + 1]),
+        )
+        denominator = left - 2.0 * centre + right
+        if denominator != 0.0:
+            fraction = float(np.clip(0.5 * (left - right) / denominator, -0.5, 0.5))
+    delay = float(index + fraction)
+    count = min(x.size, y.size - index)
+    if count <= 0:
+        return delay, 0.0
+    observed = y[index : index + count]
+    reference = x[:count]
+    denominator = float(np.linalg.norm(reference) * np.linalg.norm(observed))
+    score = abs(float(np.dot(reference, observed))) / denominator if denominator else 0.0
+    return delay, score
+
+
+def _fractional_signed_lag_and_correlation(
+    reference: np.ndarray,
+    target: np.ndarray,
+    *,
+    maximum_abs_lag: int,
+) -> tuple[float, float]:
+    """같은 plant를 지난 repeat response 사이 signed lag와 관측 score를 낸다."""
+
+    x = np.asarray(reference, dtype=np.float64)
+    y = np.asarray(target, dtype=np.float64)
+    if x.ndim != 1 or y.ndim != 1 or x.size != y.size or x.size < 3:
+        raise RecordingGainLinearityError("clock pilot repeat response shape 불일치")
+    bound = int(maximum_abs_lag)
+    if bound <= 0 or bound >= x.size - 1:
+        raise RecordingGainLinearityError("clock pilot signed-lag bound가 유효하지 않습니다")
+    correlation = signal.fftconvolve(y, x[::-1], mode="full")
+    lags = np.arange(-x.size + 1, y.size, dtype=np.int64)
+    selected = np.flatnonzero((lags >= -bound) & (lags <= bound))
+    magnitude = np.abs(correlation[selected])
+    local_index = int(np.argmax(magnitude))
+    correlation_index = int(selected[local_index])
+    integer_lag = int(lags[correlation_index])
+    fraction = 0.0
+    if 0 < correlation_index < correlation.size - 1:
+        left = float(abs(correlation[correlation_index - 1]))
+        centre = float(abs(correlation[correlation_index]))
+        right = float(abs(correlation[correlation_index + 1]))
+        denominator = left - 2.0 * centre + right
+        if denominator != 0.0:
+            fraction = float(
+                np.clip(0.5 * (left - right) / denominator, -0.5, 0.5)
+            )
+    if integer_lag >= 0:
+        observed = y[integer_lag:]
+        expected = x[: observed.size]
+    else:
+        expected = x[-integer_lag:]
+        observed = y[: expected.size]
+    denominator = float(np.linalg.norm(expected) * np.linalg.norm(observed))
+    score = (
+        abs(float(np.dot(expected, observed))) / denominator
+        if denominator > 0.0
+        else 0.0
+    )
+    return float(integer_lag + fraction), score
+
+
+def _callback_time_witness(
+    value: Mapping[str, np.ndarray], *, expected_frames: int
+) -> dict[str, Any]:
+    """Callback sample coverage와 ADC/DAC monotonic timebase를 raw 배열에서 재검산한다.
+
+    PortAudio ``time_info``는 callback이 본 host-side buffer timestamp다. 특히
+    ``outputBufferDacTime``은 driver queue 예측이 섞여 callback별 step이 일정하지 않으므로
+    이 값의 회귀 기울기를 ADC/DAC clock-q authority로 쓰지 않는다. 실제 q는 캡처 PCM에
+    삽입한 다섯 clock pilot response의 trajectory로 별도 판정한다.
+    """
+
+    if not isinstance(value, Mapping):
+        raise RecordingGainLinearityError("callback time witness가 mapping이 아닙니다")
+    arrays = {
+        name: np.asarray(value.get(name)).reshape(-1)
+        for name in CALLBACK_TIME_INFO_FIELDS
+    }
+    sizes = {array.size for array in arrays.values()}
+    if len(sizes) != 1 or not sizes or next(iter(sizes)) < 2:
+        raise RecordingGainLinearityError("callback time witness 길이 불일치")
+    starts = arrays["callback_start_frames"]
+    counts = arrays["callback_frame_counts"]
+    if starts.dtype.kind not in "iu" or counts.dtype.kind not in "iu":
+        raise RecordingGainLinearityError("callback frame witness가 integer가 아닙니다")
+    starts = starts.astype(np.int64)
+    counts = counts.astype(np.int64)
+    if (
+        starts[0] != 0
+        or np.any(counts <= 0)
+        or np.any(counts != BLOCK_SIZE)
+        or np.any(starts < 0)
+        or np.any(np.diff(starts) != np.minimum(counts[:-1], expected_frames - starts[:-1]))
+        or int(starts[-1]) + min(int(counts[-1]), expected_frames - int(starts[-1]))
+        != expected_frames
+    ):
+        raise RecordingGainLinearityError("callback frame coverage/slip witness 위반")
+    informational_time_rates: dict[str, float] = {}
+    for name in (
+        "input_buffer_adc_time",
+        "output_buffer_dac_time",
+        "callback_current_time",
+    ):
+        times = arrays[name].astype(np.float64)
+        if not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0.0):
+            raise RecordingGainLinearityError(f"{name}가 finite monotonic이 아닙니다")
+        slope = float(np.polyfit(starts.astype(np.float64), times, 1)[0])
+        rate_ratio = slope * SAMPLE_RATE
+        ppm = (rate_ratio - 1.0) * 1.0e6
+        if not math.isfinite(ppm):
+            raise RecordingGainLinearityError(f"{name} callback 회귀 기울기가 유한하지 않습니다")
+        informational_time_rates[name] = ppm
+    return {
+        "valid": True,
+        "callback_count": int(starts.size),
+        "software_frame_gap_count": 0,
+        "hardware_sample_slip_authority": False,
+        "portaudio_time_rate_authority": False,
+        "informational_fit_rate_ppm": informational_time_rates,
+        "role": "callback_monotonic_and_sample_coverage_witness_not_clock_q_authority",
+    }
+
+
+def callback_time_info_evidence(
+    value: Mapping[str, np.ndarray], *, group_index: int, expected_frames: int
+) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    """Live publisher가 JSON metadata와 NPZ raw array를 분리해 봉인하게 한다."""
+
+    witness = _callback_time_witness(value, expected_frames=expected_frames)
+    arrays: dict[str, np.ndarray] = {}
+    refs: dict[str, Any] = {}
+    for field in CALLBACK_TIME_INFO_FIELDS:
+        dtype = "<i8" if field in {"callback_start_frames", "callback_frame_counts"} else "<f8"
+        array = np.ascontiguousarray(np.asarray(value[field]), dtype=dtype)
+        key = f"callback_group_{int(group_index)}_{field}"
+        arrays[key] = array
+        refs[field] = {
+            "array_key": key,
+            "dtype": dtype,
+            "shape": [int(array.size)],
+            "sha256": _sha256_bytes(array.tobytes(order="C")),
+        }
+    return {"summary": witness, "arrays": refs}, arrays
+
+
+def _load_callback_time_info(
+    evidence: Any,
+    arrays: Mapping[str, np.ndarray],
+    *,
+    expected_frames: int,
+) -> dict[str, Any]:
+    if not isinstance(evidence, Mapping) or set(evidence) != {"summary", "arrays"}:
+        raise RecordingGainLinearityError("callback time evidence schema 불일치")
+    refs = evidence.get("arrays")
+    if not isinstance(refs, Mapping) or set(refs) != set(CALLBACK_TIME_INFO_FIELDS):
+        raise RecordingGainLinearityError("callback time raw ref 집합 불일치")
+    loaded: dict[str, np.ndarray] = {}
+    for field in CALLBACK_TIME_INFO_FIELDS:
+        ref = refs[field]
+        dtype = "<i8" if field in {"callback_start_frames", "callback_frame_counts"} else "<f8"
+        if not isinstance(ref, Mapping) or set(ref) != {"array_key", "dtype", "shape", "sha256"}:
+            raise RecordingGainLinearityError("callback time raw ref schema 불일치")
+        key = ref.get("array_key")
+        array = arrays.get(key) if isinstance(key, str) else None
+        if (
+            array is None
+            or ref.get("dtype") != dtype
+            or ref.get("shape") != [int(np.asarray(array).size)]
+        ):
+            raise RecordingGainLinearityError("callback time raw dtype/shape 불일치")
+        canonical = np.ascontiguousarray(np.asarray(array), dtype=dtype)
+        if _sha256_bytes(canonical.tobytes(order="C")) != ref.get("sha256"):
+            raise RecordingGainLinearityError("callback time raw SHA 불일치")
+        loaded[field] = canonical
+    rebuilt = _callback_time_witness(loaded, expected_frames=expected_frames)
+    if evidence.get("summary") != rebuilt:
+        raise RecordingGainLinearityError("callback time summary 독립 재계산 불일치")
+    return rebuilt
+
+
+def _group_clock_alignment(
+    *,
+    payload: Mapping[str, Any],
+    source_float: np.ndarray,
+    input_float: np.ndarray,
+) -> tuple[dict[int, dict[str, Any]], list[str]]:
+    """Plant-colored repeat response로 group별 affine q와 공통 offset을 관측한다.
+
+    source pilot와 mic response의 직접 correlation은 덕트의 coloration 때문에 낮을 수
+    있으므로 관측 gate로 쓰지 않는다. 첫 response와 뒤 repeat response들을 서로 비교해
+    clock trajectory를 얻고, source→첫 response peak는 absolute offset에만 사용한다.
+    """
+
+    result: dict[int, dict[str, Any]] = {}
+    reasons: list[str] = []
+    relative_values: list[float] = []
+    for group_index, group in enumerate(payload["capture_groups"]):
+        pilot_starts = [int(value) for value in group["clock_pilot_start_frames"]]
+        if len(pilot_starts) != len(CLOCK_PILOT_OFFSETS_SECONDS):
+            raise RecordingGainLinearityError("clock pilot start 개수가 exact 계약과 다릅니다")
+        pilot = np.asarray(
+            source_float[
+                pilot_starts[0] : pilot_starts[0] + CLOCK_PILOT_FRAMES
+            ],
+            dtype=np.float64,
+        )
+        pilot_axis = np.asarray(pilot_starts, dtype=np.float64) - float(
+            pilot_starts[0]
+        )
+        maximum_repeat_lag = int(
+            math.ceil(
+                float(pilot_axis[-1]) * CLOCK_MAX_ABS_PPM / 1.0e6
+            )
+        ) + 16
+        channels: dict[str, Any] = {}
+        for name, channel in (("err", 0), ("ref", 1)):
+            response_windows: list[np.ndarray] = []
+            for pilot_start in pilot_starts:
+                stop = pilot_start + CLOCK_PILOT_FRAMES + MAX_DELAY_SAMPLES
+                if stop > int(group["stop_frame"]):
+                    raise RecordingGainLinearityError("clock pilot response guard가 부족합니다")
+                response_windows.append(
+                    np.asarray(input_float[pilot_start:stop, channel], dtype=np.float64)
+                )
+            absolute_delay, source_template_correlation = (
+                _fractional_delay_and_correlation(pilot, response_windows[0])
+            )
+            relative_lags = [0.0]
+            repeat_correlations = [1.0]
+            for response in response_windows[1:]:
+                lag, correlation = _fractional_signed_lag_and_correlation(
+                    response_windows[0],
+                    response,
+                    maximum_abs_lag=maximum_repeat_lag,
+                )
+                relative_lags.append(lag)
+                repeat_correlations.append(correlation)
+            relative_array = np.asarray(relative_lags, dtype=np.float64)
+            slope, intercept = np.polyfit(pilot_axis, relative_array, 1)
+            trajectory_residual = relative_array - (
+                slope * pilot_axis + intercept
+            )
+            delays = absolute_delay + relative_array
+            q = 1.0 + float(slope)
+            ppm = (q - 1.0) * 1.0e6
+            if min(repeat_correlations) < CLOCK_PILOT_MIN_NORMALISED_CORRELATION:
+                reasons.append(f"group_{group_index}_{name}_pilot_correlation")
+            maximum_residual = float(np.max(np.abs(trajectory_residual)))
+            if (
+                not math.isfinite(maximum_residual)
+                or maximum_residual > CLOCK_TRAJECTORY_MAX_RESIDUAL_SAMPLES
+            ):
+                reasons.append(f"group_{group_index}_{name}_clock_trajectory")
+            if not math.isfinite(ppm) or abs(ppm) > CLOCK_MAX_ABS_PPM:
+                reasons.append(f"group_{group_index}_{name}_clock_q")
+            channels[name] = {
+                "pilot_delay_samples": [float(value) for value in delays],
+                "repeat_response_lag_samples": relative_lags,
+                "repeat_response_normalised_correlation": repeat_correlations,
+                "source_template_first_delay_samples": absolute_delay,
+                "source_template_first_normalised_correlation_informational": (
+                    source_template_correlation
+                ),
+                "trajectory_residual_samples": [
+                    float(value) for value in trajectory_residual
+                ],
+                "maximum_abs_trajectory_residual_samples": maximum_residual,
+                "q_ratio": q,
+                "rate_ppm": ppm,
+            }
+        q_values = [channels[name]["q_ratio"] for name in ("err", "ref")]
+        if abs(q_values[0] - q_values[1]) * 1.0e6 > CLOCK_CHANNEL_MAX_DIFFERENCE_PPM:
+            reasons.append(f"group_{group_index}_channel_clock_q_disagreement")
+        relative_delays = [
+            float(err_value - ref_value)
+            for err_value, ref_value in zip(
+                channels["err"]["pilot_delay_samples"],
+                channels["ref"]["pilot_delay_samples"],
+                strict=True,
+            )
+        ]
+        relative_values.extend(relative_delays)
+        observed_common_response_offset = min(
+            channels["err"]["pilot_delay_samples"][0],
+            channels["ref"]["pilot_delay_samples"][0],
+        )
+        result[group_index] = {
+            "group_index": group_index,
+            "level_millionths": int(group["level_millionths"]),
+            "capture_timeline_offset_samples": 0.0,
+            "observed_common_response_offset_samples": (
+                observed_common_response_offset
+            ),
+            "common_q_ratio": float(np.median(q_values)),
+            "relative_delay_samples": relative_delays,
+            "channels": channels,
+        }
+    relative_spread = float(np.ptp(relative_values)) if relative_values else math.inf
+    if not math.isfinite(relative_spread) or relative_spread > RELATIVE_DELAY_MAX_SPREAD_SAMPLES:
+        reasons.append("err_ref_relative_delay_spread")
+    for item in result.values():
+        item["all_groups_relative_delay_spread_samples"] = relative_spread
+    return result, reasons
+
+
+def _aligned_channel_view(
+    values: np.ndarray,
+    *,
+    group: Mapping[str, Any],
+    alignment: Mapping[str, Any],
+    output_start: int,
+    output_stop: int,
+) -> np.ndarray:
+    """공통 q/offset만 적용해 두 마이크 사이 상대 지연은 보존한다."""
+
+    start = int(group["start_frame"])
+    stop = int(group["stop_frame"])
+    source_axis = np.arange(start, stop, dtype=np.float64)
+    query_output = np.arange(output_start, output_stop, dtype=np.float64)
+    # submitted/recorded arrays는 같은 duplex callback cursor로 시작한다. Pilot에서
+    # 보이는 source→mic offset은 plant acoustic delay이며 timeline offset이 아니다.
+    # 이를 여기서 제거하면 colored FIR의 peak 이전 에너지가 잘려 safety operator가
+    # 비인과적으로 된다. Clock-rate correction만 group stream 시작점에 anchor한다.
+    query = float(start) + float(alignment["common_q_ratio"]) * (
+        query_output - float(start)
+    )
+    if query.size == 0 or query[0] < source_axis[0] or query[-1] > source_axis[-1]:
+        raise RecordingGainLinearityError("clock-corrected interpolation support가 부족합니다")
+    spline = interpolate.CubicSpline(
+        source_axis,
+        np.asarray(values[start:stop], dtype=np.float64),
+        extrapolate=False,
+    )
+    result = np.asarray(spline(query), dtype=np.float64)
+    if not np.all(np.isfinite(result)):
+        raise RecordingGainLinearityError("clock-corrected cubic interpolation이 non-finite입니다")
+    return result
+
+
+def _expanded_bin_indices(spectrum_size: int, bins: set[int]) -> set[int]:
     selected: set[int] = set()
     for index in bins:
         for offset in (-1, 0, 1):
             candidate = index + offset
-            if 0 < candidate < spectrum.size:
+            if 0 < candidate < spectrum_size:
                 selected.add(candidate)
+    return selected
+
+
+def _bin_power(spectrum: np.ndarray, bins: set[int]) -> float:
+    selected = _expanded_bin_indices(spectrum.size, bins)
     if not selected:
         return 0.0
     return float(np.sum(np.abs(spectrum[sorted(selected)]) ** 2))
 
 
-def _distortion_metrics(values: np.ndarray, pair: tuple[float, float]) -> dict[str, float]:
+def _coherent_average_power(values: np.ndarray) -> np.ndarray:
     samples = np.asarray(values, dtype=np.float64)
-    window = np.hanning(samples.size)
-    spectrum = np.fft.rfft(samples * window)
-    resolution = SAMPLE_RATE / samples.size
+    frames = int(round(DISTORTION_COHERENT_SUBWINDOW_SECONDS * SAMPLE_RATE))
+    if frames <= 0 or samples.size < frames or samples.size % frames != 0:
+        raise RecordingGainLinearityError("distortion coherent subwindow 길이 불일치")
+    windows = samples.reshape(-1, frames)
+    spectra = np.fft.rfft(windows, axis=1)
+    return np.mean(np.square(np.abs(spectra)), axis=0)
+
+
+def _distortion_metrics(
+    values: np.ndarray,
+    pair: tuple[float, float],
+    *,
+    preflight_values: np.ndarray,
+) -> dict[str, Any]:
+    spectrum = np.sqrt(_coherent_average_power(values)).astype(np.complex128)
+    preflight = np.sqrt(
+        _coherent_average_power(
+            np.asarray(preflight_values, dtype=np.float64)[
+                : int(round(IMD_ANALYSIS_SECONDS * SAMPLE_RATE))
+            ]
+        )
+    ).astype(np.complex128)
+    frames = int(round(DISTORTION_COHERENT_SUBWINDOW_SECONDS * SAMPLE_RATE))
+    resolution = SAMPLE_RATE / frames
 
     def index(frequency: float) -> int:
         return int(round(float(frequency) / resolution))
@@ -614,10 +1357,82 @@ def _distortion_metrics(values: np.ndarray, pair: tuple[float, float]) -> dict[s
     harmonics -= fundamentals
     products -= fundamentals | harmonics
     fundamental_power = _bin_power(spectrum, fundamentals)
+    signal_bins = fundamentals | harmonics | products
+    expanded_signal_bins = _expanded_bin_indices(spectrum.size, signal_bins)
+    neighbourhood: set[int] = set()
+    for signal_bin in signal_bins:
+        neighbourhood.update(
+            candidate
+            for candidate in range(signal_bin - 12, signal_bin + 13)
+            if 0 < candidate < spectrum.size
+            and candidate not in expanded_signal_bins
+        )
+    capture_noise_per_bin = (
+        float(
+            np.quantile(
+                np.abs(spectrum[sorted(neighbourhood)]) ** 2,
+                0.95,
+            )
+        )
+        if neighbourhood
+        else 0.0
+    )
+
+    def matched_noise_upper(bins: set[int]) -> tuple[float, int]:
+        selected = _expanded_bin_indices(spectrum.size, bins)
+        capture_upper = capture_noise_per_bin * len(selected)
+        preflight_upper = (
+            float(np.sum(np.abs(preflight[sorted(selected)]) ** 2))
+            if selected
+            else 0.0
+        )
+        return max(capture_upper, preflight_upper), len(selected)
+
+    fundamental_noise, fundamental_noise_bin_count = matched_noise_upper(fundamentals)
+    thd_noise, thd_noise_bin_count = matched_noise_upper(harmonics)
+    imd_noise, imd_noise_bin_count = matched_noise_upper(products)
     floor = np.finfo(np.float64).tiny
-    thd = 10.0 * math.log10(max(_bin_power(spectrum, harmonics), floor) / max(fundamental_power, floor))
-    imd = 10.0 * math.log10(max(_bin_power(spectrum, products), floor) / max(fundamental_power, floor))
-    return {"thd_dbc": float(thd), "imd_dbc": float(imd)}
+    denominator = max(fundamental_power, floor)
+    thd = 10.0 * math.log10(
+        max(_bin_power(spectrum, harmonics), floor) / denominator
+    )
+    imd = 10.0 * math.log10(
+        max(_bin_power(spectrum, products), floor) / denominator
+    )
+    fundamental_snr = 10.0 * math.log10(
+        denominator / max(fundamental_noise, floor)
+    )
+    thd_noise_dbc = 10.0 * math.log10(max(thd_noise, floor) / denominator)
+    imd_noise_dbc = 10.0 * math.log10(max(imd_noise, floor) / denominator)
+    thd_noise_margin = THD_IMD_GATE_DBC - thd_noise_dbc
+    imd_noise_margin = THD_IMD_GATE_DBC - imd_noise_dbc
+    observable = bool(
+        math.isfinite(fundamental_snr)
+        and fundamental_snr >= DISTORTION_MIN_FUNDAMENTAL_SNR_DB
+        and thd_noise_margin >= DISTORTION_MIN_NOISE_MARGIN_DB
+        and imd_noise_margin >= DISTORTION_MIN_NOISE_MARGIN_DB
+    )
+    verdict = (
+        "INCONCLUSIVE"
+        if not observable
+        else ("PASS" if thd <= THD_IMD_GATE_DBC and imd <= THD_IMD_GATE_DBC else "FAIL")
+    )
+    return {
+        "thd_dbc": float(thd),
+        "imd_dbc": float(imd),
+        "fundamental_snr_db": float(fundamental_snr),
+        "capture_noise_per_bin_power_95th": float(capture_noise_per_bin),
+        "fundamental_noise_bin_count": fundamental_noise_bin_count,
+        "thd_noise_bin_count": thd_noise_bin_count,
+        "imd_noise_bin_count": imd_noise_bin_count,
+        "thd_matched_noise_dbc": float(thd_noise_dbc),
+        "imd_matched_noise_dbc": float(imd_noise_dbc),
+        "thd_noise_margin_below_gate_db": float(thd_noise_margin),
+        "imd_noise_margin_below_gate_db": float(imd_noise_margin),
+        "coherent_subwindow_seconds": DISTORTION_COHERENT_SUBWINDOW_SECONDS,
+        "observable": observable,
+        "verdict": verdict,
+    }
 
 
 def _operator_target(
@@ -626,6 +1441,8 @@ def _operator_target(
     source_float: np.ndarray,
     row: Mapping[str, Any],
     channel: int,
+    group: Mapping[str, Any],
+    alignment: Mapping[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """한 ESS slot에서 source와 delay-aligned causal response를 돌려준다."""
 
@@ -633,8 +1450,18 @@ def _operator_target(
     stop = int(row["stop_frame"])
     active = int(row["active_frames"])
     source = np.asarray(source_float[start : start + active], dtype=np.float64)
-    slot = np.asarray(input_float[start:stop, channel], dtype=np.float64)
-    delay = _delay_samples(source, slot)
+    slot = _aligned_channel_view(
+        input_float[:, channel],
+        group=group,
+        alignment=alignment,
+        output_start=start,
+        output_stop=stop,
+    )
+    correlation_peak_delay = _delay_samples(source, slot)
+    # A colored duct response의 correlation argmax는 acoustic onset가 아니라 FIR의
+    # dominant peak다. Peak부터 자르면 그 이전 에너지가 non-causal loss가 된다.
+    # Compact plant와 같은 256-sample pre-roll을 보존해 causal safety FIR을 맞춘다.
+    delay = max(0, correlation_peak_delay - OPERATOR_PEAK_PRE_ROLL_SAMPLES)
     target_frames = active + OPERATOR_FIR_LENGTH - 1
     if delay + target_frames > slot.size:
         raise RecordingGainLinearityError(
@@ -682,7 +1509,11 @@ def _fit_compact_operator(
 
 
 def _complex_roundtrip(
-    target: np.ndarray, predicted: np.ndarray, bounds: tuple[float, float]
+    target: np.ndarray,
+    predicted: np.ndarray,
+    bounds: tuple[float, float],
+    *,
+    reference_target_norm: float | None = None,
 ) -> dict[str, Any]:
     if target.shape != predicted.shape or target.ndim != 1:
         raise RecordingGainLinearityError("operator round-trip shape 불일치")
@@ -704,16 +1535,31 @@ def _complex_roundtrip(
             abs(np.vdot(estimate, truth)) / (estimate_norm * truth_norm)
         )
         relative_error = float(np.linalg.norm(estimate - truth) / truth_norm)
-    passed = bool(
+    target_norm_ratio = (
+        1.0
+        if reference_target_norm is None
+        else truth_norm / max(float(reference_target_norm), np.finfo(np.float64).tiny)
+    )
+    relative_gate_applicable = bool(
+        reference_target_norm is None
+        or target_norm_ratio >= OPERATOR_RELATIVE_SUBBAND_MIN_NORM_RATIO
+    )
+    relative_gate_passed = bool(
         math.isfinite(agreement)
         and math.isfinite(relative_error)
         and agreement >= OPERATOR_MIN_COMPLEX_AGREEMENT
         and relative_error <= OPERATOR_MAX_RELATIVE_ERROR
     )
+    passed = bool(relative_gate_passed or not relative_gate_applicable)
     return {
         "band_hz": [float(bounds[0]), float(bounds[1])],
+        "target_spectrum_norm": truth_norm,
+        "target_norm_ratio_to_fullband": float(target_norm_ratio),
         "complex_agreement": agreement,
         "relative_error": relative_error,
+        "relative_gate_applicable": relative_gate_applicable,
+        "relative_gate_passed": relative_gate_passed,
+        "absolute_residual_bound_role": not relative_gate_applicable,
         "passed": passed,
     }
 
@@ -722,10 +1568,16 @@ def _operator_example_metrics(
     *, source: np.ndarray, target: np.ndarray, fir: np.ndarray
 ) -> dict[str, Any]:
     predicted = signal.fftconvolve(source, fir, mode="full")
+    fullband = _complex_roundtrip(target, predicted, ESS_BAND_HZ)
     rows = [
-        _complex_roundtrip(target, predicted, ESS_BAND_HZ),
+        fullband,
         *[
-            _complex_roundtrip(target, predicted, bounds)
+            _complex_roundtrip(
+                target,
+                predicted,
+                bounds,
+                reference_target_norm=float(fullband["target_spectrum_norm"]),
+            )
             for bounds in OPERATOR_SUBBANDS_HZ
         ],
     ]
@@ -747,9 +1599,13 @@ def _operator_example_metrics(
 
 
 def _build_safety_operators(
-    *, payload: Mapping[str, Any], source_float: np.ndarray, input_float: np.ndarray
+    *,
+    payload: Mapping[str, Any],
+    source_float: np.ndarray,
+    input_float: np.ndarray,
+    clock_alignment: Mapping[int, Mapping[str, Any]],
 ) -> tuple[dict[str, Any], list[str]]:
-    """독립 12k holdout을 포함한 ERR/REF source-gain 전용 operator를 만든다."""
+    """독립 6k holdout을 포함한 ERR/REF source-gain 전용 operator를 만든다."""
 
     ess_rows = {
         int(row["level_millionths"]): row
@@ -759,14 +1615,18 @@ def _build_safety_operators(
     if set(ess_rows) != set(LEVELS_MILLIONTHS):
         raise RecordingGainLinearityError("ESS level row 집합이 exact하지 않습니다")
     result: dict[str, Any] = {
-        "schema": "recording_gain_safety_operator/v2",
+        "schema": "recording_gain_safety_operator/v3_gainprobe006",
         "role": "source_gain_prediction_only_not_anc_plant_authority",
         "band_hz": list(ESS_BAND_HZ),
         "fit_levels_millionths": list(OPERATOR_FIT_LEVELS_MILLIONTHS),
         "holdout_level_millionths": OPERATOR_HOLDOUT_LEVEL_MILLIONTHS,
         "fir_length": OPERATOR_FIR_LENGTH,
+        "peak_pre_roll_samples": OPERATOR_PEAK_PRE_ROLL_SAMPLES,
         "minimum_complex_agreement": OPERATOR_MIN_COMPLEX_AGREEMENT,
         "maximum_relative_error": OPERATOR_MAX_RELATIVE_ERROR,
+        "relative_subband_minimum_target_norm_ratio": (
+            OPERATOR_RELATIVE_SUBBAND_MIN_NORM_RATIO
+        ),
         "channels": {},
     }
     reasons: list[str] = []
@@ -777,6 +1637,8 @@ def _build_safety_operators(
                 source_float=source_float,
                 row=ess_rows[level],
                 channel=channel,
+                group=payload["capture_groups"][LEVELS_MILLIONTHS.index(level)],
+                alignment=clock_alignment[LEVELS_MILLIONTHS.index(level)],
             )
             for level in LEVELS_MILLIONTHS
         }
@@ -876,6 +1738,112 @@ def _load_raw(
     return metadata, arrays, _file_ref(relative, snapshot)
 
 
+def _load_capture_publication(
+    *,
+    repo_root: Path,
+    publication_path: str,
+    expected_sha256: str,
+    raw_ref: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """외부 SHA와 sidecar bytes를 포함해 3-leaf 발행을 독립 검증한다."""
+
+    relative = _relative(
+        publication_path, label="gain-linearity capture publication path"
+    )
+    snapshot = _snapshot(
+        repo_root, relative, label="gain-linearity capture publication"
+    )
+    if snapshot.sha256 != _require_sha(
+        expected_sha256, label="capture publication expected SHA"
+    ):
+        raise RecordingGainLinearityError("capture publication 외부 SHA 불일치")
+    assert snapshot.data is not None
+    try:
+        value = json.loads(snapshot.data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RecordingGainLinearityError(
+            f"capture publication JSON 오류: {exc}"
+        ) from exc
+    if not isinstance(value, Mapping) or set(value) != _PUBLICATION_KEYS:
+        raise RecordingGainLinearityError("capture publication schema keys 불일치")
+    publication = dict(value)
+    seal = publication.pop("publication_payload_sha256", None)
+    if (
+        not isinstance(seal, str)
+        or _SHA_RE.fullmatch(seal) is None
+        or seal != _seal(publication)
+        or value.get("schema") != GAIN_LINEARITY_PUBLICATION_SCHEMA
+        or value.get("role")
+        != "held_directory_noreplace_raw_sidecar_binding"
+    ):
+        raise RecordingGainLinearityError("capture publication self-seal/schema 불일치")
+    session = _relative(
+        str(value.get("canonical_session_path", "")),
+        label="capture publication canonical session",
+    )
+    publication_expected_path = f"{session}/capture_publication.json"
+    if relative != publication_expected_path:
+        raise RecordingGainLinearityError("capture publication canonical sibling path 불일치")
+    raw_expected_path = f"{session}/raw_measurement.npz"
+    metadata_expected_path = f"{session}/metadata.json"
+    published_raw = value.get("raw")
+    published_metadata = value.get("metadata")
+    if (
+        not isinstance(published_raw, Mapping)
+        or set(published_raw) != _PUBLICATION_REF_KEYS
+        or not isinstance(published_metadata, Mapping)
+        or set(published_metadata) != _PUBLICATION_REF_KEYS
+    ):
+        raise RecordingGainLinearityError("capture publication file ref schema 불일치")
+    # Published inode는 원 장비 witness이고 현재 copy inode와 같을 필요가 없다.
+    normalized_raw = _portable_publication_ref(
+        published_raw, expected_path=raw_expected_path, label="published raw"
+    )
+    normalized_metadata = _portable_publication_ref(
+        published_metadata,
+        expected_path=metadata_expected_path,
+        label="published metadata",
+    )
+    if any(
+        normalized_raw[key] != raw_ref.get(key)
+        for key in ("path", "size", "sha256")
+    ):
+        raise RecordingGainLinearityError("capture publication raw binding 불일치")
+    metadata_snapshot = _snapshot(
+        repo_root, metadata_expected_path, label="gain-linearity metadata sidecar"
+    )
+    if (
+        int(metadata_snapshot.size) != normalized_metadata["size"]
+        or str(metadata_snapshot.sha256) != normalized_metadata["sha256"]
+    ):
+        raise RecordingGainLinearityError("capture publication metadata SHA/size 불일치")
+    assert metadata_snapshot.data is not None
+    try:
+        sidecar = json.loads(metadata_snapshot.data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RecordingGainLinearityError(
+            f"gain-linearity metadata sidecar JSON 오류: {exc}"
+        ) from exc
+    if sidecar != dict(metadata):
+        raise RecordingGainLinearityError("metadata sidecar와 embedded metadata 불일치")
+    if (
+        value.get("source_commit") != metadata.get("source_commit")
+        or value.get("repository_execution") != metadata.get("repository_execution")
+        or value.get("plan") != metadata.get("plan")
+    ):
+        raise RecordingGainLinearityError("capture publication authority binding 불일치")
+    return {
+        "file": _file_ref(relative, snapshot),
+        "metadata_file": {
+            "path": normalized_metadata["path"],
+            "size": normalized_metadata["size"],
+            "sha256": normalized_metadata["sha256"],
+        },
+        "payload": dict(value),
+    }
+
+
 def _validate_raw_authority_metadata(
     *,
     repo_root: Path,
@@ -906,6 +1874,8 @@ def _validate_raw_authority_metadata(
             saved_execution.get("repository_commit") != source_commit
             or saved_execution.get("repository_dirty") is not False
             or saved_execution.get("script_path") != GAIN_LINEARITY_SCRIPT_PATH
+            or not isinstance(saved_execution.get("repository_branch"), str)
+            or not saved_execution.get("repository_branch")
         ):
             reasons.append("repository_execution_identity")
         try:
@@ -915,7 +1885,15 @@ def _validate_raw_authority_metadata(
         except (OSError, RuntimeError, ValueError):
             reasons.append("repository_execution_current")
         else:
-            if dict(saved_execution) != current_execution:
+            # Raw는 Jetson의 named branch에서 캡처한 뒤 같은 exact commit의
+            # detached Elice checkout에서 독립 검증한다. branch 이름은 provenance
+            # 기록일 뿐 executable bytes의 identity가 아니므로 portable 비교에서
+            # 제외하고 commit/clean/script path+blob hash만 exact하게 묶는다.
+            portable_keys = _EXECUTION_KEYS - {"repository_branch"}
+            if set(current_execution) != _EXECUTION_KEYS or any(
+                saved_execution.get(key) != current_execution.get(key)
+                for key in portable_keys
+            ):
                 reasons.append("repository_execution_current")
 
     expected_frames = int(
@@ -965,6 +1943,35 @@ def _validate_raw_authority_metadata(
     return reasons
 
 
+def _finalize_gain_linearity_receipt(
+    *,
+    payload: Mapping[str, Any],
+    plan_ref: Mapping[str, Any],
+    raw_ref: Mapping[str, Any],
+    publication_ref: Mapping[str, Any] | None,
+    analysis: Mapping[str, Any],
+    reasons: list[str],
+) -> dict[str, Any]:
+    unique_reasons = list(dict.fromkeys(reasons))
+    receipt: dict[str, Any] = {
+        "schema": GAIN_LINEARITY_RECEIPT_SCHEMA,
+        "status": "PASS" if not unique_reasons else "FAIL",
+        "source_commit": payload["source_commit"],
+        "plan": dict(plan_ref),
+        "plan_payload_sha256": payload["plan_payload_sha256"],
+        "raw": dict(raw_ref),
+        "capture_publication": (
+            None if publication_ref is None else dict(publication_ref)
+        ),
+        "hardware": payload["hardware"],
+        "contract": payload["contract"],
+        "analysis": dict(analysis),
+        "failure_reasons": unique_reasons,
+    }
+    receipt["evidence_sha256"] = _seal(receipt)
+    return receipt
+
+
 def build_gain_linearity_receipt(
     *,
     repo_root: str | Path,
@@ -972,8 +1979,14 @@ def build_gain_linearity_receipt(
     expected_raw_sha256: str,
     plan_path: str,
     expected_plan_sha256: str,
+    publication_path: str | None = None,
+    expected_publication_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Raw/plan을 독립 재계산하고 PASS/FAIL receipt payload를 만든다."""
+    """Raw/plan/publication을 독립 재계산하고 PASS/FAIL receipt를 만든다.
+
+    Publication anchor가 없어도 forensic metrics는 계산하지만 canonical PASS는 절대
+    발급하지 않는다. 정상 CLI는 path와 외부 SHA를 모두 필수로 전달한다.
+    """
 
     root = Path(repo_root).resolve()
     plan = load_gain_linearity_plan(
@@ -985,6 +1998,29 @@ def build_gain_linearity_receipt(
     payload = plan["payload"]
     pcm = plan["pcm"]
     reasons: list[str] = []
+    authority_reasons: list[str] = []
+    publication_ref: dict[str, Any] | None = None
+    if publication_path is None and expected_publication_sha256 is None:
+        authority_reasons.append("capture_publication_missing")
+    elif publication_path is None or expected_publication_sha256 is None:
+        authority_reasons.append("capture_publication_anchor_incomplete")
+    else:
+        try:
+            publication = _load_capture_publication(
+                repo_root=root,
+                publication_path=publication_path,
+                expected_sha256=expected_publication_sha256,
+                raw_ref=raw_ref,
+                metadata=metadata,
+            )
+        except (OSError, RecordingGainLinearityError) as exc:
+            authority_reasons.append(f"capture_publication_invalid:{exc}")
+        else:
+            publication_ref = publication["file"]
+    if str(raw_ref.get("path", "")).startswith(
+        ".deep_anc_live_recovery_"
+    ):
+        authority_reasons.append("raw_recovery_only")
     if metadata.get("raw_capture_schema") != GAIN_LINEARITY_RAW_SCHEMA:
         reasons.append("raw_schema")
     expected_plan_ref = {
@@ -1031,7 +2067,20 @@ def build_gain_linearity_receipt(
     if not isinstance(telemetry, list) or len(telemetry) != len(payload["capture_groups"]):
         reasons.append("segment_telemetry_count")
     else:
+        previous_campaign_elapsed = -math.inf
         for item, group in zip(telemetry, payload["capture_groups"], strict=True):
+            expected_group_frames = int(group["stop_frame"]) - int(
+                group["start_frame"]
+            )
+            campaign_elapsed = item.get("live_campaign_elapsed_seconds")
+            output_elapsed = item.get("output_elapsed_seconds")
+            absolute_deadline = item.get("absolute_deadline_monotonic")
+            nominal_output = item.get("nominal_output_seconds")
+            hard_max_output = item.get("hard_max_output_seconds")
+            expected_nominal_seconds = expected_group_frames / float(SAMPLE_RATE)
+            expected_hard_seconds = expected_nominal_seconds + float(
+                payload["duration"]["per_stream_watchdog_grace_seconds"]
+            )
             if (
                 item.get("level_millionths") != group["level_millionths"]
                 or item.get("start_frame") != group["start_frame"]
@@ -1040,6 +2089,44 @@ def build_gain_linearity_receipt(
                 or int(item.get("xrun_count", -1)) != 0
                 or int(item.get("unexpected_status_count", -1)) != 0
                 or int(item.get("callback_status_count", -1)) != 0
+                or int(item.get("priming_output_count", -1)) != 0
+                or item.get("statuses") != []
+                or item.get("termination_signal") is not None
+                or int(item.get("captured_frames", -1)) != expected_group_frames
+                or isinstance(campaign_elapsed, bool)
+                or not isinstance(campaign_elapsed, (int, float))
+                or not math.isfinite(float(campaign_elapsed))
+                or not previous_campaign_elapsed < float(campaign_elapsed)
+                or float(campaign_elapsed)
+                > float(payload["duration"]["live_campaign_hard_deadline_seconds"])
+                or item.get("absolute_deadline_exceeded") is not False
+                or item.get("absolute_deadline_abort_error") is not None
+                or isinstance(absolute_deadline, bool)
+                or not isinstance(absolute_deadline, (int, float))
+                or not math.isfinite(float(absolute_deadline))
+                or isinstance(output_elapsed, bool)
+                or not isinstance(output_elapsed, (int, float))
+                or not math.isfinite(float(output_elapsed))
+                or float(output_elapsed) < 0.0
+                or float(output_elapsed) > expected_hard_seconds
+                or isinstance(nominal_output, bool)
+                or not isinstance(nominal_output, (int, float))
+                or not math.isfinite(float(nominal_output))
+                or not math.isclose(
+                    float(nominal_output),
+                    expected_nominal_seconds,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                or isinstance(hard_max_output, bool)
+                or not isinstance(hard_max_output, (int, float))
+                or not math.isfinite(float(hard_max_output))
+                or not math.isclose(
+                    float(hard_max_output),
+                    expected_hard_seconds,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
                 or item.get("callback_error") is not None
                 or item.get("stream_abort_error") is not None
                 or item.get("stream_close_error") is not None
@@ -1047,35 +2134,103 @@ def build_gain_linearity_receipt(
             ):
                 reasons.append("segment_telemetry_invalid")
                 break
+            try:
+                callback_summary = _load_callback_time_info(
+                    item.get("callback_time_info"),
+                    arrays,
+                    expected_frames=expected_group_frames,
+                )
+            except RecordingGainLinearityError:
+                reasons.append("callback_timebase_witness_invalid")
+                break
+            if int(item.get("callback_count", -1)) != int(
+                callback_summary["callback_count"]
+            ):
+                reasons.append("callback_metadata_raw_count_mismatch")
+                break
+            previous_campaign_elapsed = float(campaign_elapsed)
     if reasons or submitted is None or recorded is None:
         analysis: dict[str, Any] = {"rows": [], "failure_before_metrics": True}
     else:
         source_float = submitted[:, 0].astype(np.float64) / 32767.0
         input_float = recorded.astype(np.float64) / float(2**31)
-        first_ess = payload["layout"][0]
-        x0 = source_float[first_ess["start_frame"] : first_ess["active_stop_frame"]]
-        delays = {
-            name: _delay_samples(
-                x0,
-                input_float[
-                    first_ess["start_frame"] : first_ess["stop_frame"], channel
-                ],
+        try:
+            clock_alignment, clock_reasons = _group_clock_alignment(
+                payload=payload,
+                source_float=source_float,
+                input_float=input_float,
             )
-            for name, channel in (("err", 0), ("ref", 1))
-        }
+            reasons.extend(clock_reasons)
+        except RecordingGainLinearityError as exc:
+            reasons.append(f"clock_alignment_build:{exc}")
+            return _finalize_gain_linearity_receipt(
+                payload=payload,
+                plan_ref=plan["file"],
+                raw_ref=raw_ref,
+                publication_ref=publication_ref,
+                analysis={
+                    "rows": [],
+                    "clock_alignment": [],
+                    "safety_operator": None,
+                    "failure_before_metrics": True,
+                },
+                reasons=[*authority_reasons, *reasons],
+            )
         try:
             safety_operator, operator_reasons = _build_safety_operators(
                 payload=payload,
                 source_float=source_float,
                 input_float=input_float,
+                clock_alignment=clock_alignment,
             )
             reasons.extend(operator_reasons)
         except RecordingGainLinearityError as exc:
-            safety_operator = None
             reasons.append(f"safety_operator_build:{exc}")
+            return _finalize_gain_linearity_receipt(
+                payload=payload,
+                plan_ref=plan["file"],
+                raw_ref=raw_ref,
+                publication_ref=publication_ref,
+                analysis={
+                    "rows": [],
+                    "clock_alignment": [
+                        clock_alignment[index] for index in sorted(clock_alignment)
+                    ],
+                    "safety_operator": None,
+                    "failure_before_metrics": True,
+                },
+                reasons=[*authority_reasons, *reasons],
+            )
         rows: list[dict[str, Any]] = []
         ess_gain: dict[str, list[tuple[int, float]]] = {"err": [], "ref": []}
         peak_ratios: dict[str, list[float]] = {"err": [], "ref": []}
+        group_peaks: list[dict[str, Any]] = []
+        for group in payload["capture_groups"]:
+            group_start = int(group["start_frame"])
+            group_stop = int(group["stop_frame"])
+            level = int(group["level_millionths"])
+            item = {"level_millionths": level, "channels": {}}
+            for name, channel in (("err", 0), ("ref", 1)):
+                values = input_float[group_start:group_stop, channel]
+                peak = float(np.max(np.abs(values)))
+                clip_ratio = float(np.mean(np.abs(values) >= 0.999))
+                peak_ratios[name].append(peak / (level / 1_000_000.0))
+                item["channels"][name] = {
+                    "peak_linear": peak,
+                    "clip_ratio": clip_ratio,
+                }
+                if peak >= ADC_ABSOLUTE_PEAK_CEILING:
+                    reasons.append(f"{name}_group_absolute_peak_{level}")
+                if peak >= ADC_CERTIFICATION_PEAK:
+                    reasons.append(f"{name}_group_certification_peak_{level}")
+                if clip_ratio != 0.0:
+                    reasons.append(f"{name}_group_clip_{level}")
+            group_peaks.append(item)
+        group_by_level = {
+            int(group["level_millionths"]): (index, group)
+            for index, group in enumerate(payload["capture_groups"])
+        }
+        preflight_float = np.asarray(preflight, dtype=np.float64) / float(2**31)
         for row in payload["layout"]:
             start, stop = int(row["start_frame"]), int(row["stop_frame"])
             level = int(row["level_millionths"])
@@ -1086,10 +2241,10 @@ def build_gain_linearity_receipt(
                 "channels": {},
             }
             for name, channel in (("err", 0), ("ref", 1)):
+                group_index, group = group_by_level[level]
                 values = input_float[start:stop, channel]
                 peak = float(np.max(np.abs(values)))
                 clip_ratio = float(np.mean(np.abs(values) >= 0.999))
-                peak_ratios[name].append(peak / (level / 1_000_000.0))
                 item: dict[str, Any] = {
                     "peak_linear": peak,
                     "rms_dbfs": float(
@@ -1105,10 +2260,17 @@ def build_gain_linearity_receipt(
                     reasons.append(f"{name}_clip_{level}")
                 active = int(row["active_frames"])
                 drive = source_float[start : start + active]
-                delay = _delay_samples(drive, input_float[start:stop, channel])
+                aligned_slot = _aligned_channel_view(
+                    input_float[:, channel],
+                    group=group,
+                    alignment=clock_alignment[group_index],
+                    output_start=start,
+                    output_stop=min(stop, start + active + MAX_DELAY_SAMPLES),
+                )
+                delay = _delay_samples(drive, aligned_slot)
                 item["delay_samples"] = delay
                 if row["kind"] == "ESS":
-                    response = input_float[start + delay : start + delay + active, channel]
+                    response = aligned_slot[delay : delay + active]
                     rms = math.sqrt(float(np.mean(response**2)))
                     normalized = 20.0 * math.log10(max(rms, 1e-30)) - 20.0 * math.log10(
                         level / 1_000_000.0
@@ -1116,15 +2278,16 @@ def build_gain_linearity_receipt(
                     item["normalised_gain_db"] = float(normalized)
                     ess_gain[name].append((level, float(normalized)))
                 else:
-                    analysis_start = start + delay + int(
+                    analysis_start = delay + int(
                         round(IMD_ANALYSIS_START_SECONDS * SAMPLE_RATE)
                     )
                     analysis_stop = analysis_start + int(
                         round(IMD_ANALYSIS_SECONDS * SAMPLE_RATE)
                     )
                     distortion = _distortion_metrics(
-                        input_float[analysis_start:analysis_stop, channel],
+                        aligned_slot[analysis_start:analysis_stop],
                         tuple(float(v) for v in row["pair_hz"]),
+                        preflight_values=preflight_float[:, channel],
                     )
                     item.update(distortion)
                     if distortion["thd_dbc"] > THD_IMD_GATE_DBC:
@@ -1156,32 +2319,53 @@ def build_gain_linearity_receipt(
             )
             for name, value in ratio_upper.items()
         }
+        distortion_channels = [
+            channel
+            for row in rows
+            if row["kind"] == "IMD"
+            for channel in row["channels"].values()
+        ]
+        observable_distortion_rows = sum(
+            channel.get("observable") is True for channel in distortion_channels
+        )
         analysis = {
             "rows": rows,
-            "delay_samples": delays,
+            "group_peak_safety": group_peaks,
+            "clock_alignment": [clock_alignment[index] for index in sorted(clock_alignment)],
             "compression": compression,
             "peak_gain_upper_with_uncertainty": ratio_upper,
             "empirical_upper_amplitude_millionths": empirical_upper,
-            "supported_max_amplitude_millionths": min(empirical_upper.values()),
+            "tested_max_amplitude_millionths": LEVELS_MILLIONTHS[-1],
+            "supported_max_amplitude_millionths": min(
+                LEVELS_MILLIONTHS[-1], *empirical_upper.values()
+            ),
             "safety_operator": safety_operator,
             "safety_operator_is_anc_plant_authority": False,
+            # 이 probe의 낮은 acoustic level에서는 THD/IMD를 noise로부터 항상
+            # 분리할 수 없다. INCONCLUSIVE를 THD PASS로 승격하지 않는다. 대신
+            # independent 0.006 holdout과 induced/absolute residual을 포함한 operator가
+            # tested 범위의 ADC peak safety만 bound한다.
+            "distortion_certified": False,
+            "distortion_observability": {
+                "channel_row_count": len(distortion_channels),
+                "observable_channel_row_count": observable_distortion_rows,
+                "inconclusive_channel_row_count": (
+                    len(distortion_channels) - observable_distortion_rows
+                ),
+                "observable_rows_still_require_minus_30_dbc": True,
+                "inconclusive_is_not_thd_pass": True,
+            },
+            "physical_authority_scope": GAIN_LINEARITY_AUTHORITY_SCOPE,
             "failure_before_metrics": False,
         }
-    reasons = list(dict.fromkeys(reasons))
-    receipt: dict[str, Any] = {
-        "schema": GAIN_LINEARITY_RECEIPT_SCHEMA,
-        "status": "PASS" if not reasons else "FAIL",
-        "source_commit": payload["source_commit"],
-        "plan": plan["file"],
-        "plan_payload_sha256": payload["plan_payload_sha256"],
-        "raw": raw_ref,
-        "hardware": payload["hardware"],
-        "contract": payload["contract"],
-        "analysis": analysis,
-        "failure_reasons": reasons,
-    }
-    receipt["evidence_sha256"] = _seal(receipt)
-    return receipt
+    return _finalize_gain_linearity_receipt(
+        payload=payload,
+        plan_ref=plan["file"],
+        raw_ref=raw_ref,
+        publication_ref=publication_ref,
+        analysis=analysis,
+        reasons=[*authority_reasons, *reasons],
+    )
 
 
 def issue_gain_linearity_receipt(
@@ -1192,6 +2376,8 @@ def issue_gain_linearity_receipt(
     expected_raw_sha256: str,
     plan_path: str,
     expected_plan_sha256: str,
+    publication_path: str | None = None,
+    expected_publication_sha256: str | None = None,
 ) -> tuple[Path, str, dict[str, Any]]:
     root = Path(repo_root).resolve()
     relative = _relative(output_path, label="gain-linearity receipt path")
@@ -1201,6 +2387,8 @@ def issue_gain_linearity_receipt(
         expected_raw_sha256=expected_raw_sha256,
         plan_path=plan_path,
         expected_plan_sha256=expected_plan_sha256,
+        publication_path=publication_path,
+        expected_publication_sha256=expected_publication_sha256,
     )
     data = _pretty_json_bytes(payload)
     target = root / relative
@@ -1236,20 +2424,52 @@ def validate_gain_linearity_receipt(
     unsealed.pop("evidence_sha256", None)
     if not isinstance(seal, str) or seal != _seal(unsealed):
         raise RecordingGainLinearityError("gain-linearity receipt self-seal 불일치")
+    publication_ref = payload.get("capture_publication")
+    if publication_ref is not None and not isinstance(publication_ref, Mapping):
+        raise RecordingGainLinearityError("receipt capture_publication schema 불일치")
     rebuilt = build_gain_linearity_receipt(
         repo_root=root,
         raw_path=str(payload["raw"]["path"]),
         expected_raw_sha256=str(payload["raw"]["sha256"]),
         plan_path=str(payload["plan"]["path"]),
         expected_plan_sha256=str(payload["plan"]["sha256"]),
+        publication_path=(
+            None if publication_ref is None else str(publication_ref["path"])
+        ),
+        expected_publication_sha256=(
+            None if publication_ref is None else str(publication_ref["sha256"])
+        ),
     )
     if payload != rebuilt:
         raise RecordingGainLinearityError("gain-linearity receipt 독립 재계산 불일치")
+    capture_publication = None
+    capture_metadata = None
+    if publication_ref is not None:
+        metadata, _arrays, raw_ref = _load_raw(
+            repo_root=root,
+            raw_path=str(payload["raw"]["path"]),
+            expected_sha256=str(payload["raw"]["sha256"]),
+        )
+        publication = _load_capture_publication(
+            repo_root=root,
+            publication_path=str(publication_ref["path"]),
+            expected_sha256=str(publication_ref["sha256"]),
+            raw_ref=raw_ref,
+            metadata=metadata,
+        )
+        capture_publication = dict(publication["file"])
+        capture_metadata = dict(publication["metadata_file"])
+        if capture_publication != dict(publication_ref):
+            raise RecordingGainLinearityError(
+                "receipt/publication transfer ref가 독립 재검증과 다릅니다"
+            )
     return {
         "receipt_path": relative,
         "receipt_sha256": str(snapshot.sha256),
         "payload": payload,
         "passed": payload.get("status") == "PASS",
+        "capture_publication": capture_publication,
+        "capture_metadata": capture_metadata,
     }
 
 
@@ -1257,11 +2477,13 @@ __all__ = [
     "ADC_ABSOLUTE_PEAK_CEILING",
     "ADC_CERTIFICATION_PEAK",
     "GAIN_LINEARITY_PLAN_SCHEMA",
+    "GAIN_LINEARITY_PUBLICATION_SCHEMA",
     "GAIN_LINEARITY_RAW_SCHEMA",
     "GAIN_LINEARITY_RECEIPT_SCHEMA",
     "LEVELS_MILLIONTHS",
     "PREDICTIVE_STOP_PEAK",
     "RecordingGainLinearityError",
+    "build_gain_linearity_capture_publication_payload",
     "build_gain_linearity_plan",
     "build_gain_linearity_receipt",
     "issue_gain_linearity_receipt",

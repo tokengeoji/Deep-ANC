@@ -48,10 +48,12 @@ from deep_anc.data.recording_level_campaign import (
     validate_recording_level_source_gain_session_binding,
 )
 from deep_anc.data.recording_source_gain import (
+    PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS,
     RecordingSourceGainError,
     validate_recording_source_gain_plan,
 )
 from deep_anc.data.recording_gain_linearity import (
+    GAIN_LINEARITY_AUTHORITY_SCOPE,
     RecordingGainLinearityError,
     validate_gain_linearity_receipt,
 )
@@ -66,6 +68,7 @@ from deep_anc.data.recorded_dns_selection import (
     DNS_COMPOSITE_SECONDS,
     DNS_REPEAT_COUNT,
     DNS_SELECTION_RECEIPT,
+    DNS_SELECTION_GENERATION_ID,
     DNS_SOURCE_KIND,
     DNS_TRANSFORM,
     DNSSelectionError,
@@ -297,6 +300,7 @@ CANONICAL_EXTERNAL_ESC_OUTPUT_NAMES = {
 ADDITION_LINEAGE_SCHEMA = "exact_collection_plan/v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GENERATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
+CANONICAL_GENERATION_ID = DNS_SELECTION_GENERATION_ID
 
 
 class RecordedGenerationError(ValueError):
@@ -331,10 +335,20 @@ def _generation_id(value: object) -> str:
     return value
 
 
-def validate_generation_id(value: object) -> str:
-    """CLI와 builder가 공유하는 recorded generation 식별자 검증."""
+def _canonical_generation_id(value: object) -> str:
+    generation_id = _generation_id(value)
+    if generation_id != CANONICAL_GENERATION_ID:
+        raise RecordedGenerationError(
+            "현행 exact source plan generation-id이자 recorded generation-id는 "
+            f"{CANONICAL_GENERATION_ID!r}입니다: actual={generation_id!r}"
+        )
+    return generation_id
 
-    return _generation_id(value)
+
+def validate_generation_id(value: object) -> str:
+    """CLI와 builder가 공유하는 현행 exact recorded generation 식별자 검증."""
+
+    return _canonical_generation_id(value)
 
 
 def _relative(value: object, *, field: str, prefix: str | None = None) -> str:
@@ -1002,7 +1016,7 @@ def _canonical_source_selection_evidence(
 
     payload = {
         "schema": SOURCE_SELECTION_CONTRACT_SCHEMA,
-        "generation_id": "stage1-coverage-v3-gain012",
+        "generation_id": DNS_SELECTION_GENERATION_ID,
         "strict_primary": _file_ref(primary, repo_root=repo_root),
         "algorithm": {
             "source_population": "full_source_pool_160_authority_DSU",
@@ -1166,10 +1180,34 @@ def _validate_addition_population(rows: list[dict[str, Any]]) -> None:
         )
 
 
-def _read_source_plan(
-    *, repo_root: Path, relative: str, require_source_files: bool
+def validate_recorded_source_plan_candidate(
+    *,
+    repo_root: Path,
+    candidate_relative: str,
+    canonical_relative: str,
+    require_source_files: bool,
 ) -> tuple[FileSnapshot, list[dict[str, Any]], str, dict[str, Any]]:
-    snapshot = _snapshot(repo_root, relative, label="recorded additions source plan", capture_bytes=True)
+    """Staging bytes를 canonical 경로 의미로 검증하되 권위로 발행하지 않는다.
+
+    Builder의 ``--check-only``/``--write``는 아직 canonical leaf가 존재하지 않는
+    상태에서 후보 bytes를 먼저 완전히 검증해야 한다. 따라서 읽는 물리 경로와 CSV가
+    선언하는 논리 generation 경로를 분리한다. 논리 경로는 현행 canonical exact 값으로
+    고정하며, 반환 snapshot은 staging 파일을 가리킨다. 이 함수 자체는 파일을 이동하거나
+    canonical authority를 발행하지 않는다.
+    """
+
+    expected_relative = f"{SOURCE_PLAN_ROOT}/{CANONICAL_GENERATION_ID}.csv"
+    if canonical_relative != expected_relative:
+        raise RecordedGenerationError(
+            "현행 exact recorded additions source plan 경로가 아닙니다: "
+            f"expected={expected_relative!r}, actual={canonical_relative!r}"
+        )
+    snapshot = _snapshot(
+        repo_root,
+        candidate_relative,
+        label="recorded additions source plan candidate",
+        capture_bytes=True,
+    )
     assert snapshot.data is not None
     try:
         handle = io.StringIO(snapshot.data.decode("utf-8"), newline="")
@@ -1234,7 +1272,7 @@ def _read_source_plan(
     lineages: set[str] = set()
     source_hashes: set[str] = set()
     used_authority_tokens: set[str] = set()
-    generation_id = Path(relative).stem
+    generation_id = _canonical_generation_id(Path(canonical_relative).stem)
     for offset, raw in enumerate(raw_rows, start=2):
         try:
             source_kind = str(raw["source_kind"])
@@ -1860,6 +1898,19 @@ def _read_source_plan(
     )
 
 
+def _read_source_plan(
+    *, repo_root: Path, relative: str, require_source_files: bool
+) -> tuple[FileSnapshot, list[dict[str, Any]], str, dict[str, Any]]:
+    """이미 발행된 canonical source-plan leaf만 읽는다."""
+
+    return validate_recorded_source_plan_candidate(
+        repo_root=repo_root,
+        candidate_relative=relative,
+        canonical_relative=relative,
+        require_source_files=require_source_files,
+    )
+
+
 def _session_file_evidence(session_dir: Path, *, repo_root: Path) -> dict[str, object]:
     tree = snapshot_regular_tree_metadata(
         session_dir, repo_root=repo_root, label=f"recorded addition {session_dir.name}"
@@ -1952,6 +2003,8 @@ def _validate_recording_level_binding(
     gain_linearity_receipt_ref = None
     gain_linearity_plan_ref = None
     gain_linearity_raw_ref = None
+    gain_linearity_metadata_ref = None
+    gain_linearity_publication_ref = None
     try:
         campaign = validate_recording_level_campaign(
             repo_root=repo_root,
@@ -2001,6 +2054,10 @@ def _validate_recording_level_binding(
             gain_payload = gain_summary["payload"]
             gain_linearity_plan_ref = gain_payload.get("plan")
             gain_linearity_raw_ref = gain_payload.get("raw")
+            gain_linearity_metadata_ref = gain_summary.get("capture_metadata")
+            gain_linearity_publication_ref = gain_summary.get(
+                "capture_publication"
+            )
             actual_rendered = rendered_source_level_evidence_v2(
                 rendered_source,
                 amplitude_millionths=int(
@@ -2097,12 +2154,22 @@ def _validate_recording_level_binding(
             or set(gain_linearity_plan_ref) != {"path", "size", "sha256"}
             or not isinstance(gain_linearity_raw_ref, dict)
             or set(gain_linearity_raw_ref) != {"path", "size", "sha256"}
+            or not isinstance(gain_linearity_metadata_ref, dict)
+            or set(gain_linearity_metadata_ref) != {"path", "size", "sha256"}
+            or not isinstance(gain_linearity_publication_ref, dict)
+            or set(gain_linearity_publication_ref)
+            != {"path", "size", "sha256"}
         ):
             raise RecordedGenerationError(
-                f"추가 session v2 gain plan/raw refs가 불완전합니다: {session_dir}"
+                "추가 session v2 gain plan/raw/metadata/publication refs가 "
+                f"불완전합니다: {session_dir}"
             )
         result["gain_linearity_plan"] = dict(gain_linearity_plan_ref)
         result["gain_linearity_raw"] = dict(gain_linearity_raw_ref)
+        result["gain_linearity_metadata"] = dict(gain_linearity_metadata_ref)
+        result["gain_linearity_publication"] = dict(
+            gain_linearity_publication_ref
+        )
     return result
 
 
@@ -2336,6 +2403,7 @@ def _validate_additions(
     combined_manifest_path: Path,
     require_source_files: bool,
 ) -> tuple[dict[str, object], list[dict[str, Any]]]:
+    generation_id = _canonical_generation_id(generation_id)
     expected_root = f"{ADDITIONS_ROOT}/{generation_id}"
     expected_plan = f"{SOURCE_PLAN_ROOT}/{generation_id}.csv"
     if additions_root != expected_root or source_plan != expected_plan:
@@ -2695,7 +2763,7 @@ def build_recorded_generation_payload(
     """이미 no-replace 발행된 combined manifest로 generation payload를 유도한다."""
 
     root = Path(os.path.abspath(repo_root))
-    generation = _generation_id(generation_id)
+    generation = _canonical_generation_id(generation_id)
     directory = f"{GENERATION_ROOT}/{generation}"
     combined_relative = f"{directory}/recorded.jsonl"
     combined_path = root / combined_relative
@@ -2784,7 +2852,7 @@ def build_combined_manifest_bytes(
     """parent와 additions 증거에서만 combined JSONL bytes를 만든다."""
 
     root = Path(os.path.abspath(repo_root))
-    generation = _generation_id(generation_id)
+    generation = _canonical_generation_id(generation_id)
     combined_path = root / GENERATION_ROOT / generation / "recorded.jsonl"
     _parent, parent_entries = _parent_summary(
         repo_root=root,
@@ -2847,7 +2915,7 @@ def validate_recorded_generation(
         or payload.get("schema_version") != RECORDED_GENERATION_SCHEMA_VERSION
     ):
         raise RecordedGenerationError("recorded generation schema_version은 1이어야 합니다")
-    generation = _generation_id(payload.get("generation_id"))
+    generation = _canonical_generation_id(payload.get("generation_id"))
     expected_path = root / GENERATION_ROOT / generation / "generation.json"
     if Path(os.path.abspath(snapshot.path)) != Path(os.path.abspath(expected_path)):
         raise RecordedGenerationError(
@@ -2893,7 +2961,7 @@ def validate_recorded_generation(
 def _expected_recording_amplitude(
     metadata: dict[str, Any], *, session_dir: Path
 ) -> float:
-    """Legacy .06 또는 v2 session binding의 exact measured-domain gain을 반환한다."""
+    """Legacy .06 또는 현행 dynamic binding의 exact measured-domain gain을 반환한다."""
 
     level_binding = metadata.get("recording_level_binding")
     if (
@@ -2907,18 +2975,32 @@ def _expected_recording_amplitude(
             if isinstance(embedded_gain, dict)
             else None
         )
+        supported_max = (
+            embedded_gain.get("supported_max_amplitude_millionths")
+            if isinstance(embedded_gain, dict)
+            else None
+        )
         if (
             isinstance(millionths, bool)
             or not isinstance(millionths, int)
-            or not 1 <= millionths <= 12_000
+            or isinstance(supported_max, bool)
+            or not isinstance(supported_max, int)
+            or not 1
+            <= millionths
+            <= supported_max
+            <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
+            or embedded_gain.get("distortion_certified") is not False
+            or embedded_gain.get("physical_authority_scope")
+            != GAIN_LINEARITY_AUTHORITY_SCOPE
         ):
             raise RecordedGenerationError(
-                f"추가 session v2 amplitude_millionths가 유효하지 않습니다: {session_dir}"
+                "추가 session dynamic amplitude_millionths가 유효하지 않습니다: "
+                f"{session_dir}"
             )
         return millionths / 1_000_000.0
     if metadata.get("plant_domain") == "current_strict":
         raise RecordedGenerationError(
-            "current_strict addition에는 v2 recording_level_binding/source-gain "
+            "current_strict addition에는 현행 dynamic recording_level_binding/source-gain "
             f"authority가 필수입니다: {session_dir}"
         )
     return CANONICAL_RECORDING_AMPLITUDE

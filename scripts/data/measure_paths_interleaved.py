@@ -61,6 +61,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -100,7 +101,6 @@ from deep_anc.dsp.measurement_level import (  # noqa: E402
     load_measurement_level_evidence,
     measurement_hardware_identity,
     repository_audio_lock,
-    scoped_live_audio_signal_handlers,
     validate_bootstrap_meter_raw,
     validate_measurement_hardware_contract,
 )
@@ -824,7 +824,11 @@ def defer_termination_signals_during_raw_commit():
 
     watched = tuple(
         value
-        for value in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None))
+        for value in (
+            getattr(signal, "SIGINT", None),
+            getattr(signal, "SIGTERM", None),
+            getattr(signal, "SIGHUP", None),
+        )
         if value is not None
     )
     previous = {value: signal.getsignal(value) for value in watched}
@@ -864,6 +868,70 @@ class PartialCaptureError(RuntimeError):
         self.output_pcm = output_pcm
         self.telemetry = telemetry
         super().__init__(f"{type(cause).__name__}: {cause}")
+
+
+class _CaptureCleanupSignalGuard:
+    """Live 중에는 즉시 중단하고 cleanup 중에는 종료 신호를 queue한다.
+
+    ``scoped_live_audio_signal_handlers``를 stream body에만 쓰면 그 context가 기존
+    handler를 복원한 직후 ``abort()/close()``에 도달하기 전의 작은 구간이 남는다.
+    그 구간의 SIGINT/SIGTERM/SIGHUP가 cleanup 자체를 건너뛰지 않도록 동일 handler를
+    stream body부터 cleanup 완료까지 유지한다.
+    """
+
+    def __init__(self) -> None:
+        self._watched = tuple(
+            value
+            for value in (
+                getattr(signal, "SIGINT", None),
+                getattr(signal, "SIGTERM", None),
+                getattr(signal, "SIGHUP", None),
+            )
+            if value is not None
+        )
+        self._previous: dict[int, Any] = {}
+        self._pending: list[int] = []
+        self._cleanup_mode = False
+        self._installed = False
+
+    def install(self) -> None:
+        if self._installed:
+            raise RuntimeError("capture cleanup signal guard가 이미 설치됐습니다")
+        self._previous = {
+            int(value): signal.getsignal(value) for value in self._watched
+        }
+
+        def handle(signum: int, _frame: Any) -> None:
+            self._pending.append(int(signum))
+            if self._cleanup_mode:
+                return
+            # 첫 live 종료 신호가 cleanup 진입을 유발한 뒤 이어지는 신호가 그
+            # cleanup을 다시 끊지 못하게 raise보다 먼저 mode를 바꾼다.
+            self._cleanup_mode = True
+            raise LiveAudioTermination(int(signum))
+
+        try:
+            for value in self._watched:
+                signal.signal(value, handle)
+        except BaseException:
+            for value, previous in self._previous.items():
+                signal.signal(value, previous)
+            raise
+        self._installed = True
+
+    def defer_for_cleanup(self) -> None:
+        self._cleanup_mode = True
+
+    @property
+    def pending_signal(self) -> int | None:
+        return None if not self._pending else int(self._pending[0])
+
+    def close(self) -> None:
+        if not self._installed:
+            return
+        for value, previous in self._previous.items():
+            signal.signal(value, previous)
+        self._installed = False
 
 
 _CaptureResult = TypeVar("_CaptureResult")
@@ -908,18 +976,24 @@ def announce_speaker_disconnect(*, output_stop_confirmed: bool = True) -> None:
 
 def capture_with_speaker_release_notice(
     capture: Callable[[], _CaptureResult],
+    *,
+    before_notice: Callable[[], None] | None = None,
 ) -> _CaptureResult:
     """성공/실패 모두 스트림 반환 직후 분리 안내를 보장한다."""
 
     try:
         result = capture()
     except BaseException as exc:
+        if before_notice is not None:
+            before_notice()
         confirmed = not (
             isinstance(exc, PartialCaptureError)
             and exc.telemetry.get("output_stop_confirmed") is False
         )
         announce_speaker_disconnect(output_stop_confirmed=confirmed)
         raise
+    if before_notice is not None:
+        before_notice()
     announce_speaker_disconnect(output_stop_confirmed=True)
     return result
 
@@ -936,6 +1010,9 @@ def capture_measurement_preserving_partial(
     meter_completed_at_utc: dt.datetime | None = None,
     pre_open_check: Callable[[], None] | None = None,
     record_callback_time_info: bool = False,
+    absolute_deadline_monotonic: float | None = None,
+    monotonic_function: Callable[[], float] = time.monotonic,
+    on_output_cleanup_complete: Callable[[], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """interleaved 전용 full-duplex; 실패도 partial arrays/telemetry를 surface한다."""
 
@@ -968,11 +1045,25 @@ def capture_measurement_preserving_partial(
         "hard_max_output_seconds": (
             total / float(fs) + LIVE_WATCHDOG_GRACE_SECONDS
         ),
+        "absolute_deadline_monotonic": absolute_deadline_monotonic,
+        "absolute_deadline_exceeded": False,
+        "absolute_deadline_abort_error": None,
     }
+    if absolute_deadline_monotonic is not None and (
+        not np.isfinite(float(absolute_deadline_monotonic))
+    ):
+        raise ValueError("absolute audio deadline은 finite여야 합니다")
 
     def callback(indata, outdata, frames, _time_info, status):
         outdata.fill(0)
         try:
+            if watchdog_expired.is_set() or (
+                absolute_deadline_monotonic is not None
+                and float(monotonic_function())
+                >= float(absolute_deadline_monotonic)
+            ):
+                telemetry["absolute_deadline_exceeded"] = True
+                raise RuntimeError("absolute audio deadline 이후 callback 차단")
             telemetry["callback_count"] += 1
             timing_index = int(telemetry["callback_count"]) - 1
             if record_callback_time_info:
@@ -1026,11 +1117,49 @@ def capture_measurement_preserving_partial(
 
     stream = None
     failure: BaseException | None = None
-    call_started = time.monotonic()
+    call_started = float(monotonic_function())
     stream_started: float | None = None
     deadline: float | None = None
+    watchdog_stop = threading.Event()
+    watchdog_expired = threading.Event()
+    stream_holder: dict[str, Any | None] = {"stream": None}
+    watchdog_thread: threading.Thread | None = None
+
+    def absolute_watchdog() -> None:
+        assert absolute_deadline_monotonic is not None
+        while not watchdog_stop.is_set():
+            remaining = float(absolute_deadline_monotonic) - float(
+                monotonic_function()
+            )
+            if remaining <= 0.0:
+                telemetry["absolute_deadline_exceeded"] = True
+                watchdog_expired.set()
+                active_stream = stream_holder["stream"]
+                if active_stream is not None:
+                    try:
+                        active_stream.abort()
+                    except BaseException as exc:  # pragma: no cover - backend specific
+                        telemetry["absolute_deadline_abort_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                return
+            watchdog_stop.wait(min(remaining, 0.01))
+
+    cleanup_signal_guard = _CaptureCleanupSignalGuard()
+    cleanup_signal_guard.install()
+    if absolute_deadline_monotonic is not None:
+        watchdog_thread = threading.Thread(
+            target=absolute_watchdog,
+            name="deep-anc-absolute-audio-watchdog",
+            daemon=True,
+        )
+        try:
+            watchdog_thread.start()
+        except BaseException:
+            cleanup_signal_guard.close()
+            raise
     try:
-        with scoped_live_audio_signal_handlers():
+        try:
             if meter_completed_at_utc is not None:
                 now_utc = dt.datetime.now(dt.timezone.utc)
                 completed = meter_completed_at_utc.astimezone(dt.timezone.utc)
@@ -1045,6 +1174,12 @@ def capture_measurement_preserving_partial(
                     )
             if pre_open_check is not None:
                 pre_open_check()
+            if watchdog_expired.is_set() or (
+                absolute_deadline_monotonic is not None
+                and float(monotonic_function()) >= float(absolute_deadline_monotonic)
+            ):
+                telemetry["absolute_deadline_exceeded"] = True
+                raise TimeoutError("audio absolute deadline 전에 stream을 열지 못했습니다")
             stream = sd.Stream(
                 samplerate=fs,
                 blocksize=block_size,
@@ -1055,78 +1190,151 @@ def capture_measurement_preserving_partial(
                 callback=callback,
                 prime_output_buffers_using_stream_callback=True,
             )
+            stream_holder["stream"] = stream
+            if watchdog_expired.is_set() or (
+                absolute_deadline_monotonic is not None
+                and float(monotonic_function()) >= float(absolute_deadline_monotonic)
+            ):
+                telemetry["absolute_deadline_exceeded"] = True
+                raise TimeoutError("audio absolute deadline 뒤 stream start를 금지합니다")
+            # start()가 callback을 실행한 채 block하는 시간도 output elapsed와
+            # absolute watchdog에 포함한다. start 반환 뒤 새 기준시각을 만들지 않는다.
+            stream_started = float(monotonic_function())
             stream.start()
-            stream_started = time.monotonic()
             telemetry["stream_started_at_utc"] = dt.datetime.now(
                 dt.timezone.utc
             ).isoformat()
             deadline = stream_started + total / fs + LIVE_WATCHDOG_GRACE_SECONDS
+            if absolute_deadline_monotonic is not None:
+                deadline = min(deadline, float(absolute_deadline_monotonic))
+            if watchdog_expired.is_set() or float(monotonic_function()) >= deadline:
+                telemetry["absolute_deadline_exceeded"] = bool(
+                    absolute_deadline_monotonic is not None
+                    and float(monotonic_function())
+                    >= float(absolute_deadline_monotonic)
+                )
+                raise TimeoutError("오디오 start가 hard deadline을 넘었습니다")
             while not telemetry["completed"]:
                 if telemetry["callback_error"] is not None:
                     raise RuntimeError(f"오디오 콜백 실패: {telemetry['callback_error']}")
-                if time.monotonic() >= deadline:
+                if watchdog_expired.is_set() or float(monotonic_function()) >= deadline:
+                    telemetry["absolute_deadline_exceeded"] = bool(
+                        absolute_deadline_monotonic is not None
+                        and float(monotonic_function())
+                        >= float(absolute_deadline_monotonic)
+                    )
                     raise TimeoutError("오디오 hard-max watchdog을 넘었습니다")
                 time.sleep(0.01)
-    except LiveAudioTermination as exc:
-        telemetry["termination_signal"] = int(exc.signum)
-        failure = exc
-    except BaseException as exc:
-        failure = exc
+        except LiveAudioTermination as exc:
+            telemetry["termination_signal"] = int(exc.signum)
+            failure = exc
+        except BaseException as exc:
+            failure = exc
+        finally:
+            # 이 뒤에는 callback/nonzero output을 다시 시작하지 않는다. stream
+            # cleanup과 partial-array surface가 끝날 때까지 종료 신호는 queue-only다.
+            cleanup_signal_guard.defer_for_cleanup()
 
-    abort_error: BaseException | None = None
-    close_error: BaseException | None = None
-    if stream is not None:
+        cleanup_stage_error: BaseException | None = None
         try:
-            stream.abort()
+            capture_finished = float(monotonic_function())
+            watchdog_stop.set()
+            if watchdog_thread is not None:
+                watchdog_thread.join(timeout=1.0)
+                if watchdog_thread.is_alive():
+                    telemetry["absolute_deadline_abort_error"] = (
+                        "RuntimeError: absolute watchdog thread join timeout"
+                    )
         except BaseException as exc:
-            abort_error = exc
-        try:
-            stream.close()
-        except BaseException as exc:
-            close_error = exc
-    telemetry["stream_abort_error"] = (
-        None if abort_error is None else f"{type(abort_error).__name__}: {abort_error}"
-    )
-    telemetry["stream_close_error"] = (
-        None if close_error is None else f"{type(close_error).__name__}: {close_error}"
-    )
-    # close가 실패하면 abort 성공 여부와 관계없이 PortAudio/driver의 최종 상태를
-    # 확인할 수 없다. 성공처럼 안내하거나 telemetry를 삼키지 않는다.
-    telemetry["output_stop_confirmed"] = bool(
-        stream is None or close_error is None
-    )
-    telemetry["captured_frames"] = int(cursor["frames"])
-    if record_callback_time_info:
-        count = int(telemetry["callback_count"])
-        telemetry["callback_time_info"] = {
-            name: np.asarray(values[:count]).copy()
-            for name, values in timing_arrays.items()
-        }
-    telemetry["elapsed_seconds"] = float(time.monotonic() - call_started)
-    telemetry["output_elapsed_seconds"] = (
-        None
-        if stream_started is None
-        else float(time.monotonic() - stream_started)
-    )
-    cleanup_failures = [
-        value for value in (abort_error, close_error) if value is not None
-    ]
-    if failure is not None or cleanup_failures:
-        details: list[str] = []
-        if failure is not None:
-            details.append(f"capture={type(failure).__name__}: {failure}")
-        if abort_error is not None:
-            details.append(f"abort={type(abort_error).__name__}: {abort_error}")
-        if close_error is not None:
-            details.append(f"close={type(close_error).__name__}: {close_error}")
-        cause = RuntimeError("; ".join(details))
-        raise PartialCaptureError(
-            cause,
-            recorded_raw=recorded_raw,
-            output_pcm=output_pcm,
-            telemetry=telemetry,
-        ) from failure
-    return recorded_raw, output_pcm, telemetry
+            # 보조 cleanup이 실패해도 abort/close는 반드시 시도한다.
+            cleanup_stage_error = exc
+            capture_finished = float(call_started)
+            watchdog_stop.set()
+
+        abort_error: BaseException | None = None
+        close_error: BaseException | None = None
+        if stream is not None:
+            try:
+                stream.abort()
+            except BaseException as exc:
+                abort_error = exc
+            try:
+                stream.close()
+            except BaseException as exc:
+                close_error = exc
+        telemetry["stream_abort_error"] = (
+            None
+            if abort_error is None
+            else f"{type(abort_error).__name__}: {abort_error}"
+        )
+        telemetry["stream_close_error"] = (
+            None
+            if close_error is None
+            else f"{type(close_error).__name__}: {close_error}"
+        )
+        # close가 실패하면 abort 성공 여부와 관계없이 PortAudio/driver의 최종 상태를
+        # 확인할 수 없다. 성공처럼 안내하거나 telemetry를 삼키지 않는다.
+        telemetry["output_stop_confirmed"] = bool(
+            stream is None or close_error is None
+        )
+        telemetry["captured_frames"] = int(cursor["frames"])
+        if record_callback_time_info:
+            count = int(telemetry["callback_count"])
+            telemetry["callback_time_info"] = {
+                name: np.asarray(values[:count]).copy()
+                for name, values in timing_arrays.items()
+            }
+        if cleanup_stage_error is not None and failure is None:
+            failure = cleanup_stage_error
+        telemetry["elapsed_seconds"] = float(monotonic_function() - call_started)
+        telemetry["output_elapsed_seconds"] = (
+            None
+            if stream_started is None
+            else float(capture_finished - stream_started)
+        )
+        if on_output_cleanup_complete is not None:
+            try:
+                on_output_cleanup_complete()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        # gainprobe raw-first caller는 위 callback에서 자신의 handler를 queue-only로
+        # 바꾼다. 그 뒤 local handler를 복원해야 return/PartialCaptureError 경계에도
+        # 종료 신호가 raw commit을 건너뛰지 않는다.
+        cleanup_signal_guard.close()
+        if cleanup_signal_guard.pending_signal is not None:
+            signum = int(cleanup_signal_guard.pending_signal)
+            telemetry["termination_signal"] = signum
+            if failure is None:
+                failure = LiveAudioTermination(signum)
+        cleanup_failures = [
+            value
+            for value in (cleanup_stage_error, abort_error, close_error)
+            if value is not None
+        ]
+        if failure is not None or cleanup_failures:
+            details: list[str] = []
+            if failure is not None:
+                details.append(f"capture={type(failure).__name__}: {failure}")
+            if cleanup_stage_error is not None:
+                details.append(
+                    "cleanup="
+                    f"{type(cleanup_stage_error).__name__}: {cleanup_stage_error}"
+                )
+            if abort_error is not None:
+                details.append(f"abort={type(abort_error).__name__}: {abort_error}")
+            if close_error is not None:
+                details.append(f"close={type(close_error).__name__}: {close_error}")
+            cause = RuntimeError("; ".join(details))
+            raise PartialCaptureError(
+                cause,
+                recorded_raw=recorded_raw,
+                output_pcm=output_pcm,
+                telemetry=telemetry,
+            ) from failure
+        return recorded_raw, output_pcm, telemetry
+    finally:
+        cleanup_signal_guard.close()
 
 
 def write_immutable_raw_capture_atomic(
@@ -2097,6 +2305,13 @@ def capture_telemetry_invalid_reasons(telemetry: dict[str, Any]) -> list[str]:
         reasons.append(f"stream_close_error_{telemetry['stream_close_error']}")
     if telemetry.get("output_stop_confirmed") is False:
         reasons.append("output_stop_unconfirmed")
+    if telemetry.get("absolute_deadline_exceeded") is True:
+        reasons.append("absolute_audio_deadline_exceeded")
+    if telemetry.get("absolute_deadline_abort_error"):
+        reasons.append(
+            "absolute_deadline_abort_error_"
+            f"{telemetry['absolute_deadline_abort_error']}"
+        )
     if not telemetry.get("completed"):
         reasons.append("capture_incomplete")
     return reasons

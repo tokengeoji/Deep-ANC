@@ -27,6 +27,7 @@ def _write_case(
     *,
     control_leak: bool = False,
     fallback_silence_blocks: int = 0,
+    engine_error_blocks: int = 0,
     include_time_domains: bool = True,
     maximum_input_backlog_samples: int = causal_v4.BLOCK,
     maximum_output_backlog_samples: int = causal_v4.BLOCK,
@@ -103,6 +104,7 @@ def _write_case(
         "runtime_counters_final": {
             "xrun_count": 0,
             "deadline_miss_count": 0,
+            "engine_error_blocks": engine_error_blocks,
             "input_ring_drop_samples": 0,
             "output_ring_drop_samples": 0,
             "input_ring_overrun_blocks": 0,

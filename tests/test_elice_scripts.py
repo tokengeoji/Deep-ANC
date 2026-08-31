@@ -207,7 +207,8 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert "minimum_mib = 79 * 1024" in text
     assert "minimum_total_bytes=$((128 * 1024 * 1024 * 1024 - 128 * 1024 * 1024))" in text
     assert "minimum_available_bytes=$((96 * 1024 * 1024 * 1024))" in text
-    assert "public corpus가 이미 완전하므로 재개 시 96GiB staging 예산 검사를 건너뜁니다" in text
+    assert "minimum_available_bytes=$((72 * 1024 * 1024 * 1024))" in text
+    assert "public corpus가 이미 완전하므로 재개 시 ${minimum_available_gib}GiB 초기 예산 검사를 건너뜁니다" in text
     assert 'df -B1 --output=size,avail "$REPO"' in text
     assert 'str(torch.__version__) != "2.5.1+cu121"' in text
     assert 'str(torch.version.cuda) != "12.1"' in text
@@ -218,7 +219,8 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     assert "기존 exact 환경을 재사용하고 freeze를 expected commit에 갱신했습니다" in text
     assert 'BOOTSTRAP_RECEIPT="$REPO/data/manifests/elice_bootstrap_receipt.json"' in text
     assert '"recorded_aggregate_sha256": summary["recorded_aggregate_sha256"]' in text
-    assert '"schema_version": 2' in text
+    assert '"schema_version": 3' in text
+    assert '"archive_cache_consumption": archive_cache_binding' in text
     assert '"recorded_subband_coverage": {' in text
     assert '"coverage_contract_sha256": coverage_payload[' in text
     assert '"freeze_receipt_sha256": environment.sha256' in text
@@ -738,6 +740,15 @@ def _make_bootstrap_git_repo(tmp_path: Path) -> tuple[Path, str]:
         "def test_bootstrap_positive():\n    pass\n",
         encoding="utf-8",
     )
+    archive_cache_cli = root / "scripts/elice/public_archive_cache.py"
+    archive_cache_cli.parent.mkdir(parents=True, exist_ok=True)
+    archive_cache_cli.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'authority':'fixture','command':sys.argv[1]}))\n",
+        encoding="utf-8",
+    )
+    pget = root / "scripts/elice/pget.py"
+    pget.write_text("# fixture pget\n", encoding="utf-8")
     validator.write_text(
         validator.read_text(encoding="utf-8").replace(
             "f73260fd112b8cd42bcd4f7c8918fc66b19d9d4c7b97f4faedce524b59e95d6b",
@@ -756,6 +767,8 @@ def _make_bootstrap_git_repo(tmp_path: Path) -> tuple[Path, str]:
             str(static_reference_checker.relative_to(root)),
             str(static_registry.relative_to(root)),
             str(static_target.relative_to(root)),
+            str(archive_cache_cli.relative_to(root)),
+            str(pget.relative_to(root)),
         ],
         cwd=root,
         check=True,
@@ -798,7 +811,7 @@ def _run_bootstrap_gate(
 
 def _make_cache_preflight_runtime(
     root: Path, commit: str
-) -> tuple[dict[str, str], str, Path, Path, Path]:
+) -> tuple[dict[str, str], str, Path, Path, Path, tuple[str, ...]]:
     """실제 GPU/37k raw 없이 cache-only shell 경계를 끝까지 실행하는 fixture."""
 
     fake_bin = root.parent / "cache-preflight-fake-bin"
@@ -811,6 +824,18 @@ def _make_cache_preflight_runtime(
     audit = root / "results/provenance/decoder_audit.json"
     audit.parent.mkdir(parents=True, exist_ok=True)
     audit.write_text("{}\n", encoding="utf-8")
+    cache_root = root.parent / "archive-cache"
+    cache_root.mkdir()
+    cache_manifest = cache_root / "manifest.json"
+    cache_manifest.write_bytes(b"{}\n")
+    cache_args = (
+        "--archive-cache-root",
+        str(cache_root),
+        "--archive-cache-manifest",
+        str(cache_manifest),
+        "--expected-archive-cache-manifest-sha256",
+        _sha256(cache_manifest),
+    )
 
     venv_python = root / ".venv/bin/python"
     venv_python.parent.mkdir(parents=True)
@@ -827,6 +852,10 @@ def _make_cache_preflight_runtime(
         'if [[ " $* " == *" -m pip freeze "* ]]; then exit 91; fi\n'
         'if [[ " $* " == *" scripts/data/verify_decoder_audit_reuse.py "* ]]; then\n'
         '  exit "${FAKE_AUDIT_EXIT:-0}"\n'
+        "fi\n"
+        'if [[ " $* " == *"public_archive_cache.py verify-consumed-raw"* ]]; then\n'
+        '  printf \'{"completion_path":"fixture/complete.json","completion_sha256":"%064d","inventory_path":"fixture/inventory.json","inventory_sha256":"%064d","current_output_projection_sha256":"%064d","decoder_audit_path":"results/provenance/decoder_audit.json","decoder_audit_file_sha256":"%064d","decoder_audit_semantic_sha256":"%064d","decoder_cache_projection_sha256":"%064d"}\\n\' 0 0 0 0 0 0\n'
+        "  exit 0\n"
         "fi\n"
         'if [[ "${1:-}" == "-B" && "${2:-}" == "-" && "${3:-}" == *"elice_transfer_manifest.json" ]]; then\n'
         '  printf "1\\tdata/manifests/recorded_regrouped.jsonl\\t%s\\t82\\t%s\\t1\\t-\\t-\\n" '
@@ -874,7 +903,7 @@ def _make_cache_preflight_runtime(
         "FAKE_TRANSFER_SHA": transfer_sha,
         "FAKE_RECORDED_MANIFEST_SHA": "b" * 64,
     }
-    return environment, transfer_sha, call_log, freeze, marker
+    return environment, transfer_sha, call_log, freeze, marker, cache_args
 
 
 def test_bootstrap_derives_default_repo_from_its_own_path(tmp_path: Path):
@@ -885,7 +914,7 @@ def test_bootstrap_derives_default_repo_from_its_own_path(tmp_path: Path):
     root.rename(underscore_root)
     root = underscore_root
     script = root / "scripts/elice/bootstrap_all.sh"
-    script.parent.mkdir(parents=True)
+    script.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ELICE_SCRIPTS[0], script)
     subprocess.run(["git", "add", str(script.relative_to(root))], cwd=root, check=True)
     subprocess.run(
@@ -1380,6 +1409,560 @@ def test_bootstrap_rejects_invalid_or_duplicate_raw_hash_worker_setting_before_s
     assert not (root / "data").exists()
 
 
+def test_bootstrap_archive_cache_arguments_are_all_or_nothing_before_setup(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    common = (
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+    )
+    orphan = _run_bootstrap_gate(
+        root,
+        *common,
+        "--archive-cache-root",
+        str(tmp_path / "incoming"),
+        "--no-update",
+    )
+    invalid_sha = _run_bootstrap_gate(
+        root,
+        *common,
+        "--archive-cache-root",
+        str(tmp_path / "incoming"),
+        "--archive-cache-manifest",
+        str(tmp_path / "incoming/manifest.json"),
+        "--expected-archive-cache-manifest-sha256",
+        "deadbeef",
+        "--no-update",
+    )
+    duplicate = _run_bootstrap_gate(
+        root,
+        *common,
+        "--archive-cache-root",
+        str(tmp_path / "incoming"),
+        f"--archive-cache-root={tmp_path / 'incoming'}",
+        "--no-update",
+    )
+    missing_only_contract = _run_bootstrap_gate(
+        root, *common, "--archive-cache-only", "--no-update"
+    )
+
+    assert orphan.returncode == 2
+    assert invalid_sha.returncode == 2
+    assert duplicate.returncode == 2
+    assert missing_only_contract.returncode == 2
+    assert "모두 함께" in orphan.stderr
+    assert "64자리" in invalid_sha.stderr
+    assert "한 번만" in duplicate.stderr
+    assert "모두 필수" in missing_only_contract.stderr
+    assert not (root / "data").exists()
+    assert not (root / ".venv").exists()
+
+
+def test_bootstrap_archive_cache_rejects_modes_that_would_ignore_or_overclaim_it(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    cache_args = (
+        "--archive-cache-root",
+        str(tmp_path / "incoming"),
+        "--archive-cache-manifest",
+        str(tmp_path / "incoming/manifest.json"),
+        "--expected-archive-cache-manifest-sha256",
+        "b" * 64,
+    )
+    common = (
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+    )
+    preflight = _run_bootstrap_gate(
+        root, *common, *cache_args, "--preflight-only", "--no-update"
+    )
+    cache_preflight = _run_bootstrap_gate(
+        root, *common, *cache_args, "--cache-preflight-only", "--no-update"
+    )
+    full_octave = _run_bootstrap_gate(
+        root,
+        *common,
+        *cache_args,
+        "--archive-cache-only",
+        "--full-octave",
+        "--no-update",
+    )
+    duplicate_only = _run_bootstrap_gate(
+        root,
+        *common,
+        *cache_args,
+        "--archive-cache-only",
+        "--archive-cache-only",
+        "--no-update",
+    )
+
+    assert preflight.returncode == 2
+    assert cache_preflight.returncode == 2
+    assert full_octave.returncode == 2
+    assert duplicate_only.returncode == 2
+    assert "--preflight-only" in preflight.stderr
+    assert "--reuse-decoder-audit" in cache_preflight.stderr
+    assert "--full-octave" in full_octave.stderr
+    assert "한 번만" in duplicate_only.stderr
+    assert not (root / "data").exists()
+    assert not (root / ".venv").exists()
+
+
+def test_archive_cache_only_stops_after_manifest_verify_and_restore_without_authority(
+    tmp_path: Path,
+):
+    root, _initial_commit = _make_bootstrap_git_repo(tmp_path)
+    fake_cli = root / "scripts/elice/public_archive_cache.py"
+    fake_cli.parent.mkdir(parents=True, exist_ok=True)
+    fake_cli.write_text(
+        "from __future__ import annotations\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "command = sys.argv[1]\n"
+        "if command not in {'verify-manifest', 'restore', 'consume'}:\n"
+        "    raise SystemExit(91)\n"
+        "with Path(os.environ['FAKE_ARCHIVE_CACHE_LOG']).open('a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "print(json.dumps({'authority': 'transport_acceleration_only_not_raw_or_training_authority', 'command': command}))\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", str(fake_cli.relative_to(root))], cwd=root, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "add archive cache fixture"],
+        cwd=root,
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    manifest = incoming / "manifest.json"
+    manifest.write_bytes(b"{}\n")
+    log = tmp_path / "archive-cache-calls.jsonl"
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--archive-cache-root",
+        str(incoming),
+        "--archive-cache-manifest",
+        str(manifest),
+        "--expected-archive-cache-manifest-sha256",
+        _sha256(manifest),
+        "--archive-cache-only",
+        "--no-update",
+        extra_env={"FAKE_ARCHIVE_CACHE_LOG": str(log)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [call[0] for call in calls] == ["verify-manifest", "restore"]
+    assert "raw/training authority가 아닙니다" in result.stdout
+    assert not (root / ".venv").exists()
+    assert not (root / "data/manifests/elice_bootstrap_receipt.json").exists()
+
+    full = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--archive-cache-root",
+        str(incoming),
+        "--archive-cache-manifest",
+        str(manifest),
+        "--expected-archive-cache-manifest-sha256",
+        _sha256(manifest),
+        "--no-update",
+        extra_env={"FAKE_ARCHIVE_CACHE_LOG": str(log)},
+    )
+    assert full.returncode == 2
+    assert "expected-transfer-manifest-sha256" in full.stderr
+    assert "held-fd extractor handoff" not in full.stderr
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [call[0] for call in calls] == ["verify-manifest", "restore", "verify-manifest"]
+    assert not (root / ".venv").exists()
+
+
+def test_plain_bootstrap_rejects_cache_restored_archive_and_forged_local_marker(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    restored = root / "data/raw/noise/shard000.tar.bz2"
+    restored.parent.mkdir(parents=True, exist_ok=True)
+    restored.write_bytes(b"cache-restored-but-unanchored")
+    origin_dir = root / "data/raw/noise/.archive_cache_origins"
+    origin_dir.mkdir()
+    forged = origin_dir / f"archive_cache_origin.{'b' * 64}.{commit}.json"
+    forged.write_text(
+        json.dumps(
+            {
+                "kind": "deep_anc_archive_cache_origin_receipt",
+                "manifest_sha256": "b" * 64,
+                "publisher_commit": commit,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    before = restored.read_bytes()
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--no-update",
+    )
+
+    assert result.returncode == 1
+    assert "origin laundering" in result.stderr
+    assert "matching archive-cache external manifest anchor" in result.stderr
+    assert restored.read_bytes() == before
+    assert not (root / ".venv").exists()
+    assert not (root / "data/manifests/elice_bootstrap_receipt.json").exists()
+
+
+def test_plain_bootstrap_rejects_even_empty_cache_consume_intent_directory(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    marker_directory = root / "data/raw/noise/.archive_cache_consumptions"
+    marker_directory.mkdir(parents=True)
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--no-update",
+    )
+
+    assert result.returncode == 1
+    assert "plain bootstrap raw 재사용을 금지" in result.stderr
+    assert "matching archive-cache external anchors" in result.stderr
+    assert list(marker_directory.iterdir()) == []
+    assert not (root / ".venv").exists()
+    assert not (root / "data/manifests/elice_bootstrap_receipt.json").exists()
+
+
+def test_plain_archive_helpers_reject_any_existing_final_before_network(
+    tmp_path: Path,
+):
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    wget_function = text[
+        text.index("ensure_wget_zip() {") : text.index("ensure_pget_zip() {")
+    ]
+    pget_function = text[
+        text.index("ensure_pget_zip() {") : text.index("download_dns_archive() {")
+    ]
+    dns_function = text[
+        text.index("download_dns_archive() {") : text.index("download_esc50() {")
+    ]
+    network_log = tmp_path / "network.log"
+    cases = [
+        (
+            wget_function,
+            "archive=invalid-demand.zip\n"
+            "wget() { echo wget >> \"$NETWORK_LOG\"; return 0; }\n"
+            "zip_valid() { return 1; }\n"
+            "ensure_wget_zip https://example.invalid \"$archive\" 1\n",
+        ),
+        (
+            pget_function,
+            "archive=invalid-mimii.zip\n"
+            "fake_pget() { echo pget >> \"$NETWORK_LOG\"; return 0; }\n"
+            "PGET=(fake_pget)\n"
+            "zip_valid() { return 1; }\n"
+            "ensure_pget_zip https://example.invalid \"$archive\" 4 1\n",
+        ),
+        (
+            dns_function,
+            "archive=invalid-dns.tar.bz2\n"
+            "fake_pget() { echo dns >> \"$NETWORK_LOG\"; return 0; }\n"
+            "PGET=(fake_pget)\n"
+            "download_dns_archive https://example.invalid \"$archive\"\n",
+        ),
+    ]
+    for index, (function, invocation) in enumerate(cases):
+        case_dir = tmp_path / f"case-{index}"
+        case_dir.mkdir()
+        archive = case_dir / invocation.splitlines()[0].split("=", 1)[1]
+        archive.write_bytes(b"injected-invalid-final")
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "set -u\n"
+                f"NETWORK_LOG={str(network_log)!r}\n"
+                + function
+                + "\n"
+                + invocation,
+            ],
+            cwd=case_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "덮어쓰거나 재사용하지 않습니다" in result.stderr
+        assert archive.read_bytes() == b"injected-invalid-final"
+    assert not network_log.exists()
+
+
+def test_plain_pget_final_injection_is_no_replace_and_resume_path_is_stable(
+    tmp_path: Path,
+):
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    prepare_function = text[
+        text.index("prepare_pget_download_stage() {") : text.index(
+            "# ZIP은 live corpus", text.index("prepare_pget_download_stage() {")
+        )
+    ]
+    pget_function = text[
+        text.index("ensure_pget_zip() {") : text.index("download_dns_archive() {")
+    ]
+    seed = tmp_path / "seed.zip"
+    import zipfile
+
+    with zipfile.ZipFile(seed, "w") as archive:
+        archive.writestr("root/a.wav", b"fixture")
+    target = tmp_path / "mimii.zip"
+    output_log = tmp_path / "pget-outputs.log"
+    first = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "set -u\n"
+            f"VENV_PYTHON={sys.executable!r}\n"
+            f"SEED={str(seed)!r}\nTARGET={str(target)!r}\n"
+            "zip_valid() { [ -f \"$1\" ] && unzip -tq \"$1\" >/dev/null 2>&1; }\n"
+            "fake_pget() { cp \"$SEED\" \"$2\"; printf injected > \"$TARGET\"; }\n"
+            "PGET=(fake_pget)\n"
+            + prepare_function
+            + pget_function
+            + "\nensure_pget_zip https://example.invalid \"$TARGET\" 4 1\n",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert first.returncode != 0
+    assert "no-replace 경합" in first.stderr
+    assert target.read_bytes() == b"injected"
+
+    resume_target = tmp_path / "resume-mimii.zip"
+    resume_script = (
+        "set -u\n"
+        f"VENV_PYTHON={sys.executable!r}\nOUTPUT_LOG={str(output_log)!r}\n"
+        "zip_valid() { return 1; }\n"
+        "fake_pget() { echo \"$2\" >> \"$OUTPUT_LOG\"; "
+        "touch \"$2.part\" \"$2.part.lock\" \"$2.part.state.json\"; return 1; }\n"
+        "PGET=(fake_pget)\n"
+        + prepare_function
+        + pget_function
+        + f"\nensure_pget_zip https://example.invalid {str(resume_target)!r} 4 1 || true\n"
+        + "stage=$(dirname \"$(tail -n 1 \"$OUTPUT_LOG\")\")\n"
+        + "quarantine=\"$stage/.resume-mimii.zip.part.quarantine.abc123_\"\n"
+        + "mkdir -m 700 \"$quarantine\"\n"
+        + "printf old > \"$quarantine/resume-mimii.zip.part\"\n"
+        + f"ensure_pget_zip https://example.invalid {str(resume_target)!r} 4 1 || true\n"
+    )
+    resumed = subprocess.run(
+        ["bash", "-c", resume_script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    outputs = output_log.read_text(encoding="utf-8").splitlines()
+    assert len(outputs) == 2
+    assert outputs[0] == outputs[1]
+
+
+def test_plain_bootstrap_rejects_intermediate_archive_parent_symlink_before_setup(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    outside = tmp_path / "outside-demand"
+    outside.mkdir()
+    noise = root / "data/raw/noise"
+    noise.mkdir(parents=True, exist_ok=True)
+    (noise / "demand").symlink_to(outside, target_is_directory=True)
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--no-update",
+    )
+
+    assert result.returncode == 1
+    assert "fixed archive parent" in result.stderr
+    assert list(outside.iterdir()) == []
+    assert not (root / ".venv").exists()
+
+
+def test_archive_cache_gate_order_precedes_setup_and_held_consume_precedes_download():
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    exact = text.index("if ! verify_exact_checkout; then")
+    static = text.index('python3 -I -B "$STATIC_REFERENCE_CHECKER"')
+    holdout = text.index("if ! verify_canonical_bundle; then", static)
+    anchor = text.index("begin_status_stage archive_cache_anchor")
+    plain_intent_guard = text.index(
+        "archive-cache consumption intent/completion directory가 있어"
+    )
+    transfer = text.index("if ! verify_transfer_manifest_anchor || ! hardware_storage_preflight")
+    early = text.index("begin_status_stage early_pytest")
+    consume = text.index(
+        'echo "=== [archive cache] fixed DNS3 + DEMAND6 + MIMII1 held-fd consume ==="'
+    )
+    download = text.index('echo "=== [2/6] 데이터 다운로드 (병렬) ==="')
+
+    assert exact < static < holdout < plain_intent_guard < anchor < transfer < early < consume < download
+    assert '"$ARCHIVE_CACHE_CLI" consume' in text[consume:download]
+    assert "archive-cache full consumption은 held-fd extractor handoff가 없어" not in text
+    raw_start = text.index('echo "=== [3/6] DNS 샤드 무결성 검사 + 해제 ==="')
+    raw_end = text.index("if ! raw_wav_tree_exact dns_fullband 16000", raw_start)
+    raw_section = text[raw_start:raw_end]
+    assert raw_section.index('archive_cache_argument_count" -eq 3') < raw_section.index(
+        'bzip2 -t "$f"'
+    )
+    assert "legacy DNS pathname bzip2/tar extractor를 건너뜁니다" in raw_section
+
+
+def test_archive_cache_active_never_falls_back_for_dns_demand_or_mimii():
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    dns_loop = text[text.index('for f in "${!DL[@]}"; do') :]
+    dns_guard = dns_loop.index('if [ "$archive_cache_argument_count" -eq 3 ]; then')
+    dns_network = dns_loop.index('start_download "DNS $f"')
+    demand_function = text[
+        text.index("download_demand() {") : text.index("download_mimii() {")
+    ]
+    mimii_start = text.index("download_mimii() {")
+    mimii_function = text[
+        mimii_start : text.index(
+            'if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ]; then', mimii_start
+        )
+    ]
+
+    assert dns_guard < dns_network
+    assert "official network fallback을 금지" in dns_loop[dns_guard:dns_network]
+    assert demand_function.index('archive_cache_argument_count" -eq 3') < demand_function.index(
+        "ensure_wget_zip"
+    )
+    assert mimii_function.index('archive_cache_argument_count" -eq 3') < mimii_function.index(
+        "ensure_pget_zip"
+    )
+    assert "official network fallback" in demand_function
+    assert "official network fallback" in mimii_function
+    assert "legacy DEMAND pathname downloader/extractor 호출을 금지" in demand_function
+    assert "legacy MIMII pathname downloader/extractor 호출을 금지" in mimii_function
+
+
+def test_archive_cache_active_corruption_calls_zero_network_helpers(tmp_path: Path):
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    log = tmp_path / "network.log"
+    demand_function = text[
+        text.index("download_demand() {") : text.index("download_mimii() {")
+    ]
+    mimii_start = text.index("download_mimii() {")
+    mimii_function = text[
+        mimii_start : text.index(
+            'if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ]; then', mimii_start
+        )
+    ]
+    dns_loop = text[
+        text.index('for f in "${!DL[@]}"; do') : text.index(
+            "if esc50_complete; then", text.index('for f in "${!DL[@]}"; do')
+        )
+    ]
+    common = (
+        "set -u\n"
+        "archive_cache_argument_count=3\n"
+        f"NETWORK_LOG={str(log)!r}\n"
+        "zip_valid() { return 1; }\n"
+        "ensure_wget_zip() { echo wget >> \"$NETWORK_LOG\"; }\n"
+        "ensure_pget_zip() { echo pget >> \"$NETWORK_LOG\"; }\n"
+        "demand_environment_complete() { return 1; }\n"
+        "file_count() { echo 0; }\n"
+        "safe_extract_zip() { return 91; }\n"
+        "publish_staged_directory() { return 92; }\n"
+        "ZEN=https://example.invalid\n"
+    )
+    demand = subprocess.run(
+        [
+            "bash",
+            "-c",
+            common
+            + "DEMAND_ENVIRONMENTS=(DKITCHEN)\n"
+            + demand_function
+            + "\ndownload_demand\n",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    mimii = subprocess.run(
+        ["bash", "-c", common + mimii_function + "\ndownload_mimii\n"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    dns = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "set -u\n"
+            "archive_cache_argument_count=3\n"
+            f"NETWORK_LOG={str(log)!r}\n"
+            "declare -A DL=([shard000.tar.bz2]=https://example.invalid/dns)\n"
+            "declare -A DEST=([shard000.tar.bz2]=dns_fullband)\n"
+            "dns_marker_complete() { return 1; }\n"
+            "bzip2() { return 1; }\n"
+            "start_download() { echo dns >> \"$NETWORK_LOG\"; }\n"
+            + dns_loop,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert demand.returncode != 0
+    assert mimii.returncode != 0
+    assert dns.returncode != 0
+    assert not log.exists()
+
+
 def test_bootstrap_full_octave_requires_external_highrate_source_evidence_before_setup(
     tmp_path: Path,
 ):
@@ -1484,6 +2067,9 @@ def test_cache_preflight_requires_reuse_anchors_and_rejects_other_modes_before_s
     missing_reuse = _run_bootstrap_gate(
         root, *common, "--cache-preflight-only", "--no-update"
     )
+    missing_cache = _run_bootstrap_gate(
+        root, *common, *reuse, "--cache-preflight-only", "--no-update"
+    )
     preflight_conflict = _run_bootstrap_gate(
         root,
         *common,
@@ -1510,10 +2096,12 @@ def test_cache_preflight_requires_reuse_anchors_and_rejects_other_modes_before_s
     )
 
     assert missing_reuse.returncode == 2
+    assert missing_cache.returncode == 2
     assert preflight_conflict.returncode == 2
     assert full_octave_conflict.returncode == 2
     assert duplicate.returncode == 2
     assert "--reuse-decoder-audit" in missing_reuse.stderr
+    assert "archive cache root/manifest" in missing_cache.stderr
     assert "--preflight-only" in preflight_conflict.stderr
     assert "--full-octave" in full_octave_conflict.stderr
     assert "한 번만 지정" in duplicate.stderr
@@ -1526,7 +2114,7 @@ def test_cache_preflight_runs_full_read_only_cache_verification_in_order(
 ):
     root, commit = _make_bootstrap_git_repo(tmp_path)
     _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
-    environment, transfer_sha, call_log, freeze, marker = (
+    environment, transfer_sha, call_log, freeze, marker, cache_args = (
         _make_cache_preflight_runtime(root, commit)
     )
     freeze_before = freeze.read_bytes()
@@ -1551,6 +2139,7 @@ def test_cache_preflight_runs_full_read_only_cache_verification_in_order(
         "e" * 64,
         "--raw-hash-workers",
         "8",
+        *cache_args,
         "--cache-preflight-only",
         "--status-root",
         str(status_root),
@@ -1586,8 +2175,23 @@ def test_cache_preflight_runs_full_read_only_cache_verification_in_order(
         for index, call in enumerate(calls)
         if "verify_decoder_audit_reuse.py" in call
     )
+    held_raw = next(
+        index
+        for index, call in enumerate(calls)
+        if "public_archive_cache.py verify-consumed-raw" in call
+    )
     assert len(transfer_calls) == 2
-    assert transfer_calls[0] < collect < focused < first_raw < audit < transfer_calls[1]
+    assert (
+        transfer_calls[0]
+        < collect
+        < focused
+        < first_raw
+        < audit
+        < held_raw
+        < transfer_calls[1]
+    )
+    assert not any("public_archive_cache.py consume" in call for call in calls)
+    assert not any("--decoder-projection-only" in call for call in calls)
     assert not any("-m pip freeze" in call for call in calls)
     assert freeze.read_bytes() == freeze_before
     assert freeze.stat().st_mtime_ns == freeze_mtime_before
@@ -1599,6 +2203,7 @@ def test_cache_preflight_runs_full_read_only_cache_verification_in_order(
     ]
     assert {payload["stage"] for payload in status_payloads} == {
         "source_preflight",
+        "archive_cache_anchor",
         "environment",
         "early_pytest",
         "cache_verification",
@@ -1623,7 +2228,7 @@ def test_cache_preflight_missing_existing_venv_never_runs_setup_or_creates_it(
 ):
     root, commit = _make_bootstrap_git_repo(tmp_path)
     _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
-    environment, transfer_sha, call_log, _freeze, _marker = (
+    environment, transfer_sha, call_log, _freeze, _marker, cache_args = (
         _make_cache_preflight_runtime(root, commit)
     )
     shutil.rmtree(root / ".venv")
@@ -1643,6 +2248,7 @@ def test_cache_preflight_missing_existing_venv_never_runs_setup_or_creates_it(
         "d" * 64,
         "--expected-decoder-audit-file-sha256",
         "e" * 64,
+        *cache_args,
         "--cache-preflight-only",
         "--status-root",
         str(status_root),
@@ -1674,7 +2280,7 @@ def test_early_focused_failure_stops_before_raw_and_decoder_audit(
 ):
     root, commit = _make_bootstrap_git_repo(tmp_path)
     _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
-    environment, transfer_sha, call_log, _freeze, _marker = (
+    environment, transfer_sha, call_log, _freeze, _marker, cache_args = (
         _make_cache_preflight_runtime(root, commit)
     )
     environment["FAKE_FOCUSED_EXIT"] = "43"
@@ -1692,6 +2298,7 @@ def test_early_focused_failure_stops_before_raw_and_decoder_audit(
         "d" * 64,
         "--expected-decoder-audit-file-sha256",
         "e" * 64,
+        *cache_args,
         "--cache-preflight-only",
         "--no-update",
         extra_env=environment,

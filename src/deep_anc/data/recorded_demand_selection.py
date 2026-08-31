@@ -24,6 +24,7 @@ from . import public_lineage
 from .holdout_contract import read_regular_file_snapshot, validate_holdout_contract
 from .manifest import read_manifest_bytes
 from .recorded_dns_selection import (
+    DNS_SELECTION_GENERATION_ID,
     DNS_MIN_DENSITY_RATIO,
     DNS_STRICT_SUBBANDS_HZ,
     _band_density,
@@ -38,10 +39,10 @@ from .source_trust import (
 
 DEMAND_SELECTION_SCHEMA_VERSION = 2
 DEMAND_SELECTION_KIND = "recorded_demand_environment_selection"
-DEMAND_SELECTION_GENERATION_ID = "stage1-coverage-v3-gain012"
+DEMAND_SELECTION_GENERATION_ID = DNS_SELECTION_GENERATION_ID
 DEMAND_SELECTION_BUNDLE_ROOT = (
     "data/source_plans/recorded_additions/demand_environment_selections/"
-    "stage1-coverage-v3-gain012/canonical"
+    "stage1-coverage-v4-gainprobe006/canonical"
 )
 DEMAND_SELECTION_RECEIPT = f"{DEMAND_SELECTION_BUNDLE_ROOT}/selection_receipt.json"
 DEMAND_SELECTION_PARENT_MANIFEST = (

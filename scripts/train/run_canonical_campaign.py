@@ -15,10 +15,10 @@
 * 중단된 pilot/probe/100k/50k는 checkpoint 경로와 외부 SHA를 둘 다 명시하지
   않으면 재개하지 않는다.
 
-Contract schema v2 (경로는 저장소 밖 regular file이어야 한다)::
+Contract schema v3 (경로는 저장소 밖 regular file이어야 한다)::
 
   {
-    "schema_version": 2,
+    "schema_version": 3,
     "expected_commit": "<40 hex>",
     "expected_holdout_sha256": "<64 hex>",
     "expected_transfer_manifest_sha256": "<64 hex>",
@@ -26,6 +26,7 @@ Contract schema v2 (경로는 저장소 밖 regular file이어야 한다)::
     "bootstrap": {
       "raw_hash_workers": 8,
       "cublas_workspace_config": ":4096:8",
+      "archive_cache": null,
       "decoder_audit": {
         "expected_audit_sha256": "<64 hex>",
         "expected_file_sha256": "<64 hex>"
@@ -37,7 +38,10 @@ Contract schema v2 (경로는 저장소 밖 regular file이어야 한다)::
     ]
   }
 
-``decoder_audit``은 fresh decode를 의도할 때만 ``null``이다. 후보 숫자는 JSON
+``archive_cache``는 official download를 쓸 때 ``null``이다. cache를 쓸 때는 저장소 밖
+absolute ``root``/``manifest``와 신뢰 채널에서 받은
+``expected_manifest_sha256``을 모두 넣는다. ``decoder_audit``은 fresh decode를 의도할
+때만 ``null``이다. 후보 숫자는 JSON
 number가 아니라 canonical decimal string이다. alpha 0.85가 필요해진 경우 candidate
 목록은 0.7, 0.85, 1.0 순서의 새 contract로 다시 봉인한다.
 
@@ -60,12 +64,12 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STATUS_SCHEMA_VERSION = 1
 CANONICAL_PRETRAIN_CONFIG = "configs/train_pretrain_tiny.yaml"
 CANONICAL_FINETUNE_CONFIG = "configs/train_finetune.yaml"
@@ -79,6 +83,13 @@ _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 _ALPHA_ORDER = ("0.7", "0.85", "1.0")
+_ARCHIVE_CACHE_RAW_ROOTS = (
+    "data/raw/noise/dns_fullband",
+    "data/raw/noise/speech",
+    "data/raw/noise/demand",
+    "data/raw/noise/machine/fan",
+)
+_PROJECT_IMPORT_BOUNDARY_INITIALIZED = False
 CANONICAL_STAGE_ORDER = (
     "bootstrap",
     "pre_g0_readiness",
@@ -192,6 +203,13 @@ class SecondSeedLink:
 
 
 @dataclass(frozen=True)
+class ArchiveCacheContract:
+    root: Path
+    manifest: Path
+    expected_manifest_sha256: str
+
+
+@dataclass(frozen=True)
 class CampaignContract:
     path: Path
     sha256: str
@@ -204,6 +222,7 @@ class CampaignContract:
     candidates: tuple[Candidate, ...]
     seed: int
     second_seed: SecondSeedLink | None
+    archive_cache: ArchiveCacheContract | None = None
 
 
 @dataclass
@@ -228,10 +247,12 @@ def _regular_bytes(path: Path, *, label: str) -> bytes:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise CampaignError(f"{label}는 symlink가 아닌 regular file이어야 합니다: {path}")
     try:
-        with path.open("rb") as handle:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as handle:
             before = os.fstat(handle.fileno())
             content = handle.read()
             after = os.fstat(handle.fileno())
+        named = path.lstat()
     except OSError as exc:
         raise CampaignError(f"{label}를 snapshot할 수 없습니다: {path}: {exc}") from exc
     if (
@@ -239,6 +260,10 @@ def _regular_bytes(path: Path, *, label: str) -> bytes:
         or before.st_ino != after.st_ino
         or before.st_size != after.st_size
         or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+        or (named.st_dev, named.st_ino) != (after.st_dev, after.st_ino)
+        or stat.S_ISLNK(named.st_mode)
+        or not stat.S_ISREG(named.st_mode)
         or len(content) != after.st_size
     ):
         raise CampaignError(f"{label}가 검증 중 변경됐습니다: {path}")
@@ -246,8 +271,25 @@ def _regular_bytes(path: Path, *, label: str) -> bytes:
 
 
 def _json_object(content: bytes, *, label: str) -> dict[str, Any]:
+    def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise CampaignError(f"{label} duplicate JSON key를 거부합니다: {key}")
+            result[key] = value
+        return result
+
+    def no_nonfinite(token: str) -> Any:
+        raise CampaignError(f"{label} non-finite JSON number를 거부합니다: {token}")
+
     try:
-        value = json.loads(content.decode("utf-8"))
+        value = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=no_duplicates,
+            parse_constant=no_nonfinite,
+        )
+    except CampaignError:
+        raise
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise CampaignError(f"{label} JSON이 손상됐습니다") from exc
     if not isinstance(value, dict):
@@ -385,9 +427,49 @@ def load_contract(
         )
     bootstrap = _exact_keys(
         payload["bootstrap"],
-        {"raw_hash_workers", "cublas_workspace_config", "decoder_audit"},
+        {
+            "raw_hash_workers",
+            "cublas_workspace_config",
+            "archive_cache",
+            "decoder_audit",
+        },
         label="campaign bootstrap",
     )
+    archive_cache_raw = bootstrap["archive_cache"]
+    archive_cache: ArchiveCacheContract | None
+    if archive_cache_raw is None:
+        archive_cache = None
+    else:
+        archive_cache_map = _exact_keys(
+            archive_cache_raw,
+            {"root", "manifest", "expected_manifest_sha256"},
+            label="campaign archive cache",
+        )
+        root_raw = archive_cache_map["root"]
+        manifest_raw = archive_cache_map["manifest"]
+        if not isinstance(root_raw, str) or not root_raw:
+            raise CampaignError("bootstrap.archive_cache.root는 absolute string이어야 합니다")
+        if not isinstance(manifest_raw, str) or not manifest_raw:
+            raise CampaignError(
+                "bootstrap.archive_cache.manifest는 absolute string이어야 합니다"
+            )
+        cache_root = Path(root_raw)
+        cache_manifest = Path(manifest_raw)
+        if not cache_root.is_absolute() or not cache_manifest.is_absolute():
+            raise CampaignError("archive cache root/manifest는 absolute path여야 합니다")
+        if _inside(cache_root, repo_root) or _inside(cache_manifest, repo_root):
+            raise CampaignError("archive cache root/manifest는 저장소 밖이어야 합니다")
+        if cache_root.absolute() == cache_manifest.absolute():
+            raise CampaignError("archive cache root와 manifest는 같은 path일 수 없습니다")
+        archive_cache = ArchiveCacheContract(
+            root=cache_root.absolute(),
+            manifest=cache_manifest.absolute(),
+            expected_manifest_sha256=_hex(
+                archive_cache_map["expected_manifest_sha256"],
+                length=64,
+                label="archive cache manifest SHA-256",
+            ),
+        )
     workers = bootstrap["raw_hash_workers"]
     if type(workers) is not int or not 1 <= workers <= 32:
         raise CampaignError("bootstrap.raw_hash_workers는 1~32 정수여야 합니다")
@@ -452,6 +534,7 @@ def load_contract(
         candidates=tuple(candidates),
         seed=seed,
         second_seed=second_seed,
+        archive_cache=archive_cache,
     )
     if second_seed is not None:
         primary = load_contract(
@@ -468,6 +551,7 @@ def load_contract(
             "expected_transfer_manifest_sha256",
             "raw_hash_workers",
             "cublas_workspace_config",
+            "archive_cache",
             "decoder_audit",
             "candidates",
         )
@@ -581,6 +665,7 @@ def verify_pre_execution_authority(
     )
     if reloaded != contract:
         raise CampaignError("dry-run 뒤 campaign contract 의미가 바뀌었습니다")
+    _validate_archive_cache_external_anchor(reloaded, repo_root)
     actual_seal = build_execution_seal(action, command, repo_root=repo_root)
     if actual_seal != expected_seal:
         raise CampaignError(
@@ -621,11 +706,32 @@ def _append_set(command: list[str], overrides: Iterable[str]) -> list[str]:
     return command
 
 
+def _archive_cache_data_overrides(contract: CampaignContract) -> list[str]:
+    cache = contract.archive_cache
+    if cache is None:
+        return [
+            "data.archive_cache_root=null",
+            "data.archive_cache_manifest=null",
+            "data.archive_cache_manifest_sha256=null",
+        ]
+    return [
+        f"data.archive_cache_root={json.dumps(str(cache.root))}",
+        f"data.archive_cache_manifest={json.dumps(str(cache.manifest))}",
+        f"data.archive_cache_manifest_sha256={cache.expected_manifest_sha256}",
+    ]
+
+
 def _candidate_overrides(
-    candidate: Candidate, bootstrap_sha: str, *, role: str, init_ckpt: str | None = None
+    contract: CampaignContract,
+    candidate: Candidate,
+    bootstrap_sha: str,
+    *,
+    role: str,
+    init_ckpt: str | None = None,
 ) -> list[str]:
     common = [
         f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+        *_archive_cache_data_overrides(contract),
         f"experiment_role={role}",
         "init_eligible=false",
         f"loss.nmse_cvar_alpha={candidate.alpha_text}",
@@ -658,6 +764,17 @@ def build_bootstrap_command(contract: CampaignContract, repo_root: Path) -> list
         str(contract.raw_hash_workers),
         "--no-update",
     ]
+    if contract.archive_cache is not None:
+        command.extend(
+            [
+                "--archive-cache-root",
+                str(contract.archive_cache.root),
+                "--archive-cache-manifest",
+                str(contract.archive_cache.manifest),
+                "--expected-archive-cache-manifest-sha256",
+                contract.archive_cache.expected_manifest_sha256,
+            ]
+        )
     if contract.decoder_audit is not None:
         command.extend(
             [
@@ -807,6 +924,646 @@ def _primary_evidence_transition(
     )
 
 
+def _validate_archive_cache_external_anchor(
+    contract: CampaignContract, repo_root: Path
+) -> dict[str, Any] | None:
+    cache = getattr(contract, "archive_cache", None)
+    if cache is None:
+        return None
+    try:
+        root_resolved = cache.root.resolve(strict=True)
+        root_info = cache.root.lstat()
+        manifest_resolved = cache.manifest.resolve(strict=True)
+    except OSError as exc:
+        raise CampaignError(f"archive cache external anchor를 열 수 없습니다: {exc}") from exc
+    if (
+        root_resolved != cache.root.absolute()
+        or stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+    ):
+        raise CampaignError("archive cache root ancestor symlink/non-directory를 거부합니다")
+    if manifest_resolved != cache.manifest.absolute():
+        raise CampaignError("archive cache manifest ancestor symlink를 거부합니다")
+    content = _regular_bytes(cache.manifest, label="external archive cache manifest")
+    actual = _sha256_bytes(content)
+    if actual != cache.expected_manifest_sha256:
+        raise CampaignError(
+            "archive cache manifest SHA가 campaign external anchor와 다릅니다: "
+            f"expected={cache.expected_manifest_sha256}, actual={actual}"
+        )
+    manifest_payload = _json_object(content, label="external archive cache manifest")
+    canonical = (
+        json.dumps(
+            manifest_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if canonical != content:
+        raise CampaignError("external archive cache manifest는 canonical JSON이어야 합니다")
+    manifest_payload = _exact_keys(
+        manifest_payload,
+        {
+            "archive_count",
+            "archives",
+            "authority",
+            "excluded_corpora",
+            "kind",
+            "publisher_commit",
+            "publisher_entry_script_sha256",
+            "publisher_pget_sha256",
+            "schema_version",
+        },
+        label="external archive cache manifest",
+    )
+    script_sha = _sha256_bytes(
+        _regular_bytes(
+            repo_root / "scripts/elice/public_archive_cache.py",
+            label="archive cache entry script",
+        )
+    )
+    pget_sha = _sha256_bytes(
+        _regular_bytes(
+            repo_root / "scripts/elice/pget.py", label="archive cache pget script"
+        )
+    )
+    entries = manifest_payload.get("archives")
+    if (
+        manifest_payload.get("schema_version") != 1
+        or manifest_payload.get("kind") != "deep_anc_public_archive_cache"
+        or manifest_payload.get("authority")
+        != "transport_acceleration_only_not_raw_or_training_authority"
+        or manifest_payload.get("publisher_commit") != contract.expected_commit
+        or manifest_payload.get("publisher_entry_script_sha256") != script_sha
+        or manifest_payload.get("publisher_pget_sha256") != pget_sha
+        or manifest_payload.get("excluded_corpora")
+        != ["esc50", "fma_small", "fma_metadata", "librispeech"]
+        or manifest_payload.get("archive_count") != 10
+        or not isinstance(entries, list)
+        or len(entries) != 10
+    ):
+        raise CampaignError("external archive cache manifest semantic binding 불일치")
+    entry_keys = {
+        "archive_format",
+        "archive_id",
+        "archive_sha256",
+        "archive_size",
+        "cache_path",
+        "canonical_target",
+        "corpus",
+        "filename",
+        "member_inventory_sha256",
+        "member_content_inventory_sha256",
+        "member_prefix",
+        "provider_checksum",
+        "provider_checksum_kind",
+        "provider_etag",
+        "regular_file_bytes",
+        "regular_file_count",
+        "source_url",
+        "output_content_inventory_sha256",
+        "wav_bytes",
+        "wav_count",
+    }
+    expected_ids = (
+        "dns_noise_000",
+        "dns_noise_001",
+        "dns_speech_000",
+        "demand_dkitchen",
+        "demand_dwashing",
+        "demand_ooffice",
+        "demand_ohallway",
+        "demand_tmetro",
+        "demand_tcar",
+        "mimii_fan",
+    )
+    for index, raw_entry in enumerate(entries):
+        entry = _exact_keys(
+            raw_entry, entry_keys, label=f"external archive cache entry[{index}]"
+        )
+        archive_id = entry.get("archive_id")
+        archive_sha = entry.get("archive_sha256")
+        output_sha = entry.get("output_content_inventory_sha256")
+        filename = entry.get("filename")
+        size = entry.get("archive_size")
+        if (
+            archive_id != expected_ids[index]
+            or not isinstance(archive_sha, str)
+            or _HEX64.fullmatch(archive_sha) is None
+            or not isinstance(output_sha, str)
+            or _HEX64.fullmatch(output_sha) is None
+            or not isinstance(filename, str)
+            or not filename
+            or type(size) is not int
+            or size <= 0
+            or entry.get("cache_path")
+            != (
+                f"archives/v1/{archive_id}/bytes_{size}/"
+                f"sha256_{archive_sha}/{filename}"
+            )
+        ):
+            raise CampaignError("external archive cache entry value/binding 불일치")
+    return {
+        "root": str(cache.root),
+        "manifest": str(cache.manifest),
+        "manifest_sha256": actual,
+        "manifest_size": len(content),
+        "manifest_payload": manifest_payload,
+    }
+
+
+def _validate_archive_cache_receipt_v3(
+    contract: CampaignContract, payload: dict[str, Any], repo_root: Path
+) -> None:
+    contract_cache = getattr(contract, "archive_cache", None)
+    if payload.get("schema_version") != 3:
+        if contract_cache is not None:
+            raise CampaignError(
+                "archive-cache campaign은 schema-v3 bootstrap receipt가 필요합니다"
+            )
+        return
+    binding = payload.get("archive_cache_consumption")
+    marker = repo_root / "data/raw/noise/.archive_cache_consumptions"
+    if binding is None:
+        if contract_cache is not None:
+            raise CampaignError(
+                "campaign이 archive cache를 요구하지만 bootstrap receipt는 no-cache입니다"
+            )
+        if marker.exists() or marker.is_symlink():
+            raise CampaignError(
+                "schema-v3 no-cache bootstrap receipt에 archive-cache marker가 남았습니다"
+            )
+        return
+    if contract_cache is None:
+        raise CampaignError(
+            "campaign은 official download를 요구하지만 bootstrap receipt가 archive cache를 사용했습니다"
+        )
+    binding = _exact_keys(
+        binding,
+        {
+            "archive_manifest_sha256",
+            "authority",
+            "completion_path",
+            "completion_sha256",
+            "member_inventory_path",
+            "member_inventory_sha256",
+            "output_path_size_sha256_inventory_sha256",
+            "decoder_audit_path",
+            "decoder_audit_file_sha256",
+            "decoder_audit_semantic_sha256",
+            "decoder_cache_projection_sha256",
+        },
+        label="bootstrap archive cache binding",
+    )
+    manifest_sha = _hex(
+        binding["archive_manifest_sha256"],
+        length=64,
+        label="archive cache manifest SHA-256",
+    )
+    if manifest_sha != contract_cache.expected_manifest_sha256:
+        raise CampaignError(
+            "bootstrap archive cache manifest SHA가 campaign external anchor와 다릅니다"
+        )
+    external_evidence = _validate_archive_cache_external_anchor(contract, repo_root)
+    if external_evidence is None:  # pragma: no cover - contract_cache branch invariant
+        raise CampaignError("archive cache external manifest evidence가 없습니다")
+    external_payload = external_evidence["manifest_payload"]
+    external_entries = {
+        str(entry["archive_id"]): entry for entry in external_payload["archives"]
+    }
+    commit = _hex(payload["expected_commit"], length=40, label="bootstrap commit")
+    stem = f"{manifest_sha}.{commit}"
+    expected_completion = (
+        "data/raw/noise/.archive_cache_consumptions/"
+        f"consume_complete.{stem}.json"
+    )
+    expected_inventory = (
+        "data/raw/noise/.archive_cache_consumptions/"
+        f"consume_inventory.{stem}.json"
+    )
+    expected_intent = (
+        "data/raw/noise/.archive_cache_consumptions/"
+        f"consume_intent.{stem}.json"
+    )
+    expected_origin = (
+        "data/raw/noise/.archive_cache_origins/"
+        f"archive_cache_origin.{stem}.json"
+    )
+    if (
+        binding["authority"]
+        != "cache_transport_state_bound_to_exact_decoder_inventory"
+        or binding["completion_path"] != expected_completion
+        or binding["member_inventory_path"] != expected_inventory
+        or binding["decoder_audit_path"] != DECODER_AUDIT_REPORT
+    ):
+        raise CampaignError("bootstrap archive cache fixed path/authority binding 불일치")
+    for field in (
+        "completion_sha256",
+        "member_inventory_sha256",
+        "output_path_size_sha256_inventory_sha256",
+        "decoder_audit_file_sha256",
+        "decoder_audit_semantic_sha256",
+        "decoder_cache_projection_sha256",
+    ):
+        _hex(binding[field], length=64, label=f"archive cache {field}")
+    if (
+        binding["output_path_size_sha256_inventory_sha256"]
+        != binding["decoder_cache_projection_sha256"]
+    ):
+        raise CampaignError("bootstrap archive cache/decoder projection SHA 불일치")
+
+    def bound_json_sha(
+        relative: str, expected_sha: str, label: str
+    ) -> dict[str, Any]:
+        content = _regular_bytes(repo_root / relative, label=label)
+        if _sha256_bytes(content) != expected_sha:
+            raise CampaignError(f"{label} SHA가 bootstrap receipt와 다릅니다")
+        return _json_object(content, label=label)
+
+    completion = bound_json_sha(
+        expected_completion,
+        str(binding["completion_sha256"]),
+        "archive cache completion",
+    )
+    completion = _exact_keys(
+        completion,
+        {
+            "archive_manifest_sha256",
+            "authority",
+            "intent_path",
+            "intent_sha256",
+            "kind",
+            "member_inventory_path",
+            "member_inventory_sha256",
+            "origin_receipt_path",
+            "origin_receipt_sha256",
+            "output_bytes",
+            "output_count",
+            "output_path_size_sha256_inventory_sha256",
+            "publisher_commit",
+            "schema_version",
+            "state",
+        },
+        label="archive cache completion",
+    )
+    intent_sha = _hex(
+        completion.get("intent_sha256"),
+        length=64,
+        label="archive cache intent SHA-256",
+    )
+    origin_sha = _hex(
+        completion.get("origin_receipt_sha256"),
+        length=64,
+        label="archive cache origin SHA-256",
+    )
+    if (
+        completion.get("archive_manifest_sha256") != manifest_sha
+        or completion.get("publisher_commit") != commit
+        or completion.get("authority")
+        != "cache_transport_state_only_requires_exact_raw_and_decoder_authority"
+        or completion.get("kind")
+        != "deep_anc_archive_cache_consumption_completion"
+        or completion.get("schema_version") != 1
+        or completion.get("state")
+        != "held_fd_consume_complete_pending_exact_raw_and_decoder_authority"
+        or completion.get("intent_path") != expected_intent
+        or completion.get("origin_receipt_path") != expected_origin
+        or completion.get("member_inventory_path") != expected_inventory
+        or completion.get("member_inventory_sha256")
+        != binding["member_inventory_sha256"]
+        or completion.get("output_path_size_sha256_inventory_sha256")
+        != binding["output_path_size_sha256_inventory_sha256"]
+    ):
+        raise CampaignError("archive cache completion semantic binding 불일치")
+
+    intent = bound_json_sha(
+        expected_intent, intent_sha, "archive cache consumption intent"
+    )
+    origin = bound_json_sha(
+        expected_origin, origin_sha, "archive cache origin receipt"
+    )
+    inventory = bound_json_sha(
+        expected_inventory,
+        str(binding["member_inventory_sha256"]),
+        "archive cache member inventory",
+    )
+    decoder = bound_json_sha(
+        DECODER_AUDIT_REPORT,
+        str(binding["decoder_audit_file_sha256"]),
+        "archive cache-bound decoder audit",
+    )
+    inventory = _exact_keys(
+        inventory,
+        {
+            "archive_manifest_sha256",
+            "authority",
+            "kind",
+            "output_bytes",
+            "output_count",
+            "publisher_commit",
+            "rows",
+            "schema_version",
+        },
+        label="archive cache member inventory",
+    )
+    if (
+        inventory.get("archive_manifest_sha256") != manifest_sha
+        or inventory.get("publisher_commit") != commit
+        or inventory.get("authority")
+        != "cache_transport_state_only_requires_exact_raw_and_decoder_authority"
+        or inventory.get("kind")
+        != "deep_anc_archive_cache_consumed_member_inventory"
+        or inventory.get("schema_version") != 1
+    ):
+        raise CampaignError("archive cache member inventory semantic binding 불일치")
+
+    intent = _exact_keys(
+        intent,
+        {
+            "archive_count",
+            "archive_manifest_sha256",
+            "authority",
+            "expected_output_bytes",
+            "expected_output_count",
+            "expected_output_path_size_inventory_sha256",
+            "kind",
+            "publisher_commit",
+            "restorer_entry_script_sha256",
+            "restorer_pget_sha256",
+            "schema_version",
+            "state",
+        },
+        label="archive cache consumption intent",
+    )
+    script_sha = _sha256_bytes(
+        _regular_bytes(
+            repo_root / "scripts/elice/public_archive_cache.py",
+            label="archive cache entry script",
+        )
+    )
+    pget_sha = _sha256_bytes(
+        _regular_bytes(
+            repo_root / "scripts/elice/pget.py",
+            label="archive cache pget script",
+        )
+    )
+    if (
+        intent.get("archive_manifest_sha256") != manifest_sha
+        or intent.get("publisher_commit") != commit
+        or intent.get("authority")
+        != "cache_transport_state_only_requires_exact_raw_and_decoder_authority"
+        or intent.get("kind") != "deep_anc_archive_cache_consumption_intent"
+        or intent.get("schema_version") != 1
+        or intent.get("state")
+        != "in_progress_or_completed_requires_matching_external_anchors"
+        or intent.get("archive_count") != 10
+        or intent.get("restorer_entry_script_sha256") != script_sha
+        or intent.get("restorer_pget_sha256") != pget_sha
+    ):
+        raise CampaignError("archive cache intent semantic binding 불일치")
+
+    origin = _exact_keys(
+        origin,
+        {
+            "archives",
+            "authority",
+            "kind",
+            "manifest_sha256",
+            "publisher_commit",
+            "restorer_entry_script_sha256",
+            "restorer_pget_sha256",
+            "schema_version",
+        },
+        label="archive cache origin receipt",
+    )
+    expected_archives = {
+        "dns_noise_000": (5_364_611_964, "data/raw/noise/shard000.tar.bz2"),
+        "dns_noise_001": (5_357_916_291, "data/raw/noise/shard001.tar.bz2"),
+        "dns_speech_000": (4_664_045_287, "data/raw/noise/speech000.tar.bz2"),
+        "demand_dkitchen": (336_992_458, "data/raw/noise/demand/DKITCHEN_48k.zip"),
+        "demand_dwashing": (306_101_499, "data/raw/noise/demand/DWASHING_48k.zip"),
+        "demand_ooffice": (277_643_831, "data/raw/noise/demand/OOFFICE_48k.zip"),
+        "demand_ohallway": (252_905_617, "data/raw/noise/demand/OHALLWAY_48k.zip"),
+        "demand_tmetro": (367_513_573, "data/raw/noise/demand/TMETRO_48k.zip"),
+        "demand_tcar": (373_520_251, "data/raw/noise/demand/TCAR_48k.zip"),
+        "mimii_fan": (928_511_244, "data/raw/noise/mimii_fan.zip"),
+    }
+    expected_archive_ids = set(expected_archives)
+    expected_archive_outputs = {
+        "dns_noise_000": ("data/raw/noise/dns_fullband/", 8_000, None),
+        "dns_noise_001": ("data/raw/noise/dns_fullband/", 8_000, None),
+        "dns_speech_000": ("data/raw/noise/speech/", 8_065, 8_000_834_860),
+        "demand_dkitchen": ("data/raw/noise/demand/DKITCHEN/", 16, 460_806_848),
+        "demand_dwashing": ("data/raw/noise/demand/DWASHING/", 16, 460_806_848),
+        "demand_ooffice": ("data/raw/noise/demand/OOFFICE/", 16, 460_806_848),
+        "demand_ohallway": ("data/raw/noise/demand/OHALLWAY/", 16, 460_806_848),
+        "demand_tmetro": ("data/raw/noise/demand/TMETRO/", 16, 460_806_848),
+        "demand_tcar": ("data/raw/noise/demand/TCAR/", 16, 460_806_848),
+        "mimii_fan": ("data/raw/noise/machine/fan/", 3_600, 1_152_158_400),
+    }
+    origin_rows = origin.get("archives")
+    if (
+        origin.get("authority")
+        != "cache_origin_only_not_official_raw_or_training_authority"
+        or origin.get("kind") != "deep_anc_archive_cache_origin_receipt"
+        or origin.get("manifest_sha256") != manifest_sha
+        or origin.get("publisher_commit") != commit
+        or origin.get("restorer_entry_script_sha256") != script_sha
+        or origin.get("restorer_pget_sha256") != pget_sha
+        or origin.get("schema_version") != 1
+        or not isinstance(origin_rows, list)
+        or len(origin_rows) != 10
+    ):
+        raise CampaignError("archive cache origin semantic binding 불일치")
+    seen_origin_ids: set[str] = set()
+    for row in origin_rows:
+        row = _exact_keys(
+            row,
+            {"archive_id", "archive_sha256", "archive_size", "canonical_target"},
+            label="archive cache origin archive row",
+        )
+        archive_id = row.get("archive_id")
+        if (
+            not isinstance(archive_id, str)
+            or archive_id in seen_origin_ids
+            or archive_id not in expected_archive_ids
+            or not isinstance(row.get("archive_sha256"), str)
+            or _HEX64.fullmatch(str(row["archive_sha256"])) is None
+            or type(row.get("archive_size")) is not int
+            or int(row["archive_size"])
+            != expected_archives[str(row["archive_id"])][0]
+            or not isinstance(row.get("canonical_target"), str)
+            or row.get("canonical_target")
+            != expected_archives[str(row["archive_id"])][1]
+            or row.get("archive_sha256")
+            != external_entries[str(row["archive_id"])]["archive_sha256"]
+            or row.get("archive_size")
+            != external_entries[str(row["archive_id"])]["archive_size"]
+            or row.get("canonical_target")
+            != external_entries[str(row["archive_id"])]["canonical_target"]
+        ):
+            raise CampaignError("archive cache origin archive row 값이 유효하지 않습니다")
+        seen_origin_ids.add(archive_id)
+    if seen_origin_ids != expected_archive_ids:
+        raise CampaignError("archive cache origin archive ID 집합 불일치")
+
+    rows = inventory.get("rows")
+    decoder_rows = decoder.get("inventory")
+    if not isinstance(rows, list) or not isinstance(decoder_rows, list):
+        raise CampaignError("archive cache/decoder inventory가 없습니다")
+    expected: dict[str, tuple[int, str]] = {}
+    inventory_archive_ids: set[str] = set()
+    archive_output_counts = {archive_id: 0 for archive_id in expected_archive_ids}
+    archive_output_bytes = {archive_id: 0 for archive_id in expected_archive_ids}
+    archive_content_rows: dict[str, list[tuple[str, int, str]]] = {
+        archive_id: [] for archive_id in expected_archive_ids
+    }
+    total_bytes = 0
+    projection = hashlib.sha256()
+    path_size_projection = hashlib.sha256()
+    for row in rows:
+        row = _exact_keys(
+            row,
+            {"archive_id", "path", "sha256", "size"},
+            label="archive cache member row",
+        )
+        path = row.get("path")
+        archive_id = row.get("archive_id")
+        size = row.get("size")
+        sha256 = row.get("sha256")
+        if (
+            not isinstance(archive_id, str)
+            or archive_id not in expected_archive_ids
+            or not isinstance(path, str)
+            or path in expected
+            or type(size) is not int
+            or size < 0
+            or not isinstance(sha256, str)
+            or _HEX64.fullmatch(sha256) is None
+        ):
+            raise CampaignError("archive cache member row value가 유효하지 않습니다")
+        pure = PurePosixPath(path)
+        if (
+            pure.is_absolute()
+            or any(part in ("", ".", "..") for part in pure.parts)
+            or not path.startswith(expected_archive_outputs[archive_id][0])
+        ):
+            raise CampaignError("archive cache member row path traversal을 거부합니다")
+        inventory_archive_ids.add(archive_id)
+        archive_output_counts[archive_id] += 1
+        archive_output_bytes[archive_id] += size
+        archive_content_rows[archive_id].append((path, size, sha256))
+        expected[path] = (size, sha256)
+        total_bytes += size
+        projection.update(
+            (json.dumps(
+                {"path": path, "sha256": sha256, "size": size},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n").encode("utf-8")
+        )
+        path_size_projection.update(
+            (json.dumps(
+                {"path": path, "size": size},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n").encode("utf-8")
+        )
+    if (
+        inventory_archive_ids != expected_archive_ids
+        or any(
+            archive_output_counts[archive_id] != expected_archive_outputs[archive_id][1]
+            or (
+                expected_archive_outputs[archive_id][2] is not None
+                and archive_output_bytes[archive_id]
+                != expected_archive_outputs[archive_id][2]
+            )
+            for archive_id in expected_archive_ids
+        )
+        or inventory.get("output_count") != len(expected)
+        or inventory.get("output_bytes") != total_bytes
+        or completion.get("output_count") != len(expected)
+        or completion.get("output_bytes") != total_bytes
+        or intent.get("expected_output_count") != len(expected)
+        or intent.get("expected_output_bytes") != total_bytes
+        or intent.get("expected_output_path_size_inventory_sha256")
+        != path_size_projection.hexdigest()
+        or projection.hexdigest() != binding["decoder_cache_projection_sha256"]
+    ):
+        raise CampaignError("archive cache inventory aggregate SHA 불일치")
+    for archive_id, content_rows in archive_content_rows.items():
+        digest = hashlib.sha256()
+        for path, size, sha256 in sorted(content_rows):
+            digest.update(
+                (
+                    json.dumps(
+                        {"path": path, "sha256": sha256, "size": size},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+        if (
+            digest.hexdigest()
+            != external_entries[archive_id]["output_content_inventory_sha256"]
+        ):
+            raise CampaignError(
+                f"external archive manifest output projection 불일치: {archive_id}"
+            )
+    actual: dict[str, tuple[int, str]] = {}
+    for row in decoder_rows:
+        if not isinstance(row, dict):
+            raise CampaignError("decoder inventory row가 object가 아닙니다")
+        path = row.get("relative_path")
+        size = row.get("content_size")
+        sha256 = row.get("content_sha256")
+        if (
+            not isinstance(path, str)
+            or type(size) is not int
+            or size < 0
+            or not isinstance(sha256, str)
+            or _HEX64.fullmatch(sha256) is None
+        ):
+            raise CampaignError("decoder inventory path/size/SHA가 유효하지 않습니다")
+        if path in actual:
+            raise CampaignError("decoder inventory path가 중복됐습니다")
+        actual[path] = (size, sha256)
+    actual_cache_paths = {
+        path
+        for path in actual
+        if any(path.startswith(f"{root}/") for root in _ARCHIVE_CACHE_RAW_ROOTS)
+    }
+    if actual_cache_paths != set(expected):
+        raise CampaignError(
+            "decoder audit/cache raw exact-set 불일치: "
+            f"extra={sorted(actual_cache_paths - set(expected))[:20]}, "
+            f"missing={sorted(set(expected) - actual_cache_paths)[:20]}"
+        )
+    if any(actual.get(path) != value for path, value in expected.items()):
+        raise CampaignError("decoder audit/cache member content projection 불일치")
+    semantic = decoder.get("audit_sha256")
+    semantic_raw = json.dumps(
+        {key: value for key, value in decoder.items() if key != "audit_sha256"},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if (
+        semantic != binding["decoder_audit_semantic_sha256"]
+        or hashlib.sha256(semantic_raw).hexdigest() != semantic
+    ):
+        raise CampaignError("decoder audit semantic SHA binding 불일치")
+
+
 def _load_bootstrap_receipt(
     contract: CampaignContract, repo_root: Path
 ) -> tuple[str, dict[str, Any]] | None:
@@ -814,19 +1571,20 @@ def _load_bootstrap_receipt(
     if not path.exists() and not path.is_symlink():
         return None
     content = _regular_bytes(path, label="Elice bootstrap receipt")
-    payload = _exact_keys(
-        _json_object(content, label="Elice bootstrap receipt"),
-        {
-            "schema_version",
-            "expected_commit",
-            "canonical_holdout",
-            "transfer_manifest",
-            "recorded_aggregate_sha256",
-            "recorded_subband_coverage",
-            "environment",
-        },
-        label="Elice bootstrap receipt",
-    )
+    payload = _json_object(content, label="Elice bootstrap receipt")
+    schema = payload.get("schema_version")
+    receipt_keys = {
+        "schema_version",
+        "expected_commit",
+        "canonical_holdout",
+        "transfer_manifest",
+        "recorded_aggregate_sha256",
+        "recorded_subband_coverage",
+        "environment",
+    }
+    if schema == 3:
+        receipt_keys.add("archive_cache_consumption")
+    payload = _exact_keys(payload, receipt_keys, label="Elice bootstrap receipt")
     holdout = _exact_keys(
         payload["canonical_holdout"], {"path", "sha256"}, label="bootstrap holdout"
     )
@@ -834,13 +1592,43 @@ def _load_bootstrap_receipt(
         payload["transfer_manifest"], {"path", "sha256"}, label="bootstrap transfer"
     )
     if (
-        payload["schema_version"] != 2
+        payload["schema_version"] not in {2, 3}
         or payload["expected_commit"] != contract.expected_commit
         or holdout
         != {"path": HOLDOUT_MANIFEST, "sha256": contract.expected_holdout_sha256}
         or transfer.get("path") != TRANSFER_MANIFEST
     ):
         raise CampaignError("bootstrap receipt가 contract commit/holdout/canonical path와 다릅니다")
+    _validate_archive_cache_external_anchor(contract, repo_root)
+    _validate_archive_cache_receipt_v3(contract, payload, repo_root)
+    expected_decoder = getattr(contract, "decoder_audit", None)
+    if expected_decoder is not None:
+        decoder_content = _regular_bytes(
+            repo_root / DECODER_AUDIT_REPORT,
+            label="campaign-bound decoder audit",
+        )
+        decoder_file_sha = _sha256_bytes(decoder_content)
+        decoder_payload = _json_object(
+            decoder_content, label="campaign-bound decoder audit"
+        )
+        if (
+            decoder_file_sha != expected_decoder["expected_file_sha256"]
+            or decoder_payload.get("audit_sha256")
+            != expected_decoder["expected_audit_sha256"]
+        ):
+            raise CampaignError(
+                "bootstrap decoder audit가 campaign external SHA anchor와 다릅니다"
+            )
+        cache_binding = payload.get("archive_cache_consumption")
+        if isinstance(cache_binding, dict) and (
+            cache_binding.get("decoder_audit_file_sha256")
+            != expected_decoder["expected_file_sha256"]
+            or cache_binding.get("decoder_audit_semantic_sha256")
+            != expected_decoder["expected_audit_sha256"]
+        ):
+            raise CampaignError(
+                "archive-cache decoder binding이 campaign external SHA anchor와 다릅니다"
+            )
     _hex(transfer.get("sha256"), length=64, label="bootstrap transfer manifest SHA-256")
     return _sha256_bytes(content), payload
 
@@ -882,6 +1670,13 @@ def _inspect_local_admission(
             f"canonical campaign에는 101-session schema-v2 transfer가 필요합니다: current={schema!r}",
             local=context,
         )
+    archive_cache_evidence = _validate_archive_cache_external_anchor(contract, repo_root)
+    if archive_cache_evidence is not None:
+        context["archive_cache"] = {
+            key: value
+            for key, value in archive_cache_evidence.items()
+            if key != "manifest_payload"
+        }
     receipt = _load_bootstrap_receipt(contract, repo_root)
     previous_bootstrap: dict[str, Any] | None = None
     if receipt is not None:
@@ -962,16 +1757,89 @@ def _inspect_local_admission(
     return context, None
 
 
+def _pin_project_import_boundary(repo_root: Path) -> Path:
+    """Put exact repo source first and reject spoofed cached project modules."""
+
+    source_path = repo_root / "src"
+    try:
+        source = source_path.resolve(strict=True)
+    except OSError as exc:
+        raise CampaignError(f"exact repository src가 없습니다: {source_path}: {exc}") from exc
+    if source != source_path.absolute() or not source.is_dir():
+        raise CampaignError(f"repository src ancestor symlink/non-directory를 거부합니다: {source_path}")
+    cached_project_modules = tuple(
+        (name, module)
+        for name, module in sys.modules.items()
+        if name == "deep_anc" or name.startswith("deep_anc.")
+    )
+    if not _PROJECT_IMPORT_BOUNDARY_INITIALIZED and cached_project_modules:
+        raise CampaignError(
+            "first trusted project import 전에 preloaded deep_anc module을 거부합니다"
+        )
+    for name, module in cached_project_modules:
+        origin = getattr(module, "__file__", None)
+        spec = getattr(module, "__spec__", None)
+        loader = getattr(module, "__loader__", None)
+        if not isinstance(origin, str):
+            raise CampaignError(f"cached project module origin이 없습니다: {name}")
+        try:
+            resolved = Path(origin).resolve(strict=True)
+            resolved.relative_to(source)
+        except (OSError, ValueError) as exc:
+            raise CampaignError(
+                "foreign cached project module을 거부합니다: "
+                f"module={name}, origin={origin}, expected_root={source}"
+            ) from exc
+        spec_origin = getattr(spec, "origin", None)
+        spec_loader = getattr(spec, "loader", None)
+        if (
+            not isinstance(spec_origin, str)
+            or loader is None
+            or spec_loader is not loader
+        ):
+            raise CampaignError(
+                f"cached project module loader/spec authority가 없습니다: {name}"
+            )
+        try:
+            resolved_spec = Path(spec_origin).resolve(strict=True)
+            if resolved_spec != resolved:
+                raise CampaignError(
+                    f"cached project module __file__/spec.origin 불일치: {name}"
+                )
+            get_filename = getattr(loader, "get_filename", None)
+            get_data = getattr(loader, "get_data", None)
+            if not callable(get_filename) or not callable(get_data):
+                raise CampaignError(
+                    f"cached project module source loader가 아닙니다: {name}"
+                )
+            loader_path = Path(get_filename(name)).resolve(strict=True)
+            if loader_path != resolved or bytes(get_data(str(resolved))) != resolved.read_bytes():
+                raise CampaignError(
+                    f"cached project module loader/source blob 불일치: {name}"
+                )
+        except (OSError, ImportError, TypeError, ValueError) as exc:
+            raise CampaignError(
+                f"cached project module source authority 검증 실패: {name}: {exc}"
+            ) from exc
+    source_text = str(source)
+    sys.path[:] = [entry for entry in sys.path if entry != source_text]
+    sys.path.insert(0, source_text)
+    return source
+
+
 def _lazy_imports(repo_root: Path) -> dict[str, Any]:
+    global _PROJECT_IMPORT_BOUNDARY_INITIALIZED
     expected_prefix = (repo_root / ".venv").absolute()
     if Path(sys.prefix).absolute() != expected_prefix:
         raise CampaignError(
             "bootstrap 뒤 campaign 검증은 exact .venv interpreter로 다시 실행해야 "
             f"합니다: expected_prefix={expected_prefix}, current_prefix={sys.prefix}"
         )
-    source = str(repo_root / "src")
-    if source not in sys.path:
-        sys.path.insert(0, source)
+    source = _pin_project_import_boundary(repo_root)
+    # The first boundary rejected every preloaded project module.  Mark it as
+    # initialised before the imports so the post-import source/blob pass below
+    # validates the modules just loaded instead of mistaking them for a preload.
+    _PROJECT_IMPORT_BOUNDARY_INITIALIZED = True
     try:
         import torch
 
@@ -1018,10 +1886,30 @@ def _lazy_imports(repo_root: Path) -> dict[str, Any]:
             validate_second_seed_test_ledger_state,
         )
     except (ImportError, OSError) as exc:
+        _PROJECT_IMPORT_BOUNDARY_INITIALIZED = False
         raise CampaignError(
             "bootstrap 뒤 상태 검사는 exact .venv interpreter로 실행해야 합니다: "
             f"{repo_root / '.venv/bin/python'} ({exc})"
         ) from exc
+    # Import hooks or a preloaded parent package must not redirect any project
+    # dependency after the initial check.
+    _pin_project_import_boundary(repo_root)
+    for required in (
+        "deep_anc.config",
+        "deep_anc.train.a100_pretrain_smoke",
+        "deep_anc.train.campaign_evidence",
+        "deep_anc.train.finetune_readiness",
+    ):
+        module = sys.modules.get(required)
+        origin = getattr(module, "__file__", None)
+        if not isinstance(origin, str):
+            raise CampaignError(f"required project module import가 없습니다: {required}")
+        try:
+            Path(origin).resolve(strict=True).relative_to(source)
+        except (OSError, ValueError) as exc:
+            raise CampaignError(
+                f"required project module origin이 exact repo src 밖입니다: {required}: {origin}"
+            ) from exc
     return locals()
 
 
@@ -1039,6 +1927,7 @@ def _canonical_cfg(
     execution_seed = contract.seed if seed is None else seed
     overrides = [
         f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+        *_archive_cache_data_overrides(contract),
         f"campaign_prerequisite_sha256={ledger_sha}",
         f"loss.nmse_cvar_alpha={candidate.alpha_text}",
         "loss.lambda_frame=0.0",
@@ -1072,7 +1961,7 @@ def _derivative_cfg(
     return modules["load_train_config"](
         REPO_ROOT / CANONICAL_PRETRAIN_CONFIG,
         _candidate_overrides(
-            candidate, bootstrap_sha, role=role, init_ckpt=init_text
+            contract, candidate, bootstrap_sha, role=role, init_ckpt=init_text
         ),
     )
 
@@ -1239,7 +2128,12 @@ def _explicit_resume(
 
 
 def _smoke_cfg(
-    modules: dict[str, Any], bootstrap_sha: str, winner: Candidate, *, seed: int
+    modules: dict[str, Any],
+    contract: CampaignContract,
+    bootstrap_sha: str,
+    winner: Candidate,
+    *,
+    seed: int,
 ) -> dict[str, Any]:
     return modules["load_train_config"](
         REPO_ROOT / CANONICAL_PRETRAIN_CONFIG,
@@ -1255,6 +2149,7 @@ def _smoke_cfg(
             "a100_smoke_run_label=uninterrupted",
             "run_until_step=500",
             f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+            *_archive_cache_data_overrides(contract),
             f"loss.nmse_cvar_alpha={winner.alpha_text}",
             f"loss.lambda_dnh={winner.lambda_text}",
             f"seed={seed}",
@@ -1263,6 +2158,7 @@ def _smoke_cfg(
 
 
 def _issuer_command(
+    contract: CampaignContract,
     bootstrap_sha: str,
     winner: Candidate,
     chains: list[dict[str, Any]],
@@ -1279,6 +2175,17 @@ def _issuer_command(
         "--loss-lambda-dnh",
         winner.lambda_text,
     ]
+    if contract.archive_cache is not None:
+        command.extend(
+            [
+                "--archive-cache-root",
+                str(contract.archive_cache.root),
+                "--archive-cache-manifest",
+                str(contract.archive_cache.manifest),
+                "--archive-cache-manifest-sha256",
+                contract.archive_cache.expected_manifest_sha256,
+            ]
+        )
     selected_gradient = _candidate_paths(winner, repo_root)["selected_gradient_receipt"]
     command.extend(["--gradient-receipt", _relative(selected_gradient, repo_root)])
     for row in chains:
@@ -1352,12 +2259,18 @@ def _second_seed_issuer_command(
 
 
 def _finetune_overrides(
-    *, bootstrap_sha: str, winner: Candidate, init_checkpoint: Path, seed: int | None
+    *,
+    contract: CampaignContract,
+    bootstrap_sha: str,
+    winner: Candidate,
+    init_checkpoint: Path,
+    seed: int | None,
 ) -> list[str]:
     values = [
         "data.digital_primary_path_mode=measured",
         f"init_ckpt={json.dumps(str(init_checkpoint.absolute()))}",
         f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+        *_archive_cache_data_overrides(contract),
         f"loss.nmse_cvar_alpha={winner.alpha_text}",
         f"loss.lambda_dnh={winner.lambda_text}",
     ]
@@ -1369,6 +2282,7 @@ def _finetune_overrides(
 def _readiness_command(
     repo_root: Path,
     *,
+    contract: CampaignContract,
     bootstrap_sha: str,
     winner: Candidate,
     init_checkpoint: Path,
@@ -1383,6 +2297,7 @@ def _readiness_command(
     return _append_set(
         command,
         _finetune_overrides(
+            contract=contract,
             bootstrap_sha=bootstrap_sha,
             winner=winner,
             init_checkpoint=init_checkpoint,
@@ -1394,6 +2309,7 @@ def _readiness_command(
 def _pre_g0_readiness_command(
     repo_root: Path,
     *,
+    contract: CampaignContract,
     bootstrap_sha: str,
     candidate: Candidate,
     out_dir: Path,
@@ -1412,6 +2328,7 @@ def _pre_g0_readiness_command(
             "data.digital_primary_path_mode=measured",
             "init_ckpt=null",
             f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+            *_archive_cache_data_overrides(contract),
             f"loss.nmse_cvar_alpha={candidate.alpha_text}",
             f"loss.lambda_dnh={candidate.lambda_text}",
         ],
@@ -1423,6 +2340,7 @@ def _pre_g0_readiness_command(
 def _finetune_pipeline_command(
     repo_root: Path,
     *,
+    contract: CampaignContract,
     bootstrap_sha: str,
     winner: Candidate,
     init_checkpoint: Path,
@@ -1437,6 +2355,7 @@ def _finetune_pipeline_command(
     return _append_set(
         command,
         _finetune_overrides(
+            contract=contract,
             bootstrap_sha=bootstrap_sha,
             winner=winner,
             init_checkpoint=init_checkpoint,
@@ -1602,6 +2521,7 @@ def _validate_second_seed_primary_context(
     primary_finetune_cfg = modules["load_train_config"](
         repo_root / CANONICAL_FINETUNE_CONFIG,
         _finetune_overrides(
+            contract=contract,
             bootstrap_sha=bootstrap_sha,
             winner=winner,
             init_checkpoint=primary_init,
@@ -1926,6 +2846,7 @@ def _inspect_post_bootstrap(
                 "data.digital_primary_path_mode=measured",
                 "init_ckpt=null",
                 f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+                *_archive_cache_data_overrides(contract),
                 f"loss.nmse_cvar_alpha={pre_candidate.alpha_text}",
                 f"loss.lambda_dnh={pre_candidate.lambda_text}",
             ],
@@ -1948,6 +2869,7 @@ def _inspect_post_bootstrap(
             "pre_g0_readiness",
             _pre_g0_readiness_command(
                 repo_root,
+                contract=contract,
                 bootstrap_sha=bootstrap_sha,
                 candidate=pre_candidate,
                 out_dir=pre_readiness_dir,
@@ -2078,7 +3000,7 @@ def _inspect_post_bootstrap(
         except CampaignError as exc:
             return _blocked("loss_pilot", "INVALID_PILOT_RUN", str(exc), candidate=candidate.key)
         overrides = _candidate_overrides(
-            candidate, bootstrap_sha, role="loss_pilot"
+            contract, candidate, bootstrap_sha, role="loss_pilot"
         )
         train_command = build_train_command(
             repo_root, config=CANONICAL_PRETRAIN_CONFIG, overrides=overrides
@@ -2182,6 +3104,7 @@ def _inspect_post_bootstrap(
         run_dir = repo_root / str(probe_cfg["ckpt_dir"])
         init_rel = _relative(pilot_dir / "ckpt/best.pt", repo_root)
         overrides = _candidate_overrides(
+            contract,
             candidate,
             bootstrap_sha,
             role="measured_probe",
@@ -2441,7 +3364,7 @@ def _inspect_post_bootstrap(
     # primary smoke를 재사용하지 않고 seed=20260903 target을 fresh 실행한다.
     try:
         smoke_cfg = _smoke_cfg(
-            modules, bootstrap_sha, winner, seed=contract.seed
+            modules, contract, bootstrap_sha, winner, seed=contract.seed
         )
         target = modules["build_a100_pretrain_smoke_target"](
             smoke_cfg, repo_root=repo_root
@@ -2510,6 +3433,7 @@ def _inspect_post_bootstrap(
                 "campaign_ledger",
                 "issue_campaign_ledger",
                 _issuer_command(
+                    contract,
                     bootstrap_sha,
                     winner,
                     chains,
@@ -2660,6 +3584,7 @@ def _inspect_post_bootstrap(
     pretrain_dir = repo_root / str(final_cfg["ckpt_dir"])
     pretrain_overrides = [
         f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+        *_archive_cache_data_overrides(contract),
         f"campaign_prerequisite_sha256={ledger_sha}",
         f"loss.nmse_cvar_alpha={winner.alpha_text}",
         f"loss.lambda_dnh={winner.lambda_text}",
@@ -2728,6 +3653,7 @@ def _inspect_post_bootstrap(
     # 10) readiness report stage, then fresh recomputation before 50k.
     init_checkpoint = pretrain_dir / "ckpt/best.pt"
     finetune_overrides = _finetune_overrides(
+        contract=contract,
         bootstrap_sha=bootstrap_sha,
         winner=winner,
         init_checkpoint=init_checkpoint,
@@ -2759,6 +3685,7 @@ def _inspect_post_bootstrap(
             "finetune_readiness",
             _readiness_command(
                 repo_root,
+                contract=contract,
                 bootstrap_sha=bootstrap_sha,
                 winner=winner,
                 init_checkpoint=init_checkpoint,
@@ -2796,6 +3723,7 @@ def _inspect_post_bootstrap(
         return _blocked("canonical_finetune", "INVALID_FINETUNE_RUN", str(exc), winner=winner_detail)
     pipeline_command = _finetune_pipeline_command(
         repo_root,
+        contract=contract,
         bootstrap_sha=bootstrap_sha,
         winner=winner,
         init_checkpoint=init_checkpoint,
@@ -3161,6 +4089,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the authority-bearing CLI only under the isolated interpreter."""
+
+    if not sys.flags.isolated or not sys.dont_write_bytecode:
+        print(
+            "[오류] canonical campaign은 exact import boundary를 위해 "
+            "`.venv/bin/python -I -B scripts/train/run_canonical_campaign.py ...`로 "
+            "실행해야 합니다",
+            file=sys.stderr,
+        )
+        return 2
+    return _main_impl(argv)
+
+
+def _main_impl(argv: list[str] | None = None) -> int:
+    """Testable command body; production callers must enter through :func:`main`."""
+
     args = build_parser().parse_args(argv)
     if (args.resume_checkpoint is None) != (
         args.expected_resume_checkpoint_sha256 is None

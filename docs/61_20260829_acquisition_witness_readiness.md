@@ -2,7 +2,8 @@
 
 > [!CAUTION]
 > 이 문서는 2026-08-29 장치 inventory와 당시 17/99 수집 계획의 역사 감사다. 현행
-> `stage1-coverage-v2`는 19 additions/101 combined이며
+> 세대는 `stage1-coverage-v4-gainprobe006`의 19 additions/101 combined이며,
+> 아래 `stage1-coverage-v2` 및 17/99 표기는 모두 역사적 진단값이다.
 > [recorded generation 계약](17_recorded_generation.md)과 `HANDOFF.md` §0.15가 수량·실행
 > authority다. 아래 하드웨어 결론은 유지되지만 17/99를 현재 명령에 복사하지 않는다.
 

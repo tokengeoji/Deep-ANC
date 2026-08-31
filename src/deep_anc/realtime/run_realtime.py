@@ -18,6 +18,7 @@ safety.PipelineHandoffBudget 이 단 한 곳에서 유도하고, 비대칭이면
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -340,6 +341,30 @@ class RealtimeANC:
         self.plant_contract = (
             validate_runtime_plant_contract(cfg) if validate_plant_contract else None
         )
+        self._runtime_deployment_snapshot_start = None
+        self._runtime_physical_fingerprint_start = None
+        if (
+            float(record_seconds) > 0.0
+            and str(cfg.get("controller", "dl")) == "dl"
+            and self.plant_contract is not None
+        ):
+            # 실시간 증거를 녹음할 때는 실제로 로드할 checkpoint/export/
+            # sidecar/P/S bytes를 stream open 전에 고정한다. 종료 후 동일
+            # snapshot을 다시 계산해 캡처 중 변경을 거부한다.
+            from ..eval.broadband_runtime import snapshot_runtime_deployment_files
+
+            self._runtime_deployment_snapshot_start = (
+                snapshot_runtime_deployment_files(
+                    runtime_cfg=cfg,
+                    plant=self.plant_contract,
+                    repo_root=REPO_ROOT,
+                )
+            )
+            from ..dsp.measurement_level import collect_alsa_physical_fingerprint
+
+            self._runtime_physical_fingerprint_start = (
+                collect_alsa_physical_fingerprint(cfg["hardware"])
+            )
 
         reference = str(cfg.get("reference", "digital"))
         digital_reference_lead = validate_digital_reference_lead(
@@ -434,14 +459,24 @@ class RealtimeANC:
         # inference ``engine.step`` 자체가 1 block wall-time을 넘긴 횟수다.
         # output ring이 비어 실제 무음을 낸 fallback과 같은 사건으로 중복 계상하지 않는다.
         self._deadline_miss_blocks = 0
+        # engine.step 예외를 무음으로 바꾸는 것은 오디오 안전을 위해
+        # 필요하지만, 그 블록을 정상 추론으로 숨기면 latency/연속성 증거가
+        # 위조된다. deadline/fallback과 독립적으로 exact 0을 강제한다.
+        self._engine_error_blocks = 0
         self._fallback_silence_blocks = 0
         # 현재 runtime은 hard sample insertion으로 clock을 맞추지 않는다. 향후
         # rate matcher가 추가되면 이 counter를 실제 삽입 sample 수에 연결해야 한다.
         self._ring_add_samples = 0
+        # 첫 callback이 추론 결과 없이 시작하는 구조적 fallback을 없애기 위한
+        # 의도된 1-hop 무음 프라임. start()가 오디오 stream을 열기 전에 단 한
+        # 번만 발행하며, runtime raw에 그 수를 보존한다.
+        self._intentional_startup_prime_blocks = 0
+        self._inference_step_count = 0
         self._last_anc = False
         self._adaptation_hold_samples = 0
 
         self.record_len = int(record_seconds * self.fs)
+        self._record_runtime_evidence = self.record_len > 0
         self.rec_pos = 0
         if self.record_len > 0:
             self.rec = {
@@ -485,6 +520,7 @@ class RealtimeANC:
         return RuntimeCounterSnapshot(
             xrun_count=int(getattr(self, "xruns", 0)),
             deadline_miss_count=int(getattr(self, "_deadline_miss_blocks", 0)),
+            engine_error_blocks=int(getattr(self, "_engine_error_blocks", 0)),
             input_ring_drop_samples=int(self.in_ring.drops),
             output_ring_drop_samples=int(self.out_ring.drops),
             input_ring_overrun_blocks=int(self.in_ring.overruns),
@@ -657,6 +693,15 @@ class RealtimeANC:
                 "fxlms_adapt_allowed": adapt_allowed,
                 "fxlms_adapt_hold_samples": self._adaptation_hold_samples,
                 "underruns": self.out_ring.underruns,
+                "fallback_silence_blocks": int(
+                    getattr(self, "_fallback_silence_blocks", 0)
+                ),
+                "deadline_miss_blocks": int(
+                    getattr(self, "_deadline_miss_blocks", 0)
+                ),
+                "engine_error_blocks": int(
+                    getattr(self, "_engine_error_blocks", 0)
+                ),
                 "drops": self.out_ring.drops,
                 "stale_input_drops": input_drops,
                 "watchdog_trips": {
@@ -720,33 +765,86 @@ class RealtimeANC:
                 y = self.engine.step(ref.copy(), err.copy())
             except Exception as exc:
                 self.state.messages.put(f"엔진 오류: {exc!r} — 무음 출력")
+                self._engine_error_blocks = int(
+                    getattr(self, "_engine_error_blocks", 0)
+                ) + 1
                 y = np.zeros(self.hop, dtype=np.float32)
             dt = (time.perf_counter() - t0) * 1000.0
             self.step_times_ms.append(dt)
+            self._inference_step_count = int(
+                getattr(self, "_inference_step_count", 0)
+            ) + 1
             if dt >= 1000.0 * self.hop / self.fs:
                 self._deadline_miss_blocks += 1
-            if len(self.step_times_ms) > 10000:
+            # 녹음 session은 초반 spike를 삭제하면 max/deadline 증거를 잃는다.
+            # 미녹음 장시간 interactive 세션만 메모리 상한을 둔다.
+            if (
+                not bool(getattr(self, "_record_runtime_evidence", False))
+                and len(self.step_times_ms) > 10000
+            ):
                 del self.step_times_ms[:5000]
             self.out_ring.push(y.reshape(1, -1))
 
     # ---------- 실행 ----------
 
+    def _prime_output_handoff(self) -> None:
+        """stream open 전 exact 1-hop 무음을 발행해 첫 callback fallback을 없앤다.
+
+        이 push는 inference producer thread가 시작하기 전에만 수행한다. 그 뒤에는
+        inference thread만 ``out_ring.write_pos``의 producer다. 두 블록을 넣어
+        실효 handoff를 늘리는 경로는 즉시 거부한다.
+        """
+
+        if int(getattr(self, "_intentional_startup_prime_blocks", 0)) != 0:
+            raise RuntimeError("runtime output handoff prime은 단 한 번만 허용됩니다")
+        if (
+            self.out_ring.available() != 0
+            or self.out_ring.write_pos != 0
+            or self.out_ring.read_pos != 0
+        ):
+            raise RuntimeError("runtime output ring이 비어 있지 않아 startup prime을 거부합니다")
+        self.out_ring.push(np.zeros((1, self.hop), dtype=np.float32))
+        if self.out_ring.available() != self.hop or self.out_ring.overruns != 0:
+            raise RuntimeError("runtime output handoff prime 발행에 실패했습니다")
+        self._intentional_startup_prime_blocks = 1
+
     def start(self) -> None:
+        # PortAudio가 prime callback을 즉시 호출해도 output ring은 이미 exact
+        # 1-hop 무음을 가진다. inference thread보다도 먼저여야 SPSC producer
+        # 소유권 인계가 명확하다.
+        self._prime_output_handoff()
         self._infer_thread = threading.Thread(
             target=self._inference_loop, daemon=True, name="anc-inference"
         )
         self._infer_thread.start()
-        self._stream = self.sd.Stream(
-            samplerate=self.fs,
-            blocksize=self.block,
-            device=(self.in_dev, self.out_dev),
-            channels=(2, 2),
-            dtype=("int32", "int16"),
-            latency=(self.latency, self.latency),
-            callback=self._callback,
-            prime_output_buffers_using_stream_callback=True,
-        )
-        self._stream.start()
+        try:
+            self._stream = self.sd.Stream(
+                samplerate=self.fs,
+                blocksize=self.block,
+                device=(self.in_dev, self.out_dev),
+                channels=(2, 2),
+                dtype=("int32", "int16"),
+                latency=(self.latency, self.latency),
+                callback=self._callback,
+                prime_output_buffers_using_stream_callback=True,
+            )
+            self._stream.start()
+        except BaseException:
+            # Stream 생성/start 실패가 inference producer를 뒤에 남기면 다음
+            # PCM 실행과 겹쳐 timing을 오염시킬 수 있다. 원래 예외를 보존하되
+            # 이 start가 만든 자원은 반환 전에 모두 닫는다.
+            self.state.quit_event.set()
+            if self._stream is not None:
+                try:
+                    self._stream.abort()
+                except BaseException:
+                    pass
+                try:
+                    self._stream.close()
+                except BaseException:
+                    pass
+            self._infer_thread.join(timeout=1.0)
+            raise
 
     def stop(self) -> None:
         # 종료 페이드 시퀀스 (안전장치 8)
@@ -771,6 +869,90 @@ class RealtimeANC:
             return {}
         n = self.rec_pos
         return {k: v[:n].copy() for k, v in self.rec.items()}
+
+    def runtime_timing_data(self) -> dict[str, np.ndarray]:
+        """session NPZ에 결속할 전수 inference wall-time raw를 반환한다."""
+
+        times = np.asarray(self.step_times_ms, dtype=np.float64)
+        count = int(getattr(self, "_inference_step_count", len(times)))
+        if bool(getattr(self, "_record_runtime_evidence", False)) and count != len(times):
+            raise RuntimeError(
+                "녹음 runtime inference step count와 보존 latency raw 수가 다릅니다"
+            )
+        if times.ndim != 1 or np.any(~np.isfinite(times)) or np.any(times < 0.0):
+            raise RuntimeError("runtime inference latency raw가 유한한 1-D 양수가 아닙니다")
+        payload = {
+            "inference_step_times_ms": times,
+            "inference_step_count": np.asarray(count, dtype=np.int64),
+            "intentional_startup_prime_blocks": np.asarray(
+                int(getattr(self, "_intentional_startup_prime_blocks", 0)),
+                dtype=np.int64,
+            ),
+        }
+        start_snapshot = getattr(self, "_runtime_deployment_snapshot_start", None)
+        if start_snapshot is not None:
+            from ..eval.broadband_runtime import snapshot_runtime_deployment_files
+
+            end_snapshot = snapshot_runtime_deployment_files(
+                runtime_cfg=self.cfg,
+                plant=self.plant_contract,
+                repo_root=REPO_ROOT,
+            )
+            if end_snapshot != start_snapshot:
+                raise RuntimeError(
+                    "runtime 녹음 중 checkpoint/export/metadata/plant bytes가 변경됐습니다"
+                )
+            snapshot_json = json.dumps(
+                start_snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            payload.update(
+                {
+                    "runtime_deployment_snapshot_json": np.asarray(snapshot_json),
+                    "runtime_deployment_snapshot_sha256": np.asarray(
+                        start_snapshot["snapshot_sha256"]
+                    ),
+                }
+            )
+            from ..dsp.measurement_level import collect_alsa_physical_fingerprint
+
+            end_fingerprint = collect_alsa_physical_fingerprint(
+                self.cfg["hardware"]
+            )
+            start_fingerprint = getattr(
+                self, "_runtime_physical_fingerprint_start", None
+            )
+            if end_fingerprint != start_fingerprint:
+                raise RuntimeError(
+                    "runtime 녹음 중 ALSA 물리 hardware fingerprint가 변경됐습니다"
+                )
+            fingerprint_json = json.dumps(
+                start_fingerprint,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            payload.update(
+                {
+                    "runtime_physical_fingerprint_json": np.asarray(
+                        fingerprint_json
+                    ),
+                    "runtime_physical_fingerprint_sha256": np.asarray(
+                        start_fingerprint["sha256"]
+                    ),
+                }
+            )
+        elif (
+            bool(getattr(self, "_record_runtime_evidence", False))
+            and isinstance(getattr(self, "cfg", None), dict)
+            and str(self.cfg.get("controller", "dl")) == "dl"
+        ):
+            raise RuntimeError("DL runtime 녹음에 deployment start snapshot이 없습니다")
+        return payload
 
 
 def _prepare_runtime_record_targets(record_path: str | Path) -> tuple[Path, Path]:
@@ -852,7 +1034,11 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
                     print(
                         f"[{'ON ' if s['anc'] else 'OFF'}] e={s['err_dbfs']:7.2f} dBFS | "
                         f"ctrl={s['ctrl_dbfs']:7.2f} | 저감={red_txt} dB | "
-                        f"step={s['step_ms']:5.2f}ms | miss={s['underruns']} | xrun={s['xruns']}"
+                        f"step={s['step_ms']:5.2f}ms | "
+                        f"deadline={s.get('deadline_miss_blocks', 0)} | "
+                        f"fallback={s.get('fallback_silence_blocks', s['underruns'])} | "
+                        f"engine_err={s.get('engine_error_blocks', 0)} | "
+                        f"xrun={s['xruns']}"
                     )
                 next_report = now + 1.0
             if anc.state.fatal_error is not None:
@@ -871,6 +1057,7 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
     if record_path:
         assert record_targets is not None
         data = anc.session_data()
+        timing_data = anc.runtime_timing_data()
         npz_path, clock_receipt_path = record_targets
         telemetry_digest = payload_sha256(clock_payload)
         # raw와 telemetry binding을 덮어쓰지 못하게 session NPZ도 exclusive-create한다.
@@ -883,6 +1070,7 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
                     clock_payload["authority_status"]
                 ),
                 **data,
+                **timing_data,
             )
             handle.flush()
             os.fsync(handle.fileno())

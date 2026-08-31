@@ -438,6 +438,8 @@ def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
         "gain_linearity_receipt": "recording_gain_linearity_receipt",
         "gain_linearity_plan": "recording_gain_linearity_plan",
         "gain_linearity_raw": "recording_gain_linearity_raw",
+        "gain_linearity_metadata": "recording_gain_linearity_metadata",
+        "gain_linearity_publication": "recording_gain_linearity_publication",
     }
     gain_campaign_keys = {
         "campaign_id",
@@ -452,7 +454,7 @@ def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
         if campaign_keys != frozenset(gain_campaign_keys):
             raise TransferContractError(
                 f"recording level campaign summary #{index}에 canonical source-gain/"
-                "linearity authority 4종이 필수입니다"
+                "linearity authority 6종이 필수입니다"
             )
         current_gain_refs: dict[str, dict[str, object]] = {}
         for field, role in gain_roles.items():

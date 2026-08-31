@@ -126,6 +126,7 @@ def validate_canonical_pretrain_ledger_payload(
             "git_commit",
             "source_tree_sha256",
             "bootstrap_receipt_sha256",
+            "archive_cache_manifest_sha256",
             "primary_path_sha256",
             "secondary_path_sha256",
         },
@@ -138,6 +139,9 @@ def validate_canonical_pretrain_ledger_payload(
         "bootstrap_receipt_sha256": (cfg.get("data") or {}).get(
             "bootstrap_receipt_sha256"
         ),
+        "archive_cache_manifest_sha256": (cfg.get("data") or {}).get(
+            "archive_cache_manifest_sha256"
+        ),
         "transfer_manifest_sha256": (cfg.get("data") or {}).get(
             "transfer_manifest_sha256"
         ),
@@ -145,7 +149,20 @@ def validate_canonical_pretrain_ledger_payload(
             "recorded_transfer_aggregate_sha256"
         ),
     }
-    if input_generation != expected_generation or not all(expected_generation.values()):
+    required_generation = {
+        key: value
+        for key, value in expected_generation.items()
+        if key != "archive_cache_manifest_sha256"
+    }
+    archive_manifest_sha = expected_generation["archive_cache_manifest_sha256"]
+    if (
+        input_generation != expected_generation
+        or not all(required_generation.values())
+        or (
+            archive_manifest_sha is not None
+            and not _SHA256.fullmatch(str(archive_manifest_sha))
+        )
+    ):
         raise ValueError("campaign prerequisite contract input generation이 불완전합니다")
     expected_source = {
         "git_commit": contract_source.get("git_commit"),
@@ -153,10 +170,16 @@ def validate_canonical_pretrain_ledger_payload(
         "bootstrap_receipt_sha256": (cfg.get("data") or {}).get(
             "bootstrap_receipt_sha256"
         ),
+        "archive_cache_manifest_sha256": archive_manifest_sha,
         "primary_path_sha256": (artifacts.get("primary_path") or {}).get("sha256"),
         "secondary_path_sha256": (artifacts.get("secondary_path") or {}).get("sha256"),
     }
-    if source != expected_source or not all(expected_source.values()):
+    required_source = {
+        key: value
+        for key, value in expected_source.items()
+        if key != "archive_cache_manifest_sha256"
+    }
+    if source != expected_source or not all(required_source.values()):
         raise ValueError("campaign prerequisite strict P/S/source/bootstrap identity가 다릅니다")
 
     # schema v7은 사람이 적은 `all_finite`, NMSE, gradient share, score, winner,

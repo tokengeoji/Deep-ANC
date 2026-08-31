@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import threading
+import time
+from typing import Callable
 
 import numpy as np
 
@@ -432,6 +435,8 @@ def capture_measurement_preflight_raw(
     hardware: dict,
     *,
     seconds: float = 1.5,
+    absolute_deadline_monotonic: float | None = None,
+    monotonic_function: Callable[[], float] = time.monotonic,
 ) -> tuple[np.ndarray, dict]:
     """출력 장치를 열지 않는 official measurement input-only preflight.
 
@@ -464,14 +469,64 @@ def capture_measurement_preflight_raw(
 
     total_frames = int(duration * fs)
     settle_frames = int(0.5 * fs)
-    probe = sd.rec(
-        total_frames,
-        samplerate=fs,
-        channels=2,
-        dtype=MEASUREMENT_DTYPE[0],
-        device=device,
-    )
-    sd.wait()
+    if absolute_deadline_monotonic is not None and not np.isfinite(
+        float(absolute_deadline_monotonic)
+    ):
+        raise ValueError("input preflight absolute deadline은 finite여야 합니다")
+    watchdog_stop = threading.Event()
+    watchdog_expired = threading.Event()
+    watchdog_error: list[str] = []
+
+    def deadline_watchdog() -> None:
+        assert absolute_deadline_monotonic is not None
+        while not watchdog_stop.is_set():
+            remaining = float(absolute_deadline_monotonic) - float(
+                monotonic_function()
+            )
+            if remaining <= 0.0:
+                watchdog_expired.set()
+                try:
+                    sd.stop()
+                except BaseException as exc:  # pragma: no cover - backend specific
+                    watchdog_error.append(f"{type(exc).__name__}: {exc}")
+                return
+            watchdog_stop.wait(min(remaining, 0.01))
+
+    watchdog_thread: threading.Thread | None = None
+    if absolute_deadline_monotonic is not None:
+        if float(monotonic_function()) >= float(absolute_deadline_monotonic):
+            raise TimeoutError("input preflight 시작 전 absolute deadline 초과")
+        watchdog_thread = threading.Thread(
+            target=deadline_watchdog,
+            name="deep-anc-input-preflight-watchdog",
+            daemon=True,
+        )
+        watchdog_thread.start()
+    try:
+        probe = sd.rec(
+            total_frames,
+            samplerate=fs,
+            channels=2,
+            dtype=MEASUREMENT_DTYPE[0],
+            device=device,
+        )
+        if watchdog_expired.is_set():
+            raise TimeoutError("input preflight rec가 absolute deadline을 넘었습니다")
+        sd.wait()
+        if watchdog_expired.is_set() or (
+            absolute_deadline_monotonic is not None
+            and float(monotonic_function()) >= float(absolute_deadline_monotonic)
+        ):
+            detail = f"; stop={watchdog_error[0]}" if watchdog_error else ""
+            raise TimeoutError(
+                "input preflight wait가 absolute deadline을 넘었습니다" + detail
+            )
+    finally:
+        watchdog_stop.set()
+        if watchdog_thread is not None:
+            watchdog_thread.join(timeout=1.0)
+            if watchdog_thread.is_alive():
+                raise RuntimeError("input preflight watchdog thread join timeout")
     observed = np.asarray(probe)
     if observed.dtype != np.dtype("<i4") or observed.shape != (total_frames, 2):
         raise RuntimeError(

@@ -1,6 +1,6 @@
 # Elice 외부 데이터 staging 규칙
 
-갱신일: 2026-08-30
+갱신일: 2026-08-31
 
 ## 1. 상태와 권위 경계
 
@@ -33,7 +33,9 @@ repository, `.git`, data, results와 과거 receipt를 함께 포함하므로 �
 - 과거 readiness, selector, pilot, run과 checkpoint
 - 환경 fingerprint가 다른 decoder audit
 
-새 Elice에서 재사용할 수 있는 범위는 검증된 **raw-only cache인 `data/raw/`**뿐이다. recorded
+과거 snapshot에서 재사용할 수 있는 범위는 검증된 **raw-only cache인 `data/raw/`**뿐이다.
+이와 별도로 아래 §3.1의 official public archive cache는 고정 10개 archive의 전송 가속용으로만
+사용할 수 있다. recorded
 101세션, RIR, strict P/S, holdout/provenance와 transfer schema v2는 현재 Jetson exact commit이
 발행한 transfer manifest의 상대경로와 SHA대로 별도 전송한다. 과거 snapshot의 recorded 82세션과
 schema v1을 additions 19세션이 포함된 현재 generation처럼 취급하지 않는다.
@@ -60,6 +62,72 @@ Elice 인스턴스 삭제와 Drive remote snapshot 삭제는 서로 다른 결�
 검증과 metadata readback, 필요한 고유 결과의 별도 보존이 모두 확인된 뒤에만 삭제 후보가 된다.
 Drive remote는 후속 snapshot의 전체 cold-restore가 독립 검증되고 사용자가 정확한 삭제 대상을
 다시 승인하기 전까지 보존한다. 이 문서의 절차에는 archive 또는 remote 삭제 작업이 없다.
+
+### 3.1 official public archive cache 계약
+
+`scripts/elice/public_archive_cache.py`는 임의 URL·dataset ID·target을 받지 않는다. 정확히
+DNS Fullband 3개, DEMAND 6개, MIMII fan 1개만 고정 순서로 다룬다. FMA-small/FMA metadata와
+ESC-50은 현재 Drive의 extracted restore 또는 기존 bootstrap 경로를 그대로 사용하며 이 cache에
+넣지 않는다. LibriSpeech는 현행 public raw 37,761개 계약의 extra이므로 다운로드·복원 대상이
+아니다.
+
+| ID | archive bytes | 공급자 검증 |
+|---|---:|---|
+| `dns_noise_000` | 5,364,611,964 | Content-Length + strong ETag `0x8D9B5BADC55F6BB` |
+| `dns_noise_001` | 5,357,916,291 | Content-Length + strong ETag `0x8D9B5B0DB55DD9B` |
+| `dns_speech_000` | 4,664,045,287 | Content-Length + strong ETag `0x8D9B5BA782095C9` |
+| `demand_dkitchen` | 336,992,458 | provider MD5 `b4d38241fbd50d8a17f8742ca6870c10` |
+| `demand_dwashing` | 306,101,499 | provider MD5 `ecf765f12b8d3ada7ef0ec664b8f8d73` |
+| `demand_ooffice` | 277,643,831 | provider MD5 `6f87edf8a6b03f17b3f693af1754aab4` |
+| `demand_ohallway` | 252,905,617 | provider MD5 `cb9227a75d2c1342de0b6548da4bbb1b` |
+| `demand_tmetro` | 367,513,573 | provider MD5 `00d895020233f94348aafce7140d671f` |
+| `demand_tcar` | 373,520,251 | provider MD5 `8550f03e8356d8054ae845e8b4b6c773` |
+| `mimii_fan` | 928,511,244 | provider MD5 `a1a9b488934a82426bacc933d87aacde` |
+
+DNS 공급자는 cryptographic archive checksum을 공개하지 않는다. 따라서 ETag를 MD5/SHA로
+오인하지 않고 manifest에 `provider_checksum_kind=none`, 고정 ETag, 계산한 content SHA-256을
+각각 분리한다. 모든 archive는 size/provider validator 뒤 bzip2 또는 ZIP CRC, traversal,
+absolute path, symlink/hardlink/device, duplicate/case-collision, 고정 prefix와 WAV count/bytes를
+검사한다. DNS noise aggregate는 WAV 16,000개/15,360,708,826 bytes, speech는
+8,065개/8,000,834,860 bytes, DEMAND는 96개/2,764,841,088 bytes, MIMII는
+3,600개/1,152,158,400 bytes여야 한다.
+
+clean exact checkout에서 caller가 만든 저장소 밖 staging root와 rclone remote root를 명시한다.
+다음 명령은 이 문서를 작성하면서 실행하지 않았으며, 실제 실행 시에도 OAuth/service-account
+정보를 인자로 넘기지 않는다. 인증은 기존 rclone config에서만 읽는다.
+
+```bash
+test -d /dev/shm
+.venv/bin/python -I -B scripts/elice/public_archive_cache.py publish \
+  --staging-root /dev/shm \
+  --remote-root "gdrive:DeepANC/public_archive_cache/$EXPECTED_COMMIT" \
+  --expected-commit "$EXPECTED_COMMIT" \
+  --rclone "$(command -v rclone)"
+```
+
+publisher는 exact commit에 tracked된 `pget.py`로 archive를 하나씩만 받고 검증한다. 성공한
+archive도 manifest-last publish가 끝날 때까지 지우지 않으므로 `/dev/shm` peak는 10개 archive
+합계 18,229,762,015 bytes + 고정 512 MiB headroom이다. publisher는 이 전체 공간을 첫
+provider 요청/remote write 전에 검사한다. 실패한 `.part`, 완성 archive와 이미
+올라간 content-addressed remote object는 덮어쓰거나 삭제하지 않는다. Drive 명령은
+`copyto --immutable`, `transfers=1`,
+`checkers=1`, `tpslimit=2`, `drive-pacer-min-sleep=500ms`로 고정하고, 각 archive마다
+`rclone check --download`와 `rclone cat` SHA-256 readback을 수행한다.
+
+publisher의 exact-source gate는 `git status`만 보지 않는다. replace ref, graft,
+assume-unchanged/skip-worktree, HEAD/index/tree/mode와 실제 tracked blob 전체를 기존
+`exact_clean_source_evidence()`로 재검증한다. 그 checker 자체, cache entry script와 tracked
+`pget.py`는 실행 전에 expected commit의 blob과 직접 비교하며, manifest에는 entry script SHA와
+`publisher_pget_sha256`을 함께 봉인한다. bootstrap Git은 PATH/상속 `GIT_*`를 쓰지 않고 regular
+non-symlink `/usr/bin/git`과 명시 git-dir/work-tree만 사용한다. 검증 뒤 경로를 다시 여는 대신
+expected-commit의 `source_trust.py`/`pget.py` blob bytes 자체를 compile/exec하며, CLI는
+`python -I -B`를 강제한다. hidden pget 변조·path swap·다른 downloader path는 허용하지 않는다.
+
+remote 상대경로는
+`archives/v1/<id>/bytes_<N>/sha256_<SHA>/<official-name>`이다. 10개가 모두 통과한 뒤에만
+`manifests/v1/sha256_<SHA>/archive_cache_manifest.json`을 마지막 immutable object로 발행한다.
+stdout의 manifest 상대경로와 SHA-256을 서로 다른 신뢰 채널로 Elice에 전달한다. mutable
+`latest` pointer나 remote delete/sync는 없다.
 
 ## 4. 권장 cold-start 흐름
 
@@ -97,6 +165,85 @@ receipt, results, runs는 incoming에서 복사하지 않는다. monolithic arch
 inventory receipt가 없으면 archive 전체를 `/home/elicer`에 풀지 말고 이 경로를 건너뛴다. 이 경우
 아래 full bootstrap이 공식 public source에서 다시 받게 하는 것이 권장 경로다.
 
+### 4.2.1 content-addressed archive cache restore / held-fd consume
+
+archive cache는 remote를 repository에 직접 mount하지 않는다. repository 밖 read-only mount 또는
+별도 incoming tree로 정확한 content-addressed layout을 노출하고, manifest SHA를 외부에서
+명시한다. 예를 들어 Elice에서 read-only mount를 쓰면 다음과 같다.
+
+```bash
+mkdir -p /mnt/deep_anc_archive_cache
+rclone mount \
+  "gdrive:DeepANC/public_archive_cache/$EXPECTED_COMMIT" \
+  /mnt/deep_anc_archive_cache \
+  --read-only --vfs-cache-mode off --daemon \
+  --transfers 1 --checkers 1 --tpslimit 2 --drive-pacer-min-sleep 500ms
+
+ARCHIVE_CACHE_ROOT=/mnt/deep_anc_archive_cache
+ARCHIVE_CACHE_MANIFEST="$ARCHIVE_CACHE_ROOT/$ARCHIVE_CACHE_MANIFEST_RELATIVE"
+```
+
+mount 대신 local incoming을 쓰면 `rclone copy --immutable`로 저장소 밖에 받고
+`rclone check --one-way --download`까지 마친다. 어느 방식도 cache source에 sidecar나 marker를
+쓰지 않는다. 먼저 archive만 no-replace 복원하고 종료하려면 다음 명령을 사용한다.
+
+```bash
+bash scripts/elice/bootstrap_all.sh \
+  --expected-commit "$EXPECTED_COMMIT" \
+  --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
+  --archive-cache-root "$ARCHIVE_CACHE_ROOT" \
+  --archive-cache-manifest "$ARCHIVE_CACHE_MANIFEST" \
+  --expected-archive-cache-manifest-sha256 "$ARCHIVE_CACHE_MANIFEST_SHA256" \
+  --archive-cache-only \
+  --no-update
+```
+
+`--archive-cache-only`는 manifest external anchor와 10개 archive의 size/checksum/SHA/member
+inventory를 다시 계산하고, 고정 canonical archive filename에 exclusive staging copy+fsync+hardlink
+no-replace로 발행한 뒤 끝난다. 이미 exact한 target은 받아들이지만 다른 bytes, symlink 또는
+non-regular target은 바꾸지 않고 실패한다. 복사 중 실패한 staging은 forensic evidence로
+보존한다. extractor, 37,761 raw audit, decoder audit, six manifest, bootstrap receipt는 모두
+발행하지 않으므로 이 성공은 raw/training authority가 아니다.
+
+restore 성공은
+`data/raw/noise/.archive_cache_origins/archive_cache_origin.<manifest-sha>.<commit>.json`도
+no-replace로 발행한다. 이 receipt는 10개 target의 SHA/size, manifest SHA, exact commit,
+entry/pget SHA를 결속하지만 `cache_origin_only_not_official_raw_or_training_authority`일 뿐이다.
+다음 full bootstrap에서도 반드시 같은 cache 세 인자와 외부 manifest SHA를 다시 제시해야 한다.
+receipt 파일만 남기거나 복사한 것은 external anchor를 대체하지 않는다.
+
+full bootstrap은 restored pathname을 shell `tar`/`unzip`에 넘기지 않는다. 별도 `consume` subprocess가
+external SHA로 검증한 manifest를 메모리에 고정하고, cache root를 dirfd로 순회해 10개 archive
+inode를 `O_NOFOLLOW`로 모두 연다. 각 descriptor는 size/provider checksum/SHA/member inventory 검증,
+decompression/no-replace raw publish, 마지막 SHA/metadata readback과 cache-origin receipt 발행이 끝날
+때까지 유지한다. 따라서 검증 뒤 archive pathname rename/replacement는 추출 입력이 될 수 없고,
+same-inode 변경은 최종 gate에서 실패한다. raw target도 모든 ancestor fd/identity를 유지해 중간
+symlink 교체를 거부하고 existing target은 decompressed bytes가 exact할 때만 재개한다.
+
+manifest는 archive member의 path/size뿐 아니라 각 decompressed member content SHA와 최종 raw
+상대경로 projection SHA도 봉인한다. `consume`은 약 27,761개 cache-origin WAV의 descriptor를
+RLIMIT_NOFILE 범위 안에서 모두 열어 둔 채 content SHA, inode, link count, mtime/ctime과 named path를
+inventory→origin→completion receipt 전후로 반복 대조한다. 첫 raw보다 먼저 immutable intent를 쓰며,
+완료 시 per-member `{archive_id,path,size,sha256}` inventory와 completion을 no-replace로 결속한다.
+중단되어 raw count만 완성됐거나 marker directory 생성 직후 종료된 경우에도 cache 세 external
+anchor가 없는 plain bootstrap은 이를 official raw로 승격하지 않는다.
+
+shell은 consume 직후, decoder audit 직전, decoder audit/prepare 뒤와 최종 receipt 직전에 current
+raw를 durable per-member inventory에 다시 결속한다. decoder report의 `relative_path`,
+`content_size`, `content_sha256` projection도 external archive manifest에서 유도된 projection과
+exact해야 한다. `dns_fullband`/`speech`/`demand`/`machine/fan` 네 cache-owned root의 nofollow
+WAV exact-set도 durable inventory와 같아야 하므로 extra WAV를 decoder에 넣어 재봉인하는 방식은
+거부된다. 최종
+bootstrap receipt는 **schema v3**이며 cache를 쓰지 않았으면 `archive_cache_consumption=null`, 썼으면
+manifest/completion/member-inventory/decoder file·semantic·projection SHA를 명시한다. schema v2 receipt는
+forensic 호환 입력으로만 읽을 수 있고 새 bootstrap이 발행하지 않는다.
+
+canonical campaign과 direct trainer/ledger issuer는 schema-v3 receipt 내부 문자열만 신뢰하지
+않는다. 저장소 밖 external manifest path와 별도 SHA-256 anchor를 resolved data config까지 전달하고,
+manifest bytes·publisher source·archive origin·archive별 output-content projection을 재검증한다. 이
+external manifest SHA는 experiment contract와 canonical prerequisite에도 남는다. campaign CLI는
+project import shadow를 막기 위해 항상 `.venv/bin/python -I -B`로 실행한다.
+
 ### 4.3 현재 transfer schema v2 배치
 
 Jetson에서 발행한 `data/manifests/elice_transfer_manifest.json`과 manifest가 열거한 파일을
@@ -123,13 +270,16 @@ semantic bytes, GPU, storage, environment 또는 public raw를 확인했다는 �
 
 ### 4.5 full bootstrap
 
-현재 schema v2 transfer 파일 배치와 선택적 raw cache 검증을 마친 뒤 같은 네 anchor로 실행한다.
+현재 schema v2 transfer 파일 배치 뒤 cache를 쓰려면 세 external anchor를 그대로 포함한다.
 
 ```bash
 bash scripts/elice/bootstrap_all.sh \
   --expected-commit "$EXPECTED_COMMIT" \
   --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
   --expected-transfer-manifest-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
+  --archive-cache-root "$ARCHIVE_CACHE_ROOT" \
+  --archive-cache-manifest "$ARCHIVE_CACHE_MANIFEST" \
+  --expected-archive-cache-manifest-sha256 "$ARCHIVE_CACHE_MANIFEST_SHA256" \
   --raw-hash-workers 8 \
   --no-update
 ```
@@ -139,6 +289,50 @@ decoder audit, six manifests, QA와 pytest를 검사하고 bootstrap receipt를 
 있어도 검증을 생략하지 않는다. bootstrap은 학습을 자동 시작하지 않으므로 receipt 이후 readiness,
 G0, gradient, pilot/probe, A100 resume-equivalence smoke와 campaign ledger를
 `docs/05_training_elice.md` 순서대로 통과해야 한다.
+
+파일시스템 total 127.875 GiB 계약은 cache 여부와 무관하다. 미완성 raw의 최초 실행에서 official
+download는 repository archive/staging peak를 포함해 available 96 GiB를, held-fd cache consume은
+외부 archive를 repository에 재복사하지 않으므로 available 72 GiB를 요구한다.
+이 shell 수치와 별도로 cache CLI가 각 canonical archive/raw target의 실제 parent dirfd에
+`fstatvfs`를 실행한다. 따라서 `data/raw`가 repository와 다른 mount이면 그 mount별 missing bytes,
+sequential staging peak와 512 MiB reserve가 첫 archive/raw publish 전에 충족되어야 한다.
+
+archive cache 세 인자는 all-or-nothing이다. full bootstrap은 transfer/environment/early pytest 뒤
+`public_archive_cache.py consume`으로 고정 10개를 held-fd 추출한다. 이후 DNS shell bzip2/tar와
+DEMAND/MIMII ZIP pathname extractor는 cache mode에서 호출하지 않는다. cache object 하나라도
+missing/손상/manifest 불일치이거나 held source/target identity가 바뀌면 즉시 종료하며 해당 corpus를
+official network에서 다시 받는 fallback은 0회다. 반면 FMA/ESC는 이 cache의 대상이 아니므로 기존
+official/extracted restore 경로를 따른다.
+
+consume은 성공해도 raw/bootstrap authority가 아니다. no-replace raw tree를 만든 뒤 기존 exact
+16,000 DNS noise + 8,065 speech + 96 DEMAND + 3,600 MIMII count, 전체 decoder fingerprint/SHA audit,
+six manifests, QA, pytest와 bootstrap receipt를 그대로 실행한다. 실패 중간에 발행된 exact member와
+forensic staging은 자동 overwrite/delete하지 않는다. origin receipt는 completion보다 먼저 발행될 수
+있어 crash 뒤 남을 수 있지만 cache transport provenance일 뿐 raw/training authority가 아니다. 같은
+external anchors로 재실행하면 기존 raw member가 archive에서 다시 읽은 bytes와
+exact할 때만 이어간다.
+
+consume/restore는 실제 target parent의 filesystem별로 byte와 inode 여유를 모두 첫 publish 전에
+검사한다. raw/archive output뿐 아니라 intent/inventory/origin/completion parent mount도 포함한다.
+missing final bytes/inodes, 한 번에 하나인 staging peak, 512 MiB 및 receipt/forensic 64 inode
+reserve 중 하나라도 부족하면 intent/raw/archive를 발행하지 않는다. `data/raw` 별도 mount도 이 검사를
+우회하지 않는다.
+
+완료된 cache-origin raw에서 `--cache-preflight-only`를 다시 쓸 때는 cache root/manifest/external
+manifest SHA 세 인자를 함께 유지한다. decoder reuse verifier의 전수 대조가 끝난 뒤 단순 projection
+비교까지 raw pathname이 바뀌는 창을 없애기 위해, archive verifier가 cache 대상 raw descriptor를
+전부 다시 열어 보유한 채 current content와 durable member inventory 및 decoder report를 한 경계에서
+재결속한다. 따라서 cache-origin raw는 의도적으로 두 번 hash한다. `--decoder-projection-only`는 이
+TOCTOU를 닫을 수 없어 거부하며, preflight도 receipt/raw authority를 발행하지 않는다.
+
+반대로 cache 세 인자가 없는 plain bootstrap은 시작 시점에 위 DNS/DEMAND/MIMII working archive
+10개 중 하나라도 이미 있으면 CRC/bzip2가 정상이어도 즉시 거부한다. 이는 cache-only bytes를
+official-origin archive로 세탁하는 경로를 막기 위한 의도된 restart 경계다. official downloader가
+같은 실행에서 새로 만든 완성 archive만 즉시 extractor로 넘길 수 있다. 중단 뒤 남은 `.part`는
+pget의 held validator와 archive별 0700 deterministic private staging으로 같은 output에서 재개할
+수 있지만, 완성 archive는 자동 재사용·삭제하지 않는다. final은 no-replace publish하며 fixed target
+parent의 intermediate symlink도 setup/network 전에 거부한다. matching cache anchor를 제시하거나
+bytes를 별도로 보존·격리한 뒤 official download를 새로 시작한다.
 
 ## 5. 외부 공급원 공통 규칙
 

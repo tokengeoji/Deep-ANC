@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import time
 
 import numpy as np
 import pytest
@@ -76,8 +77,8 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
     "scripts/data/measure_recording_gain_linearity.py": (
         True,
         True,
-        "source-gain v2 bounded ESS/IMD 실측. public int32 input-only preflight와 "
-        "exact plan/SHA/hardware pre-open gate 뒤 0.012까지만 출력한다",
+        "source-gain v3 gainprobe006 bounded ESS/IMD 실측. public int32 input-only "
+        "preflight와 exact plan/SHA/hardware pre-open gate 뒤 0.006까지만 출력한다",
     ),
     "scripts/data/calibrate_wideband.py": (True, True, "채널별 ESS 측정"),
     "scripts/data/set_amp_level.py": (True, True, "앰프 레벨 교정 미터"),
@@ -449,3 +450,43 @@ def test_public_measurement_preflight_is_input_only_owned_and_analyzer_bound(
     assert calls[3][0] == "rec"
     source.fill(0)
     assert np.any(raw != 0)
+
+
+def test_measurement_input_preflight_wait_obeys_absolute_campaign_deadline(
+    monkeypatch,
+):
+    import deep_anc.audio_io as audio_io
+
+    fs = 48_000
+    events = []
+
+    class SlowInput:
+        def check_input_settings(self, **_kwargs):
+            return None
+
+        def rec(self, frames, **_kwargs):
+            return np.zeros((frames, 2), dtype="<i4")
+
+        def wait(self):
+            time.sleep(0.06)
+
+        def stop(self):
+            events.append("stop")
+
+    hardware = {
+        "sample_rate": fs,
+        "input": {"card": "APE", "pcm": 1},
+        "output": {"card": "Audio", "pcm": 0},
+    }
+    monkeypatch.setattr(audio_io, "assert_measurement_pcm_unoccupied", lambda _h: None)
+    monkeypatch.setattr(audio_io, "assert_capture_clock_undisturbed", lambda _c: None)
+    monkeypatch.setattr(audio_io, "resolve_alsa_portaudio_device", lambda *_a, **_k: 4)
+
+    with pytest.raises(TimeoutError, match="absolute deadline"):
+        audio_io.capture_measurement_preflight_raw(
+            SlowInput(),
+            hardware,
+            seconds=1.5,
+            absolute_deadline_monotonic=time.monotonic() + 0.02,
+        )
+    assert events == ["stop"]

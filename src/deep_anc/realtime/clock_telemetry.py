@@ -46,6 +46,7 @@ class RuntimeCounterSnapshot:
 
     xrun_count: int = 0
     deadline_miss_count: int = 0
+    engine_error_blocks: int = 0
     input_ring_drop_samples: int = 0
     output_ring_drop_samples: int = 0
     input_ring_overrun_blocks: int = 0
@@ -62,6 +63,7 @@ class RuntimeCounterSnapshot:
         values = {
             "xrun_count": int(self.xrun_count),
             "deadline_miss_count": int(self.deadline_miss_count),
+            "engine_error_blocks": int(self.engine_error_blocks),
             "input_ring_drop_samples": int(self.input_ring_drop_samples),
             "output_ring_drop_samples": int(self.output_ring_drop_samples),
             "input_ring_overrun_blocks": int(self.input_ring_overrun_blocks),
@@ -490,6 +492,7 @@ class ClockTelemetryRecorder:
         zero_fields = (
             "xrun_count",
             "deadline_miss_count",
+            "engine_error_blocks",
             "input_ring_drop_samples",
             "output_ring_drop_samples",
             "input_ring_overrun_blocks",
@@ -578,6 +581,10 @@ class ClockTelemetryRecorder:
             "counter_semantics": {
                 "deadline_miss_count": (
                     "engine.step wall-time이 한 callback block deadline 이상인 횟수"
+                ),
+                "engine_error_blocks": (
+                    "engine.step 예외로 상쇄 출력을 무음으로 대체한 블록 수; "
+                    "canonical runtime에서는 exact 0이어야 함"
                 ),
                 "fallback_silence_blocks": (
                     "callback에서 output ring data가 없어 실제 상쇄 출력을 무음으로 "

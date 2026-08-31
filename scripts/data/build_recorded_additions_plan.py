@@ -50,6 +50,7 @@ from deep_anc.data.recorded_generation import (  # noqa: E402
     _canonical_source_selection_evidence,
     _canonical_source_lineage,
     _read_source_plan,
+    validate_recorded_source_plan_candidate,
     validate_generation_id,
 )
 from deep_anc.data.recording_gain_linearity import (  # noqa: E402
@@ -75,12 +76,13 @@ from deep_anc.data.recorded_demand_selection import (  # noqa: E402
 )
 from deep_anc.data.recorded_dns_selection import (  # noqa: E402
     DNS_REPEAT_COUNT,
+    DNS_SELECTION_GENERATION_ID,
     DNS_SELECTION_RECEIPT,
     DNS_TRANSFORM,
     validate_dns_selection_receipt,
 )
 
-CANONICAL_GENERATION_ID = "stage1-coverage-v3-gain012"
+CANONICAL_GENERATION_ID = DNS_SELECTION_GENERATION_ID
 
 
 def _snapshot(relative: str, *, label: str):
@@ -316,9 +318,11 @@ def _validate_bytes(
     ) as directory:
         candidate = Path(directory) / f"{generation_id}.csv"
         candidate.write_bytes(raw)
-        _read_source_plan(
+        canonical_relative = f"{SOURCE_PLAN_ROOT}/{generation_id}.csv"
+        validate_recorded_source_plan_candidate(
             repo_root=REPO_ROOT,
-            relative=candidate.relative_to(REPO_ROOT).as_posix(),
+            candidate_relative=candidate.relative_to(REPO_ROOT).as_posix(),
+            canonical_relative=canonical_relative,
             require_source_files=True,
         )
         return _require_all_rows_feasible(
@@ -390,6 +394,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         generation_id = validate_generation_id(args.generation_id)
+        if generation_id != CANONICAL_GENERATION_ID:
+            raise ValueError(
+                "현행 exact source plan generation-id는 "
+                f"{CANONICAL_GENERATION_ID!r}입니다"
+            )
         dns_receipt_sha = str(args.dns_selection_receipt_sha256).lower()
         demand_receipt_sha = str(args.demand_selection_receipt_sha256).lower()
         for option, value in (

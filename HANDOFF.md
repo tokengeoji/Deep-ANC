@@ -6,96 +6,108 @@
 ## 현재 권위 상태 (2026-08-31)
 
 **학습은 아직 시작하지 않았다.** canonical surrogate pretrain 100k, measured fine-tune
-50k, canonical checkpoint, G4, 현장 ANC OFF/ON raw는 모두 0이다. Elice 크레딧이 끝나
-기존 인스턴스도 종료됐으며, 로컬의 2026-08-02~05 checkpoint는 legacy/diagnostic-only다.
+50k, canonical checkpoint, G4, **현행 strict 계약에 결속된** 현장 ANC OFF/ON raw는 모두
+0이다. 2026-08-04의 OFF/ON session raw는 로컬에 남아 있지만 legacy checkpoint/plant에
+결속된 diagnostic-only 자료이며 현행 성능 근거가 아니다. Elice 크레딧이 끝나 기존
+인스턴스도 종료됐으며, 로컬의 2026-08-02~05 checkpoint도 legacy/diagnostic-only다.
 
-현재 복구·백업 상태는 다음과 같다.
+현재 authoritative 상태는 다음과 같다.
 
-- GitHub는 `main`과 `dev`만 유지한다. 2026-08-31 작업 시작 readback에서 local/origin
-  `dev`는 `b074c136086f1b227d05e57b958e8b5d69956508`, local/origin `main`은
-  `67572b14436f65c917f3cd4bb18e64b121898fa1`로 exact였다. 이 아래의 새 가드레일은 전체
-  테스트 후 `dev`에 별도 clean commit으로 push한다. raw/checkpoint/private key/rclone
-  config는 Git에 넣지 않는다.
-- Drive의 `DeepANC/jetson_data_backup_20260827/data`는 원격 readback 기준
-  13,428파일/17,439,445,191 regular-file bytes다. 고정 manifest 13,428행의 SHA-256은
-  `1dd9fef8d796cc1f27fbf5d434d640c8b80554e16f04b6bfac0d3403c748bea2`이고, 현재
-  transfer가 참조하는 `data/` 337개는 missing/SHA mismatch가 모두 0이다.
-- `DeepANC/bootstrap_cache_b074`에는 완료 decoder audit 90,424,631바이트와 current
-  transfer authority 11개를 별도로 no-replace 보존했다. audit file SHA-256은
-  `ed3b379827f1a38b170f3ab394a689e8164a0251d8f5ff84642f61765a15c9e8`, 내부 semantic
-  SHA는 `0b39019a347f3a555d73c45b455e47b62f51a2faf52138c664eb85ddc1e56975`다.
-  반면 2026-08-30 Elice tar는 10조각 중 part 5가 없으므로 완전 복구본이 아니다.
-- 종료된 Elice에서 전체 pytest와 public raw decoder audit은 완료됐지만, 최신 DNS/DEMAND
-  selector는 Jetson으로 이관되지 않았다. 새 인스턴스의 새 exact commit에서 다시 발행한다.
-
-다음 Elice bootstrap은 비싼 작업 전에 exact source/holdout/transfer, A100 80GB,
-128 GiB storage, 전체 test collection과 핵심 Elice 회귀를 먼저 검사한다. fresh 인스턴스는
-public raw와 venv가 없으므로 `--cache-preflight-only`가 아니라 decoder audit의 두 외부 SHA를
-붙인 full bootstrap을 실행한다. `--cache-preflight-only`는 raw와 exact venv가 이미 있는 재개
-인스턴스에서만 쓴다. `--status-root`에는 단계별 atomic JSON을 남기며 실패한 cache를 자동
-수선하거나 full decode로 조용히 fallback하지 않는다. 상세 백업·복원 anchor는
-[`docs/64_20260831_training_backup_bootstrap_status.md`](docs/64_20260831_training_backup_bootstrap_status.md)에
-있다.
-
-Stage-1 실측 추가 수집도 아직 0/19다. 첫 실패 raw를 독립 재계산한 결과 공통 시간축
-hunting과 source별 약 22.82 dB의 strict-P 예측 peak 편차가 있어, fixed amplitude `0.06`을
-19개에 일괄 적용하는 것은 안전 authority가 아니다. 무출력 source-gain v1은 source별 ERR
-상한/하한을 계산하지만 REF 상한과 실제 다중레벨 선형성 receipt가 없으므로 live를 열지
-않는다. 다음 물리 단계는 단 한 번의 bounded 다중레벨/동기 probe로 REF와 선형성 authority를
-만든 뒤 source별 gain을 결속하는 것이다. 이 PASS 전에는 19개 batch를 실행하지 않는다.
+- GitHub branch는 `main`과 `dev`만 유지한다. 마지막 clean/pushed `dev` 기준선은
+  `65ebd73df51a686865a2eb7e7532d1b1bea2a78c`, local/`origin/main`은
+  `67572b14436f65c917f3cd4bb18e64b121898fa1`다. 이 문서를 포함한 후속 통합은
+  2026-08-31 전체 pytest 2,926개(162파일) exit 0, static reference, Python/shell syntax,
+  `git diff --check`를 통과했다. 최종 비밀정보 검사 뒤 하나의 새 clean `dev` commit으로
+  push한다. raw/checkpoint/PEM/rclone config는 Git에 넣지 않는다.
+- Drive의 `DeepANC/jetson_data_backup_20260827/data`는 readback 기준
+  13,428파일/17,439,445,191바이트이며 manifest SHA-256은
+  `1dd9fef8d796cc1f27fbf5d434d640c8b80554e16f04b6bfac0d3403c748bea2`다. 현재 transfer의
+  `data/` 337개는 missing/SHA mismatch 0이다.
+- 기존 recorded data는 실제 재검산에서 82/82 session PASS, 5,740초(95.67분), 61개
+  lineage group, 4 family, 오류·경고 0이다. 데이터가 잘못됐다는 뜻은 아니지만 현행
+  family×split의 600--1600 Hz 독립 coverage가 부족하므로 이 82개만으로 공식 학습을 열지는
+  않는다. 부족분은 gain probe가 허용한 source별 amplitude로 19개 짧은 session을 수집한다.
+- 첫 physical gain probe v2는 authority가 아니다. `.003/.006/.009`까지만 캡처됐고
+  `.009` REF peak `0.4177616` 때문에 `.012`를 출력하기 전에 안전 중단했다. raw는
+  `results/recording_gain_linearity_v2/ab0d2402f6c96232/raw_measurement.npz`
+  (SHA-256 `e2616dfbabfeb18afd79a1d0c00c4bb191c9bf93b1224975a736bf8b924eee1e`), FAIL receipt는
+  `results/data_audit/recording_gain_linearity_v2_receipt.json`
+  (SHA-256 `d888948d46fa8748fd8d9f15f155acbb5c529b00865f54f6773e19920972608e`)다. Drive
+  `DeepANC/jetson_measurements_20260831/forensic_fail/recording_gain_linearity_v2/`
+  아래 5파일은 `rclone check --download`에서 0 differences/5 matching이다.
+- 현행 no-replace generation ID는 오직 `stage1-coverage-v4-gainprobe006`이다. v2/v3 이름,
+  amplitude `0.06`, cap `0.012`는 diagnostic-only이며 direct CLI/batch/source-plan/
+  generation/transfer 어느 경로에서도 현행 입력으로 승격하지 않는다.
+- 새 gain probe는 `.003/.004/.005` fit + 독립 `.006` holdout, NS ch0 only, CS ch1 exact
+  zero다. 같은 덕트를 지난 pilot response 5개로 affine clock trajectory와 중간 sample step을
+  검증한다. nominal active `15.615667초`, exact int16 nonzero `13.821375초`, output-open
+  `26초`, software-enforced live hard deadline `37초`다. 저 SNR 왜곡은 INCONCLUSIVE이며
+  `distortion_certified=false`; PASS가 나더라도 권한은 tested range의 ADC peak safety뿐이다.
+  live raw는 held directory의 raw/metadata/capture-publication 3개 no-replace 파일과 외부
+  SHA가 모두 일치할 때만 offline receipt PASS가 가능하다. output 종료부터 durable commit까지
+  종료 신호를 보존하고 recovery-only raw는 분석 가능해도 authority로 승격하지 않는다.
+  **아직 v3 physical raw/PASS receipt/dynamic cap은 없다.**
+- Google Drive용 fixed public archive cache는 DNS3+DEMAND6+MIMII1 총
+  `18,229,762,015`바이트를 한 파일씩 검증·immutable 업로드하고 manifest를 마지막에
+  발행하도록 구현했다. FMA/ESC는 기존 Drive snapshot을 사용하고 LibriSpeech는 포함하지
+  않는다. actual archive download/Drive publish는 아직 0회이며 clean exact commit 뒤에만
+  실행한다. cache origin marker와 external manifest SHA가 없으면 이후 bootstrap이 기존
+  archive를 재사용하지 못한다.
+- fixed cache의 실제 소비 경계는 external manifest 원문 SHA와 archive별 projection을
+  transfer/experiment/prerequisite까지 직접 결속하고, cache-root decoder inventory는
+  expected output과 exact-set이어야 한다. campaign CLI는 호출 방식과 무관하게 `-I -B`를
+  요구하며 최초 trusted import 전의 모든 preloaded `deep_anc*`를 거부한다. same-path
+  custom-loader spoof를 포함한 cache→transfer→campaign→bootstrap 회귀 195개가 PASS했다.
+- 종료된 Elice의 최신 DNS/DEMAND selector는 이관되지 않았고 현재 Elice 인스턴스도 없다.
+  다음 인스턴스는 archive cache를 local SSD로 no-replace 복원한 뒤 exact raw audit/
+  selector를 발행하고, 19-session 수집·schema-v2 이관 후에만 G0→20k/5k probe→fresh
+  100k→50k campaign을 연다. transport cache 자체는 raw/training authority가 아니다.
 
 현재 strict Stage-1 timing은 P delay 1386, S delay 1245, handoff 256에서
-`PlantDelays.lead()=115`로 닫혀 있다. 그러나 최신 natural raw의 REF→ERR coherence²
-`0.8337`은 historical minimum `0.9643`보다 낮고 low/high coherence도 각각 약
-`0.598/0.338`이므로, 이를 2/4/8 kHz 또는 realtime 성능 authority로 승격하지 않는다.
-광대역 목표와 latency fail-closed 조건은 그대로 유지한다.
+`PlantDelays.lead()=115`다. 이 strict P/S의 authority는 150--1600 Hz뿐이다. 2/4/8 kHz
+coupling 진단이나 legacy checkpoint를 광대역 P/S·ANC 성능 근거로 승격하지 않는다.
 
-### 2026-08-31 통합 가드레일 완료 상태
+latency gate는 성능 마진과 별개로 완화하지 않는다. 48 kHz/256-frame의 물리 블록 시간은
+`5.333... ms`이고 canonical runtime은 inference P99 `<3 ms`, max `<5.333 ms`, deadline
+miss/xrun/ring drop·add/excess backlog/fallback/watchdog/sample slip 모두 0, lead 115 exact를
+요구한다. 감쇠 여유가 작다는 이유만으로 준비 실험을 폐기하지는 않지만, 양의 감쇠·고역
+do-no-harm·위 latency gate를 통과하기 전에는 실제 ANC 성공이나 배포 가능으로 판정하지 않는다.
 
-이 절을 포함한 `dev` tip에서 통합 focused test, 변경 Python `py_compile`, Elice shell
-`bash -n`, static pytest/SHA reference audit와 전체 pytest를 다시 실행했다. 최종 전체
-pytest는 **0 FAIL**이고 선택적 실기 test 3개만 skip됐다. 로컬 public manifest 4종이 없는
-진단 fixture에서 발생한 두 RuntimeWarning은 Elice bootstrap 전 누락 source를 조용히 합성
-대체하지 못하게 하는 의도된 경고다.
+여기서 “latency 0”은 물리 전달과 causal block 처리를 0 sample로 만든다는 뜻이 아니다.
+고정 one-hop 256 samples는 strict plant timing에 포함하고 digital reference를 lead 115로
+정렬한다. 절대 0이어야 하는 것은 deadline miss, xrun, engine exception, ring drop/add,
+허용 one-hop을 넘는 excess backlog, fallback silence, watchdog, sample slip이다. callback
+race로 관측 가능한 absolute backlog 0 또는 256 samples는 정상 범위다. 현재 working tree는
+첫 callback의 구조적 fallback을 없애기 위해 stream open 전 exact 1-block zero를 한 번만
+prime하고, 녹음 session의 전 inference wall-time raw·engine-error counter·checkpoint/export/
+sidecar/P/S 시작-종료 SHA snapshot을 보존한다. acoustic physical witness만으로 callback 전
+silent period drop 0을 self-claim하지 못하도록 independent electrical authority는 외부 raw
+schema가 생길 때까지 fail-closed false다. 이는 학습 admission blocker가 아니라 canonical
+모델을 실제 배포 성능으로 승격할 때의 마지막 hardware/runtime blocker다.
 
-이번 통합으로 다음 소프트웨어 경계를 닫았다.
+gain probe의 live signal handler는 callback 시작부터 watchdog 정지, stream abort/close,
+partial-array surface까지 연속 유지한다. cleanup 중 SIGINT/SIGTERM/SIGHUP는 queue하고 raw
+commit guard로 handoff하며, 그룹 사이 pending signal은 다음 stream을 열기 전에 중단한다.
+cleanup 경계 SIGTERM에서도 `abort→close→partial raw`와 ch1 exact zero를 보존하는 회귀를
+포함해 gain/interleaved/audio-entry focused 전체가 PASS했다.
 
-- 새 Elice의 권위 경로는 schema-v1 bootstrap/selector → Jetson 19-session authority →
-  schema-v2 bootstrap/training 두 단계다. `push_transfer_bundle.py`가 exact commit과
-  상대경로/SHA를 no-delete rsync로 전달하고, `run_canonical_campaign.py`가
-  G0 → output-gradient → 20k pilot → 5k measured probe → raw val winner → resume smoke →
-  fresh 100k → readiness 17/17 → 50k 순서를 한 단계씩만 연다.
-- 경계 결과에서만 seed `20260903` prerequisite를 별도로 발행한다. direct cross-seed CLI와
-  test capability도 각 후보의 `canonical_finetune` 50k completion, 같은 seed의
-  `canonical_pretrain` 100k completion/init, primary campaign 또는 secondary prerequisite를
-  raw checkpoint에서 다시 검증한다. 첫 seed의 init을 두 번째 seed가 재사용하는 경로는
-  차단됐다.
-- recorded additions 현행 no-replace generation은
-  `stage1-coverage-v3-gain012`다. 과거 `stage1-coverage-v2`와 amplitude `0.06`은
-  diagnostic-only로 보존한다. canonical direct CLI, batch, generation, transfer 어느
-  경로에서도 v2 source-gain plan과 gain-linearity PASS receipt 없이 legacy session을
-  `current_strict`로 승격할 수 없다.
-- 물리 gain/linearity probe는 `.003/.006/.009/.012` 네 bounded level, NS ch0 only,
-  CS ch1 exact zero다. 무출력 dry-run 계산은 audible `14.762333초`, output-open `24초`,
-  input preflight를 포함한 connected hard upper `35초`다. plan/source/hardware/campaign/
-  strict P/S/linearity authority를 held inode/SHA로 고정하고 stream을 연 뒤 다시 검증한
-  다음에만 explicit start한다. 실패 raw는 분석보다 먼저 immutable하게 보존한다.
-- 현 로컬 source-pool 9행은 measured cap `0.012`의 exact precondition을 통과한다.
-  기존 disk CSV는 stale하고 현재 external DNS/DEMAND 선택 일부가 같은 cap에서 실패하므로,
-  다음 Elice에서 public raw selector를 새 generation으로 재발행해야 한다. additions plan은
-  gain receipt를 소비해 **19/19 feasible**일 때만 생성되며 임계값을 낮추지 않는다.
+2026-08-31 이번 통합 중 재실행한 read-only 현장 확인에서도 모든 PCM은 `closed`였고
+PulseAudio는 control node만 열고 있었다. AB13X는 계속 48 kHz/S16, 2-channel
+`ADAPTIVE` playback과 mono `ASYNC` capture이며 APE의 `CVB-RT Jack-state`는 `None`이었다.
+따라서 현재 연결은 짧은 Stage-1 USB 출력/ERR·REF 녹음에는 사용할 수 있지만, callback 전
+silent period drop을 독립 전기 시간축으로 증명하는 common-clock authority로는 승격하지
+않는다. 이 read-only 확인에서는 스피커 출력을 하지 않았다.
 
-커밋 뒤 다음 실제 순서는 하나다.
+커밋 뒤 다음 순서는 다음과 같다.
 
-1. 모든 PCM과 외부 작업의 장치 점유를 다시 확인하고, exact clean commit으로 위 probe의
-   no-audio dry-run plan을 no-replace 발행한다.
-2. 사용자 지시에 따라 스피커·마이크의 물리 연결은 준비 완료까지 유지할 수 있지만, 출력
-   창 밖에서는 PCM을 닫고 두 DAC 채널을 exact zero로 둔다. 한 번의 최대 35초 창만 실행하고
-   자동 재시도하지 않는다.
-3. raw SHA를 고정한 뒤 오프라인 분석으로 PASS receipt를 발행한다. FAIL이면 raw를 보존하고
-   원인을 먼저 고치며 19-session batch로 진행하지 않는다.
-4. PASS artifact를 Drive에 상대경로/SHA readback으로 추가 백업한다. 그 뒤에만 새 Elice를
-   열어 fresh public raw selector와 `stage1-coverage-v3-gain012` 19/19 plan을 만든다.
+1. 완료된 전체 pytest/정적 검사의 최종 비밀정보 재검사를 마치고 clean `dev` commit을 push한다.
+2. 모든 PCM과 외부 장치 점유를 확인한 뒤 그 exact commit으로 no-audio plan을 발행한다.
+3. 물리 연결은 사용자 지시대로 유지하되 출력 창 밖에서는 PCM을 닫고 두 DAC 채널을 exact
+   zero로 둔다. 본 probe는 한 번만 실행하고 자동 재시도하지 않는다.
+4. raw SHA를 먼저 고정하고 오프라인 receipt를 발행한다. FAIL이면 raw를 보존하고 19-session
+   batch를 열지 않는다. PASS면 Drive readback 뒤 dynamic cap 이하에서만 source plan을 만든다.
+5. clean commit으로 public archive cache를 Drive에 발행·readback한다. 새 Elice는 이 두 물리·
+   데이터 준비가 끝난 뒤 selector와 실제 GPU 학습을 연속 실행할 때만 생성한다.
 
 아직 canonical checkpoint, G4 또는 실제 덕트 ANC OFF/ON raw가 없으므로 현재 모델의 감쇠 dB,
 2/4/8 kHz ANC 성능, unseen-source 일반화 또는 Tiny/Base 우위를 숫자로 주장하지 않는다.

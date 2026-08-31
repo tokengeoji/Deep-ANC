@@ -383,11 +383,34 @@ def test_declared_source_file_sha_is_checked_by_batch_and_record_duct(tmp_path):
     assert excinfo.value.code == 2
 
 
+@pytest.mark.parametrize(
+    "stale_generation_id",
+    ("stage1-coverage-v2", "stage1-coverage-v3-gain012"),
+)
+def test_canonical_batch_rejects_stale_generation_before_audio_open(
+    tmp_path, monkeypatch, capsys, stale_generation_id
+):
+    monkeypatch.setattr(BATCH, "REPO_ROOT", tmp_path)
+    _source, plan = _source_plan(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        BATCH.main(
+            [
+                "--sources",
+                str(plan),
+                "--canonical-additions-generation",
+                stale_generation_id,
+                "--dry-run",
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert "현행 exact source plan generation-id" in capsys.readouterr().err
+
+
 def test_canonical_additions_mode_requires_exact_generation_paths_and_header(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(BATCH, "REPO_ROOT", tmp_path)
-    generation_id = "highband-v1"
+    generation_id = BATCH.CANONICAL_GENERATION_ID
     source = tmp_path / "source.wav"
     sf.write(source, np.zeros(2_000, dtype=np.float32), 100, subtype="FLOAT")
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -522,7 +545,7 @@ def test_canonical_batch_qa_failure_is_quarantined_and_exits_nonzero(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(BATCH, "REPO_ROOT", tmp_path)
-    generation_id = "highband-v1"
+    generation_id = BATCH.CANONICAL_GENERATION_ID
     source = tmp_path / "source.wav"
     sf.write(source, np.zeros(2_000, dtype=np.float32), 100, subtype="FLOAT")
     source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -576,13 +599,16 @@ def test_canonical_batch_qa_failure_is_quarantined_and_exits_nonzero(
     monkeypatch.setattr(
         BATCH,
         "_validate_batch_source_gain_plan",
-        lambda *_args, **_kwargs: {"plan_sha256": "g" * 64},
+        lambda *_args, **_kwargs: {
+            "plan_sha256": "g" * 64,
+            "payload": {"contract": {"reference_amplitude_millionths": 6_000}},
+        },
     )
     monkeypatch.setattr(
         BATCH,
         "_canonical_source_gain_by_row",
         lambda _summary, current_entries: {
-            int(entry["source_row_number"]): 0.012 for entry in current_entries
+            int(entry["source_row_number"]): 0.006 for entry in current_entries
         },
     )
 

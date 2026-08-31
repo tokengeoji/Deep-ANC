@@ -168,6 +168,7 @@ def test_ring_fallback_watchdog_and_excess_backlog_are_bound_and_blocked():
     snapshot = RuntimeCounterSnapshot(
         xrun_count=1,
         deadline_miss_count=2,
+        engine_error_blocks=1,
         input_ring_drop_samples=3,
         output_ring_drop_samples=4,
         ring_add_samples=1,
@@ -183,6 +184,7 @@ def test_ring_fallback_watchdog_and_excess_backlog_are_bound_and_blocked():
     assert receipt["authority_status"] == "BLOCKED"
     assert receipt["runtime_counters_final"]["xrun_count"] == 1
     assert receipt["runtime_counters_final"]["deadline_miss_count"] == 2
+    assert receipt["runtime_counters_final"]["engine_error_blocks"] == 1
     assert receipt["runtime_counters_final"]["fallback_silence_blocks"] == 1
     assert receipt["counter_semantics"][
         "deadline_and_fallback_are_distinct_not_duplicate_aliases"
@@ -240,6 +242,111 @@ def test_inference_deadline_counter_is_not_the_fallback_counter(monkeypatch):
 
     assert anc._deadline_miss_blocks == 1
     assert anc._fallback_silence_blocks == 0
+
+
+def test_engine_exception_is_a_separate_zero_required_counter(monkeypatch):
+    ticks = iter((30.0, 30.001))
+    monkeypatch.setattr(runtime_module.time, "perf_counter", lambda: next(ticks))
+    anc = RealtimeANC.__new__(RealtimeANC)
+    anc.cfg = {"engine": {}}
+    anc.fs = FS
+    anc.hop = BLOCK
+    anc.reference = "digital"
+    anc.in_ring = SPSCRing(4, BLOCK * 2)
+    anc.out_ring = SPSCRing(1, BLOCK * 2)
+    anc.in_ring.push(np.zeros((4, BLOCK), dtype=np.float32))
+    anc.handoff_budget = SimpleNamespace(input_keep_backlog_samples=BLOCK)
+    anc.step_times_ms = []
+    anc._deadline_miss_blocks = 0
+    anc._engine_error_blocks = 0
+    anc._fallback_silence_blocks = 0
+    anc._record_runtime_evidence = True
+    anc._inference_step_count = 0
+    anc.state = SimpleNamespace(
+        quit_event=threading.Event(),
+        reset_event=threading.Event(),
+        messages=queue.Queue(),
+    )
+
+    def fail(_ref, _err):
+        anc.state.quit_event.set()
+        raise RuntimeError("fixture engine failure")
+
+    anc.engine = SimpleNamespace(step=fail)
+    anc._inference_loop()
+
+    assert anc._engine_error_blocks == 1
+    assert anc._deadline_miss_blocks == 0
+    assert anc._fallback_silence_blocks == 0
+    assert anc._inference_step_count == len(anc.step_times_ms) == 1
+    assert np.all(anc.out_ring.pop(BLOCK) == 0.0)
+
+
+def test_startup_handoff_prime_is_exactly_one_block_and_not_fallback():
+    anc = RealtimeANC.__new__(RealtimeANC)
+    anc.hop = BLOCK
+    anc.out_ring = SPSCRing(1, BLOCK * 4)
+    anc._intentional_startup_prime_blocks = 0
+    anc._fallback_silence_blocks = 0
+
+    anc._prime_output_handoff()
+    primed, had_data = anc.out_ring.pop_latest(BLOCK, keep_backlog=BLOCK)
+
+    assert had_data is True
+    assert np.all(primed == 0.0)
+    assert anc._intentional_startup_prime_blocks == 1
+    assert anc._fallback_silence_blocks == 0
+    with pytest.raises(RuntimeError, match="단 한 번"):
+        anc._prime_output_handoff()
+
+
+def test_stream_constructor_failure_stops_started_inference_thread():
+    anc = RealtimeANC.__new__(RealtimeANC)
+    anc.hop = BLOCK
+    anc.fs = FS
+    anc.block = BLOCK
+    anc.in_dev = 1
+    anc.out_dev = 2
+    anc.latency = "low"
+    anc.out_ring = SPSCRing(1, BLOCK * 4)
+    anc._intentional_startup_prime_blocks = 0
+    anc._stream = None
+    anc.state = SimpleNamespace(quit_event=threading.Event())
+    stopped = threading.Event()
+
+    def inference_loop():
+        anc.state.quit_event.wait(timeout=2.0)
+        stopped.set()
+
+    def fail_stream(**_kwargs):
+        raise RuntimeError("fixture stream constructor failure")
+
+    anc._inference_loop = inference_loop
+    anc._callback = lambda *_args: None
+    anc.sd = SimpleNamespace(Stream=fail_stream)
+
+    with pytest.raises(RuntimeError, match="constructor failure"):
+        anc.start()
+
+    assert anc.state.quit_event.is_set()
+    assert stopped.wait(timeout=0.1)
+    assert anc._infer_thread is not None
+    assert not anc._infer_thread.is_alive()
+
+
+def test_recorded_runtime_timing_keeps_raw_samples_and_prime_count():
+    anc = RealtimeANC.__new__(RealtimeANC)
+    anc.step_times_ms = [0.7, 0.9, 1.1]
+    anc._inference_step_count = 3
+    anc._record_runtime_evidence = True
+    anc._intentional_startup_prime_blocks = 1
+
+    payload = anc.runtime_timing_data()
+
+    assert payload["inference_step_times_ms"].dtype == np.float64
+    assert payload["inference_step_times_ms"].tolist() == [0.7, 0.9, 1.1]
+    assert int(payload["inference_step_count"]) == 3
+    assert int(payload["intentional_startup_prime_blocks"]) == 1
 
 
 @pytest.mark.parametrize("occupied_suffix", [".npz", ".runtime_clock.json"])
@@ -405,4 +512,7 @@ def test_realtime_callback_binds_portaudio_time_info_without_opening_device():
     assert receipt["runtime_counters_final"]["deadline_miss_count"] == 0
     assert receipt["runtime_counters_final"]["fallback_silence_blocks"] == 0
     assert receipt["authority_status"] == "INCONCLUSIVE"
+    assert anc.state.latest_stats["deadline_miss_blocks"] == 0
+    assert anc.state.latest_stats["fallback_silence_blocks"] == 0
+    assert anc.state.latest_stats["engine_error_blocks"] == 0
     assert anc.state.latest_stats["clock_telemetry_status"] == "INCONCLUSIVE"

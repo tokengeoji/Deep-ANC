@@ -443,6 +443,7 @@ def _validate_clock_bundle(
     zero_counters = (
         "xrun_count",
         "deadline_miss_count",
+        "engine_error_blocks",
         "input_ring_drop_samples",
         "output_ring_drop_samples",
         "input_ring_overrun_blocks",

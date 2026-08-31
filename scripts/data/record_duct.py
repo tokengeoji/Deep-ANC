@@ -234,7 +234,7 @@ def _validate_recording_level_authority(
     ):
         raise RecordingLevelCampaignError(
             "recording level campaign session은 exact 48kHz/15초이며, legacy는 amplitude "
-            "0.06, v2는 verified source-gain row amplitude여야 합니다"
+            "0.06, 현행 canonical은 verified receipt-bound source-gain row amplitude여야 합니다"
         )
     summary = validate_recording_level_campaign(
         repo_root=REPO_ROOT,
@@ -279,7 +279,7 @@ def _validate_source_gain_authority(
     require_clean_execution: bool,
     authority_required: bool = False,
 ) -> dict | None:
-    """v2 source-gain plan/row/amplitude/commit을 audio open 전에 결속한다."""
+    """현행 receipt-bound source-gain plan/row/amplitude/commit을 open 전에 결속한다."""
 
     plan_path = args.source_gain_plan
     expected_sha = args.source_gain_plan_sha256
@@ -289,7 +289,7 @@ def _validate_source_gain_authority(
     if plan_path is None and expected_sha is None:
         if required:
             raise RecordingSourceGainError(
-                "canonical v2 live에는 --source-gain-plan과 외부 SHA가 필요합니다"
+                "canonical live에는 현행 --source-gain-plan과 외부 SHA가 필요합니다"
             )
         return None
     if plan_path is None or expected_sha is None:
@@ -320,7 +320,7 @@ def _validate_source_gain_authority(
         or source_ref.get("sha256") != collection_plan.get("source_list_sha256")
     ):
         raise RecordingSourceGainError(
-            "source-gain v2 live eligibility/source-list SHA 결속 실패"
+            "현행 source-gain live eligibility/source-list SHA 결속 실패"
         )
     if require_clean_execution:
         execution = repository_execution_identity(REPO_ROOT, SCRIPT_RELATIVE_PATH)
@@ -386,7 +386,7 @@ def _is_within_repo_subtree(value: str | Path, relative_root: str) -> bool:
 def _requires_v2_source_gain_authority(
     args: argparse.Namespace, collection_plan: dict
 ) -> bool:
-    """Canonical additions/authority 경로는 hidden CLI flag가 없어도 v2를 요구한다."""
+    """Canonical additions 경로는 hidden flag가 없어도 현행 gain authority를 요구한다."""
 
     source_list = collection_plan.get("source_list")
     return bool(
@@ -420,7 +420,7 @@ def _open_live_authority_guards(
     collection_plan: dict,
     source_gain_binding: dict,
 ) -> list[RepositoryFileGuard]:
-    """Stream 시작 전부터 종료까지 모든 v2 authority inode/bytes를 고정한다."""
+    """Stream 시작 전부터 종료까지 모든 source-gain authority inode/bytes를 고정한다."""
 
     receipt = source_gain_binding.get("gain_linearity_receipt")
     paths: list[tuple[str | Path, str]] = [
@@ -1006,12 +1006,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--source-gain-plan",
         default=None,
-        help="v2 source별 physical gain plan 저장소 상대경로",
+        help="현행 source별 physical gain plan 저장소 상대경로",
     )
     parser.add_argument(
         "--source-gain-plan-sha256",
         default=None,
-        help="v2 source별 gain plan의 외부 SHA-256 anchor",
+        help="현행 source별 gain plan의 외부 SHA-256 anchor",
     )
     parser.add_argument(
         "--require-source-gain-plan",
@@ -1141,7 +1141,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         if v2_authority_required and source_gain_authority is None:
             print(
-                "[DRY-RUN 안내] live canonical 실행에는 PASS v2 source-gain plan path/SHA가 "
+                "[DRY-RUN 안내] live canonical 실행에는 현행 PASS source-gain plan path/SHA가 "
                 "필수입니다"
             )
         print("[DRY-RUN PASS] 파일 생성/수정 및 오디오 장치 open 없음")

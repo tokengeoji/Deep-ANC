@@ -395,6 +395,320 @@ class RepositoryFileGuard:
         self.close()
 
 
+class RepositoryDirectoryGuard:
+    """Fresh repository directory held by inode for one live publication.
+
+    A live capture must not create a directory by pathname and reopen that
+    pathname after the speaker has run.  This guard creates the final
+    directory with ``mkdirat`` under already-held parent descriptors, pins the
+    new directory inode, and publishes leaves with ``openat``/``linkat`` only.
+    ``verify()`` additionally proves that the original lexical path still
+    names the pinned inode; publication itself remains directed at the pinned
+    inode even after a hostile rename so unique raw bytes are not redirected.
+    """
+
+    def __init__(
+        self,
+        repository_root_path: str | os.PathLike[str],
+        relative_path: str,
+        *,
+        label: str = "repository directory",
+    ) -> None:
+        self.root = repository_root(repository_root_path)
+        self.relative_path = canonical_relative_path(relative_path, label=label)
+        self.label = label
+        self._filename = ""
+        self._chain: list[tuple[Path, int, int, int]] = []
+        self._descriptor = -1
+        self._identity: tuple[int, int] | None = None
+
+    @classmethod
+    def create_fresh(
+        cls,
+        repository_root_path: str | os.PathLike[str],
+        relative_path: str,
+        *,
+        label: str = "repository directory",
+        mode: int = 0o700,
+    ) -> "RepositoryDirectoryGuard":
+        guard = cls(repository_root_path, relative_path, label=label)
+        try:
+            guard._filename, guard._chain = open_parent_chain(
+                guard.root, guard.relative_path, create=True
+            )
+            parent_fd = guard._chain[-1][1]
+            try:
+                os.stat(
+                    guard._filename,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(
+                    f"기존 directory/symlink를 덮어쓰지 않습니다: "
+                    f"{guard.relative_path}"
+                )
+            os.mkdir(guard._filename, mode, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            guard._descriptor = os.open(
+                guard._filename,
+                _directory_flags(),
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(guard._descriptor)
+            named = os.stat(
+                guard._filename,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (named.st_dev, named.st_ino)
+            ):
+                raise RuntimeError(
+                    f"{label} fresh inode가 directory path와 다릅니다"
+                )
+            guard._identity = (int(opened.st_dev), int(opened.st_ino))
+            guard.verify()
+            return guard
+        except BaseException:
+            guard.close()
+            raise
+
+    @property
+    def path(self) -> Path:
+        return self.root.joinpath(*PurePosixPath(self.relative_path).parts)
+
+    @property
+    def descriptor(self) -> int:
+        if self._descriptor < 0:
+            raise RuntimeError("repository directory guard가 열리지 않았습니다")
+        return self._descriptor
+
+    def _verify_held_inode(self) -> os.stat_result:
+        if self._descriptor < 0 or self._identity is None:
+            raise RuntimeError("repository directory guard가 열리지 않았습니다")
+        current = os.fstat(self._descriptor)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (int(current.st_dev), int(current.st_ino)) != self._identity
+        ):
+            raise RuntimeError(
+                f"{self.label} held inode가 변경됐습니다: {self.relative_path}"
+            )
+        return current
+
+    def verify(self) -> None:
+        current = self._verify_held_inode()
+        parent_fd = self._chain[-1][1]
+        named = os.stat(
+            self._filename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or (named.st_dev, named.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise RuntimeError(
+                f"{self.label} pathname이 retarget됐습니다: {self.relative_path}"
+            )
+        verify_parent_chain(self._chain)
+
+    def binding_valid(self) -> bool:
+        try:
+            self.verify()
+        except (FileNotFoundError, NotADirectoryError, OSError, RuntimeError):
+            return False
+        return True
+
+    def assert_leaf_fresh(self, filename: str) -> None:
+        if (
+            type(filename) is not str
+            or not filename
+            or PurePosixPath(filename).name != filename
+            or filename in {".", ".."}
+        ):
+            raise ValueError("held directory leaf 이름이 유효하지 않습니다")
+        self._verify_held_inode()
+        try:
+            os.stat(filename, dir_fd=self.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise FileExistsError(f"기존 held-directory leaf를 덮어쓰지 않습니다: {filename}")
+
+    def publish_bytes_noreplace(
+        self,
+        filename: str,
+        payload: bytes,
+        *,
+        mode: int = 0o600,
+        preserve_parent_recovery_link: bool = False,
+        recovery_tag: str = "live_raw",
+    ) -> dict[str, Any]:
+        """Publish one leaf through the pinned directory and return same-fd SHA."""
+
+        if type(payload) is not bytes:
+            raise TypeError("held directory publish payload는 bytes여야 합니다")
+        if preserve_parent_recovery_link:
+            self._verify_held_inode()
+        else:
+            self.assert_leaf_fresh(filename)
+        if (
+            type(recovery_tag) is not str
+            or not recovery_tag
+            or any(
+                not (
+                    character.islower()
+                    or character.isdigit()
+                    or character == "_"
+                )
+                for character in recovery_tag
+            )
+        ):
+            raise ValueError("recovery_tag 형식이 유효하지 않습니다")
+        token = hashlib.sha256(os.urandom(32)).hexdigest()[:24]
+        staging = f".{filename}.{token}.partial"
+        descriptor = -1
+        linked = False
+        recovery_name = f".deep_anc_live_recovery_{token}_{recovery_tag}"
+        recovery_relative: str | None = None
+        final_published = False
+        evidence_linked = False
+        try:
+            descriptor = os.open(
+                staging,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                mode,
+                dir_fd=self.descriptor,
+            )
+            view = memoryview(payload)
+            written = 0
+            while written < len(view):
+                count = os.write(descriptor, view[written:])
+                if count <= 0:
+                    raise OSError("held directory publish short write")
+                written += count
+            os.fsync(descriptor)
+            staged = os.fstat(descriptor)
+            if not stat.S_ISREG(staged.st_mode):
+                raise RuntimeError("held directory staging이 regular file이 아닙니다")
+            actual = _read_descriptor(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                actual != payload
+                or int(after.st_size) != len(payload)
+            ):
+                raise RuntimeError("held directory staging bytes 검증 실패")
+            if preserve_parent_recovery_link:
+                # The recovery name lives directly under the pinned repository
+                # root.  A rename/replacement of results/, the raw root, or the
+                # session directory therefore cannot retarget its lexical path.
+                recovery_fd = self._chain[0][1]
+                os.link(
+                    staging,
+                    recovery_name,
+                    src_dir_fd=self.descriptor,
+                    dst_dir_fd=recovery_fd,
+                    follow_symlinks=False,
+                )
+                evidence_linked = True
+                os.fsync(recovery_fd)
+                recovery = os.stat(
+                    recovery_name,
+                    dir_fd=recovery_fd,
+                    follow_symlinks=False,
+                )
+                if (recovery.st_dev, recovery.st_ino) != (
+                    after.st_dev,
+                    after.st_ino,
+                ):
+                    raise RuntimeError("held raw recovery hardlink 검증 실패")
+                recovery_relative = recovery_name
+            self._verify_held_inode()
+            try:
+                os.link(
+                    staging,
+                    filename,
+                    src_dir_fd=self.descriptor,
+                    dst_dir_fd=self.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                if not preserve_parent_recovery_link:
+                    raise
+            else:
+                linked = True
+                final_published = True
+                os.fsync(self.descriptor)
+                named = os.stat(
+                    filename,
+                    dir_fd=self.descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(named.st_mode)
+                    or (named.st_dev, named.st_ino)
+                    != (staged.st_dev, staged.st_ino)
+                ):
+                    raise RuntimeError("held directory final inode 검증 실패")
+            os.unlink(staging, dir_fd=self.descriptor)
+            os.fsync(self.descriptor)
+            self._verify_held_inode()
+            if final_published:
+                final = os.stat(
+                    filename,
+                    dir_fd=self.descriptor,
+                    follow_symlinks=False,
+                )
+                if (final.st_dev, final.st_ino) != (after.st_dev, after.st_ino):
+                    raise RuntimeError("held directory final leaf가 교체됐습니다")
+            return {
+                "path": str(PurePosixPath(self.relative_path) / filename),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+                "device": int(after.st_dev),
+                "inode": int(after.st_ino),
+                "recovery_path": recovery_relative,
+                "final_published": final_published,
+            }
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(staging, dir_fd=self.descriptor)
+                os.fsync(self.descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                if not linked and not evidence_linked:
+                    raise
+
+    def close(self) -> None:
+        if self._descriptor >= 0:
+            os.close(self._descriptor)
+            self._descriptor = -1
+        if self._chain:
+            close_parent_chain(self._chain)
+            self._chain = []
+
+    def __enter__(self) -> "RepositoryDirectoryGuard":
+        if self._descriptor < 0:
+            raise RuntimeError("create_fresh로 연 guard만 사용할 수 있습니다")
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:  # noqa: ANN001
+        self.close()
+
+
 def read_repository_file_nofollow(
     repository_root_path: str | os.PathLike[str], relative_path: str
 ) -> dict[str, Any]:
@@ -583,6 +897,7 @@ def publish_repository_bytes_noreplace(
 
 
 __all__ = [
+    "RepositoryDirectoryGuard",
     "RepositoryFileGuard",
     "assert_repository_target_fresh_nofollow",
     "canonical_relative_path",

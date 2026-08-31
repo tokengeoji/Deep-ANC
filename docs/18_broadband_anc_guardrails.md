@@ -15,8 +15,8 @@
    0 dB보다 크다.
 3. **모든 소리**: speech, music, environment, machine 네 family와 모델 선택 뒤 새로 얻은
    Level-5 실제 덕트 소리를 모두 통과한다.
-4. **실시간성**: 48 kHz/256 sample에서 xrun, deadline miss, ring drop/add,
-   fallback은 exact 0이다. ring의 absolute maximum backlog는 정상 one-hop 허용량
+4. **실시간성**: 48 kHz/256 sample에서 xrun, deadline miss, engine exception,
+   ring drop/add, fallback, watchdog, sample slip은 exact 0이다. ring의 absolute maximum backlog는 정상 one-hop 허용량
    256 samples 이하여야 하고, 그 허용량을 넘은 maximum excess backlog는 exact 0이어야
    한다. 고정 지연은 모델링할 수 있지만 비결정적 1-sample slip은 허용하지 않는다.
 5. **공간 판정 분리**: 단일 ERR 지점 감쇠를 quiet zone으로 부르지 않는다. 1.633 kHz 위
@@ -32,10 +32,13 @@
 Jetson runtime 증거의 별도 단일 출처는
 `src/deep_anc/eval/broadband_runtime.py`다. 최소 30초 raw runtime log에서
 P99 `<3 ms`, max `<5.333 ms`, plant/checkpoint/deployment/runtime lead exact 일치와
-miss/xrun/drop/add/fallback/watchdog/sample-slip exact 0, absolute backlog `≤256`,
+miss/engine-error/xrun/drop/add/fallback/watchdog/sample-slip exact 0, absolute backlog `≤256`,
 maximum excess backlog `=0`을 동시에 요구한다. producer/consumer 관측 race에 따라
 정상 absolute backlog는 0 또는 256일 수 있으므로 absolute 0을 강제하지 않는다.
 8 kHz의 1 sample은 60°이므로 평균 latency가 빠르다는 사실만으로 이 gate를 대신할 수 없다.
+첫 callback의 의도된 handoff prime은 stream open 전에 exact zero 한 block을 한 번만
+발행하고 별도 counter로 보존한다. 이 prime은 fallback으로 세지 않지만 두 번 발행하거나
+prime 이후 실제 fallback이 한 번이라도 생기면 runtime PASS가 아니다.
 
 ## 2. Stage-1과 최종 광대역 계약의 관계
 

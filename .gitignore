@@ -14,6 +14,8 @@ venv/
 /runs/
 /results/
 /transfer/
+# live one-shot raw의 session/results ancestor 교체에도 남는 root-held hardlink
+/.deep_anc_live_recovery_*
 *.wav
 *.flac
 *.mp3

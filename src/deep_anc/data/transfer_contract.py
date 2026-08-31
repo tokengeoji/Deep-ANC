@@ -39,6 +39,51 @@ TRANSFER_GENERATION_SCHEMA_VERSION = 2
 EXPECTED_RECORDED_SESSIONS = 82
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_ARCHIVE_CACHE_CONSUMPTION_DIRECTORY = (
+    "data/raw/noise/.archive_cache_consumptions"
+)
+_ARCHIVE_CACHE_BINDING_AUTHORITY = (
+    "cache_transport_state_bound_to_exact_decoder_inventory"
+)
+_ARCHIVE_CACHE_RAW_ROOTS = (
+    "data/raw/noise/dns_fullband",
+    "data/raw/noise/speech",
+    "data/raw/noise/demand",
+    "data/raw/noise/machine/fan",
+)
+_ARCHIVE_CACHE_EXTERNAL_MANIFEST_KEYS = {
+    "archive_count",
+    "archives",
+    "authority",
+    "excluded_corpora",
+    "kind",
+    "publisher_commit",
+    "publisher_entry_script_sha256",
+    "publisher_pget_sha256",
+    "schema_version",
+}
+_ARCHIVE_CACHE_EXTERNAL_ENTRY_KEYS = {
+    "archive_format",
+    "archive_id",
+    "archive_sha256",
+    "archive_size",
+    "cache_path",
+    "canonical_target",
+    "corpus",
+    "filename",
+    "member_inventory_sha256",
+    "member_content_inventory_sha256",
+    "member_prefix",
+    "provider_checksum",
+    "provider_checksum_kind",
+    "provider_etag",
+    "regular_file_bytes",
+    "regular_file_count",
+    "source_url",
+    "output_content_inventory_sha256",
+    "wav_bytes",
+    "wav_count",
+}
 _ROLES = frozenset(
     {
         "recorded",
@@ -60,6 +105,8 @@ _ROLES = frozenset(
         "recording_gain_linearity_receipt",
         "recording_gain_linearity_plan",
         "recording_gain_linearity_raw",
+        "recording_gain_linearity_metadata",
+        "recording_gain_linearity_publication",
         "recorded_source_plan",
         "recorded_source_selection",
         "lineage_tracks",
@@ -91,6 +138,8 @@ _ROLE_PREFIXES = {
     "recording_gain_linearity_receipt": "results/",
     "recording_gain_linearity_plan": "results/",
     "recording_gain_linearity_raw": "results/",
+    "recording_gain_linearity_metadata": "results/",
+    "recording_gain_linearity_publication": "results/",
     "recorded_source_plan": "data/source_plans/recorded_additions/",
     "recorded_source_selection": "data/source_plans/recorded_additions/",
     "lineage_tracks": "data/raw/music/fma_metadata/",
@@ -468,6 +517,8 @@ def validate_transfer_manifest(
                 "recording_gain_linearity_receipt",
                 "recording_gain_linearity_plan",
                 "recording_gain_linearity_raw",
+                "recording_gain_linearity_metadata",
+                "recording_gain_linearity_publication",
                 "recorded_source_plan",
                 "recorded_source_selection",
             )
@@ -504,12 +555,14 @@ def validate_transfer_manifest(
                 "recording_gain_linearity_receipt",
                 "recording_gain_linearity_plan",
                 "recording_gain_linearity_raw",
+                "recording_gain_linearity_metadata",
+                "recording_gain_linearity_publication",
             )
         }
         if set(gain_role_counts.values()) != {1}:
             raise TransferContractError(
                 "schema v2 canonical additions에는 source-gain/linearity authority "
-                "4개 role이 각각 정확히 1개여야 합니다"
+                "6개 role이 각각 정확히 1개여야 합니다"
             )
     if by_role["lineage_tracks"] != ["data/raw/music/fma_metadata/tracks.csv"]:
         raise TransferContractError("lineage_tracks role은 canonical FMA tracks.csv 1개여야 합니다")
@@ -767,6 +820,8 @@ def validate_transfer_manifest(
             "gain_linearity_receipt": set(),
             "gain_linearity_plan": set(),
             "gain_linearity_raw": set(),
+            "gain_linearity_metadata": set(),
+            "gain_linearity_publication": set(),
         }
         seen_campaign_ids: set[str] = set()
         from .recording_level_campaign import (
@@ -787,6 +842,8 @@ def validate_transfer_manifest(
             "gain_linearity_receipt": "recording_gain_linearity_receipt",
             "gain_linearity_plan": "recording_gain_linearity_plan",
             "gain_linearity_raw": "recording_gain_linearity_raw",
+            "gain_linearity_metadata": "recording_gain_linearity_metadata",
+            "gain_linearity_publication": "recording_gain_linearity_publication",
         }
         gain_campaign_keys = {
             "campaign_id",
@@ -803,7 +860,7 @@ def validate_transfer_manifest(
             if campaign_keys != frozenset(gain_campaign_keys):
                 raise TransferContractError(
                     f"schema v2 recording level campaign #{index} summary에 "
-                    "source-gain/linearity authority 4종이 필수입니다"
+                    "source-gain/linearity authority 6종이 필수입니다"
                 )
             campaign_id = campaign_ref.get("campaign_id")
             if not isinstance(campaign_id, str) or campaign_id in seen_campaign_ids:
@@ -935,6 +992,12 @@ def validate_transfer_manifest(
                 != campaign_ref["gain_linearity_receipt"]
                 or gain_payload.get("plan") != campaign_ref["gain_linearity_plan"]
                 or gain_payload.get("raw") != campaign_ref["gain_linearity_raw"]
+                or gain_payload.get("capture_publication")
+                != campaign_ref["gain_linearity_publication"]
+                or gain_linearity.get("capture_publication")
+                != campaign_ref["gain_linearity_publication"]
+                or gain_linearity.get("capture_metadata")
+                != campaign_ref["gain_linearity_metadata"]
                 or source_payload.get("gain_linearity_hardware")
                 != gain_payload.get("hardware")
                 or gain_payload.get("hardware", {}).get("path")
@@ -1244,6 +1307,692 @@ def validate_transfer_manifest(
     }
 
 
+def _read_external_archive_manifest_bytes(path: Path) -> bytes:
+    try:
+        resolved = path.resolve(strict=True)
+        if resolved != path.absolute():
+            raise TransferContractError(
+                "archive-cache external manifest ancestor symlink를 거부합니다"
+            )
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise TransferContractError(
+            f"archive-cache external manifest를 열 수 없습니다: {path}: {exc}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise TransferContractError(
+                "archive-cache external manifest는 regular single-link file이어야 합니다"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        named = path.lstat()
+    finally:
+        os.close(descriptor)
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        or (named.st_dev, named.st_ino) != (after.st_dev, after.st_ino)
+        or stat.S_ISLNK(named.st_mode)
+        or not stat.S_ISREG(named.st_mode)
+        or named.st_nlink != 1
+    ):
+        raise TransferContractError("archive-cache external manifest가 검증 중 변경됐습니다")
+    content = b"".join(chunks)
+    if len(content) != after.st_size:
+        raise TransferContractError("archive-cache external manifest short read")
+    return content
+
+
+def _validate_archive_cache_external_manifest(
+    *,
+    root: Path,
+    commit: str,
+    raw_binding: dict[str, Any],
+    inventory_rows: list[dict[str, Any]],
+    origin_archives: list[dict[str, Any]],
+    script_sha256: str,
+    pget_sha256: str,
+    expected_cache_root: object,
+    expected_manifest_path: object,
+    expected_manifest_sha256: object,
+) -> tuple[str, str, str]:
+    if (
+        not isinstance(expected_cache_root, str)
+        or not expected_cache_root
+        or not isinstance(expected_manifest_path, str)
+        or not expected_manifest_path
+        or not isinstance(expected_manifest_sha256, str)
+        or _SHA256_RE.fullmatch(expected_manifest_sha256.lower()) is None
+    ):
+        raise TransferContractError(
+            "cache-backed training에는 data.archive_cache_root/manifest/manifest_sha256 "
+            "external anchor가 모두 필요합니다"
+        )
+    cache_root = Path(expected_cache_root)
+    manifest_path = Path(expected_manifest_path)
+    if not cache_root.is_absolute() or not manifest_path.is_absolute():
+        raise TransferContractError("archive-cache external root/manifest는 absolute path여야 합니다")
+    try:
+        cache_resolved = cache_root.resolve(strict=True)
+        cache_info = cache_root.lstat()
+        manifest_resolved = manifest_path.resolve(strict=True)
+        manifest_resolved.relative_to(cache_resolved)
+    except (OSError, ValueError) as exc:
+        raise TransferContractError(
+            "archive-cache external root/manifest containment가 유효하지 않습니다"
+        ) from exc
+    if (
+        cache_resolved != cache_root.absolute()
+        or stat.S_ISLNK(cache_info.st_mode)
+        or not stat.S_ISDIR(cache_info.st_mode)
+    ):
+        raise TransferContractError("archive-cache external root symlink/non-directory를 거부합니다")
+    try:
+        cache_resolved.relative_to(root.resolve(strict=True))
+    except ValueError:
+        pass
+    else:
+        raise TransferContractError("archive-cache external root는 저장소 밖이어야 합니다")
+    if manifest_resolved != manifest_path.absolute():
+        raise TransferContractError("archive-cache external manifest ancestor symlink를 거부합니다")
+    content = _read_external_archive_manifest_bytes(manifest_path)
+    actual_sha = hashlib.sha256(content).hexdigest()
+    expected_sha = expected_manifest_sha256.lower()
+    if actual_sha != expected_sha or raw_binding.get("archive_manifest_sha256") != expected_sha:
+        raise TransferContractError(
+            "archive-cache receipt/manifest가 external manifest SHA anchor와 다릅니다"
+        )
+    try:
+        manifest = json.loads(
+            content.decode("utf-8"), object_pairs_hook=_object_without_duplicates
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TransferContractError("archive-cache external manifest JSON 오류") from exc
+    try:
+        canonical = (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise TransferContractError("archive-cache external manifest canonical JSON 오류") from exc
+    entries = manifest.get("archives") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != _ARCHIVE_CACHE_EXTERNAL_MANIFEST_KEYS
+        or canonical != content
+        or manifest.get("schema_version") != 1
+        or manifest.get("kind") != "deep_anc_public_archive_cache"
+        or manifest.get("authority")
+        != "transport_acceleration_only_not_raw_or_training_authority"
+        or manifest.get("publisher_commit") != commit
+        or manifest.get("publisher_entry_script_sha256") != script_sha256
+        or manifest.get("publisher_pget_sha256") != pget_sha256
+        or manifest.get("excluded_corpora")
+        != ["esc50", "fma_small", "fma_metadata", "librispeech"]
+        or manifest.get("archive_count") != 10
+        or not isinstance(entries, list)
+        or len(entries) != 10
+    ):
+        raise TransferContractError("archive-cache external manifest semantic binding 불일치")
+    expected_ids = (
+        "dns_noise_000",
+        "dns_noise_001",
+        "dns_speech_000",
+        "demand_dkitchen",
+        "demand_dwashing",
+        "demand_ooffice",
+        "demand_ohallway",
+        "demand_tmetro",
+        "demand_tcar",
+        "mimii_fan",
+    )
+    entry_by_id: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or set(entry) != _ARCHIVE_CACHE_EXTERNAL_ENTRY_KEYS:
+            raise TransferContractError("archive-cache external manifest entry key 불일치")
+        archive_id = entry.get("archive_id")
+        archive_sha = entry.get("archive_sha256")
+        output_sha = entry.get("output_content_inventory_sha256")
+        filename = entry.get("filename")
+        size = entry.get("archive_size")
+        if (
+            archive_id != expected_ids[index]
+            or not isinstance(archive_sha, str)
+            or _SHA256_RE.fullmatch(archive_sha) is None
+            or not isinstance(output_sha, str)
+            or _SHA256_RE.fullmatch(output_sha) is None
+            or not isinstance(filename, str)
+            or not filename
+            or type(size) is not int
+            or size <= 0
+            or entry.get("cache_path")
+            != f"archives/v1/{archive_id}/bytes_{size}/sha256_{archive_sha}/{filename}"
+        ):
+            raise TransferContractError("archive-cache external manifest entry value 불일치")
+        entry_by_id[str(archive_id)] = entry
+    origin_by_id = {
+        str(row["archive_id"]): row for row in origin_archives if isinstance(row, dict)
+    }
+    if set(origin_by_id) != set(entry_by_id):
+        raise TransferContractError("archive-cache external manifest/origin archive set 불일치")
+    grouped: dict[str, list[tuple[str, int, str]]] = {
+        archive_id: [] for archive_id in entry_by_id
+    }
+    for row in inventory_rows:
+        grouped[str(row["archive_id"])].append(
+            (str(row["path"]), int(row["size"]), str(row["sha256"]))
+        )
+    for archive_id, entry in entry_by_id.items():
+        origin = origin_by_id[archive_id]
+        if (
+            origin.get("archive_sha256") != entry["archive_sha256"]
+            or origin.get("archive_size") != entry["archive_size"]
+            or origin.get("canonical_target") != entry["canonical_target"]
+        ):
+            raise TransferContractError(
+                f"archive-cache external manifest/origin 불일치: {archive_id}"
+            )
+        digest = hashlib.sha256()
+        for path, size, sha256 in sorted(grouped[archive_id]):
+            digest.update(
+                (
+                    json.dumps(
+                        {"path": path, "sha256": sha256, "size": size},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+        if digest.hexdigest() != entry["output_content_inventory_sha256"]:
+            raise TransferContractError(
+                f"archive-cache external manifest output projection 불일치: {archive_id}"
+            )
+    return str(cache_resolved), str(manifest_resolved), expected_sha
+
+
+def _validate_archive_cache_bootstrap_binding(
+    root: Path,
+    receipt_payload: dict[str, Any],
+    *,
+    expected_cache_root: object = None,
+    expected_manifest_path: object = None,
+    expected_manifest_sha256: object = None,
+    require_external_anchor: bool = False,
+) -> dict[str, Any] | None:
+    """Validate schema-v3 cache/no-cache state and its durable decoder binding."""
+
+    if receipt_payload.get("schema_version") != 3:
+        return None
+    raw_binding = receipt_payload.get("archive_cache_consumption")
+    marker_directory = root / _ARCHIVE_CACHE_CONSUMPTION_DIRECTORY
+    if raw_binding is None:
+        if require_external_anchor and any(
+            value not in (None, "")
+            for value in (
+                expected_cache_root,
+                expected_manifest_path,
+                expected_manifest_sha256,
+            )
+        ):
+            raise TransferContractError(
+                "no-cache bootstrap receipt에는 archive-cache external anchor를 설정할 수 없습니다"
+            )
+        if marker_directory.exists() or marker_directory.is_symlink():
+            raise TransferContractError(
+                "schema-v3 no-cache receipt인데 archive-cache consumption marker가 있습니다"
+            )
+        return None
+    keys = {
+        "archive_manifest_sha256",
+        "authority",
+        "completion_path",
+        "completion_sha256",
+        "member_inventory_path",
+        "member_inventory_sha256",
+        "output_path_size_sha256_inventory_sha256",
+        "decoder_audit_path",
+        "decoder_audit_file_sha256",
+        "decoder_audit_semantic_sha256",
+        "decoder_cache_projection_sha256",
+    }
+    if not isinstance(raw_binding, dict) or set(raw_binding) != keys:
+        raise TransferContractError(
+            "schema-v3 archive_cache_consumption exact field set이 유효하지 않습니다"
+        )
+    commit = str(receipt_payload["expected_commit"])
+    manifest_sha = raw_binding.get("archive_manifest_sha256")
+    if not isinstance(manifest_sha, str) or not _SHA256_RE.fullmatch(manifest_sha):
+        raise TransferContractError("archive-cache manifest SHA가 유효하지 않습니다")
+    stem = f"{manifest_sha}.{commit}"
+    expected_completion = (
+        f"{_ARCHIVE_CACHE_CONSUMPTION_DIRECTORY}/consume_complete.{stem}.json"
+    )
+    expected_inventory = (
+        f"{_ARCHIVE_CACHE_CONSUMPTION_DIRECTORY}/consume_inventory.{stem}.json"
+    )
+    expected_intent = (
+        f"{_ARCHIVE_CACHE_CONSUMPTION_DIRECTORY}/consume_intent.{stem}.json"
+    )
+    sha_fields = (
+        "completion_sha256",
+        "member_inventory_sha256",
+        "output_path_size_sha256_inventory_sha256",
+        "decoder_audit_file_sha256",
+        "decoder_audit_semantic_sha256",
+        "decoder_cache_projection_sha256",
+    )
+    if (
+        raw_binding.get("authority") != _ARCHIVE_CACHE_BINDING_AUTHORITY
+        or raw_binding.get("completion_path") != expected_completion
+        or raw_binding.get("member_inventory_path") != expected_inventory
+        or raw_binding.get("decoder_audit_path")
+        != "results/provenance/decoder_audit.json"
+        or any(
+            not isinstance(raw_binding.get(field), str)
+            or not _SHA256_RE.fullmatch(str(raw_binding[field]))
+            for field in sha_fields
+        )
+        or raw_binding["output_path_size_sha256_inventory_sha256"]
+        != raw_binding["decoder_cache_projection_sha256"]
+    ):
+        raise TransferContractError(
+            "schema-v3 archive-cache path/SHA/projection binding이 유효하지 않습니다"
+        )
+
+    def snapshot_json(relative: str, expected_sha: str, *, label: str) -> dict[str, Any]:
+        try:
+            snapshot = read_regular_file_snapshot(
+                root / relative,
+                root=root,
+                label=label,
+            )
+        except HoldoutContractError as exc:
+            raise TransferContractError(str(exc)) from exc
+        if snapshot.sha256 != expected_sha:
+            raise TransferContractError(f"{label} SHA가 bootstrap receipt와 다릅니다")
+        assert snapshot.data is not None
+        try:
+            payload = json.loads(
+                snapshot.data.decode("utf-8"),
+                object_pairs_hook=_object_without_duplicates,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TransferContractError(f"{label} JSON 오류: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise TransferContractError(f"{label} 최상위는 object여야 합니다")
+        return payload
+
+    completion = snapshot_json(
+        expected_completion,
+        str(raw_binding["completion_sha256"]),
+        label="archive-cache consumption completion",
+    )
+    inventory = snapshot_json(
+        expected_inventory,
+        str(raw_binding["member_inventory_sha256"]),
+        label="archive-cache consumed member inventory",
+    )
+    decoder = snapshot_json(
+        "results/provenance/decoder_audit.json",
+        str(raw_binding["decoder_audit_file_sha256"]),
+        label="archive-cache-bound decoder audit",
+    )
+    completion_keys = {
+        "archive_manifest_sha256",
+        "authority",
+        "intent_path",
+        "intent_sha256",
+        "kind",
+        "member_inventory_path",
+        "member_inventory_sha256",
+        "origin_receipt_path",
+        "origin_receipt_sha256",
+        "output_bytes",
+        "output_count",
+        "output_path_size_sha256_inventory_sha256",
+        "publisher_commit",
+        "schema_version",
+        "state",
+    }
+    if (
+        set(completion) != completion_keys
+        or completion.get("archive_manifest_sha256") != manifest_sha
+        or completion.get("publisher_commit") != commit
+        or completion.get("authority")
+        != "cache_transport_state_only_requires_exact_raw_and_decoder_authority"
+        or completion.get("kind")
+        != "deep_anc_archive_cache_consumption_completion"
+        or completion.get("schema_version") != 1
+        or completion.get("intent_path") != expected_intent
+        or completion.get("member_inventory_path") != expected_inventory
+        or completion.get("member_inventory_sha256")
+        != raw_binding["member_inventory_sha256"]
+        or completion.get("output_path_size_sha256_inventory_sha256")
+        != raw_binding["output_path_size_sha256_inventory_sha256"]
+        or completion.get("state")
+        != "held_fd_consume_complete_pending_exact_raw_and_decoder_authority"
+    ):
+        raise TransferContractError("archive-cache completion semantic binding 불일치")
+    intent_sha = completion.get("intent_sha256")
+    origin_path = completion.get("origin_receipt_path")
+    origin_sha = completion.get("origin_receipt_sha256")
+    if (
+        not isinstance(intent_sha, str)
+        or not _SHA256_RE.fullmatch(intent_sha)
+        or not isinstance(origin_sha, str)
+        or not _SHA256_RE.fullmatch(origin_sha)
+        or origin_path
+        != f"data/raw/noise/.archive_cache_origins/archive_cache_origin.{stem}.json"
+    ):
+        raise TransferContractError("archive-cache intent/origin completion binding 불일치")
+    intent = snapshot_json(
+        expected_intent, intent_sha, label="archive-cache consumption intent"
+    )
+    origin = snapshot_json(
+        str(origin_path), origin_sha, label="archive-cache origin receipt"
+    )
+
+    expected_archives = {
+        "dns_noise_000": (5_364_611_964, "data/raw/noise/shard000.tar.bz2"),
+        "dns_noise_001": (5_357_916_291, "data/raw/noise/shard001.tar.bz2"),
+        "dns_speech_000": (4_664_045_287, "data/raw/noise/speech000.tar.bz2"),
+        "demand_dkitchen": (336_992_458, "data/raw/noise/demand/DKITCHEN_48k.zip"),
+        "demand_dwashing": (306_101_499, "data/raw/noise/demand/DWASHING_48k.zip"),
+        "demand_ooffice": (277_643_831, "data/raw/noise/demand/OOFFICE_48k.zip"),
+        "demand_ohallway": (252_905_617, "data/raw/noise/demand/OHALLWAY_48k.zip"),
+        "demand_tmetro": (367_513_573, "data/raw/noise/demand/TMETRO_48k.zip"),
+        "demand_tcar": (373_520_251, "data/raw/noise/demand/TCAR_48k.zip"),
+        "mimii_fan": (928_511_244, "data/raw/noise/mimii_fan.zip"),
+    }
+    expected_archive_ids = set(expected_archives)
+    expected_archive_outputs = {
+        "dns_noise_000": ("data/raw/noise/dns_fullband/", 8_000, None),
+        "dns_noise_001": ("data/raw/noise/dns_fullband/", 8_000, None),
+        "dns_speech_000": ("data/raw/noise/speech/", 8_065, 8_000_834_860),
+        "demand_dkitchen": ("data/raw/noise/demand/DKITCHEN/", 16, 460_806_848),
+        "demand_dwashing": ("data/raw/noise/demand/DWASHING/", 16, 460_806_848),
+        "demand_ooffice": ("data/raw/noise/demand/OOFFICE/", 16, 460_806_848),
+        "demand_ohallway": ("data/raw/noise/demand/OHALLWAY/", 16, 460_806_848),
+        "demand_tmetro": ("data/raw/noise/demand/TMETRO/", 16, 460_806_848),
+        "demand_tcar": ("data/raw/noise/demand/TCAR/", 16, 460_806_848),
+        "mimii_fan": ("data/raw/noise/machine/fan/", 3_600, 1_152_158_400),
+    }
+    inventory_keys = {
+        "archive_manifest_sha256",
+        "authority",
+        "kind",
+        "output_bytes",
+        "output_count",
+        "publisher_commit",
+        "rows",
+        "schema_version",
+    }
+    inventory_rows = inventory.get("rows")
+    if (
+        set(inventory) != inventory_keys
+        or inventory.get("archive_manifest_sha256") != manifest_sha
+        or inventory.get("publisher_commit") != commit
+        or inventory.get("authority")
+        != "cache_transport_state_only_requires_exact_raw_and_decoder_authority"
+        or inventory.get("kind")
+        != "deep_anc_archive_cache_consumed_member_inventory"
+        or inventory.get("schema_version") != 1
+        or not isinstance(inventory_rows, list)
+    ):
+        raise TransferContractError("archive-cache member inventory binding 불일치")
+    external_projection = hashlib.sha256()
+    cache_rows: dict[str, tuple[int, str]] = {}
+    inventory_archive_ids: set[str] = set()
+    archive_output_counts = {archive_id: 0 for archive_id in expected_archive_ids}
+    archive_output_bytes = {archive_id: 0 for archive_id in expected_archive_ids}
+    total_bytes = 0
+    for row in inventory_rows:
+        if not isinstance(row, dict) or set(row) != {
+            "archive_id",
+            "path",
+            "sha256",
+            "size",
+        }:
+            raise TransferContractError("archive-cache member inventory row가 유효하지 않습니다")
+        path = row.get("path")
+        archive_id = row.get("archive_id")
+        size = row.get("size")
+        sha256 = row.get("sha256")
+        if (
+            not isinstance(archive_id, str)
+            or archive_id not in expected_archive_ids
+            or not isinstance(path, str)
+            or path in cache_rows
+            or type(size) is not int
+            or size < 0
+            or not isinstance(sha256, str)
+            or not _SHA256_RE.fullmatch(sha256)
+        ):
+            raise TransferContractError("archive-cache member inventory 값이 유효하지 않습니다")
+        pure = PurePosixPath(path)
+        if (
+            pure.is_absolute()
+            or any(part in ("", ".", "..") for part in pure.parts)
+            or not path.startswith(expected_archive_outputs[archive_id][0])
+        ):
+            raise TransferContractError("archive-cache member output prefix/path 불일치")
+        inventory_archive_ids.add(archive_id)
+        archive_output_counts[archive_id] += 1
+        archive_output_bytes[archive_id] += size
+        cache_rows[path] = (size, sha256)
+        total_bytes += size
+        external_projection.update(
+            (json.dumps(
+                {"path": path, "sha256": sha256, "size": size},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n").encode("utf-8")
+        )
+    if (
+        inventory_archive_ids != expected_archive_ids
+        or any(
+            archive_output_counts[archive_id] != expected_archive_outputs[archive_id][1]
+            or (
+                expected_archive_outputs[archive_id][2] is not None
+                and archive_output_bytes[archive_id]
+                != expected_archive_outputs[archive_id][2]
+            )
+            for archive_id in expected_archive_ids
+        )
+        or inventory.get("output_count") != len(cache_rows)
+        or inventory.get("output_bytes") != total_bytes
+        or completion.get("output_count") != len(cache_rows)
+        or completion.get("output_bytes") != total_bytes
+        or external_projection.hexdigest()
+        != raw_binding["output_path_size_sha256_inventory_sha256"]
+    ):
+        raise TransferContractError("archive-cache member inventory aggregate 불일치")
+    path_size_projection = hashlib.sha256()
+    for path, (size, _sha256) in cache_rows.items():
+        path_size_projection.update(
+            (json.dumps(
+                {"path": path, "size": size},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n").encode("utf-8")
+        )
+    try:
+        script_snapshot = read_regular_file_snapshot(
+            root / "scripts/elice/public_archive_cache.py",
+            root=root,
+            label="archive-cache verifier entry script",
+            capture_bytes=False,
+        )
+        pget_snapshot = read_regular_file_snapshot(
+            root / "scripts/elice/pget.py",
+            root=root,
+            label="archive-cache tracked pget",
+            capture_bytes=False,
+        )
+    except HoldoutContractError as exc:
+        raise TransferContractError(str(exc)) from exc
+    intent_keys = {
+        "archive_count",
+        "archive_manifest_sha256",
+        "authority",
+        "expected_output_bytes",
+        "expected_output_count",
+        "expected_output_path_size_inventory_sha256",
+        "kind",
+        "publisher_commit",
+        "restorer_entry_script_sha256",
+        "restorer_pget_sha256",
+        "schema_version",
+        "state",
+    }
+    if (
+        set(intent) != intent_keys
+        or intent.get("archive_manifest_sha256") != manifest_sha
+        or intent.get("publisher_commit") != commit
+        or intent.get("authority")
+        != "cache_transport_state_only_requires_exact_raw_and_decoder_authority"
+        or intent.get("kind") != "deep_anc_archive_cache_consumption_intent"
+        or intent.get("schema_version") != 1
+        or intent.get("state")
+        != "in_progress_or_completed_requires_matching_external_anchors"
+        or intent.get("archive_count") != 10
+        or intent.get("expected_output_count") != len(cache_rows)
+        or intent.get("expected_output_bytes") != total_bytes
+        or intent.get("expected_output_path_size_inventory_sha256")
+        != path_size_projection.hexdigest()
+        or intent.get("restorer_entry_script_sha256") != script_snapshot.sha256
+        or intent.get("restorer_pget_sha256") != pget_snapshot.sha256
+    ):
+        raise TransferContractError("archive-cache intent semantic binding 불일치")
+    origin_keys = {
+        "archives",
+        "authority",
+        "kind",
+        "manifest_sha256",
+        "publisher_commit",
+        "restorer_entry_script_sha256",
+        "restorer_pget_sha256",
+        "schema_version",
+    }
+    origin_archives = origin.get("archives")
+    if (
+        set(origin) != origin_keys
+        or origin.get("authority")
+        != "cache_origin_only_not_official_raw_or_training_authority"
+        or origin.get("kind") != "deep_anc_archive_cache_origin_receipt"
+        or origin.get("manifest_sha256") != manifest_sha
+        or origin.get("publisher_commit") != commit
+        or origin.get("restorer_entry_script_sha256") != script_snapshot.sha256
+        or origin.get("restorer_pget_sha256") != pget_snapshot.sha256
+        or origin.get("schema_version") != 1
+        or not isinstance(origin_archives, list)
+        or len(origin_archives) != len(expected_archive_ids)
+        or {
+            str(row.get("archive_id"))
+            for row in origin_archives
+            if isinstance(row, dict)
+        }
+        != expected_archive_ids
+        or any(
+            not isinstance(row, dict)
+            or set(row)
+            != {"archive_id", "archive_sha256", "archive_size", "canonical_target"}
+            or not isinstance(row.get("archive_sha256"), str)
+            or not _SHA256_RE.fullmatch(str(row["archive_sha256"]))
+            or type(row.get("archive_size")) is not int
+            or int(row["archive_size"]) != expected_archives[str(row["archive_id"])][0]
+            or not isinstance(row.get("canonical_target"), str)
+            or row.get("canonical_target")
+            != expected_archives[str(row["archive_id"])][1]
+            for row in origin_archives
+        )
+    ):
+        raise TransferContractError("archive-cache origin semantic binding 불일치")
+    decoder_rows = decoder.get("inventory")
+    if not isinstance(decoder_rows, list):
+        raise TransferContractError("archive-cache-bound decoder inventory가 없습니다")
+    decoder_by_path: dict[str, tuple[int, str]] = {}
+    for row in decoder_rows:
+        if not isinstance(row, dict):
+            raise TransferContractError("decoder inventory row가 object가 아닙니다")
+        path = row.get("relative_path")
+        size = row.get("content_size")
+        sha256 = row.get("content_sha256")
+        if isinstance(path, str) and type(size) is int and isinstance(sha256, str):
+            if path in decoder_by_path:
+                raise TransferContractError("decoder inventory path가 중복됐습니다")
+            decoder_by_path[path] = (size, sha256)
+    decoder_cache_paths = {
+        path
+        for path in decoder_by_path
+        if any(path.startswith(f"{root}/") for root in _ARCHIVE_CACHE_RAW_ROOTS)
+    }
+    if decoder_cache_paths != set(cache_rows):
+        raise TransferContractError(
+            "decoder audit/cache raw exact-set 불일치: "
+            f"extra={sorted(decoder_cache_paths - set(cache_rows))[:20]}, "
+            f"missing={sorted(set(cache_rows) - decoder_cache_paths)[:20]}"
+        )
+    if any(decoder_by_path.get(path) != expected for path, expected in cache_rows.items()):
+        raise TransferContractError("decoder audit/cache member content projection 불일치")
+    semantic_sha = decoder.get("audit_sha256")
+    semantic_basis = {key: value for key, value in decoder.items() if key != "audit_sha256"}
+    try:
+        semantic_raw = json.dumps(
+            semantic_basis,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise TransferContractError(f"decoder audit canonical JSON 오류: {exc}") from exc
+    if (
+        semantic_sha != raw_binding["decoder_audit_semantic_sha256"]
+        or hashlib.sha256(semantic_raw).hexdigest() != semantic_sha
+    ):
+        raise TransferContractError("decoder audit semantic SHA binding 불일치")
+    if require_external_anchor:
+        cache_root_value, manifest_path_value, manifest_sha_value = (
+            _validate_archive_cache_external_manifest(
+                root=root,
+                commit=commit,
+                raw_binding=raw_binding,
+                inventory_rows=inventory_rows,
+                origin_archives=origin_archives,
+                script_sha256=script_snapshot.sha256,
+                pget_sha256=pget_snapshot.sha256,
+                expected_cache_root=expected_cache_root,
+                expected_manifest_path=expected_manifest_path,
+                expected_manifest_sha256=expected_manifest_sha256,
+            )
+        )
+        raw_binding = {
+            **raw_binding,
+            "_external_cache_root": cache_root_value,
+            "_external_manifest_path": manifest_path_value,
+            "_external_manifest_sha256": manifest_sha_value,
+        }
+    return dict(raw_binding)
+
+
 def bind_recorded_transfer_config(
     data_cfg: dict[str, Any],
     *,
@@ -1306,12 +2055,14 @@ def bind_recorded_transfer_config(
             "recorded_aggregate_sha256",
             "environment",
         }
-        if receipt_schema == 2:
+        if receipt_schema in {2, 3}:
             expected_receipt_keys.add("recorded_subband_coverage")
+        if receipt_schema == 3:
+            expected_receipt_keys.add("archive_cache_consumption")
         if not isinstance(receipt_payload, dict) or set(receipt_payload) != expected_receipt_keys:
             raise TransferContractError("bootstrap receipt schema/필드가 불완전합니다")
         if (
-            receipt_schema not in {1, 2}
+            receipt_schema not in {1, 2, 3}
             or not isinstance(receipt_payload.get("expected_commit"), str)
             or not _COMMIT_RE.fullmatch(str(receipt_payload["expected_commit"]))
         ):
@@ -1367,7 +2118,29 @@ def bind_recorded_transfer_config(
             )
         ):
             raise TransferContractError("bootstrap receipt trust-chain 필드가 유효하지 않습니다")
-        if receipt_schema == 2:
+        _archive_cache_binding = _validate_archive_cache_bootstrap_binding(
+            root,
+            receipt_payload,
+            expected_cache_root=data_cfg.get("archive_cache_root"),
+            expected_manifest_path=data_cfg.get("archive_cache_manifest"),
+            expected_manifest_sha256=data_cfg.get("archive_cache_manifest_sha256"),
+            require_external_anchor=True,
+        )
+        if _archive_cache_binding is None:
+            data_cfg["archive_cache_root"] = None
+            data_cfg["archive_cache_manifest"] = None
+            data_cfg["archive_cache_manifest_sha256"] = None
+        else:
+            data_cfg["archive_cache_root"] = _archive_cache_binding.pop(
+                "_external_cache_root"
+            )
+            data_cfg["archive_cache_manifest"] = _archive_cache_binding.pop(
+                "_external_manifest_path"
+            )
+            data_cfg["archive_cache_manifest_sha256"] = _archive_cache_binding.pop(
+                "_external_manifest_sha256"
+            )
+        if receipt_schema in {2, 3}:
             raw_coverage = receipt_payload.get("recorded_subband_coverage")
             coverage_keys = {
                 "path",

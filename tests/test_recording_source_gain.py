@@ -264,7 +264,7 @@ def _physical_receipt_summary(root: Path, receipt: Path) -> dict:
                 "definition": (
                     "young_l1_induced_plus_measured_absolute_with_uncertainty_v1"
                 ),
-                "valid_through_amplitude_millionths": 12_000,
+                "valid_through_amplitude_millionths": 6_000,
                 "induced_fir_l1_upper": 0.0,
                 "unexplained_peak_absolute_upper": 0.0,
                 "unexplained_rms_absolute_upper": 0.0,
@@ -272,9 +272,13 @@ def _physical_receipt_summary(root: Path, receipt: Path) -> dict:
             },
         }
     operator = {
-        "schema": "recording_gain_safety_operator/v2",
+        "schema": "recording_gain_safety_operator/v3_gainprobe006",
         "role": "source_gain_prediction_only_not_anc_plant_authority",
         "fir_length": gain.OPERATOR_FIR_LENGTH,
+        "peak_pre_roll_samples": gain.OPERATOR_PEAK_PRE_ROLL_SAMPLES,
+        "relative_subband_minimum_target_norm_ratio": (
+            gain.OPERATOR_RELATIVE_SUBBAND_MIN_NORM_RATIO
+        ),
         "channels": channels,
     }
     operator["operator_sha256"] = gain._seal(operator)
@@ -303,13 +307,16 @@ def _physical_receipt_summary(root: Path, receipt: Path) -> dict:
         "analysis": {
             "safety_operator": operator,
             "safety_operator_is_anc_plant_authority": False,
-            "supported_max_amplitude_millionths": 12_000,
+            "tested_max_amplitude_millionths": 6_000,
+            "supported_max_amplitude_millionths": 6_000,
+            "distortion_certified": False,
+            "physical_authority_scope": gain.GAIN_LINEARITY_AUTHORITY_SCOPE,
         },
     }
     return {"passed": True, "payload": payload}
 
 
-def test_v2_caps_selected_gain_at_measured_012_and_builds_exact_session_binding(
+def test_v3_caps_selected_gain_at_measured_006_and_builds_exact_session_binding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     _mock_strict_authority(monkeypatch)
@@ -331,13 +338,13 @@ def test_v2_caps_selected_gain_at_measured_012_and_builds_exact_session_binding(
         expected_gain_linearity_receipt_sha256=receipt_sha,
     )
     assert payload["canonical_live_eligible"] is True
-    assert payload["contract"]["reference_amplitude_millionths"] == 12_000
-    assert payload["contract"]["source_reference_amplitude"] == 0.012
+    assert payload["contract"]["reference_amplitude_millionths"] == 6_000
+    assert payload["contract"]["source_reference_amplitude"] == 0.006
     assert payload["contract"]["legacy_schema_v1_source_reference_amplitude"] is None
     row = payload["rows"][0]
-    assert row["reference_amplitude_millionths"] == 12_000
-    assert row["selected_amplitude_millionths"] == 12_000
-    assert row["bounds"]["upper_constraints"]["physical_probe_supported_max"] == 12_000
+    assert row["reference_amplitude_millionths"] == 6_000
+    assert row["selected_amplitude_millionths"] == 6_000
+    assert row["bounds"]["upper_constraints"]["physical_probe_supported_max"] == 6_000
     assert row["selected_physical_prediction"]["ref"]["upper_peak_linear"] <= 0.4
     assert payload["contract"]["safety_operator_is_anc_plant_authority"] is False
 
@@ -354,9 +361,61 @@ def test_v2_caps_selected_gain_at_measured_012_and_builds_exact_session_binding(
     binding = gain.build_recording_source_gain_session_binding(
         validated, source_row_number=2, expected_source_commit="a" * 40
     )
-    assert binding["amplitude_millionths"] == 12_000
+    assert binding["amplitude_millionths"] == 6_000
+    assert binding["supported_max_amplitude_millionths"] == 6_000
     assert binding["safety_operator_is_anc_plant_authority"] is False
     assert gain.validate_recording_source_gain_session_binding(validated, binding) == binding
+
+
+def test_v3_uses_receipt_dynamic_cap_below_tested_6k(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _mock_strict_authority(monkeypatch)
+    root, plan_sha, strict_sha = _repo(tmp_path, strict_gain=10.0)
+    receipt = root / "results/linearity_receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text("{}\n", encoding="utf-8")
+    summary = _physical_receipt_summary(root, receipt)
+    summary["payload"]["analysis"]["supported_max_amplitude_millionths"] = 5_000
+    monkeypatch.setattr(
+        gain, "validate_gain_linearity_receipt", lambda **_kwargs: summary
+    )
+    payload = gain.build_recording_source_gain_plan(
+        repo_root=root,
+        source_plan="data/source_plan.csv",
+        expected_source_plan_sha256=plan_sha,
+        strict_primary="assets/strict_primary.npz",
+        expected_strict_primary_sha256=strict_sha,
+        gain_linearity_receipt="results/linearity_receipt.json",
+        expected_gain_linearity_receipt_sha256=_sha256(receipt),
+    )
+    assert payload["contract"]["physical_probe_tested_max_amplitude_millionths"] == 6_000
+    assert payload["contract"]["reference_amplitude_millionths"] == 5_000
+    assert payload["rows"][0]["selected_amplitude_millionths"] <= 5_000
+
+
+def test_v3_rejects_residual_bound_not_valid_through_tested_holdout(
+    tmp_path: Path
+):
+    receipt = tmp_path / "receipt.json"
+    summary = _physical_receipt_summary(tmp_path, receipt)
+    analysis = summary["payload"]["analysis"]
+    operator = analysis["safety_operator"]
+    operator["channels"]["err"]["residual_bound"][
+        "valid_through_amplitude_millionths"
+    ] = 5_000
+    operator.pop("operator_sha256")
+    operator["operator_sha256"] = gain._seal(operator)
+    with pytest.raises(gain.RecordingSourceGainError, match="FIR/margin"):
+        gain._physical_operator_contract(analysis)
+
+
+def test_v3_rejects_receipt_that_claims_distortion_certification(tmp_path: Path):
+    summary = _physical_receipt_summary(tmp_path, tmp_path / "receipt.json")
+    analysis = summary["payload"]["analysis"]
+    analysis["distortion_certified"] = True
+    with pytest.raises(gain.RecordingSourceGainError, match="tested ADC peak safety"):
+        gain._physical_operator_contract(analysis)
 
 
 def test_measured_cap_audit_and_deterministic_window_selector_fail_closed(
@@ -390,7 +449,7 @@ def test_measured_cap_audit_and_deterministic_window_selector_fail_closed(
         expected_source_plan_sha256=plan_sha,
         strict_primary="assets/strict_primary.npz",
         expected_strict_primary_sha256=strict_sha,
-        amplitude_millionths=12_000,
+        amplitude_millionths=6_000,
     )
     assert blocked["all_rows_feasible"] is False
     assert blocked["feasible_row_count"] == 0
@@ -418,31 +477,32 @@ def test_measured_cap_audit_and_deterministic_window_selector_fail_closed(
         )
 
 
-def test_batch_uses_exact_v2_integer_gain_per_row():
+def test_batch_uses_exact_v3_integer_gain_per_row_and_dynamic_cap():
     batch = _load_batch_module()
     entries = [{"source_row_number": 2}, {"source_row_number": 3}]
     summary = {
         "canonical_live_eligible": True,
         "payload": {
+            "contract": {"reference_amplitude_millionths": 5_000},
             "rows": [
                 {
                     "source_row_number": 2,
-                    "selected_amplitude_millionths": 12_000,
+                    "selected_amplitude_millionths": 5_000,
                     "feasible": True,
                 },
                 {
                     "source_row_number": 3,
-                    "selected_amplitude_millionths": 9_001,
+                    "selected_amplitude_millionths": 4_001,
                     "feasible": True,
                 },
             ]
         },
     }
     assert batch._canonical_source_gain_by_row(summary, entries) == {
-        2: 0.012,
-        3: 0.009001,
+        2: 0.005,
+        3: 0.004001,
     }
-    summary["payload"]["rows"][0]["selected_amplitude_millionths"] = 12_001
+    summary["payload"]["rows"][0]["selected_amplitude_millionths"] = 5_001
     with pytest.raises(gain.RecordingSourceGainError, match="row/amplitude"):
         batch._canonical_source_gain_by_row(summary, entries)
 
@@ -454,12 +514,12 @@ def test_additions_builder_consumes_receipt_cap_and_requires_19_of_19(monkeypatc
         "validate_gain_linearity_receipt",
         lambda **_kwargs: {
             "passed": True,
-            "payload": {"analysis": {"supported_max_amplitude_millionths": 12_000}},
+            "payload": {"analysis": {"supported_max_amplitude_millionths": 6_000}},
         },
     )
     assert builder._measured_cap_from_receipt(
         receipt_path="results/receipt.json", expected_receipt_sha256="a" * 64
-    ) == 12_000
+    ) == 6_000
 
     monkeypatch.setattr(
         builder,
@@ -480,8 +540,38 @@ def test_additions_builder_consumes_receipt_cap_and_requires_19_of_19(monkeypatc
         builder._require_all_rows_feasible(
             relative_plan="data/plan.csv",
             plan_sha256="b" * 64,
-            amplitude_millionths=12_000,
+            amplitude_millionths=6_000,
         )
+
+
+def test_additions_verify_existing_rejects_stale_generation_before_receipt_read(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    builder = _load_additions_builder_module()
+    calls = []
+    monkeypatch.setattr(
+        builder,
+        "_measured_cap_from_receipt",
+        lambda **_kwargs: calls.append("receipt") or 6_000,
+    )
+    result = builder.main(
+        [
+            "--generation-id",
+            "stage1-coverage-v3-gain012",
+            "--dns-selection-receipt-sha256",
+            "a" * 64,
+            "--demand-selection-receipt-sha256",
+            "b" * 64,
+            "--gain-linearity-receipt",
+            "results/stale.json",
+            "--gain-linearity-receipt-sha256",
+            "c" * 64,
+            "--verify-existing",
+        ]
+    )
+    assert result == 1
+    assert calls == []
+    assert "현행 exact source plan generation-id" in capsys.readouterr().err
 
 
 def test_strict_primary_authority_accepts_current_full_pair_and_rejects_legacy():
@@ -501,7 +591,7 @@ def test_strict_primary_authority_accepts_current_full_pair_and_rejects_legacy()
         )
 
 
-def test_stale_environment_006_window_is_rejected_but_current_42s_is_exact_pass():
+def test_environment_006_42s_old_012_pass_is_not_reused_at_new_006_cap():
     path = "data/source_pool/environment/environment_006.wav"
     source = ROOT / path
     source_sha = _sha256(source)
@@ -525,17 +615,25 @@ def test_stale_environment_006_window_is_rejected_but_current_42s_is_exact_pass(
     stale = dict(base, start_seconds=25.75, source_identity_sha256="a" * 64)
     current = dict(base, start_seconds=42.0, source_identity_sha256="b" * 64)
     stale_evidence = gain._source_cap_evidence(
-        stale, fir, amplitude_millionths=12_000
+        stale, fir, amplitude_millionths=6_000
     )
     current_evidence = gain._source_cap_evidence(
+        current, fir, amplitude_millionths=6_000
+    )
+    old_cap_evidence = gain._source_cap_evidence(
         current, fir, amplitude_millionths=12_000
     )
     assert stale_evidence["feasible"] is False
     assert "rendered_source_preflight" in stale_evidence["blocker_reasons"]
-    assert current_evidence["feasible"] is True
-    assert current_evidence["rendered_source_preflight"]["timeline_feasibility"][
+    assert old_cap_evidence["feasible"] is True
+    assert old_cap_evidence["rendered_source_preflight"]["timeline_feasibility"][
         "eligible_ratio"
     ] >= 0.95
+    assert current_evidence["feasible"] is False
+    assert any(
+        reason.startswith("strict_primary_snr")
+        for reason in current_evidence["blocker_reasons"]
+    )
 
 
 def test_synthetic_minimal_primary_cannot_bypass_canonical_authority(tmp_path: Path):
@@ -630,8 +728,8 @@ def test_record_duct_blocks_wrong_physical_fingerprint_before_audio_open(
     binding = {
         "gain_linearity_hardware": gain_hardware,
         "source_file": {"sha256": "c" * 64},
-        "amplitude_millionths": 12_000,
-        "amplitude": 0.012,
+        "amplitude_millionths": 6_000,
+        "amplitude": 0.006,
     }
     monkeypatch.setattr(record_duct, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(
@@ -667,7 +765,7 @@ def test_record_duct_blocks_wrong_physical_fingerprint_before_audio_open(
         dry_run=False,
         hardware="configs/hardware.yaml",
         file="data/source.wav",
-        amplitude=0.012,
+        amplitude=0.006,
     )
     collection = {
         "status": "exact",
@@ -677,6 +775,17 @@ def test_record_duct_blocks_wrong_physical_fingerprint_before_audio_open(
         "source_file_sha256": "c" * 64,
     }
     with pytest.raises(gain.RecordingSourceGainError, match="physical fingerprint"):
+        record_duct._validate_source_gain_authority(
+            args, collection_plan=collection, require_clean_execution=False
+        )
+
+    monkeypatch.setattr(
+        record_duct,
+        "collect_alsa_physical_fingerprint",
+        lambda *_args: expected_fingerprint,
+    )
+    args.amplitude = 0.006001
+    with pytest.raises(gain.RecordingSourceGainError, match="CLI amplitude"):
         record_duct._validate_source_gain_authority(
             args, collection_plan=collection, require_clean_execution=False
         )

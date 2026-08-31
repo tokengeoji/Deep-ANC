@@ -20,8 +20,8 @@
 
 | ref | SHA | 판정 |
 |---|---|---|
-| local `dev` | `b074c136086f1b227d05e57b958e8b5d69956508` | clean |
-| `origin/dev` | `b074c136086f1b227d05e57b958e8b5d69956508` | local과 exact |
+| 마지막 clean local `dev` | `65ebd73df51a686865a2eb7e7532d1b1bea2a78c` | clean 기준선 |
+| `origin/dev` | `65ebd73df51a686865a2eb7e7532d1b1bea2a78c` | 기준선과 exact |
 | local/`origin/main` | `67572b14436f65c917f3cd4bb18e64b121898fa1` | 배포 기준선 유지 |
 
 실제 remote URL은 `git@github.com:tokengeoji/Deep-ANC.git`이다. 환경 문서의
@@ -31,6 +31,10 @@ config/`.env` 파일과 private-key header는 `0`이었다.
 
 Git에는 코드·계약·문서만 보존한다. raw, selector bundle, decoder audit, checkpoint는 Git
 백업으로 간주하지 않는다.
+
+이 문서를 포함한 gainprobe006/archive-cache 변경은 전체 검증 뒤 새 clean `dev` commit으로
+push한다. 따라서 위 SHA를 새 물리 plan이나 archive manifest의 expected commit으로 사용하지
+않고, 실행 직전에 `git rev-parse HEAD`와 `origin/dev`가 exact한지 다시 읽는다.
 
 ## 3. Google Drive
 
@@ -94,6 +98,31 @@ Drive 객체를 로컬 디스크에 복제하지 않고 끝까지 스트리밍�
 cache가 아니다. 2026-08-30 split tar도 한 part가 없으므로, 현재 Drive 어디에도 Elice
 public raw 37,761개를 완전하게 복원할 수 있는 단일 backup은 없다.
 
+### 3.5 2026-08-31 gain probe 실패 forensic backup
+
+첫 bounded v2 capture는 `.003/.006/.009`까지만 완료됐고 `.009` REF peak
+`0.4177616`에서 다음 `.012` 출력 전에 안전 중단됐다. raw는
+`results/recording_gain_linearity_v2/ab0d2402f6c96232/raw_measurement.npz`
+(SHA-256 `e2616dfbabfeb18afd79a1d0c00c4bb191c9bf93b1224975a736bf8b924eee1e`), FAIL receipt는
+`results/data_audit/recording_gain_linearity_v2_receipt.json`
+(SHA-256 `d888948d46fa8748fd8d9f15f155acbb5c529b00865f54f6773e19920972608e`)다.
+Drive `DeepANC/jetson_measurements_20260831/forensic_fail/recording_gain_linearity_v2/`
+아래 plan/receipt/metadata/raw/manifest 5개는 `rclone check --download`에서
+0 differences/5 matching이었다. 이 backup은 실패 원인 분석용이며 source-gain authority가
+아니다.
+
+### 3.6 public archive transport cache 구현 상태
+
+DNS noise 2 + DNS speech 1 + DEMAND 6 + MIMII fan 1의 fixed archive 10개,
+총 `18,229,762,015`바이트를 Jetson `/dev/shm`에 하나씩만 staging해 Drive로 immutable
+발행하는 도구를 추가했다. publisher는 exact Git tree와 entry/pget blob, provider checksum,
+archive traversal/CRC/bzip2, member inventory를 검증하고 각 remote 객체를 download-readback한
+뒤 manifest를 마지막에 발행한다. restore는 external manifest SHA와 exact commit을 요구하며,
+cache origin receipt 없는 기존 archive를 일반 download 결과로 세탁하지 못한다.
+
+현재 actual archive download와 Drive publish는 **0회**다. 이 cache는 transport acceleration일
+뿐 extracted raw, decoder audit, selector 또는 training readiness authority가 아니다.
+
 ## 4. 다음 Elice에서 비싼 전수 decode를 먼저 반복하지 않는 순서
 
 Elice를 켜기 전에는 현재 Jetson만으로 가능한 코드·물리 gain/linearity probe·schema-v1
@@ -104,18 +133,21 @@ Elice 이전 완료 항목으로 잘못 세지 않는다. 인스턴스를 준비
 같은 cache의 두 번째 full bootstrap을 통과하면 즉시 G0/pilot/smoke와 승인된 학습으로
 이어간다. Jetson에는 public raw 전체를 새로 staging하지 않는다.
 
-Drive에는 현재 Jetson 학습 authority와 decoder audit이 있지만 Elice public raw 37,761개의
-완전한 복원본은 없다. 첫 학습 인스턴스에서는 official source에서 이를 한 번 받아야 한다.
-첫 완전 cache가 생기면 학습과 병렬로 Drive에 immutable snapshot/manifest를 스트리밍하고,
-원격 readback이 PASS하기 전에는 Elice cache를 유일 백업으로 간주하지 않는다. Drive mount를
-학습 dataset의 직접 random-I/O 경로로 쓰지 않고, Elice local SSD를 작업 cache로 사용한다.
+Drive에는 현재 Jetson authority와 decoder audit이 있지만 Elice public raw 37,761개의
+완전한 복원본은 아직 없다. clean commit 뒤 위 fixed archive cache를 Jetson에서 먼저
+발행·readback하면 새 Elice는 official source를 다시 받는 대신 그 archive를 local SSD에
+no-replace 복원할 수 있다. cache 발행이 완료되지 않으면 첫 학습 인스턴스가 official source에서
+한 번 받아야 한다. 어느 경우에도 Drive mount를 학습 dataset의 직접 random-I/O 경로로 쓰지
+않고 Elice local SSD를 작업 cache로 사용한다.
 
 1. GitHub `dev`의 신뢰한 전체 40자리 SHA를 clean detached checkout한다.
 2. Jetson의 schema-v1 82-session transfer와 Drive decoder audit을 새 Elice로
    스트리밍하고, code/holdout/transfer/GPU/storage의 cheap gate를 먼저 통과한다.
-3. fresh 인스턴스에는 public raw가 아직 없으므로 `--cache-preflight-only`를 실행하지
-   않는다. 아래 외부 anchor를 붙인 **full bootstrap**이 public raw를 official URL에서
-   한 번 받고, 그 뒤 audit fingerprint와 raw 37,761개 SHA를 전수 대조하게 한다.
+3. archive cache가 발행됐다면 publisher manifest file SHA와 exact commit을 외부 anchor로
+   전달해 `--archive-cache-only` restore를 먼저 수행한다. 이 단계는 raw/bootstrap receipt를
+   0개만 발행해야 한다. 이어 같은 anchor를 붙인 **full bootstrap**이 archive를 해제하고
+   audit fingerprint와 raw 37,761개 SHA를 전수 대조한다. cache가 없다면 full bootstrap이
+   official URL에서 한 번 받는다.
 
    ```text
    --reuse-decoder-audit
@@ -168,16 +200,19 @@ pytest는 **0 FAIL**이고 선택적 실기 test 3개만 skip됐다. private key
   storage를 조기에 검사하고 range-resume downloader의 strong ETag와 block hash를 검증한다.
 - schema-v1 selector bundle과 schema-v2 training bundle을 한 실행으로 오인하지 않는다.
   `push_transfer_bundle.py`가 Jetson의 exact authority만 전달하고, current generation
-  `stage1-coverage-v3-gain012`는 물리 gain receipt와 19/19 source feasibility가 없으면
+  `stage1-coverage-v4-gainprobe006`는 물리 gain receipt와 19/19 source feasibility가 없으면
   발행되지 않는다.
 - `run_canonical_campaign.py`는 완료 상태 문구가 아니라 raw G0/gradient/pilot/probe/
   completion/evaluation artifact를 다시 검증해 다음 단계 하나만 실행한다. 경계 결과의
   두 번째 seed도 별도 fixed prerequisite와 같은-seed 100k init을 요구한다.
 
-따라서 다음 Elice가 생기기 전에 남은 것은 GPU 작업이 아니라 Jetson의 bounded physical
-gain/linearity probe다. 무출력 dry-run의 계획은 `.003/.006/.009/.012` 네 단계,
-audible `14.762333초`, output-open `24초`, input-only preflight를 포함한 hard upper
-`35초`다. 이 raw와 PASS receipt를 Drive에 SHA readback하기 전에는 Elice selector를
-canonical additions plan으로 승격하지 않는다. 반대로 이 PASS 뒤에도 DNS/DEMAND public
-raw selector와 19-session 수집이 남으므로 “파인튜닝 준비 완료” 또는 “학습 완료”라고 쓰지
-않는다.
+따라서 다음 Elice가 생기기 전에 남은 핵심은 Jetson의 bounded physical gain probe와 archive
+cache 실발행이다. 현행 probe는 `.003/.004/.005` fit + 독립 `.006` holdout이며 nominal
+active `15.615667초`, exact int16 nonzero `13.821375초`, output-open `26초`, 실제 monotonic
+software hard deadline `37초`다. 같은 plant를 지난 pilot response 5개로 clock trajectory를
+검사하고, low-SNR distortion은 `INCONCLUSIVE/distortion_certified=false`로 남긴다. PASS도
+tested range ADC peak safety만 인증한다. 아직 actual v3 raw/PASS receipt는 없다.
+
+이 raw와 PASS receipt 및 archive cache manifest를 Drive에서 SHA readback하기 전에는 Elice
+selector를 canonical additions plan으로 승격하지 않는다. 이 PASS 뒤에도 DNS/DEMAND selector와
+19-session 수집이 남으므로 “파인튜닝 준비 완료” 또는 “학습 완료”라고 쓰지 않는다.

@@ -66,6 +66,39 @@ FULL_OCTAVE_HIGHRATE_EVIDENCE=""
 FULL_OCTAVE_HIGHRATE_EVIDENCE_SEEN=0
 EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256=""
 EXPECTED_FULL_OCTAVE_HIGHRATE_EVIDENCE_SHA256_SEEN=0
+ARCHIVE_CACHE_ROOT=""
+ARCHIVE_CACHE_ROOT_SEEN=0
+ARCHIVE_CACHE_MANIFEST=""
+ARCHIVE_CACHE_MANIFEST_SEEN=0
+EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256=""
+EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256_SEEN=0
+ARCHIVE_CACHE_ONLY=0
+ARCHIVE_CACHE_ONLY_SEEN=0
+ARCHIVE_CACHE_FULL_CONSUMED=0
+ARCHIVE_CACHE_BINDING_VERIFIED=0
+ARCHIVE_CACHE_COMPLETION_PATH="-"
+ARCHIVE_CACHE_COMPLETION_SHA256="-"
+ARCHIVE_CACHE_INVENTORY_PATH="-"
+ARCHIVE_CACHE_INVENTORY_SHA256="-"
+ARCHIVE_CACHE_OUTPUT_PROJECTION_SHA256="-"
+ARCHIVE_CACHE_DECODER_AUDIT_PATH="-"
+ARCHIVE_CACHE_DECODER_AUDIT_FILE_SHA256="-"
+ARCHIVE_CACHE_DECODER_AUDIT_SEMANTIC_SHA256="-"
+ARCHIVE_CACHE_DECODER_PROJECTION_SHA256="-"
+# cache-only restore가 배치하는 정확한 working archive 10개다. FMA/ESC는 별도
+# extracted restore 경계이고 LibriSpeech는 금지이므로 이 목록에 넣지 않는다.
+ARCHIVE_CACHE_WORKING_TARGETS=(
+  data/raw/noise/shard000.tar.bz2
+  data/raw/noise/shard001.tar.bz2
+  data/raw/noise/speech000.tar.bz2
+  data/raw/noise/demand/DKITCHEN_48k.zip
+  data/raw/noise/demand/DWASHING_48k.zip
+  data/raw/noise/demand/OOFFICE_48k.zip
+  data/raw/noise/demand/OHALLWAY_48k.zip
+  data/raw/noise/demand/TMETRO_48k.zip
+  data/raw/noise/demand/TCAR_48k.zip
+  data/raw/noise/mimii_fan.zip
+)
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-update)
@@ -219,6 +252,77 @@ while [ "$#" -gt 0 ]; do
       CACHE_PREFLIGHT_ONLY_SEEN=1
       CACHE_PREFLIGHT_ONLY=1
       ;;
+    --archive-cache-root)
+      if [ "$ARCHIVE_CACHE_ROOT_SEEN" -ne 0 ]; then
+        echo "[오류] --archive-cache-root는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      ARCHIVE_CACHE_ROOT_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --archive-cache-root 뒤에 외부 cache 절대경로가 필요합니다." >&2
+        exit 2
+      fi
+      ARCHIVE_CACHE_ROOT=$1
+      ;;
+    --archive-cache-root=*)
+      if [ "$ARCHIVE_CACHE_ROOT_SEEN" -ne 0 ]; then
+        echo "[오류] --archive-cache-root는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      ARCHIVE_CACHE_ROOT_SEEN=1
+      ARCHIVE_CACHE_ROOT=${1#*=}
+      ;;
+    --archive-cache-manifest)
+      if [ "$ARCHIVE_CACHE_MANIFEST_SEEN" -ne 0 ]; then
+        echo "[오류] --archive-cache-manifest는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      ARCHIVE_CACHE_MANIFEST_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --archive-cache-manifest 뒤에 manifest 절대경로가 필요합니다." >&2
+        exit 2
+      fi
+      ARCHIVE_CACHE_MANIFEST=$1
+      ;;
+    --archive-cache-manifest=*)
+      if [ "$ARCHIVE_CACHE_MANIFEST_SEEN" -ne 0 ]; then
+        echo "[오류] --archive-cache-manifest는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      ARCHIVE_CACHE_MANIFEST_SEEN=1
+      ARCHIVE_CACHE_MANIFEST=${1#*=}
+      ;;
+    --expected-archive-cache-manifest-sha256)
+      if [ "$EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-archive-cache-manifest-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --expected-archive-cache-manifest-sha256 뒤에 64자리 SHA-256이 필요합니다." >&2
+        exit 2
+      fi
+      EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256=$1
+      ;;
+    --expected-archive-cache-manifest-sha256=*)
+      if [ "$EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256_SEEN" -ne 0 ]; then
+        echo "[오류] --expected-archive-cache-manifest-sha256는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256_SEEN=1
+      EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256=${1#*=}
+      ;;
+    --archive-cache-only)
+      if [ "$ARCHIVE_CACHE_ONLY_SEEN" -ne 0 ]; then
+        echo "[오류] --archive-cache-only는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      ARCHIVE_CACHE_ONLY_SEEN=1
+      ARCHIVE_CACHE_ONLY=1
+      ;;
     --status-root)
       if [ "$STATUS_ROOT_SEEN" -ne 0 ]; then
         echo "[오류] --status-root는 한 번만 지정하세요." >&2
@@ -308,6 +412,38 @@ if [[ ! "$EXPECTED_HOLDOUT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
   exit 2
 fi
 EXPECTED_HOLDOUT_SHA256=${EXPECTED_HOLDOUT_SHA256,,}
+archive_cache_argument_count=$((
+  ARCHIVE_CACHE_ROOT_SEEN +
+  ARCHIVE_CACHE_MANIFEST_SEEN +
+  EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256_SEEN
+))
+if [ "$archive_cache_argument_count" -ne 0 ] && [ "$archive_cache_argument_count" -ne 3 ]; then
+  echo "[오류] archive cache root/manifest/expected manifest SHA-256는 모두 함께 지정해야 합니다." >&2
+  exit 2
+fi
+if [ "$archive_cache_argument_count" -eq 3 ]; then
+  if [[ ! "$EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[오류] --expected-archive-cache-manifest-sha256에 64자리 SHA-256이 필요합니다." >&2
+    exit 2
+  fi
+  EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256=${EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256,,}
+fi
+if [ "$ARCHIVE_CACHE_ONLY" -eq 1 ] && [ "$archive_cache_argument_count" -ne 3 ]; then
+  echo "[오류] --archive-cache-only에는 archive cache root/manifest/expected SHA가 모두 필수입니다." >&2
+  exit 2
+fi
+if [ "$archive_cache_argument_count" -ne 0 ] && [ "$PREFLIGHT_ONLY" -eq 1 ]; then
+  echo "[오류] archive cache 인자는 --preflight-only와 함께 쓸 수 없습니다." >&2
+  exit 2
+fi
+if [ "$ARCHIVE_CACHE_ONLY" -eq 1 ] && [ "$FULL_OCTAVE" -eq 1 ]; then
+  echo "[오류] --archive-cache-only는 --full-octave와 함께 쓸 수 없습니다." >&2
+  exit 2
+fi
+if [ "$ARCHIVE_CACHE_ONLY" -eq 1 ] && { [ "$REUSE_DECODER_AUDIT" -eq 1 ] || [ "$EXPECTED_DECODER_AUDIT_SHA256_SEEN" -ne 0 ] || [ "$EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN" -ne 0 ]; }; then
+  echo "[오류] --archive-cache-only는 raw/decoder authority를 발행·재사용하지 않으므로 decoder audit 인자를 받을 수 없습니다." >&2
+  exit 2
+fi
 if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ] && [ "$PREFLIGHT_ONLY" -eq 1 ]; then
   echo "[오류] --cache-preflight-only와 --preflight-only는 함께 쓸 수 없습니다." >&2
   exit 2
@@ -318,6 +454,10 @@ if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ] && [ "$FULL_OCTAVE" -eq 1 ]; then
 fi
 if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ] && [ "$REUSE_DECODER_AUDIT" -ne 1 ]; then
   echo "[오류] --cache-preflight-only에는 --reuse-decoder-audit과 완료 audit의 두 외부 SHA anchor가 필수입니다." >&2
+  exit 2
+fi
+if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ] && [ "$archive_cache_argument_count" -ne 3 ]; then
+  echo "[오류] --cache-preflight-only에는 archive cache root/manifest/external manifest SHA 세 anchor가 필수입니다." >&2
   exit 2
 fi
 if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then
@@ -534,6 +674,7 @@ HOLDOUT_MANIFEST="$REPO/data/manifests/recorded_holdout.json"
 HOLDOUT_VALIDATOR="$REPO/src/deep_anc/data/holdout_contract.py"
 STATIC_REFERENCE_CHECKER="$REPO/scripts/ci/check_static_contract_references.py"
 TRANSFER_MANIFEST="$REPO/data/manifests/elice_transfer_manifest.json"
+ARCHIVE_CACHE_CLI="$REPO/scripts/elice/public_archive_cache.py"
 # Canonical 학습은 raw 전수 decoder audit과 한 세대로 발행한 v4 manifest만 읽는다.
 # audit 원본은 결과 증거로 보존하고, prepare transaction이 같은 bytes를 canonical
 # directory에 복사해 sidecar와 결속한다.
@@ -548,6 +689,85 @@ RECORDED_SESSION_COUNT=""
 RECORDED_TRANSFER_SCHEMA=""
 RECORDED_GENERATION=""
 RECORDED_GENERATION_SHA256=""
+
+verify_archive_cache_consumed_raw_binding() {
+  local decoder_audit=${1:-}
+  local result resolved extra
+  local -a decoder_args=()
+  [ "$archive_cache_argument_count" -eq 3 ] || return 0
+  if [ -n "$decoder_audit" ]; then
+    decoder_args=(--decoder-audit "$decoder_audit")
+  fi
+  if ! result=$(PYTHONDONTWRITEBYTECODE=1 "$VENV_PYTHON" -I -B \
+      "$ARCHIVE_CACHE_CLI" verify-consumed-raw \
+      --cache-root "$ARCHIVE_CACHE_ROOT" \
+      --manifest "$ARCHIVE_CACHE_MANIFEST" \
+      --expected-manifest-sha256 "$EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256" \
+      --expected-commit "$EXPECTED_COMMIT" \
+      --repo-root "$REPO" \
+      "${decoder_args[@]}"); then
+    echo "[오류] archive-cache current raw/external member inventory 결속 실패" >&2
+    return 1
+  fi
+  if ! resolved=$(python3 -I -B - "$result" "${decoder_audit:+required}" <<'PY'
+import json
+import re
+import sys
+
+payload = json.loads(sys.argv[1])
+required = bool(sys.argv[2])
+hex64 = re.compile(r"[0-9a-f]{64}")
+base = (
+    "completion_path",
+    "completion_sha256",
+    "inventory_path",
+    "inventory_sha256",
+    "current_output_projection_sha256",
+)
+values = [payload.get(key) for key in base]
+if not all(isinstance(value, str) and value for value in values):
+    raise SystemExit("archive cache verifier base fields missing")
+if not all(hex64.fullmatch(value) for value in (values[1], values[3], values[4])):
+    raise SystemExit("archive cache verifier base SHA fields invalid")
+decoder_keys = (
+    "decoder_audit_path",
+    "decoder_audit_file_sha256",
+    "decoder_audit_semantic_sha256",
+    "decoder_cache_projection_sha256",
+)
+decoder_values = [payload.get(key, "-") for key in decoder_keys]
+if required:
+    if not isinstance(decoder_values[0], str) or not decoder_values[0]:
+        raise SystemExit("decoder audit path binding missing")
+    if not all(
+        isinstance(value, str) and hex64.fullmatch(value)
+        for value in decoder_values[1:]
+    ):
+        raise SystemExit("decoder audit SHA binding missing")
+elif decoder_values != ["-", "-", "-", "-"]:
+    raise SystemExit("unexpected decoder binding without --decoder-audit")
+for value in values + decoder_values:
+    if "\t" in value or "\n" in value:
+        raise SystemExit("archive cache verifier field contains control characters")
+print("\t".join(values + decoder_values))
+PY
+  ); then
+    echo "[오류] archive-cache verifier JSON/schema parse 실패" >&2
+    return 1
+  fi
+  IFS=$'\t' read -r ARCHIVE_CACHE_COMPLETION_PATH \
+    ARCHIVE_CACHE_COMPLETION_SHA256 ARCHIVE_CACHE_INVENTORY_PATH \
+    ARCHIVE_CACHE_INVENTORY_SHA256 ARCHIVE_CACHE_OUTPUT_PROJECTION_SHA256 \
+    ARCHIVE_CACHE_DECODER_AUDIT_PATH ARCHIVE_CACHE_DECODER_AUDIT_FILE_SHA256 \
+    ARCHIVE_CACHE_DECODER_AUDIT_SEMANTIC_SHA256 \
+    ARCHIVE_CACHE_DECODER_PROJECTION_SHA256 extra <<<"$resolved"
+  if [ -n "$extra" ]; then
+    echo "[오류] archive-cache verifier field count 불일치" >&2
+    return 1
+  fi
+  ARCHIVE_CACHE_BINDING_VERIFIED=1
+  echo "$result"
+}
 
 verify_exact_checkout() {
   local current_commit hidden_flags replace_refs
@@ -860,16 +1080,25 @@ PY
 }
 
 hardware_storage_preflight() {
-  local gpu_inventory filesystem_stats total_bytes available_bytes minimum_total_bytes minimum_available_bytes
+  local gpu_inventory filesystem_stats total_bytes available_bytes minimum_total_bytes minimum_available_bytes minimum_available_gib
   # Elice의 nominal 128GiB overlay는 파일시스템 메타데이터 예약으로
   # df 총량이 최대 128MiB 정도 작게 보일 수 있다. nominal 계약을
   # 유지하되 이 예약분만 허용하고, 실제 작업공간은 별도로 96GiB를
   # 엄격히 요구한다.
   minimum_total_bytes=$((128 * 1024 * 1024 * 1024 - 128 * 1024 * 1024))
-  # 시작 시 free 예산: untouched/extracted public corpus 약 58GiB + archive/staging
-  # peak 24GiB + transferred inputs 5GiB + venv/checkpoint/headroom 9GiB = 96GiB.
-  # volume 용량 계약(128GiB)과 FS overhead 뒤 실제 free 계약을 분리한다.
-  minimum_available_bytes=$((96 * 1024 * 1024 * 1024))
+  # 시작 시 official-download free 예산: untouched/extracted public corpus 약
+  # 58GiB + archive/staging peak 24GiB + transferred inputs 5GiB +
+  # venv/checkpoint/headroom 9GiB = 96GiB. held-fd cache consume은 cache object를
+  # repository archive pathname으로 복사하지 않고 외부 fd에서 raw로 직접 풀므로
+  # 그 24GiB download/staging peak만 제외한 72GiB를 요구한다. total 128GiB
+  # volume 계약은 어느 경로에서도 낮추지 않는다.
+  if [ "$archive_cache_argument_count" -eq 3 ]; then
+    minimum_available_gib=72
+    minimum_available_bytes=$((72 * 1024 * 1024 * 1024))
+  else
+    minimum_available_gib=96
+    minimum_available_bytes=$((96 * 1024 * 1024 * 1024))
+  fi
   if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "[오류] Elice hardware preflight에 nvidia-smi가 필요합니다." >&2
     return 1
@@ -936,10 +1165,10 @@ PY
        [ "$esc_count" -ne 2000 ] || [ "$demand_count" -ne 96 ] ||
        [ "$machine_count" -ne 3600 ] || [ "$fma_count" -ne 8000 ] ||
        [ ! -s "$REPO/data/raw/music/fma_metadata/tracks.csv" ]; then
-      echo "[오류] archive+staging+corpus 시작 가용공간이 96 GiB 미만입니다: ${available_bytes:-unknown} bytes" >&2
+      echo "[오류] 선택한 public corpus transport의 시작 가용공간이 ${minimum_available_gib} GiB 미만입니다: ${available_bytes:-unknown} bytes" >&2
       return 1
     fi
-    echo "[hardware] public corpus가 이미 완전하므로 재개 시 96GiB staging 예산 검사를 건너뜁니다 (available_bytes=$available_bytes)"
+    echo "[hardware] public corpus가 이미 완전하므로 재개 시 ${minimum_available_gib}GiB 초기 예산 검사를 건너뜁니다 (available_bytes=$available_bytes)"
   fi
   echo "[hardware] filesystem total_bytes=$total_bytes (minimum=$minimum_total_bytes), available_bytes=$available_bytes (minimum=$minimum_available_bytes)"
 }
@@ -971,6 +1200,143 @@ if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
   echo "[preflight] exact code + canonical bundle 검증 완료. 환경/데이터는 변경하지 않았습니다. 별도 lock 파일도 만들지 않았습니다."
   exit 0
 fi
+
+# held-fd cache consume은 첫 raw publish보다 먼저 immutable intent directory를
+# 만든다. process kill로 completion/origin receipt 전 raw count만 완성돼도,
+# matching external cache anchors 없는 plain bootstrap이 DEMAND/MIMII complete
+# count를 official raw처럼 재사용하지 못하게 setup/network 전에 차단한다.
+# directory 생성과 intent O_EXCL write 사이 kill도 보수적으로 막기 위해 empty
+# reserved directory 자체를 marker로 본다.
+if [ "$archive_cache_argument_count" -eq 0 ]; then
+  if ! python3 -I -B - "$REPO" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+parts = ("data", "raw", "noise", ".archive_cache_consumptions")
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(root, flags)
+try:
+    for part in parts:
+        try:
+            child = os.open(part, flags, dir_fd=descriptor)
+        except FileNotFoundError:
+            raise SystemExit(0)
+        os.close(descriptor)
+        descriptor = child
+    print(
+        "[오류] archive-cache consumption intent/completion directory가 있어 "
+        "plain bootstrap raw 재사용을 금지합니다. matching archive-cache "
+        "external anchors를 모두 제시하세요.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+finally:
+    os.close(descriptor)
+PY
+  then
+    echo "[오류] cache consume 중단/완료 raw를 external anchor 없이 세탁하지 않습니다." >&2
+    exit 1
+  fi
+fi
+
+# 이전 --archive-cache-only 또는 중단된 구세대 bootstrap이 남긴 완성 archive를
+# bzip2/ZIP CRC만으로 official-origin bytes처럼 재사용하지 않는다. 이 실행에서
+# external manifest SHA를 다시 제시해 restore validator가 archive+origin receipt를
+# 재결속하지 않는 한, 기존 working archive 하나만 있어도 network/setup 전에 막는다.
+if ! python3 -I -B - "$REPO" "${ARCHIVE_CACHE_WORKING_TARGETS[@]}" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path, PurePosixPath
+
+root = Path(sys.argv[1])
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+root_fd = os.open(root, flags)
+try:
+    for raw in sys.argv[2:]:
+        relative = PurePosixPath(raw)
+        if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+            raise SystemExit(f"unsafe fixed archive target: {raw!r}")
+        directory_fd = os.dup(root_fd)
+        try:
+            cursor = root
+            for part in relative.parts[:-1]:
+                cursor = cursor / part
+                try:
+                    child_fd = os.open(part, flags, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    os.mkdir(part, 0o755, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                    child_fd = os.open(part, flags, dir_fd=directory_fd)
+                info = os.fstat(child_fd)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise OSError(f"not a directory: {cursor}")
+                os.close(directory_fd)
+                directory_fd = child_fd
+        finally:
+            os.close(directory_fd)
+finally:
+    os.close(root_fd)
+PY
+then
+  echo "[오류] DNS/DEMAND/MIMII fixed archive parent에 symlink/non-directory가 있습니다. setup/network/outside write를 시작하지 않습니다." >&2
+  exit 1
+fi
+preexisting_public_archives=()
+for relative_archive in "${ARCHIVE_CACHE_WORKING_TARGETS[@]}"; do
+  if [ -e "$REPO/$relative_archive" ] || [ -L "$REPO/$relative_archive" ]; then
+    preexisting_public_archives+=("$relative_archive")
+  fi
+done
+if [ "${#preexisting_public_archives[@]}" -ne 0 ] && [ "$archive_cache_argument_count" -ne 3 ]; then
+  echo "[오류] 기존 DNS/DEMAND/MIMII working archive는 origin laundering 방지를 위해 matching archive-cache external manifest anchor 없이 재사용할 수 없습니다:" >&2
+  printf '  %s\n' "${preexisting_public_archives[@]}" >&2
+  echo "기존 bytes를 자동 삭제·official 승격하지 않습니다. matching cache 세 인자를 제시하거나 보존 후 명시적으로 격리하고 official source에서 새로 시작하세요." >&2
+  exit 1
+fi
+
+# Archive cache manifest는 다운로드 가속 계약일 뿐 raw/decoder/training authority가
+# 아니다. 환경/GPU setup 전에 외부 SHA, exact commit, 고정 10-object allowlist와
+# cache-root containment만 먼저 검사한다. archive bytes 자체는 restore 호출에서 다시
+# size/provider hash/SHA/member inventory까지 전수 검사한다.
+if [ "$archive_cache_argument_count" -eq 3 ]; then
+  begin_status_stage archive_cache_anchor
+  if [ ! -f "$ARCHIVE_CACHE_CLI" ] || ! PYTHONDONTWRITEBYTECODE=1 python3 -I -B \
+      "$ARCHIVE_CACHE_CLI" verify-manifest \
+      --cache-root "$ARCHIVE_CACHE_ROOT" \
+      --manifest "$ARCHIVE_CACHE_MANIFEST" \
+      --expected-manifest-sha256 "$EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256" \
+      --expected-commit "$EXPECTED_COMMIT" \
+      --repo-root "$REPO"; then
+    echo "[오류] public archive cache manifest 외부 anchor/allowlist 검증 실패. setup/download를 시작하지 않습니다." >&2
+    exit 1
+  fi
+fi
+
+# 이 모드는 archive cache를 canonical archive filename에 no-replace 복원하는 데서만
+# 끝난다. transfer/GPU/venv/extractor/raw audit/manifest/bootstrap receipt는 열지 않는다.
+if [ "$ARCHIVE_CACHE_ONLY" -eq 1 ]; then
+  begin_status_stage archive_cache_restore
+  if ! PYTHONDONTWRITEBYTECODE=1 python3 -I -B \
+      "$ARCHIVE_CACHE_CLI" restore \
+      --cache-root "$ARCHIVE_CACHE_ROOT" \
+      --manifest "$ARCHIVE_CACHE_MANIFEST" \
+      --expected-manifest-sha256 "$EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256" \
+      --expected-commit "$EXPECTED_COMMIT" \
+      --repo-root "$REPO"; then
+    echo "[오류] public archive cache 전수검증/no-replace restore 실패. network fallback이나 raw authority 발행을 하지 않았습니다." >&2
+    exit 1
+  fi
+  echo "[archive cache only] PASS — DNS3+DEMAND6+MIMII1 archive만 복원했습니다. extractor/raw audit/manifest/bootstrap receipt는 0개이며 raw/training authority가 아닙니다."
+  exit 0
+fi
+
+# Full bootstrap은 아래 venv/transfer/early-pytest gate 뒤에서 cache CLI의
+# ``consume``을 호출한다. consume은 external manifest를 메모리에 고정하고 10개
+# cache inode를 O_NOFOLLOW fd로 계속 보유한 채 전수검증→no-replace 추출→최종
+# SHA readback을 끝낸다. 이후 shell은 cache archive pathname을 extractor로 다시
+# 열지 않는다. 이 지점에서는 아직 setup/network/raw authority를 시작하지 않는다.
 
 # 로컬 Jetson에서도 쓸 수 있는 --preflight-only 경계 뒤에서만 Elice 자원/대용량
 # transfer manifest를 요구한다. system Python에서는 external SHA anchor만 확인한다.
@@ -1155,6 +1521,27 @@ if [ "$FULL_OCTAVE" -eq 1 ]; then
     echo "[오류] high-rate machine source evidence와 별개로 full-octave P/S·population·execution admission이 BLOCKED입니다. public corpus 다운로드·manifest·학습을 시작하지 않습니다." >&2
     exit 1
   fi
+fi
+
+if [ "$archive_cache_argument_count" -eq 3 ] && [ "$CACHE_PREFLIGHT_ONLY" -eq 0 ]; then
+  begin_status_stage archive_cache_held_fd_consume
+  echo "=== [archive cache] fixed DNS3 + DEMAND6 + MIMII1 held-fd consume ==="
+  if ! PYTHONDONTWRITEBYTECODE=1 "$VENV_PYTHON" -I -B \
+      "$ARCHIVE_CACHE_CLI" consume \
+      --cache-root "$ARCHIVE_CACHE_ROOT" \
+      --manifest "$ARCHIVE_CACHE_MANIFEST" \
+      --expected-manifest-sha256 "$EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256" \
+      --expected-commit "$EXPECTED_COMMIT" \
+      --repo-root "$REPO"; then
+    echo "[오류] public archive cache held-fd 전수검증/no-replace 추출 실패. official network로 fallback하지 않습니다." >&2
+    exit 1
+  fi
+  ARCHIVE_CACHE_FULL_CONSUMED=1
+  if ! verify_archive_cache_consumed_raw_binding; then
+    echo "[오류] held-fd consume completion을 externally anchored current raw inventory에 재결속하지 못했습니다." >&2
+    exit 1
+  fi
+  echo "[archive cache] held-fd extraction PASS — raw authority는 아래 exact 37,761 inventory/decoder audit 뒤에만 발행 가능합니다."
 fi
 
 PGET=("$VENV_PYTHON" "$REPO/scripts/elice/pget.py")
@@ -1414,6 +1801,84 @@ zip_valid() {
   [ -f "$1" ] && unzip -tq "$1" >/dev/null 2>&1
 }
 
+# pget의 held-validator .part/.state 재개를 유지하되 매 실행마다 random output을
+# 만들지 않는다. archive별 private deterministic directory만 허용하고, 완성 output
+# 또는 예상 밖 entry가 남았으면 provenance를 추측하지 않고 막는다.
+prepare_pget_download_stage() {
+  local archive=$1
+  "$VENV_PYTHON" -I -B - "$archive" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+archive = Path(sys.argv[1])
+parent = archive.parent
+stage = parent / f".{archive.name}.official-pget-download"
+try:
+    os.mkdir(stage, 0o700)
+except FileExistsError:
+    pass
+info = stage.lstat()
+if (
+    stage.is_symlink()
+    or not stat.S_ISDIR(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or stat.S_IMODE(info.st_mode) != 0o700
+):
+    raise SystemExit(f"unsafe deterministic pget staging directory: {stage}")
+allowed = {
+    f"{archive.name}.part",
+    f"{archive.name}.part.lock",
+    f"{archive.name}.part.state.json",
+}
+quarantine_prefix = f".{archive.name}.part.quarantine."
+quarantine_members = {
+    f"{archive.name}.part",
+    f"{archive.name}.part.state.json",
+}
+for child in stage.iterdir():
+    child_info = child.lstat()
+    if child.name.startswith(quarantine_prefix):
+        suffix = child.name.removeprefix(quarantine_prefix)
+        if (
+            not suffix
+            or not all(
+                character.isascii() and (character.isalnum() or character == "_")
+                for character in suffix
+            )
+            or child.is_symlink()
+            or not stat.S_ISDIR(child_info.st_mode)
+            or child_info.st_uid != os.geteuid()
+            or stat.S_IMODE(child_info.st_mode) != 0o700
+        ):
+            raise SystemExit(f"unsafe deterministic pget quarantine: {child}")
+        members = list(child.iterdir())
+        if not members:
+            raise SystemExit(f"empty deterministic pget quarantine: {child}")
+        for member in members:
+            member_info = member.lstat()
+            if (
+                member.name not in quarantine_members
+                or member.is_symlink()
+                or not stat.S_ISREG(member_info.st_mode)
+                or member_info.st_nlink != 1
+                or member_info.st_uid != os.geteuid()
+            ):
+                raise SystemExit(f"unsafe deterministic pget quarantine member: {member}")
+        continue
+    if (
+        child.name not in allowed
+        or child.is_symlink()
+        or not stat.S_ISREG(child_info.st_mode)
+        or child_info.st_nlink != 1
+        or child_info.st_uid != os.geteuid()
+    ):
+        raise SystemExit(f"unexpected/unsafe deterministic pget staging entry: {child}")
+print(stage)
+PY
+}
+
 # ZIP은 live corpus에 직접 풀지 않는다. entry traversal/symlink를 거부한 뒤 같은
 # filesystem staging directory에만 해제하고, completeness gate 뒤 directory rename한다.
 safe_extract_zip() {
@@ -1482,22 +1947,41 @@ publish_staged_directory() {
 ensure_wget_zip() {
   local url=$1
   local archive=$2
-  local part="${archive}.part"
+  local require_missing=${3:-0}
+  local part="${archive}.part" stage=""
+  if [ "$require_missing" -eq 1 ] && { [ -e "$archive" ] || [ -L "$archive" ]; }; then
+    echo "[오류] matching cache anchor 없이 기존 ZIP archive 종류/bytes를 덮어쓰거나 재사용하지 않습니다: $archive" >&2
+    return 1
+  fi
   if zip_valid "$archive"; then
+    if [ "$require_missing" -eq 1 ]; then
+      echo "[오류] matching cache anchor 없이 기존 ZIP archive 재사용을 금지합니다: $archive" >&2
+      return 1
+    fi
     echo "[reuse] 무결성 확인된 $archive"
     return
   fi
+  if [ "$require_missing" -eq 1 ]; then
+    stage=$(mktemp -d "$(dirname "$archive")/.official-zip-download.XXXXXX")
+    part="$stage/$(basename "$archive")"
+  fi
   if ! wget -q -O "$part" "$url"; then
-    echo "[오류] $archive 다운로드 실패" >&2
-    rm -f "$part"
+    echo "[오류] $archive 다운로드 실패; forensic staging을 보존합니다: ${stage:-$part}" >&2
     return 1
   fi
   if ! unzip -tq "$part" >/dev/null 2>&1; then
-    echo "[오류] 다운로드한 $archive ZIP 무결성 검사 실패" >&2
-    rm -f "$part"
+    echo "[오류] 다운로드한 $archive ZIP 무결성 검사 실패; forensic staging을 보존합니다: ${stage:-$part}" >&2
     return 1
   fi
-  mv -f "$part" "$archive"
+  if [ "$require_missing" -eq 1 ]; then
+    if ! ln "$part" "$archive"; then
+      echo "[오류] ZIP final target no-replace 경합; 검증된 staging을 보존합니다: $stage" >&2
+      return 1
+    fi
+    rm -rf -- "$stage"
+  else
+    mv -f "$part" "$archive"
+  fi
 }
 
 # pget.py는 archive.part에 모든 Range를 받은 뒤 바이트 수를 검증하고 원자적으로
@@ -1506,26 +1990,71 @@ ensure_pget_zip() {
   local url=$1
   local archive=$2
   local connections=$3
+  local require_missing=${4:-0}
+  local stage="" staged_archive="$archive"
+  if [ "$require_missing" -eq 1 ] && { [ -e "$archive" ] || [ -L "$archive" ]; }; then
+    echo "[오류] matching cache anchor 없이 기존 ZIP archive 종류/bytes를 덮어쓰거나 재사용하지 않습니다: $archive" >&2
+    return 1
+  fi
   if zip_valid "$archive"; then
+    if [ "$require_missing" -eq 1 ]; then
+      echo "[오류] matching cache anchor 없이 기존 ZIP archive 재사용을 금지합니다: $archive" >&2
+      return 1
+    fi
     echo "[reuse] 무결성 확인된 $archive"
     return
   fi
-  "${PGET[@]}" "$url" "$archive" "$connections"
-  if ! unzip -tq "$archive" >/dev/null 2>&1; then
-    echo "[오류] 다운로드한 $archive ZIP 무결성 검사 실패" >&2
+  if [ "$require_missing" -eq 1 ]; then
+    if ! stage=$(prepare_pget_download_stage "$archive"); then
+      echo "[오류] deterministic pget staging 검증 실패: $archive" >&2
+      return 1
+    fi
+    staged_archive="$stage/$(basename "$archive")"
+  fi
+  if ! "${PGET[@]}" "$url" "$staged_archive" "$connections"; then
+    echo "[오류] $archive pget 실패; forensic staging을 보존합니다: ${stage:-$staged_archive}" >&2
     return 1
+  fi
+  if ! unzip -tq "$staged_archive" >/dev/null 2>&1; then
+    echo "[오류] 다운로드한 $archive ZIP 무결성 검사 실패; forensic staging을 보존합니다: ${stage:-$staged_archive}" >&2
+    return 1
+  fi
+  if [ "$require_missing" -eq 1 ]; then
+    if ! ln "$staged_archive" "$archive"; then
+      echo "[오류] ZIP final target no-replace 경합; 검증된 staging을 보존합니다: $stage" >&2
+      return 1
+    fi
+    rm -rf -- "$stage"
   fi
 }
 
 download_dns_archive() {
   local url=$1
   local archive=$2
-  "${PGET[@]}" "$url" "$archive" 12
-  if ! bzip2 -t "$archive"; then
-    echo "[오류] 다운로드한 $archive bzip2 무결성 검사 실패" >&2
+  local stage staged_archive
+  if [ -e "$archive" ] || [ -L "$archive" ]; then
+    echo "[오류] matching cache anchor 없이 기존 DNS archive 종류/bytes를 덮어쓰거나 재사용하지 않습니다: $archive" >&2
+    return 1
+  fi
+  if ! stage=$(prepare_pget_download_stage "$archive"); then
+    echo "[오류] deterministic DNS pget staging 검증 실패: $archive" >&2
+    return 1
+  fi
+  staged_archive="$stage/$(basename "$archive")"
+  if ! "${PGET[@]}" "$url" "$staged_archive" 12; then
+    echo "[오류] $archive pget 실패; forensic staging을 보존합니다: $stage" >&2
+    return 1
+  fi
+  if ! bzip2 -t "$staged_archive"; then
+    echo "[오류] 다운로드한 $archive bzip2 무결성 검사 실패; forensic staging을 보존합니다: $stage" >&2
     rm -f "${archive}.done"
     return 1
   fi
+  if ! ln "$staged_archive" "$archive"; then
+    echo "[오류] DNS final target no-replace 경합; 검증된 staging을 보존합니다: $stage" >&2
+    return 1
+  fi
+  rm -rf -- "$stage"
   touch "${archive}.done"
 }
 
@@ -1591,6 +2120,10 @@ download_fma_metadata() {
 
 download_demand() {
   local environment archive stage
+  if [ "$archive_cache_argument_count" -eq 3 ]; then
+    echo "[오류] cache mode에서 legacy DEMAND pathname downloader/extractor 호출을 금지합니다. official network fallback도 하지 않습니다." >&2
+    return 1
+  fi
   mkdir -p demand
   for environment in "${DEMAND_ENVIRONMENTS[@]}"; do
     if demand_environment_complete "$environment"; then
@@ -1600,7 +2133,7 @@ download_demand() {
     archive="demand/${environment}_48k.zip"
     ensure_wget_zip \
       "$ZEN/1227121/files/${environment}_48k.zip?download=1" \
-      "$archive"
+      "$archive" 1
     stage=$(mktemp -d "$PWD/.demand-${environment}-stage.XXXXXX")
     rmdir "$stage"
     safe_extract_zip "$archive" "$stage"
@@ -1617,7 +2150,11 @@ download_demand() {
 
 download_mimii() {
   local archive=mimii_fan.zip stage
-  ensure_pget_zip "$ZEN/6529888/files/fan.zip?download=1" "$archive" 8
+  if [ "$archive_cache_argument_count" -eq 3 ]; then
+    echo "[오류] cache mode에서 legacy MIMII pathname downloader/extractor 호출을 금지합니다. official network fallback도 하지 않습니다." >&2
+    return 1
+  fi
+  ensure_pget_zip "$ZEN/6529888/files/fan.zip?download=1" "$archive" 8 1
   stage=$(mktemp -d "$PWD/.mimii-stage.XXXXXX")
   rmdir "$stage"
   safe_extract_zip "$archive" "$stage"
@@ -1645,6 +2182,15 @@ if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ]; then
       --expected-file-sha256 "$EXPECTED_DECODER_AUDIT_FILE_SHA256" \
       --hash-workers "$RAW_HASH_WORKERS"; then
     echo "[오류] cache decoder audit 외부 anchor/fingerprint/raw inventory 전수검증 실패. 다운로드나 manifest 생성을 시작하지 않습니다." >&2
+    exit 1
+  fi
+  # reuse verifier의 각 파일 검증이 끝난 뒤 archive inventory projection을 읽기까지
+  # pathname replacement가 끼어들 수 있다. 따라서 값 projection만 비교하지 않고,
+  # archive verifier가 cache 대상 raw descriptor 전부를 다시 열어 끝까지 보유한 채
+  # current content와 decoder report를 한 경계에서 결속한다. 두 번째 raw hash scan은
+  # 의도적인 fail-closed 비용이며 이 preflight는 authority/receipt를 발행하지 않는다.
+  if ! verify_archive_cache_consumed_raw_binding "$DECODER_AUDIT_REPORT"; then
+    echo "[오류] decoder reuse 검증 결과를 cache external member inventory에 결속하지 못했습니다." >&2
     exit 1
   fi
   if ! verify_exact_checkout || ! verify_canonical_bundle || \
@@ -1678,17 +2224,19 @@ for f in "${!DL[@]}"; do
     echo "[skip] $f (추출 파일 목록 검증 완료)"
     continue
   fi
-  # 두 noise 샤드는 같은 대상 디렉터리를 사용한다. 따라서 대상에 WAV가 하나라도
-  # 있다는 이유로 특정 샤드를 완료 처리하면 안 된다. 구버전의 무표식 추출본은
-  # 보존한 채 해당 archive만 다시 받아 덮어 추출하고, 이후 파일 목록으로 검증한다.
-  if [ -f "$f" ] && [ -f "${f}.done" ]; then
-    echo "[skip] $f (다운로드+무결성 검사 완료)"
+  if [ "$archive_cache_argument_count" -eq 3 ]; then
+    if [ "$ARCHIVE_CACHE_FULL_CONSUMED" -ne 1 ]; then
+      echo "[오류] archive-cache-active DNS raw가 held-fd consume으로 발행되지 않았습니다: $f. official network fallback을 금지합니다." >&2
+      exit 1
+    fi
+    echo "[skip] $f (external anchor→held fd→no-replace extraction 완료; pathname archive 재-open 금지)"
     continue
   fi
-  if [ -f "$f" ] && bzip2 -t "$f"; then
-    touch "${f}.done"
-    echo "[reuse] $f (기존 archive 무결성 확인)"
-    continue
+  # no-cache 실행에서는 이 loop 전에 working archive가 0개였어야 한다. CRC만
+  # 맞는 기존 bytes를 official download로 승격하지 않고, partial만 pget이 재개한다.
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    echo "[오류] matching cache anchor 없이 기존 DNS archive 재사용을 금지합니다: $f" >&2
+    exit 1
   fi
   rm -f "${f}.done"
   start_download "DNS $f" download_dns_archive "${DL[$f]}" "$f"
@@ -1713,6 +2261,9 @@ fi
 
 if demand_complete; then
   echo "[skip] DEMAND (6환경 × WAV 16 = 96/96)"
+elif [ "$archive_cache_argument_count" -eq 3 ]; then
+  echo "[오류] held-fd consume 뒤 DEMAND raw가 불완전합니다. official network fallback을 금지합니다." >&2
+  exit 1
 else
   start_download "DEMAND" download_demand
 fi
@@ -1720,6 +2271,9 @@ fi
 # 기계소음: MIMII DG fan (16kHz, 저역 학습용 — QA 리포트에 표기됨)
 if mimii_complete; then
   echo "[skip] MIMII fan (WAV 3600/3600)"
+elif [ "$archive_cache_argument_count" -eq 3 ]; then
+  echo "[오류] held-fd consume 뒤 MIMII raw가 불완전합니다. official network fallback을 금지합니다." >&2
+  exit 1
 else
   start_download "MIMII fan" download_mimii
 fi
@@ -1745,13 +2299,20 @@ fi
 
 begin_status_stage raw_integrity
 echo "=== [3/6] DNS 샤드 무결성 검사 + 해제 ==="
-for f in "${!DEST[@]}"; do
-  if [ -f "$f" ] && ! bzip2 -t "$f"; then
-    echo "[오류] $f 손상 — 다음 실행에서 재다운로드합니다." >&2
-    rm -f "${f}.done"
+if [ "$archive_cache_argument_count" -eq 3 ]; then
+  if [ "$ARCHIVE_CACHE_FULL_CONSUMED" -ne 1 ]; then
+    echo "[오류] cache DNS raw-integrity 단계가 held-fd consume 없이 호출됐습니다." >&2
     exit 1
   fi
-done
+  echo "[archive cache] legacy DNS pathname bzip2/tar extractor를 건너뜁니다; 아래 exact raw audit을 계속 실행합니다."
+else
+  for f in "${!DEST[@]}"; do
+    if [ -f "$f" ] && ! bzip2 -t "$f"; then
+      echo "[오류] $f 손상 — 다음 실행에서 재다운로드합니다." >&2
+      rm -f "${f}.done"
+      exit 1
+    fi
+  done
 
 # 어떤 archive의 목록 검증이 실패해도 이미 시작된 추출 작업이 남지 않도록
 # 모든 목록을 먼저 검증한 뒤 두 번째 loop에서만 background 추출을 시작한다.
@@ -1840,9 +2401,10 @@ for p in "${extract_pids[@]}"; do
     extract_failed=1
   fi
 done
-if [ "$extract_failed" -ne 0 ]; then
-  echo "[오류] DNS 샤드 해제가 완료되지 않았습니다. bootstrap_all.sh 를 재실행하세요." >&2
-  exit 1
+  if [ "$extract_failed" -ne 0 ]; then
+    echo "[오류] DNS 샤드 해제가 완료되지 않았습니다. bootstrap_all.sh 를 재실행하세요." >&2
+    exit 1
+  fi
 fi
 if ! raw_wav_tree_exact dns_fullband 16000 || ! raw_wav_tree_exact speech 8065; then
   echo "[오류] DNS noise/speech untouched raw exact-count/symlink/duplicate gate 실패" >&2
@@ -1865,6 +2427,10 @@ fi
 # audit을 재사용하려면 파일/semantic SHA, 현재 decoder fingerprint, raw 전체
 # SHA/size를 먼저 fail-closed로 대조해야 하며, 다음 prepare transaction도 같은
 # raw 재대조를 다시 수행한다. 재사용 실패 시 새 audit으로 자동 fallback하지 않는다.
+if ! verify_archive_cache_consumed_raw_binding; then
+  echo "[오류] decoder audit 직전 cache-origin raw external inventory 재검증 실패" >&2
+  exit 1
+fi
 if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then
   echo "[decoder audit] 외부 SHA로 고정한 완료 audit을 재사용 전 전수 검증합니다."
   "$VENV_PYTHON" scripts/data/verify_decoder_audit_reuse.py \
@@ -1881,6 +2447,10 @@ else
     --out "$DECODER_AUDIT_REPORT" \
     --allow-rejections
 fi
+if ! verify_archive_cache_consumed_raw_binding "$DECODER_AUDIT_REPORT"; then
+  echo "[오류] decoder audit가 읽은 cache-origin path/size/content SHA가 external archive inventory와 다릅니다." >&2
+  exit 1
+fi
 recorded_generation_prepare_args=()
 if [ "$RECORDED_TRANSFER_SCHEMA" = "2" ]; then
   recorded_generation_prepare_args=(
@@ -1896,6 +2466,10 @@ fi
   --out "$CANONICAL_MANIFEST_DIR" \
   --decoder-audit "$DECODER_AUDIT_REPORT" \
   --hash-workers "$RAW_HASH_WORKERS"
+if ! verify_archive_cache_consumed_raw_binding "$DECODER_AUDIT_REPORT"; then
+  echo "[오류] prepare transaction 뒤 cache-origin raw/decoder binding이 바뀌었습니다." >&2
+  exit 1
+fi
 if ! verify_exact_checkout || ! verify_canonical_bundle || ! verify_transfer_bundle "$VENV_PYTHON"; then
   echo "[오류] manifest 준비 종료 gate에서 exact code/bundle이 바뀌었습니다." >&2
   exit 1
@@ -1958,12 +2532,25 @@ if ! verify_exact_checkout || ! verify_canonical_bundle || ! environment_complet
   echo "[오류] 최종 bootstrap receipt 직전 code/holdout/environment가 바뀌었습니다." >&2
   exit 1
 fi
+if ! verify_archive_cache_consumed_raw_binding "$DECODER_AUDIT_REPORT"; then
+  echo "[오류] 최종 bootstrap receipt 직전 cache-origin raw/decoder external binding 실패" >&2
+  exit 1
+fi
 BOOTSTRAP_RECEIPT="$REPO/data/manifests/elice_bootstrap_receipt.json"
 if ! PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO/src" "$VENV_PYTHON" -B - \
     "$REPO" "$EXPECTED_COMMIT" "$EXPECTED_HOLDOUT_SHA256" \
     "$TRANSFER_MANIFEST" "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
     "$ENVIRONMENT_RECEIPT" "$BOOTSTRAP_RECEIPT" \
-    "$RECORDED_SUBBAND_COVERAGE_REPORT_DIR" "$RECORDED_MANIFEST" <<'PY'
+    "$RECORDED_SUBBAND_COVERAGE_REPORT_DIR" "$RECORDED_MANIFEST" \
+    "$ARCHIVE_CACHE_BINDING_VERIFIED" \
+    "$EXPECTED_ARCHIVE_CACHE_MANIFEST_SHA256" \
+    "$ARCHIVE_CACHE_COMPLETION_PATH" "$ARCHIVE_CACHE_COMPLETION_SHA256" \
+    "$ARCHIVE_CACHE_INVENTORY_PATH" "$ARCHIVE_CACHE_INVENTORY_SHA256" \
+    "$ARCHIVE_CACHE_OUTPUT_PROJECTION_SHA256" \
+    "$ARCHIVE_CACHE_DECODER_AUDIT_PATH" \
+    "$ARCHIVE_CACHE_DECODER_AUDIT_FILE_SHA256" \
+    "$ARCHIVE_CACHE_DECODER_AUDIT_SEMANTIC_SHA256" \
+    "$ARCHIVE_CACHE_DECODER_PROJECTION_SHA256" <<'PY'
 import hashlib
 import json
 import os
@@ -1997,6 +2584,17 @@ coverage_directory = Path(sys.argv[8])
 if not coverage_directory.is_absolute():
     coverage_directory = root / coverage_directory
 selected_recorded_manifest = sys.argv[9]
+archive_cache_enabled = sys.argv[10] == "1"
+archive_cache_manifest_sha256 = sys.argv[11]
+archive_cache_completion_path = sys.argv[12]
+archive_cache_completion_sha256 = sys.argv[13]
+archive_cache_inventory_path = sys.argv[14]
+archive_cache_inventory_sha256 = sys.argv[15]
+archive_cache_output_projection_sha256 = sys.argv[16]
+archive_cache_decoder_path = sys.argv[17]
+archive_cache_decoder_file_sha256 = sys.argv[18]
+archive_cache_decoder_semantic_sha256 = sys.argv[19]
+archive_cache_decoder_projection_sha256 = sys.argv[20]
 
 # receipt를 쓰기 직전 transfer 전체를 다시 같은 validator로 hash한다. 이 결과의
 # recorded aggregate만 resolved config가 신뢰할 수 있다.
@@ -2074,8 +2672,72 @@ coverage_snapshot = read_regular_file_snapshot(
 )
 assert coverage_snapshot.data is not None
 coverage_payload = json.loads(coverage_snapshot.data.decode("utf-8"))
+archive_cache_binding = None
+if archive_cache_enabled:
+    cache_sha_values = (
+        archive_cache_manifest_sha256,
+        archive_cache_completion_sha256,
+        archive_cache_inventory_sha256,
+        archive_cache_output_projection_sha256,
+        archive_cache_decoder_file_sha256,
+        archive_cache_decoder_semantic_sha256,
+        archive_cache_decoder_projection_sha256,
+    )
+    if any(
+        len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+        for value in cache_sha_values
+    ):
+        raise SystemExit("receipt archive-cache SHA binding 형식이 잘못됐습니다")
+    completion_snapshot = read_regular_file_snapshot(
+        root / archive_cache_completion_path,
+        root=root,
+        label="archive cache consumption completion",
+    )
+    inventory_snapshot = read_regular_file_snapshot(
+        root / archive_cache_inventory_path,
+        root=root,
+        label="archive cache consumed member inventory",
+    )
+    decoder_snapshot = read_regular_file_snapshot(
+        root / archive_cache_decoder_path,
+        root=root,
+        label="archive cache-bound decoder audit",
+    )
+    if (
+        completion_snapshot.sha256 != archive_cache_completion_sha256
+        or inventory_snapshot.sha256 != archive_cache_inventory_sha256
+        or decoder_snapshot.sha256 != archive_cache_decoder_file_sha256
+    ):
+        raise SystemExit("receipt 직전 archive-cache completion/inventory/decoder SHA가 바뀌었습니다")
+    archive_cache_binding = {
+        "archive_manifest_sha256": archive_cache_manifest_sha256,
+        "completion_path": archive_cache_completion_path,
+        "completion_sha256": archive_cache_completion_sha256,
+        "member_inventory_path": archive_cache_inventory_path,
+        "member_inventory_sha256": archive_cache_inventory_sha256,
+        "output_path_size_sha256_inventory_sha256": archive_cache_output_projection_sha256,
+        "decoder_audit_path": archive_cache_decoder_path,
+        "decoder_audit_file_sha256": archive_cache_decoder_file_sha256,
+        "decoder_audit_semantic_sha256": archive_cache_decoder_semantic_sha256,
+        "decoder_cache_projection_sha256": archive_cache_decoder_projection_sha256,
+        "authority": "cache_transport_state_bound_to_exact_decoder_inventory",
+    }
+else:
+    disabled_values = (
+        archive_cache_completion_path,
+        archive_cache_completion_sha256,
+        archive_cache_inventory_path,
+        archive_cache_inventory_sha256,
+        archive_cache_output_projection_sha256,
+        archive_cache_decoder_path,
+        archive_cache_decoder_file_sha256,
+        archive_cache_decoder_semantic_sha256,
+        archive_cache_decoder_projection_sha256,
+    )
+    if archive_cache_manifest_sha256 or any(value != "-" for value in disabled_values):
+        raise SystemExit("archive-cache disabled receipt에 stale binding 값이 있습니다")
 payload = {
-    "schema_version": 2,
+    "schema_version": 3,
     "expected_commit": expected_commit,
     "canonical_holdout": {
         "path": "data/manifests/recorded_holdout.json",
@@ -2086,6 +2748,7 @@ payload = {
         "sha256": expected_transfer_sha,
     },
     "recorded_aggregate_sha256": summary["recorded_aggregate_sha256"],
+    "archive_cache_consumption": archive_cache_binding,
     "recorded_subband_coverage": {
         "path": coverage_path.relative_to(root).as_posix(),
         "sha256": coverage_snapshot.sha256,

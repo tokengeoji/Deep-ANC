@@ -104,7 +104,7 @@ PASS하기 전에는 이 문서의 17/17도 최종 광대역 배포 자격이 �
 | canonical 50k fine-tune | **BLOCKED** | readiness 17/17 뒤 canonical init에서 정확히 50k 완료 | readiness 미통과, 다른 init/plant/lead, 자동 resume | coverage와 init이 없어 시작 금지 |
 | recorded val/test G4 | **BLOCKED** | val-only 선택 후 single-use test가 G4 PASS | 측정된 증폭 또는 NMSE 기준 실패는 FAIL | canonical 모델/val selection/test raw가 없음. 표본·CI 부족은 INCONCLUSIVE→BLOCKED |
 | Level-5 unseen | **BLOCKED** | 고정 모델로 새 네 family 실제 덕트 challenge가 같은 G4 PASS | 한 family/부대역이라도 악화 | 모델 선택 전에는 실행·수집 결과를 최종 unseen 증거로 사용할 수 없음 |
-| Jetson latency·안정성 | **BLOCKED** | canonical engine P99 <3.0 ms, 256/48k=5.333 ms deadline, 공식 session의 xrun=0·deadline miss=0·backlog=0 | deadline 초과/미스/xrun/backlog 또는 plant lead 불일치 | legacy benchmark는 canonical 모델의 증거가 아님. safety의 20% mute 한계는 비상 차단값이지 배포 합격값이 아님 |
+| Jetson latency·안정성 | **BLOCKED** | canonical engine P99 <3.0 ms, max <256/48k=5.333 ms, 공식 session의 xrun·deadline miss·engine error·drop/add·fallback·watchdog·sample slip=0, absolute backlog ≤256·excess backlog=0 | deadline 초과/미스/xrun/불연속 counter, excess backlog 또는 plant lead 불일치 | 고정 1-hop handoff는 plant lead에 모델링하며 callback race로 보이는 정상 absolute backlog 0/256을 지연 불연속으로 오인하지 않는다. legacy benchmark는 canonical 모델의 증거가 아님 |
 | ONNX/TensorRT·실제 배포 | **BLOCKED** | canonical G4+Level-5+runtime PASS와 checkpoint/ONNX/engine metadata SHA·lead exact | 어떤 선행 gate라도 FAIL | 기존 export는 legacy/diagnostic이며 promotion 금지 |
 
 canonical readiness의 총수는 17개다. 다만 기존 **15/17** 기록은 새로 발견된
@@ -214,7 +214,8 @@ G4 PASS는 동시에 다음을 요구한다.
 3. recorded val selection과 one-shot test G4 PASS
 4. Level-5 unseen 네 family PASS
 5. strict runtime plant/checkpoint/ONNX lead·SHA exact
-6. Jetson P99 <3.0 ms, 공식 live session xrun/deadline miss/backlog 0
+6. Jetson P99 <3.0 ms, max <5.333 ms, 공식 live session xrun/deadline miss/
+   engine error/drop/add/fallback/watchdog/sample slip과 excess backlog 0
 7. ANC OFF/ON raw와 octave/family 결과 보존
 
 Tiny와 Base의 우열도 같은 checkpoint 세대·plant·lead·source·volume·window에서 latency와 실제

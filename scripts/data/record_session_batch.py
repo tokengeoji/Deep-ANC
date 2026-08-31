@@ -46,6 +46,7 @@ from deep_anc.data.holdout_contract import (  # noqa: E402
 from deep_anc.data.recorded_generation import (  # noqa: E402
     ADDITION_SESSION_COUNT,
     ADDITIONS_ROOT,
+    CANONICAL_GENERATION_ID,
     CANONICAL_RECORDING_AMPLITUDE,
     RecordedGenerationError,
     SOURCE_PLAN_FIELDS,
@@ -204,12 +205,26 @@ def _validate_batch_source_gain_plan(
 
 
 def _canonical_source_gain_by_row(summary: dict, entries: list[dict]) -> dict[int, float]:
-    """검증된 v2 payload의 integer-millionths를 exact canonical row에 매핑한다."""
+    """검증된 dynamic payload의 integer-millionths를 exact canonical row에 매핑한다."""
 
     if summary.get("canonical_live_eligible") is not True:
         raise RecordingSourceGainError("canonical live eligible source-gain plan이 아닙니다")
     payload = summary.get("payload")
     rows = payload.get("rows") if isinstance(payload, dict) else None
+    contract = payload.get("contract") if isinstance(payload, dict) else None
+    measured_cap = (
+        contract.get("reference_amplitude_millionths")
+        if isinstance(contract, dict)
+        else None
+    )
+    if (
+        isinstance(measured_cap, bool)
+        or not isinstance(measured_cap, int)
+        or not 1
+        <= measured_cap
+        <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
+    ):
+        raise RecordingSourceGainError("source-gain dynamic measured cap 계약 위반")
     if not isinstance(rows, list) or len(rows) != len(entries):
         raise RecordingSourceGainError("source-gain row 수가 canonical source plan과 다릅니다")
     expected = {int(entry["source_row_number"]) for entry in entries}
@@ -226,7 +241,7 @@ def _canonical_source_gain_by_row(summary: dict, entries: list[dict]) -> dict[in
             or row_number in result
             or isinstance(millionths, bool)
             or not isinstance(millionths, int)
-            or not 1 <= millionths <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
+            or not 1 <= millionths <= measured_cap
             or row.get("feasible") is not True
         ):
             raise RecordingSourceGainError("source-gain row/amplitude 계약 위반")
@@ -843,9 +858,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=CANONICAL_RECORDING_AMPLITUDE,
         help=(
-            "diagnostic/legacy file 재생 digital 진폭. canonical v2에서는 이 값을 "
+            "diagnostic/legacy file 재생 digital 진폭. 현행 canonical additions에서는 이 값을 "
             "출력에 쓰지 않고 기본 0.06을 unused legacy sentinel로만 검증한 뒤, "
-            "검증된 source-gain plan의 행별 <=0.012 값을 child에 전달합니다"
+            "검증된 source-gain plan의 행별 receipt-bound <=0.006 값을 child에 전달합니다"
         ),
     )
     parser.add_argument("--limit", type=int, default=None, help="이번 실행에서 녹음할 최대 세션 수")
@@ -869,8 +884,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--canonical-additions-generation",
         default=None,
         help=(
-            "추가 19세션 canonical 수집 모드. source plan/out-root를 generation-id별 "
-            "별도 경로에 고정하고 exact CSV를 강제합니다"
+            "추가 19세션 canonical 수집 모드. 현행 exact generation-id "
+            f"{CANONICAL_GENERATION_ID!r}와 source plan/out-root를 강제합니다"
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="파일/오디오를 변경하지 않고 계획만 검증")
@@ -951,6 +966,11 @@ def main(argv: list[str] | None = None) -> int:
             generation_id = validate_generation_id(args.canonical_additions_generation)
         except ValueError as exc:
             parser.error(str(exc))
+        if generation_id != CANONICAL_GENERATION_ID:
+            parser.error(
+                "현행 exact recorded generation-id는 "
+                f"{CANONICAL_GENERATION_ID!r}입니다"
+            )
         expected_sources = _lexical_repo_path(
             f"{SOURCE_PLAN_ROOT}/{generation_id}.csv"
         )
@@ -981,7 +1001,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.amplitude != CANONICAL_RECORDING_AMPLITUDE:
             parser.error(
-                "canonical v2에서 --amplitude는 출력값이 아닌 unused legacy sentinel이며 "
+                "현행 canonical additions에서 --amplitude는 출력값이 아닌 "
+                "unused legacy sentinel이며 "
                 f"기본 exact {CANONICAL_RECORDING_AMPLITUDE:.2f}로 두어야 합니다"
             )
         with sources_path.open(encoding="utf-8", newline="") as handle:
@@ -1070,7 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
         f"예상 output-open: {output_open_seconds:.1f}초\n"
         f"예상 connected 상한(분석/저장 제외): {connected_upper_seconds:.1f}초\n"
         f"재생 amplitude: "
-        f"{'source-gain v2 per-row' if source_gain_by_row else f'{args.amplitude:.2f} diagnostic/dry-run'} "
+        f"{'receipt-bound dynamic per-row' if source_gain_by_row else f'{args.amplitude:.2f} diagnostic/dry-run'} "
         f"(공용 peak 안전 상한 {MAX_RECORDING_OUTPUT_PEAK:.2f})\n"
         f"세션 hard timeout: 각 seconds + settle + {args.session_timeout_overhead_seconds:.1f}초\n"
         f"자동 재시도: {'실패당 1회(opt-in)' if args.retry_once else '없음'}\n"
@@ -1111,10 +1132,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         if canonical_rows is not None and not (
             0.0 < row_amplitude
-            <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS / 1_000_000.0
+            <= float(source_gain_plan["payload"]["contract"][
+                "reference_amplitude_millionths"
+            ]) / 1_000_000.0
         ):
             raise RuntimeError(
-                "canonical child amplitude가 physical measured cap 0.012를 넘었습니다"
+                "canonical child amplitude가 receipt-bound dynamic cap을 넘었습니다"
             )
         command_prefix = [
             sys.executable,

@@ -82,6 +82,9 @@ def _canonical_cfg(
     *,
     loss_alpha: float,
     loss_lambda_dnh: float,
+    archive_cache_root: str | None = None,
+    archive_cache_manifest: str | None = None,
+    archive_cache_manifest_sha256: str | None = None,
 ) -> dict:
     alpha = float(loss_alpha)
     lambda_dnh = float(loss_lambda_dnh)
@@ -91,10 +94,31 @@ def _canonical_cfg(
         raise ValueError("selected lambda_dnh가 finite 양수가 아닙니다")
     alpha_literal = f"{alpha:.1f}" if alpha.is_integer() else f"{alpha:.12g}"
     lambda_literal = repr(lambda_dnh)
+    cache_values = (
+        archive_cache_root,
+        archive_cache_manifest,
+        archive_cache_manifest_sha256,
+    )
+    if sum(value is not None for value in cache_values) not in {0, 3}:
+        raise ValueError("archive cache root/manifest/SHA는 함께 지정해야 합니다")
+    cache_overrides = (
+        [
+            f"data.archive_cache_root={json.dumps(archive_cache_root)}",
+            f"data.archive_cache_manifest={json.dumps(archive_cache_manifest)}",
+            f"data.archive_cache_manifest_sha256={archive_cache_manifest_sha256}",
+        ]
+        if archive_cache_root is not None
+        else [
+            "data.archive_cache_root=null",
+            "data.archive_cache_manifest=null",
+            "data.archive_cache_manifest_sha256=null",
+        ]
+    )
     return load_train_config(
         config,
         [
             f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+            *cache_overrides,
             f"campaign_prerequisite_sha256={prerequisite_sha}",
             # ``1``이 아닌 ``1.0``으로 직렬화해 loss selection digest가 pilot과
             # 달라지는 것을 막는다. winner와 다른 값을 주면 raw validator가 거부한다.
@@ -118,6 +142,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/train_pretrain_tiny.yaml")
     parser.add_argument("--bootstrap-receipt-sha256", required=True)
+    parser.add_argument("--archive-cache-root", default=None)
+    parser.add_argument("--archive-cache-manifest", default=None)
+    parser.add_argument("--archive-cache-manifest-sha256", default=None)
     parser.add_argument(
         "--loss-alpha",
         type=float,
@@ -249,6 +276,9 @@ def main(argv: list[str] | None = None) -> int:
         "0" * 64,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        archive_cache_root=args.archive_cache_root,
+        archive_cache_manifest=args.archive_cache_manifest,
+        archive_cache_manifest_sha256=args.archive_cache_manifest_sha256,
     )
     require_exact_source_trust(
         provisional, repo_root=REPO_ROOT, roles={"canonical_pretrain"}
@@ -268,6 +298,9 @@ def main(argv: list[str] | None = None) -> int:
             "git_commit": source["git_commit"],
             "source_tree_sha256": source["source_tree_sha256"],
             "bootstrap_receipt_sha256": bootstrap_sha,
+            "archive_cache_manifest_sha256": (provisional.get("data") or {}).get(
+                "archive_cache_manifest_sha256"
+            ),
             "primary_path_sha256": artifacts["primary_path"]["sha256"],
             "secondary_path_sha256": artifacts["secondary_path"]["sha256"],
         },
@@ -353,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
         prospective_sha,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        archive_cache_root=args.archive_cache_root,
+        archive_cache_manifest=args.archive_cache_manifest,
+        archive_cache_manifest_sha256=args.archive_cache_manifest_sha256,
     )
     validate_canonical_pretrain_ledger_payload(
         prospective_cfg,
@@ -371,6 +407,9 @@ def main(argv: list[str] | None = None) -> int:
         ledger_sha,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        archive_cache_root=args.archive_cache_root,
+        archive_cache_manifest=args.archive_cache_manifest,
+        archive_cache_manifest_sha256=args.archive_cache_manifest_sha256,
     )
     validate_canonical_pretrain_prerequisites(canonical, repo_root=REPO_ROOT)
     print(

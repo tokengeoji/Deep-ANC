@@ -1686,6 +1686,9 @@ def _prerequisite_components(tmp_path):
             "git_commit": source["git_commit"],
             "source_tree_sha256": source["source_tree_sha256"],
             "bootstrap_receipt_sha256": cfg["data"]["bootstrap_receipt_sha256"],
+            "archive_cache_manifest_sha256": cfg["data"].get(
+                "archive_cache_manifest_sha256"
+            ),
             "primary_path_sha256": artifacts["primary_path"]["sha256"],
             "secondary_path_sha256": artifacts["secondary_path"]["sha256"],
         },

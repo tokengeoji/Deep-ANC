@@ -52,9 +52,11 @@ RECORDING_LEVEL_CAMPAIGN_SCHEMA = "recording_level_campaign_v1"
 RECORDING_LEVEL_SESSION_BINDING_SCHEMA = "recording_level_session_binding_v1"
 RECORDING_LEVEL_RENDERED_SOURCE_SCHEMA = "recording_rendered_source_level_v1"
 RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA = (
-    "recording_level_source_gain_session_binding/v2"
+    "recording_level_source_gain_session_binding/v3_dynamic_gainprobe006"
 )
-RECORDING_LEVEL_RENDERED_SOURCE_V2_SCHEMA = "recording_rendered_source_level/v2"
+RECORDING_LEVEL_RENDERED_SOURCE_V2_SCHEMA = (
+    "recording_rendered_source_level/v3_dynamic_gainprobe006"
+)
 RECORDING_LEVEL_CAMPAIGN_ROOT = "results/recording_level_campaigns"
 RECORDING_LEVEL_CAMPAIGN_FILENAME = "campaign.json"
 RECORDING_LEVEL_MAX_AGE_SECONDS = BOOTSTRAP_METER_MAX_AGE_SECONDS

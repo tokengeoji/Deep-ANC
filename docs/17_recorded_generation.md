@@ -11,7 +11,8 @@
 > `stage1-coverage-v2`는 fixed `0.06`과 environment_006 `25.75 s`를 사용했던
 > **immutable stale 세대**다. source별 physical cap 계약과 맞지 않으므로 기존
 > receipt/plan/raw는 진단 증거로만 보존하고 덮어쓰거나 현행 수집에 재사용하지 않는다.
-> 현행 수집 세대는 새 no-replace ID `stage1-coverage-v3-gain012`다. v1 첫 environment 원본의 두 실제
+> 현행 수집 세대는 새 no-replace ID `stage1-coverage-v4-gainprobe006`다. v2/v3의 0.012
+> probe 계약과 v1 첫 environment 원본의 두 실제
 > capture는 하드웨어/xrun/clip 문제가 없었지만 source→ERR 150--600 Hz coherence²가
 > `0.872375`, `0.836006`으로 canonical `0.90`에 미달했다. 임계값을 낮추거나 같은
 > church-bells 원본을 반복하지 않고, 안정적인 DEMAND DKITCHEN immutable 원본으로
@@ -25,7 +26,7 @@ root에 수집하고, 검증을 모두 통과한 뒤에만 parent 82 + additions
 generation manifest를 발행한다.
 
 현재 82세션만 존재하는 schema v1은 기존 bytes를 재검증하는 forensic/readiness 계약으로만
-유효하다. 현행 `stage1-coverage-v3-gain012` 신규 학습 입력으로는 사용할 수 없다. 19세션이 실제로
+유효하다. 현행 `stage1-coverage-v4-gainprobe006` 신규 학습 입력으로는 사용할 수 없다. 19세션이 실제로
 녹음되기 전에는 101세션 generation을 만들었다고 간주하지 않으며 readiness도 기존
 82세션 증거를 사용한다.
 
@@ -36,10 +37,10 @@ generation manifest를 발행한다.
 | parent raw | `data/recorded/` | 기존 82세션 tree bytes 불변 |
 | parent manifest | `data/manifests/recorded_regrouped.jsonl` | holdout SHA와 exact 일치 |
 | parent holdout | `data/manifests/recorded_holdout.json` | lineage/tree/provenance 외부 anchor |
-| addition source plan | `data/source_plans/recorded_additions/<generation-id>.csv` | exact 19행·exact header |
-| addition raw | `data/recorded_additions/<generation-id>/` | 별도 root, session 19개 + progress 1개 |
-| combined manifest | `data/manifests/recorded_generations/<generation-id>/recorded.jsonl` | parent 82행을 의미 변경 없이 복사 + addition 19행 |
-| generation report | `data/manifests/recorded_generations/<generation-id>/generation.json` | 위 모든 현재 bytes에서 재유도 |
+| addition source plan | `data/source_plans/recorded_additions/stage1-coverage-v4-gainprobe006.csv` | 현행 exact ID·exact 19행·exact header |
+| addition raw | `data/recorded_additions/stage1-coverage-v4-gainprobe006/` | 현행 exact ID의 별도 root, session 19개 + progress 1개 |
+| combined manifest | `data/manifests/recorded_generations/stage1-coverage-v4-gainprobe006/recorded.jsonl` | parent 82행을 의미 변경 없이 복사 + addition 19행 |
+| generation report | `data/manifests/recorded_generations/stage1-coverage-v4-gainprobe006/generation.json` | 위 모든 현재 bytes에서 재유도 |
 
 구현 authority는 `src/deep_anc/data/recorded_generation.py`다. transfer schema v1/v2
 검증은 `src/deep_anc/data/transfer_contract.py`, generation/transfer 발행은 각각
@@ -54,12 +55,68 @@ speech 5, music 5, environment 5,
 machine 4로 고정한다. 모든 행은 녹음 전에 split을 지정하고, lineage component와 원본
 SHA가 서로 독립적이어야 한다.
 
-현행 generation-id는 `stage1-coverage-v3-gain012`다. canonical 구성은 environment/music
+현행 generation-id는 `stage1-coverage-v4-gainprobe006`다. canonical 구성은 environment/music
 source-pool 9행, immutable DEMAND environment 1행, external DNS speech 5행, external
 ESC machine 4행이다. DNS와 DEMAND selection receipt가 없거나 두 외부 전달 receipt
 SHA 중 하나라도 없으면 source plan은 명시적으로 BLOCKED된다. bounded physical
-gain-linearity PASS receipt와 외부 SHA도 필수이며, 그 receipt가 허용한 최대값(현재
-`0.012` 이하)에서 exact 19행 모두가 feasible일 때만 plan을 발행한다.
+gain-linearity PASS receipt와 외부 SHA도 필수이며, 그 receipt가 허용한 동적 최대값
+(독립 0.006 holdout 이하)에서 exact 19행 모두가 feasible일 때만 plan을 발행한다.
+과거 v2 partial raw/FAIL receipt와 `stage1-coverage-v3-gain012` plan은 forensic
+evidence일 뿐 이 세대의 live authority로 재사용하지 않는다. 특히 과거
+`environment_006.wav @ 42.0 s`는 0.012 기준 PASS였지만 0.006에서 600--1600 Hz SNR과
+timeline gate를 통과하지 못하므로 deterministic selector가 대체 창을 찾기 전에는
+19/19 gate가 의도대로 BLOCKED다.
+
+### 3.1 gainprobe006 물리 authority
+
+먼저 새 경로에 무출력 plan을 만든다. 기존
+`results/recording_gain_linearity_v2/`와 v2 FAIL receipt는 덮어쓰지 않는다.
+
+```bash
+.venv/bin/python scripts/data/measure_recording_gain_linearity.py \
+  --dry-run \
+  --expected-commit <40자리_SHA> \
+  --output results/data_audit/recording_gain_linearity_v3_gainprobe006_plan.json
+```
+
+새 plan은 0.003/0.004/0.005 적합과 독립 0.006 holdout, 각 6초 stimulus 앞 0.5초
+exact-zero settle, level별 IMD 순서 회전, 그룹당 서로 겹치지 않는 다섯 response pilot을
+포함한다. nominal active 합계는 정확히 `15.615666...초`, 실제 int16 ch0의 nonzero sample
+합계는 `13.821375초`, 네 stream의 output-open 합계는 26초다. input preflight와 stream별
+watchdog/전환 예산까지 포함한 **software live campaign monotonic hard deadline**은 37초다.
+이는 사용자가 물리 케이블을 연결해 둔 총 시간을 측정한다는 뜻이 아니다.
+
+PortAudio callback time-info는 exact frame coverage와 finite/strict-monotonic witness일 뿐
+ADC/DAC clock-q authority가 아니다. USB driver queue 예측이 포함된 DAC timestamp의 회귀
+기울기로 raw를 거부하지 않는다. q는 같은 colored duct를 통과한 다섯 captured pilot
+response끼리의 trajectory에서 계산하며, source template과 첫 mic response의 직접
+correlation은 coloration 진단값으로만 남긴다. trajectory 중간 step, ±1000 ppm 초과,
+ERR/REF q 불일치 또는 ERR−REF 상대 지연 흔들림은 receipt를 FAIL로 만든다.
+
+0.40 ADC gate, 0.50 absolute ceiling, 1 dB compression과 관측 가능한 row의 -30 dBc
+THD/IMD gate는 완화하지 않는다. 다만 현 저레벨에서 distortion floor를 분리하지 못한 row는
+`INCONCLUSIVE`이며 THD PASS나 global nonlinear certification으로 승격하지 않는다.
+PASS receipt도 `distortion_certified=false`와
+`physical_authority_scope=tested_range_adc_peak_safety_only_not_global_nonlinearity`를
+명시하고, independent 0.006 holdout·compression·ERR/REF induced/absolute residual로
+**tested 범위의 ADC peak safety만** 허용한다. 전달 에너지가 fullband target norm의 1%보다
+작은 subband에는 0.995/0.10 상대오차 판정을 적용하지 않고 fullband round-trip과 absolute
+residual bound 역할을 기록한다. 이를 고역 전달 또는 ANC plant PASS라고 부르지 않는다.
+
+live 실행은 위 plan의 외부 SHA와 여섯 확인 플래그를 모두 요구한다. capture 뒤 held session
+directory에 `raw_measurement.npz`, `metadata.json`, `capture_publication.json`을 차례로
+no-replace 발행한다. 세 번째 publication은 raw/sidecar의 path·size·SHA, 캡처 당시
+device/inode witness, plan·repository execution identity를 self-seal한다. 출력 stream 중의
+종료 신호는 즉시 abort하고, 출력 종료 안내 직전부터 세 파일의 durable 발행이 끝날 때까지
+SIGINT/SIGTERM/SIGHUP를 지연 처리한다. sidecar/publication 선점 또는 session 경로 교체가
+발생하면 raw recovery는 보존하지만 학습 authority는 열지 않는다.
+
+별도 `--analyze-raw` 실행은 raw/plan뿐 아니라 stdout에 기록된 publication path와 외부
+SHA도 반드시 입력받아야 receipt PASS를 발행한다. publication이 없거나 변조됐거나 recovery
+raw만 복사한 경우에는 forensic metrics를 계산할 수 있어도 receipt는 반드시 FAIL이다. receipt의
+`tested_max_amplitude_millionths=6000`과 empirical
+`supported_max_amplitude_millionths<=6000`은 서로 다른 값이며 downstream은 더 작은
+supported cap만 사용한다.
 
 | family | path | start | split |
 |---|---|---:|---|
@@ -211,7 +268,7 @@ for spec in \
   '5-222524-A-41.wav machine-222524-repeat3.wav'; do
   set -- $spec
   .venv/bin/python scripts/data/build_recorded_external_composite.py \
-    --generation-id stage1-coverage-v3-gain012 \
+    --generation-id stage1-coverage-v4-gainprobe006 \
     --raw-member "data/raw/noise/esc50/ESC-50-master/audio/$1" \
     --family machine --out-name "$2" || exit 1
 done
@@ -294,10 +351,10 @@ canonical 경로는 비워져 원인 수정 후 새 no-replace 실행이 가능�
 
 ```bash
 .venv/bin/python scripts/data/build_recorded_additions_plan.py \
-  --generation-id stage1-coverage-v3-gain012 \
+  --generation-id stage1-coverage-v4-gainprobe006 \
   --dns-selection-receipt-sha256 <Elice_selection_receipt_SHA256> \
   --demand-selection-receipt-sha256 <Elice_DEMAND_receipt_SHA256> \
-  --gain-linearity-receipt results/recording_gain_linearity/<capture>/receipt.json \
+  --gain-linearity-receipt results/data_audit/recording_gain_linearity_v3_gainprobe006_receipt.json \
   --gain-linearity-receipt-sha256 <Jetson_gain_linearity_receipt_SHA256> \
   --check-only
 ```
@@ -309,16 +366,16 @@ source plan은 다음 무음 dry-run으로 검사한다. 이 명령은 파일을
 
 ```bash
 .venv/bin/python scripts/data/record_session_batch.py \
-  --sources data/source_plans/recorded_additions/stage1-coverage-v3-gain012.csv \
-  --out-root data/recorded_additions/stage1-coverage-v3-gain012 \
-  --canonical-additions-generation stage1-coverage-v3-gain012 \
+  --sources data/source_plans/recorded_additions/stage1-coverage-v4-gainprobe006.csv \
+  --out-root data/recorded_additions/stage1-coverage-v4-gainprobe006 \
+  --canonical-additions-generation stage1-coverage-v4-gainprobe006 \
   --amplitude 0.06 \
   --dry-run
 ```
 
 위 `--amplitude 0.06`은 v1 CLI 호환을 위한 **unused legacy sentinel**이다. canonical
-v2 child 명령의 실제 출력은 PASS source-gain plan의 행별 값만 사용하고 모두
-`0.012` 이하임을 parent와 child가 다시 검사한다. sentinel을 실제 출력 레벨로
+v3 child 명령의 실제 출력은 PASS source-gain plan의 행별 값만 사용하고 모두
+receipt-bound dynamic cap(최대 `0.006`) 이하임을 parent와 child가 다시 검사한다. sentinel을 실제 출력 레벨로
 해석하거나 plan 없이 직접 canonical root에 녹음할 수 없다.
 
 이 pre-campaign dry-run은 source/lineage/plan/기존 session을 전부 읽되 오디오 장치와 fresh
@@ -349,7 +406,10 @@ canonical additions의 source-independent live authority가 아니다. 2026-08-3
 재계산에서 source별 예측 peak가 약 22.82 dB 범위로 달라 fixed `0.06` batch를 차단했다.
 canonical live는 source별 gain plan과 REF 상한 및 다중레벨 선형성 receipt를 결속해야 한다.
 schema-v1 plan은 ERR-only 무출력 계산이므로 `canonical_live_eligible=false`이며,
-아래 실행은 PASS v2 physical authority가 없으면 audio open 전에 실패해야 한다.
+아래 실행은 PASS `recording_source_gain_plan/v3_dynamic_gainprobe006` physical authority가
+없으면 audio open 전에 실패해야 한다. batch/source-plan/additions/generation builder는 모두
+현행 exact ID `stage1-coverage-v4-gainprobe006`만 허용하며, v2/v3 이름에 현행 CSV bytes를
+복사해도 오디오 open이나 generation 유도 전에 거부한다.
 어떤 digital amplitude도 같은 physical SPL이나 과거 82세션과 같은 amplifier gain을
 자동으로 증명하지 않는다.
 canonical batch/session/generation은 fresh meter raw·receipt를 recording-level campaign
@@ -379,9 +439,9 @@ config/fingerprint와 amplifier setting 확인이 유지되는지 다시 검사�
 
 ```bash
 .venv/bin/python scripts/data/record_session_batch.py \
-  --sources data/source_plans/recorded_additions/stage1-coverage-v3-gain012.csv \
-  --out-root data/recorded_additions/stage1-coverage-v3-gain012 \
-  --canonical-additions-generation stage1-coverage-v3-gain012 \
+  --sources data/source_plans/recorded_additions/stage1-coverage-v4-gainprobe006.csv \
+  --out-root data/recorded_additions/stage1-coverage-v4-gainprobe006 \
+  --canonical-additions-generation stage1-coverage-v4-gainprobe006 \
   --amplitude 0.06 \
   --recording-level-campaign results/recording_level_campaigns/<campaign-id>/campaign.json \
   --recording-level-campaign-sha256 <외부_SHA256> \
@@ -420,7 +480,7 @@ root에 남은 경우 자동 삭제하지 않고 명시적으로 quarantine하�
 
 ```bash
 .venv/bin/python scripts/data/build_recorded_generation.py \
-  --generation-id stage1-coverage-v3-gain012 \
+  --generation-id stage1-coverage-v4-gainprobe006 \
   --expected-holdout-sha256 <recorded_holdout_sha256>
 ```
 
@@ -450,7 +510,7 @@ generation의 exclusion으로 바꾸면 학습 전에 실패한다.
 검증된 기존 SHA를 명시하여 content-addressed history를 먼저 만들고, 완성된 101세션
 schema v2만 원자 교체한다. 전체 인자는 `docs/05_training_elice.md`의 canonical 명령을
 byte 그대로 사용한다. 그 완전한 명령에서 `--recorded-generation`은
-`data/manifests/recorded_generations/stage1-coverage-v3-gain012/generation.json`,
+`data/manifests/recorded_generations/stage1-coverage-v4-gainprobe006/generation.json`,
 `--rotate-existing-transfer-sha256`은 검증 직전 canonical schema v1의 실제 SHA-256이어야 한다.
 설명용 placeholder를 bash에 복사해 실행하지 않는다.
 

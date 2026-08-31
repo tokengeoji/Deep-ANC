@@ -397,6 +397,9 @@ def build_experiment_contract(
         # 1급 identity로 노출한다. binder가 stamp 전에 검증·주입한 값이다.
         "input_generation": {
             "bootstrap_receipt_sha256": data.get("bootstrap_receipt_sha256"),
+            "archive_cache_manifest_sha256": data.get(
+                "archive_cache_manifest_sha256"
+            ),
             "transfer_manifest_sha256": data.get("transfer_manifest_sha256"),
             "recorded_transfer_aggregate_sha256": data.get(
                 "recorded_transfer_aggregate_sha256"

@@ -42,19 +42,24 @@ from deep_anc.data.recording_source_preflight import (
 )
 from deep_anc.data.recording_gain_linearity import (
     ADC_CERTIFICATION_PEAK,
+    GAIN_LINEARITY_AUTHORITY_SCOPE,
     OPERATOR_FIR_LENGTH,
+    OPERATOR_PEAK_PRE_ROLL_SAMPLES,
+    OPERATOR_RELATIVE_SUBBAND_MIN_NORM_RATIO,
     RecordingGainLinearityError,
     validate_gain_linearity_receipt,
 )
 from deep_anc.realtime.noise_gen import NoiseProgram, render_recording_file_window
 RECORDING_SOURCE_GAIN_SCHEMA = "recording_source_gain_plan/v1"
-RECORDING_SOURCE_GAIN_SCHEMA_V2 = "recording_source_gain_plan/v2_physical_linearity"
+RECORDING_SOURCE_GAIN_SCHEMA_V2 = (
+    "recording_source_gain_plan/v3_dynamic_gainprobe006"
+)
 RECORDING_SOURCE_GAIN_SESSION_BINDING_SCHEMA = (
-    "recording_source_gain_session_binding/v2"
+    "recording_source_gain_session_binding/v3_dynamic_gainprobe006"
 )
 # schema-v1의 0.06은 이미 발행된 진단용 plan을 재검증하기 위한 legacy 기준이다.
 # schema-v2는 이 값을 reference/외삽 기준으로 사용하지 않고 physical receipt가
-# 실측한 최대 amplitude(현재 0.012 이하)를 reference이자 hard cap으로 사용한다.
+# receipt가 인증한 dynamic amplitude(독립 0.006 holdout 이하)를 reference/hard cap으로 쓴다.
 LEGACY_REFERENCE_AMPLITUDE_MILLIONTHS = 60_000
 MINIMUM_AMPLITUDE_MILLIONTHS = 1
 ADC_PEAK_HARD_CEILING = 0.5
@@ -68,7 +73,7 @@ GAIN_PLAN_BLOCKERS = (
     "strict_primary_not_authoritative_above_1600_hz",
     "recording_level_campaign_v2_not_implemented",
 )
-PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS = 12_000
+PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS = 6_000
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 CANONICAL_DUCT_CONFIG = "configs/duct.yaml"
 CANONICAL_HARDWARE_CONFIG = "configs/hardware_jetson.yaml"
@@ -640,13 +645,41 @@ def _physical_operator_contract(analysis: Any) -> dict[str, Any]:
     operator = analysis.get("safety_operator") if isinstance(analysis, Mapping) else None
     if not isinstance(operator, Mapping):
         raise RecordingSourceGainError("gain-linearity safety operator가 없습니다")
+    supported = analysis.get("supported_max_amplitude_millionths")
+    tested = analysis.get("tested_max_amplitude_millionths")
+    if (
+        isinstance(supported, bool)
+        or not isinstance(supported, int)
+        or isinstance(tested, bool)
+        or not isinstance(tested, int)
+        or not MINIMUM_AMPLITUDE_MILLIONTHS
+        <= supported
+        <= tested
+        == PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
+    ):
+        raise RecordingSourceGainError(
+            "gain-linearity tested/supported dynamic cap 계약 위반"
+        )
+    if (
+        analysis.get("distortion_certified") is not False
+        or analysis.get("physical_authority_scope")
+        != GAIN_LINEARITY_AUTHORITY_SCOPE
+    ):
+        raise RecordingSourceGainError(
+            "gain-linearity authority는 tested ADC peak safety 전용이어야 합니다"
+        )
     unsealed = dict(operator)
     seal = unsealed.pop("operator_sha256", None)
     if (
-        operator.get("schema") != "recording_gain_safety_operator/v2"
+        operator.get("schema")
+        != "recording_gain_safety_operator/v3_gainprobe006"
         or operator.get("role")
         != "source_gain_prediction_only_not_anc_plant_authority"
         or operator.get("fir_length") != OPERATOR_FIR_LENGTH
+        or operator.get("peak_pre_roll_samples")
+        != OPERATOR_PEAK_PRE_ROLL_SAMPLES
+        or operator.get("relative_subband_minimum_target_norm_ratio")
+        != OPERATOR_RELATIVE_SUBBAND_MIN_NORM_RATIO
         or not isinstance(seal, str)
         or _SHA256_RE.fullmatch(seal) is None
         or seal != _seal(unsealed)
@@ -685,7 +718,7 @@ def _physical_operator_contract(analysis: Any) -> dict[str, Any]:
             != item.get("fir_sha256")
             or residual.get("definition")
             != "young_l1_induced_plus_measured_absolute_with_uncertainty_v1"
-            or residual.get("valid_through_amplitude_millionths") != 12_000
+            or residual.get("valid_through_amplitude_millionths") != tested
             or induced_l1 < 0.0
             or absolute_peak < 0.0
             or absolute_rms < 0.0
@@ -694,7 +727,7 @@ def _physical_operator_contract(analysis: Any) -> dict[str, Any]:
         result[name] = {
             "fir": np.asarray(fir, dtype=np.float64),
             "fir_sha256": str(item["fir_sha256"]),
-            "valid_through_amplitude_millionths": 12_000,
+            "valid_through_amplitude_millionths": tested,
             "induced_fir_l1_upper": induced_l1,
             "unexplained_peak_absolute_upper": absolute_peak,
             "unexplained_rms_absolute_upper": absolute_rms,
@@ -702,10 +735,10 @@ def _physical_operator_contract(analysis: Any) -> dict[str, Any]:
     return {
         "operator_sha256": str(seal),
         "role": str(operator["role"]),
-        "supported_max_amplitude_millionths": min(
-            int(result[name]["valid_through_amplitude_millionths"])
-            for name in ("err", "ref")
-        ),
+        "tested_max_amplitude_millionths": tested,
+        "supported_max_amplitude_millionths": supported,
+        "distortion_certified": False,
+        "physical_authority_scope": GAIN_LINEARITY_AUTHORITY_SCOPE,
         "channels": result,
     }
 
@@ -992,7 +1025,7 @@ def audit_source_plan_at_measured_cap(
         <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
     ):
         raise RecordingSourceGainError(
-            "selector amplitude는 measured physical cap 0.012 이하여야 합니다"
+            "selector amplitude는 probe tested max 0.006 이하여야 합니다"
         )
     root = _repo_root(repo_root)
     source_ref, rows = _read_source_rows(
@@ -1178,6 +1211,8 @@ def build_recording_source_gain_plan(
             not isinstance(analysis, Mapping)
             or analysis.get("supported_max_amplitude_millionths")
             != physical_operator["supported_max_amplitude_millionths"]
+            or analysis.get("tested_max_amplitude_millionths")
+            != physical_operator["tested_max_amplitude_millionths"]
         ):
             raise RecordingSourceGainError(
                 "gain-linearity measured supported max와 operator bound가 다릅니다"
@@ -1237,10 +1272,15 @@ def build_recording_source_gain_plan(
             else "strict_primary_err_only"
         ),
         "safety_operator_is_anc_plant_authority": False,
+        "distortion_certified": False,
+        "physical_authority_scope": GAIN_LINEARITY_AUTHORITY_SCOPE,
     }
     if physical_operator is not None:
         contract["gain_linearity_source_commit"] = physical_source_commit
         contract["safety_operator_sha256"] = physical_operator["operator_sha256"]
+        contract["physical_probe_tested_max_amplitude_millionths"] = (
+            physical_operator["tested_max_amplitude_millionths"]
+        )
     live_eligible = physical_summary is not None
     payload: dict[str, Any] = {
         "schema": (
@@ -1382,6 +1422,9 @@ def build_recording_source_gain_session_binding(
         not isinstance(contract, Mapping)
         or contract.get("gain_linearity_source_commit") != commit
         or contract.get("safety_operator_is_anc_plant_authority") is not False
+        or contract.get("distortion_certified") is not False
+        or contract.get("physical_authority_scope")
+        != GAIN_LINEARITY_AUTHORITY_SCOPE
     ):
         raise RecordingSourceGainError(
             "source gain plan commit 또는 non-plant safety role이 current execution과 다릅니다"
@@ -1436,11 +1479,14 @@ def build_recording_source_gain_session_binding(
         "source_commit": commit,
         "safety_operator_sha256": contract.get("safety_operator_sha256"),
         "safety_operator_is_anc_plant_authority": False,
+        "distortion_certified": False,
+        "physical_authority_scope": GAIN_LINEARITY_AUTHORITY_SCOPE,
         "source_row_number": source_row_number,
         "source_identity_sha256": row.get("source_identity_sha256"),
         "source_file": dict(row.get("source_file") or {}),
         "amplitude_millionths": millionths,
         "amplitude": millionths / 1_000_000.0,
+        "supported_max_amplitude_millionths": measured_cap,
         "render_sample_sha256": row.get("selected_render_sample_sha256"),
         "physical_prediction": row.get("selected_physical_prediction"),
     }

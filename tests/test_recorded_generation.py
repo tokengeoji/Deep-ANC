@@ -29,7 +29,7 @@ from deep_anc.data.timeline import TimelineReport
 from deep_anc.realtime.noise_gen import NoiseProgram, render_recording_file_window
 
 
-GENERATION_ID = "highband-v1"
+GENERATION_ID = generation.CANONICAL_GENERATION_ID
 
 
 def _sha(raw: bytes) -> str:
@@ -436,7 +436,8 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
 
     # schema-v2 canonical additions는 더 이상 legacy fixed 0.06 campaign을
     # transfer authority로 승격하지 않는다. fixture도 physical probe cap 아래의
-    # exact source-gain/linearity 4종 ref를 끝까지 운반한다.
+    # exact source-gain/linearity 6종 ref를 끝까지 운반한다. Capture publication이
+    # raw와 metadata sidecar를 함께 결속하므로 전송 뒤 receipt를 독립 재계산할 수 있다.
     gain_files = {
         "source_gain_plan": root / "results/recording_source_gains/fixture.json",
         "gain_linearity_receipt": (
@@ -447,6 +448,13 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
         ),
         "gain_linearity_raw": (
             root / "results/recording_gain_linearity/fixture/raw.npz"
+        ),
+        "gain_linearity_metadata": (
+            root / "results/recording_gain_linearity/fixture/metadata.json"
+        ),
+        "gain_linearity_publication": (
+            root
+            / "results/recording_gain_linearity/fixture/capture_publication.json"
         ),
     }
     for name, path in gain_files.items():
@@ -473,8 +481,11 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
         "payload": {
             "plan": gain_ref("gain_linearity_plan"),
             "raw": gain_ref("gain_linearity_raw"),
+            "capture_publication": gain_ref("gain_linearity_publication"),
             "hardware": campaign_ref("hardware_config"),
         },
+        "capture_metadata": gain_ref("gain_linearity_metadata"),
+        "capture_publication": gain_ref("gain_linearity_publication"),
     }
 
     def validate_level_campaign(
@@ -663,7 +674,7 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
             "program": {
                 "type": "file",
                 "frequency": 300.0,
-                "amplitude": 0.012,
+                "amplitude": 0.006,
                 "band": [80.0, 1000.0],
                 "file": row["path"],
                 "file_start_seconds": float(row["start_seconds"]),
@@ -713,7 +724,10 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
         embedded_gain = {
             "source_gain_plan": gain_ref("source_gain_plan"),
             "gain_linearity_receipt": gain_ref("gain_linearity_receipt"),
-            "amplitude_millionths": 12_000,
+            "amplitude_millionths": 6_000,
+            "supported_max_amplitude_millionths": 6_000,
+            "distortion_certified": False,
+            "physical_authority_scope": generation.GAIN_LINEARITY_AUTHORITY_SCOPE,
         }
         binding_without_seal = {
             "schema": generation.RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA,
@@ -1065,13 +1079,13 @@ def test_bound_schema2_materializes_dynamic_recorded_manifest(role, monkeypatch)
         "recorded_manifest": config_module.CANONICAL_RECORDED_MANIFEST,
         "data": {
             "recorded_generation": (
-                "data/manifests/recorded_generations/stage1-coverage-v2/generation.json"
+                f"data/manifests/recorded_generations/{GENERATION_ID}/generation.json"
             ),
             "recorded_generation_sha256": "a" * 64,
         },
     }
     config_module._materialize_bound_recorded_manifest(cfg)
-    expected = "data/manifests/recorded_generations/stage1-coverage-v2/recorded.jsonl"
+    expected = f"data/manifests/recorded_generations/{GENERATION_ID}/recorded.jsonl"
     assert cfg["recorded_manifest"] == expected
     assert calls == [expected]
     cfg["recorded_manifest"] = "data/manifests/forged.jsonl"
@@ -1084,6 +1098,110 @@ def test_bound_schema2_materializes_dynamic_recorded_manifest(role, monkeypatch)
         "data/manifests/recorded_generations/-bad/recorded.jsonl"
     )
     assert not config_module._canonical_recorded_manifest_binding(cfg)
+
+
+@pytest.mark.parametrize(
+    "stale_generation_id",
+    ("stage1-coverage-v2", "stage1-coverage-v3-gain012"),
+)
+def test_current_recorded_generation_rejects_stale_generation_ids_before_io(
+    tmp_path, stale_generation_id
+):
+    with pytest.raises(generation.RecordedGenerationError, match="현행 exact"):
+        generation.validate_generation_id(stale_generation_id)
+    with pytest.raises(generation.RecordedGenerationError, match="현행 exact"):
+        generation._read_source_plan(
+            repo_root=tmp_path,
+            relative=(
+                f"{generation.SOURCE_PLAN_ROOT}/{stale_generation_id}.csv"
+            ),
+            require_source_files=False,
+        )
+    with pytest.raises(generation.RecordedGenerationError, match="현행 exact"):
+        generation.build_combined_manifest_bytes(
+            repo_root=tmp_path,
+            generation_id=stale_generation_id,
+            expected_holdout_sha256="a" * 64,
+            require_source_files=False,
+        )
+
+
+@pytest.mark.parametrize("mode", ("--check-only", "--write"))
+def test_additions_plan_builder_validates_staging_before_canonical_publish(
+    tmp_path, monkeypatch, mode, capsys
+):
+    """Candidate 의미 검증과 canonical no-replace 발행을 entrypoint에서 함께 회귀한다."""
+
+    _fixture(tmp_path, monkeypatch)
+    canonical = (
+        tmp_path
+        / generation.SOURCE_PLAN_ROOT
+        / f"{generation.CANONICAL_GENERATION_ID}.csv"
+    )
+    with canonical.open(encoding="utf-8", newline="") as handle:
+        canonical_rows = list(csv.DictReader(handle))
+    canonical.unlink()
+
+    spec = importlib.util.spec_from_file_location(
+        f"recorded_additions_plan_{mode.removeprefix('--')}_entrypoint_test",
+        Path(__file__).resolve().parents[1]
+        / "scripts/data/build_recorded_additions_plan.py",
+    )
+    builder = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = builder
+    spec.loader.exec_module(builder)
+    expected_published_raw = builder._render(canonical_rows)
+    monkeypatch.setattr(builder, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        builder,
+        "_measured_cap_from_receipt",
+        lambda **_kwargs: 6_000,
+    )
+    monkeypatch.setattr(
+        builder,
+        "build_rows",
+        lambda *_args, **_kwargs: [dict(row) for row in canonical_rows],
+    )
+    monkeypatch.setattr(
+        builder,
+        "_require_all_rows_feasible",
+        lambda **_kwargs: {
+            "row_count": generation.ADDITION_SESSION_COUNT,
+            "feasible_row_count": generation.ADDITION_SESSION_COUNT,
+            "blockers": [],
+            "evidence_sha256": "f" * 64,
+        },
+    )
+
+    result = builder.main(
+        [
+            "--generation-id",
+            generation.CANONICAL_GENERATION_ID,
+            "--dns-selection-receipt-sha256",
+            "a" * 64,
+            "--demand-selection-receipt-sha256",
+            "b" * 64,
+            "--gain-linearity-receipt",
+            "results/gain-linearity-receipt.json",
+            "--gain-linearity-receipt-sha256",
+            "c" * 64,
+            mode,
+        ]
+    )
+
+    assert result == 0, capsys.readouterr().err
+    if mode == "--check-only":
+        assert not canonical.exists()
+    else:
+        assert canonical.read_bytes() == expected_published_raw
+        checked, rows, _lineage, _selection = generation._read_source_plan(
+            repo_root=tmp_path,
+            relative=canonical.relative_to(tmp_path).as_posix(),
+            require_source_files=True,
+        )
+        assert checked.sha256 == _sha(expected_published_raw)
+        assert len(rows) == generation.ADDITION_SESSION_COUNT
 
 
 def test_generation_rejects_changed_parent_session(tmp_path, monkeypatch):
@@ -1532,6 +1650,14 @@ def test_transfer_schema_v2_requires_generation_and_loads_exact101(tmp_path, mon
     payload = json.loads(transfer.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 2
     assert payload["recorded"]["session_count"] == generation.COMBINED_SESSION_COUNT
+    transfer_roles = {entry["role"] for entry in payload["files"]}
+    assert {
+        "recording_gain_linearity_raw",
+        "recording_gain_linearity_metadata",
+        "recording_gain_linearity_publication",
+        "recording_gain_linearity_receipt",
+        "recording_gain_linearity_plan",
+    } <= transfer_roles
     summary = transfer_contract.validate_transfer_manifest(
         transfer,
         repo_root=tmp_path,
@@ -1558,22 +1684,27 @@ def test_transfer_schema_v2_requires_generation_and_loads_exact101(tmp_path, mon
         )
     _write_json(transfer, original_transfer_payload)
 
-    missing_gain_payload = json.loads(json.dumps(original_transfer_payload))
-    missing_gain_payload["files"] = [
-        entry
-        for entry in missing_gain_payload["files"]
-        if entry["role"] != "recording_gain_linearity_raw"
-    ]
-    _write_json(transfer, missing_gain_payload)
-    with pytest.raises(
-        transfer_contract.TransferContractError,
-        match="authority 4개 role",
+    for missing_role in (
+        "recording_gain_linearity_raw",
+        "recording_gain_linearity_metadata",
+        "recording_gain_linearity_publication",
     ):
-        transfer_contract.validate_transfer_manifest(
-            transfer,
-            repo_root=tmp_path,
-            expected_sha256=_sha(transfer.read_bytes()),
-        )
+        missing_gain_payload = json.loads(json.dumps(original_transfer_payload))
+        missing_gain_payload["files"] = [
+            entry
+            for entry in missing_gain_payload["files"]
+            if entry["role"] != missing_role
+        ]
+        _write_json(transfer, missing_gain_payload)
+        with pytest.raises(
+            transfer_contract.TransferContractError,
+            match="authority 6개 role",
+        ):
+            transfer_contract.validate_transfer_manifest(
+                transfer,
+                repo_root=tmp_path,
+                expected_sha256=_sha(transfer.read_bytes()),
+            )
     _write_json(transfer, original_transfer_payload)
 
     data_cfg = {
@@ -2269,12 +2400,15 @@ def test_external_librispeech_rederives_transitive_component_and_window(
         generation.validate_recorded_generation(report, repo_root=tmp_path)
 
 
-def test_generation_amplitude_contract_preserves_legacy_and_accepts_only_v2_probe_cap():
+def test_generation_amplitude_contract_preserves_legacy_and_accepts_only_v3_dynamic_cap():
     session = Path("data/recorded_additions/fixture")
     assert generation._expected_recording_amplitude(
         {"recording_level_binding": {"schema": "legacy"}}, session_dir=session
     ) == 0.06
-    with pytest.raises(generation.RecordedGenerationError, match="v2 recording_level_binding"):
+    with pytest.raises(
+        generation.RecordedGenerationError,
+        match="현행 dynamic recording_level_binding",
+    ):
         generation._expected_recording_amplitude(
             {
                 "plant_domain": "current_strict",
@@ -2285,14 +2419,19 @@ def test_generation_amplitude_contract_preserves_legacy_and_accepts_only_v2_prob
     metadata = {
         "recording_level_binding": {
             "schema": generation.RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA,
-            "source_gain": {"amplitude_millionths": 9_001},
+            "source_gain": {
+                "amplitude_millionths": 5_001,
+                "supported_max_amplitude_millionths": 5_500,
+                "distortion_certified": False,
+                "physical_authority_scope": generation.GAIN_LINEARITY_AUTHORITY_SCOPE,
+            },
         }
     }
     assert generation._expected_recording_amplitude(
         metadata, session_dir=session
-    ) == 0.009001
+    ) == 0.005001
     metadata["recording_level_binding"]["source_gain"][
         "amplitude_millionths"
-    ] = 12_001
+    ] = 5_501
     with pytest.raises(generation.RecordedGenerationError, match="amplitude_millionths"):
         generation._expected_recording_amplitude(metadata, session_dir=session)

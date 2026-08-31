@@ -4,6 +4,7 @@ import hashlib
 import json
 import datetime as dt
 import signal
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -939,6 +940,139 @@ def test_interleaved_capture_failure_surfaces_partial_arrays_for_raw_recovery():
     np.testing.assert_array_equal(
         error.output_pcm, mpi.cw.float32_to_pcm_int16(output)
     )
+
+
+def test_absolute_audio_watchdog_aborts_start_that_runs_callbacks_past_deadline():
+    events = []
+    post_deadline_output = []
+
+    class FakeSD:
+        class CallbackStop(Exception):
+            pass
+
+        class CallbackAbort(Exception):
+            pass
+
+        class Stream:
+            def __init__(self, *, callback, **_kwargs):
+                self.callback = callback
+
+            def start(self):
+                indata = np.ones((8, 2), dtype=np.int32)
+                first = np.zeros((8, 2), dtype=np.int16)
+                self.callback(indata, first, 8, None, None)
+                time.sleep(0.30)
+                second = np.full((8, 2), 123, dtype=np.int16)
+                with pytest.raises(FakeSD.CallbackAbort):
+                    self.callback(indata, second, 8, None, None)
+                post_deadline_output.append(second.copy())
+
+            def abort(self):
+                events.append("abort")
+
+            def close(self):
+                events.append("close")
+
+    output = np.full((32, 2), 0.002, dtype=np.float32)
+    with pytest.raises(mpi.PartialCaptureError) as caught:
+        mpi.capture_measurement_preserving_partial(
+            FakeSD,
+            fs=48_000,
+            block_size=8,
+            latency="low",
+            in_dev=1,
+            out_dev=2,
+            output_float=output,
+            absolute_deadline_monotonic=time.monotonic() + 0.20,
+        )
+
+    assert caught.value.telemetry["absolute_deadline_exceeded"] is True
+    assert caught.value.telemetry["output_stop_confirmed"] is True
+    assert events.count("abort") >= 1
+    assert events[-1] == "close"
+    assert len(post_deadline_output) == 1
+    assert np.count_nonzero(post_deadline_output[0]) == 0
+    assert "absolute_audio_deadline_exceeded" in mpi.capture_telemetry_invalid_reasons(
+        caught.value.telemetry
+    )
+
+
+def test_post_output_signal_cannot_skip_abort_close_or_partial_array_surface():
+    events = []
+    state = {"after_output": False, "after_output_clock_calls": 0, "clock": 1.0}
+
+    class FakeSD:
+        class CallbackStop(Exception):
+            pass
+
+        class CallbackAbort(Exception):
+            pass
+
+        class Stream:
+            def __init__(self, *, callback, **_kwargs):
+                self.callback = callback
+
+            def start(self):
+                events.append("start")
+                frames = 8
+                indata = np.arange(frames * 2, dtype=np.int32).reshape(frames, 2)
+                outdata = np.zeros((frames, 2), dtype=np.int16)
+                try:
+                    self.callback(indata, outdata, frames, None, None)
+                except FakeSD.CallbackStop:
+                    pass
+                state["after_output"] = True
+
+            def abort(self):
+                events.append("abort")
+
+            def close(self):
+                events.append("close")
+
+    def monotonic():
+        state["clock"] += 0.001
+        if state["after_output"]:
+            state["after_output_clock_calls"] += 1
+            # 첫 호출은 start 반환 직후 hard-max 검사, 두 번째가 과거 signal
+            # guard 밖이었던 capture_finished/cleanup 경계다.
+            if state["after_output_clock_calls"] == 2:
+                handler = signal.getsignal(signal.SIGTERM)
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+        return state["clock"]
+
+    def outer_handler(signum, _frame):
+        raise mpi.LiveAudioTermination(int(signum))
+
+    previous = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, outer_handler)
+    try:
+        output = np.zeros((8, 2), dtype=np.float32)
+        output[:, 0] = 0.003
+        with pytest.raises(mpi.PartialCaptureError) as caught:
+            mpi.capture_measurement_preserving_partial(
+                FakeSD,
+                fs=48_000,
+                block_size=8,
+                latency="low",
+                in_dev=1,
+                out_dev=2,
+                output_float=output,
+                monotonic_function=monotonic,
+                on_output_cleanup_complete=lambda: events.append("handoff"),
+            )
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert events == ["start", "abort", "close", "handoff"]
+    assert caught.value.telemetry["termination_signal"] == int(signal.SIGTERM)
+    assert caught.value.telemetry["output_stop_confirmed"] is True
+    assert caught.value.telemetry["captured_frames"] == 8
+    np.testing.assert_array_equal(
+        caught.value.recorded_raw,
+        np.arange(16, dtype=np.int32).reshape(8, 2),
+    )
+    assert np.count_nonzero(caught.value.output_pcm[:, 1]) == 0
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
