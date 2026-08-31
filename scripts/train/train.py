@@ -27,6 +27,9 @@ from deep_anc.train.full_octave_v3_execution import (  # noqa: E402
     audit_full_octave_v3_execution,
     is_full_octave_v3_execution_config,
 )
+from deep_anc.train.stage2_2khz_campaign import (  # noqa: E402
+    is_stage2_2khz_profile_config,
+)
 from deep_anc.train.finetune_readiness import (        # noqa: E402
     require_finetune_readiness,
 )
@@ -68,6 +71,17 @@ def main() -> int:
     # Stage-1/v2 path만 소비하므로, 이를 억지로 train.py에 넣으면 2/4/8 kHz를
     # 학습했다고 오표기할 위험이 있다. model/GPU/lock/run-dir 전에 종료한다.
     raw_config = load_yaml(args.config)
+    # Stage-2 2 kHz profile 묶음은 기존 Stage-1 TrainConfig/criterion의 trusted
+    # 대역 숫자만 조용히 늘리는 설정이 아니다. 새 raw-bound P/S·manifest·전용
+    # criterion·external contract가 준비되기 전에는 어떤 Stage-2 schema도
+    # load_train_config/lock/Trainer/GPU/run directory에 도달하지 못한다.
+    if is_stage2_2khz_profile_config(raw_config):
+        print(
+            "[중단] Stage-2 2 kHz profile은 generic Stage-1 Trainer 입력이 아닙니다. "
+            "scripts/train/check_stage2_2khz_campaign.py로 fail-closed 상태를 확인하세요.",
+            file=sys.stderr,
+        )
+        return 2
     if is_full_octave_v3_admission_config(raw_config):
         print(
             "[중단] full_octave_v3 admission-only config는 아직 Trainer에 사용할 수 "

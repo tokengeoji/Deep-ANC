@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -27,7 +28,18 @@ from deep_anc.audio_io import (
     pcm_int32_to_float32,
 )
 from deep_anc.data.holdout_contract import read_regular_file_snapshot
+from deep_anc.data.recorded_qa import (
+    CAPTURE_MIN_LOW_BAND_COHERENCE,
+    MIN_REF_ERR_COHERENCE,
+)
 from deep_anc.data.repository_fd import repository_execution_identity
+from deep_anc.data.timeline import (
+    TIMELINE_METHOD,
+    TimelineSettings,
+    align_source_to_adc,
+    estimate_lag_track,
+)
+from deep_anc.dsp.invariants import MIN_STREAM_COHERENCE, MIN_STREAM_DELAY_VALID_WINDOWS
 
 
 GAIN_LINEARITY_PLAN_SCHEMA = "recording_gain_linearity_plan/v3_gainprobe006"
@@ -36,8 +48,14 @@ GAIN_LINEARITY_PUBLICATION_SCHEMA = (
     "recording_gain_linearity_capture_publication/v1_gainprobe006"
 )
 GAIN_LINEARITY_RECEIPT_SCHEMA = "recording_gain_linearity_receipt/v4_gainprobe006"
+GAIN_LINEARITY_REANALYSIS_RECEIPT_SCHEMA = (
+    "recording_gain_linearity_receipt/v5_gainprobe006_ref_witness_reanalysis"
+)
 GAIN_LINEARITY_AUTHORITY_SCOPE = (
     "tested_range_adc_peak_safety_only_not_global_nonlinearity"
+)
+GAIN_LINEARITY_PEAK_ENVELOPE_SCHEMA = (
+    "recording_gain_peak_safety_envelope/v1_gainprobe006"
 )
 SAMPLE_RATE = 48_000
 BLOCK_SIZE = 256
@@ -98,6 +116,7 @@ CALLBACK_TIME_INFO_FIELDS = (
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 GAIN_LINEARITY_SCRIPT_PATH = "scripts/data/measure_recording_gain_linearity.py"
+GAIN_LINEARITY_ANALYZER_PATH = "src/deep_anc/data/recording_gain_linearity.py"
 EXACT_OPERATOR_CONFIRMATIONS = {
     "speaker_output": True,
     "user_present": True,
@@ -216,6 +235,62 @@ def _file_ref(relative: str, snapshot: Any) -> dict[str, Any]:
         "size": int(snapshot.size),
         "sha256": str(snapshot.sha256),
     }
+
+
+def _verify_historical_capture_execution(
+    repo_root: Path, execution: Mapping[str, Any]
+) -> None:
+    """저장된 capture script SHA를 해당 역사 commit의 Git blob과 대조한다.
+
+    재분석 checkout은 capture commit과 달라도 된다. 그렇다고 raw가 선언한 옛
+    ``script_file_sha256``를 자체 진술로만 믿지는 않는다. 원 commit의 blob을 직접
+    읽어 SHA를 비교하며 replace/graft가 없는 clean 현재 checkout 확인은 별도의
+    analyzer execution identity가 담당한다.
+    """
+
+    commit = _require_commit(execution.get("repository_commit"))
+    script = _relative(
+        str(execution.get("script_path", "")), label="historical capture script path"
+    )
+    expected = _require_sha(
+        execution.get("script_file_sha256"), label="historical capture script SHA"
+    )
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "blob", f"{commit}:{script}"],
+            check=True,
+            capture_output=True,
+            # ``git cat-file <commit>:<path>`` normally honours refs/replace.
+            # The current analyzer identity rejects replacement refs before this
+            # function is reached, but the historical lookup is also made exact
+            # in isolation so a future caller cannot silently read replacement
+            # bytes instead of the capture commit's real tree.
+            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RecordingGainLinearityError(
+            "historical capture commit/script blob을 검증할 수 없습니다"
+        ) from exc
+    if _sha256_bytes(completed.stdout) != expected:
+        raise RecordingGainLinearityError(
+            "historical capture script SHA가 선언 commit의 blob과 다릅니다"
+        )
+
+
+def _analysis_execution_identity(repo_root: Path) -> dict[str, Any]:
+    """현행 clean analyzer module을 capture 실행과 분리해 결속한다."""
+
+    execution = repository_execution_identity(repo_root, GAIN_LINEARITY_ANALYZER_PATH)
+    if (
+        not isinstance(execution, Mapping)
+        or set(execution) != _EXECUTION_KEYS
+        or execution.get("repository_dirty") is not False
+        or execution.get("script_path") != GAIN_LINEARITY_ANALYZER_PATH
+        or _COMMIT_RE.fullmatch(str(execution.get("repository_commit", ""))) is None
+        or _SHA_RE.fullmatch(str(execution.get("script_file_sha256", ""))) is None
+    ):
+        raise RecordingGainLinearityError("gain-linearity analyzer execution identity 불일치")
+    return dict(execution)
 
 
 def _portable_publication_ref(
@@ -1253,6 +1328,113 @@ def _group_clock_alignment(
     return result, reasons
 
 
+def _group_ref_witness_alignment(
+    *,
+    payload: Mapping[str, Any],
+    source_float: np.ndarray,
+    input_float: np.ndarray,
+) -> tuple[np.ndarray, dict[int, dict[str, Any]], list[str]]:
+    """REF witness로 각 reopened stream의 비선형 USB clock hunting을 보정한다.
+
+    affine ``q``를 다시 맞추지 않는다. :mod:`deep_anc.data.timeline`의
+    ``REF witness -> non-affine warp -> ERR holdout`` 경로만 사용한다. 이 probe는
+    의도적으로 sparse하므로 전체 창 대비 0.90 비율을 요구하는 15초 자연음 수집
+    계약을 잘못 적용하지 않는다. 대신 canonical 최소 유효창 8개와 같은 저/고역 및
+    REF-ERR coherence 하한을 그대로 적용한다.
+    """
+
+    aligned_source = np.asarray(source_float, dtype=np.float64).copy()
+    result: dict[int, dict[str, Any]] = {}
+    reasons: list[str] = []
+    settings = TimelineSettings(sample_rate=SAMPLE_RATE)
+    for group_index, group in enumerate(payload["capture_groups"]):
+        start = int(group["start_frame"])
+        stop = int(group["stop_frame"])
+        source = np.asarray(source_float[start:stop], dtype=np.float64)
+        ref = np.asarray(input_float[start:stop, 1], dtype=np.float64)
+        err = np.asarray(input_float[start:stop, 0], dtype=np.float64)
+        try:
+            track = estimate_lag_track(source, ref, settings)
+            aligned, report = align_source_to_adc(
+                source, ref, err, SAMPLE_RATE, settings=settings
+            )
+        except (TypeError, ValueError) as exc:
+            raise RecordingGainLinearityError(
+                f"group {group_index} REF witness timeline 실패: {exc}"
+            ) from exc
+        canonical = np.ascontiguousarray(aligned, dtype="<f4")
+        aligned_source[start:stop] = canonical.astype(np.float64)
+        if track.valid_count < MIN_STREAM_DELAY_VALID_WINDOWS:
+            reasons.append(f"group_{group_index}_timeline_valid_windows")
+        if report.coh2_150_600_after < CAPTURE_MIN_LOW_BAND_COHERENCE:
+            reasons.append(f"group_{group_index}_timeline_lowband_coherence")
+        if report.coh2_600_1600_after < MIN_STREAM_COHERENCE:
+            reasons.append(f"group_{group_index}_timeline_highband_coherence")
+        if report.coh2_ref_err_150_600 < MIN_REF_ERR_COHERENCE:
+            reasons.append(f"group_{group_index}_timeline_ref_err_coherence")
+        result[group_index] = {
+            "group_index": group_index,
+            "level_millionths": int(group["level_millionths"]),
+            "method": TIMELINE_METHOD,
+            "witness_channel": 1,
+            "holdout_channel": 0,
+            "affine_q_used": False,
+            "valid_windows": int(track.valid_count),
+            "track": track.summary(),
+            "report": report.as_metadata(),
+            "aligned_source_encoding": "float32_le",
+            "aligned_source_sha256": _sha256_bytes(canonical.tobytes(order="C")),
+            # Existing metric extraction consumes a channel-view mapping. Once the
+            # digital source has moved to the ADC timebase, the two ADC channels
+            # must remain untouched and therefore use an exact identity view.
+            "common_q_ratio": 1.0,
+        }
+    return aligned_source, result, reasons
+
+
+def _build_peak_safety_envelope(
+    *,
+    peak_gain_upper: Mapping[str, float],
+    supported_max_amplitude_millionths: int,
+) -> dict[str, Any]:
+    """Bad complex-FIR fit을 peak-safety authority로 오인하지 않는 envelope.
+
+    기존 0.995/0.10 complex round-trip 임계는 그대로 보존되고 diagnostic FIR에
+    적용된다. 이 별도 authority는 네 measured level의 실제 group peak와 1.25배
+    uncertainty에서만 유도되며 tested range 밖 외삽, THD 또는 ANC plant 권한을 주지
+    않는다.
+    """
+
+    channels: dict[str, Any] = {}
+    for name in ("err", "ref"):
+        upper = float(peak_gain_upper[name])
+        if not math.isfinite(upper) or upper <= 0.0:
+            raise RecordingGainLinearityError("peak safety envelope gain이 유효하지 않습니다")
+        channels[name] = {
+            "peak_gain_upper_with_uncertainty": upper,
+            "uncertainty_factor": PREDICTIVE_UNCERTAINTY_FACTOR,
+            "valid_through_amplitude_millionths": int(
+                LEVELS_MILLIONTHS[-1]
+            ),
+            "prediction": "upper_peak=gain_upper*rendered_source_peak",
+        }
+    envelope: dict[str, Any] = {
+        "schema": GAIN_LINEARITY_PEAK_ENVELOPE_SCHEMA,
+        "role": "source_gain_peak_envelope_only_not_anc_plant_authority",
+        "fit_levels_millionths": list(LEVELS_MILLIONTHS[:-1]),
+        "independent_holdout_level_millionths": LEVELS_MILLIONTHS[-1],
+        "tested_max_amplitude_millionths": LEVELS_MILLIONTHS[-1],
+        "supported_max_amplitude_millionths": int(
+            supported_max_amplitude_millionths
+        ),
+        "complex_operator_thresholds_relaxed": False,
+        "complex_operator_used_as_authority": False,
+        "channels": channels,
+    }
+    envelope["operator_sha256"] = _seal(envelope)
+    return envelope
+
+
 def _aligned_channel_view(
     values: np.ndarray,
     *,
@@ -1850,6 +2032,7 @@ def _validate_raw_authority_metadata(
     metadata: Mapping[str, Any],
     preflight_raw: np.ndarray | None,
     source_commit: str,
+    require_current_capture_execution: bool = True,
 ) -> list[str]:
     """Raw metadata를 현재 clean checkout 및 저장된 input-only raw에서 재유도한다.
 
@@ -1878,23 +2061,29 @@ def _validate_raw_authority_metadata(
             or not saved_execution.get("repository_branch")
         ):
             reasons.append("repository_execution_identity")
-        try:
-            current_execution = repository_execution_identity(
-                repo_root, GAIN_LINEARITY_SCRIPT_PATH
-            )
-        except (OSError, RuntimeError, ValueError):
-            reasons.append("repository_execution_current")
-        else:
-            # Raw는 Jetson의 named branch에서 캡처한 뒤 같은 exact commit의
-            # detached Elice checkout에서 독립 검증한다. branch 이름은 provenance
-            # 기록일 뿐 executable bytes의 identity가 아니므로 portable 비교에서
-            # 제외하고 commit/clean/script path+blob hash만 exact하게 묶는다.
-            portable_keys = _EXECUTION_KEYS - {"repository_branch"}
-            if set(current_execution) != _EXECUTION_KEYS or any(
-                saved_execution.get(key) != current_execution.get(key)
-                for key in portable_keys
-            ):
+        if require_current_capture_execution:
+            try:
+                current_execution = repository_execution_identity(
+                    repo_root, GAIN_LINEARITY_SCRIPT_PATH
+                )
+            except (OSError, RuntimeError, ValueError):
                 reasons.append("repository_execution_current")
+            else:
+                # Raw는 Jetson의 named branch에서 캡처한 뒤 같은 exact commit의
+                # detached Elice checkout에서 독립 검증한다. branch 이름은 provenance
+                # 기록일 뿐 executable bytes의 identity가 아니므로 portable 비교에서
+                # 제외하고 commit/clean/script path+blob hash만 exact하게 묶는다.
+                portable_keys = _EXECUTION_KEYS - {"repository_branch"}
+                if set(current_execution) != _EXECUTION_KEYS or any(
+                    saved_execution.get(key) != current_execution.get(key)
+                    for key in portable_keys
+                ):
+                    reasons.append("repository_execution_current")
+        else:
+            try:
+                _verify_historical_capture_execution(repo_root, saved_execution)
+            except (OSError, RecordingGainLinearityError, RuntimeError, ValueError):
+                reasons.append("historical_capture_execution")
 
     expected_frames = int(
         round((INPUT_PREFLIGHT_SECONDS - 0.5) * SAMPLE_RATE)
@@ -1951,12 +2140,25 @@ def _finalize_gain_linearity_receipt(
     publication_ref: Mapping[str, Any] | None,
     analysis: Mapping[str, Any],
     reasons: list[str],
+    capture_provenance: Mapping[str, Any] | None = None,
+    analysis_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     unique_reasons = list(dict.fromkeys(reasons))
+    reanalysis = analysis_provenance is not None
+    if reanalysis and capture_provenance is None:
+        raise RecordingGainLinearityError("재분석 receipt의 capture provenance가 없습니다")
     receipt: dict[str, Any] = {
-        "schema": GAIN_LINEARITY_RECEIPT_SCHEMA,
+        "schema": (
+            GAIN_LINEARITY_REANALYSIS_RECEIPT_SCHEMA
+            if reanalysis
+            else GAIN_LINEARITY_RECEIPT_SCHEMA
+        ),
         "status": "PASS" if not unique_reasons else "FAIL",
-        "source_commit": payload["source_commit"],
+        "source_commit": (
+            analysis_provenance["repository_commit"]
+            if reanalysis
+            else payload["source_commit"]
+        ),
         "plan": dict(plan_ref),
         "plan_payload_sha256": payload["plan_payload_sha256"],
         "raw": dict(raw_ref),
@@ -1968,6 +2170,13 @@ def _finalize_gain_linearity_receipt(
         "analysis": dict(analysis),
         "failure_reasons": unique_reasons,
     }
+    if reanalysis:
+        receipt["capture_provenance"] = json.loads(
+            json.dumps(dict(capture_provenance), sort_keys=True, allow_nan=False)
+        )
+        receipt["analysis_provenance"] = json.loads(
+            json.dumps(dict(analysis_provenance), sort_keys=True, allow_nan=False)
+        )
     receipt["evidence_sha256"] = _seal(receipt)
     return receipt
 
@@ -1981,6 +2190,7 @@ def build_gain_linearity_receipt(
     expected_plan_sha256: str,
     publication_path: str | None = None,
     expected_publication_sha256: str | None = None,
+    ref_witness_reanalysis: bool = False,
 ) -> dict[str, Any]:
     """Raw/plan/publication을 독립 재계산하고 PASS/FAIL receipt를 만든다.
 
@@ -1988,7 +2198,12 @@ def build_gain_linearity_receipt(
     발급하지 않는다. 정상 CLI는 path와 외부 SHA를 모두 필수로 전달한다.
     """
 
+    if type(ref_witness_reanalysis) is not bool:
+        raise RecordingGainLinearityError("ref_witness_reanalysis는 bool이어야 합니다")
     root = Path(repo_root).resolve()
+    analysis_provenance: dict[str, Any] | None = None
+    if ref_witness_reanalysis:
+        analysis_provenance = _analysis_execution_identity(root)
     plan = load_gain_linearity_plan(
         repo_root=root, plan_path=plan_path, expected_sha256=expected_plan_sha256
     )
@@ -1997,6 +2212,10 @@ def build_gain_linearity_receipt(
     )
     payload = plan["payload"]
     pcm = plan["pcm"]
+    capture_provenance = {
+        "source_commit": payload["source_commit"],
+        "repository_execution": metadata.get("repository_execution"),
+    }
     reasons: list[str] = []
     authority_reasons: list[str] = []
     publication_ref: dict[str, Any] | None = None
@@ -2052,6 +2271,7 @@ def build_gain_linearity_receipt(
             metadata=metadata,
             preflight_raw=preflight,
             source_commit=str(payload["source_commit"]),
+            require_current_capture_execution=not ref_witness_reanalysis,
         )
     )
     if (
@@ -2155,11 +2375,20 @@ def build_gain_linearity_receipt(
         source_float = submitted[:, 0].astype(np.float64) / 32767.0
         input_float = recorded.astype(np.float64) / float(2**31)
         try:
-            clock_alignment, clock_reasons = _group_clock_alignment(
-                payload=payload,
-                source_float=source_float,
-                input_float=input_float,
-            )
+            if ref_witness_reanalysis:
+                source_float, clock_alignment, clock_reasons = (
+                    _group_ref_witness_alignment(
+                        payload=payload,
+                        source_float=source_float,
+                        input_float=input_float,
+                    )
+                )
+            else:
+                clock_alignment, clock_reasons = _group_clock_alignment(
+                    payload=payload,
+                    source_float=source_float,
+                    input_float=input_float,
+                )
             reasons.extend(clock_reasons)
         except RecordingGainLinearityError as exc:
             reasons.append(f"clock_alignment_build:{exc}")
@@ -2175,32 +2404,58 @@ def build_gain_linearity_receipt(
                     "failure_before_metrics": True,
                 },
                 reasons=[*authority_reasons, *reasons],
+                capture_provenance=(
+                    capture_provenance if ref_witness_reanalysis else None
+                ),
+                analysis_provenance=analysis_provenance,
             )
-        try:
-            safety_operator, operator_reasons = _build_safety_operators(
-                payload=payload,
-                source_float=source_float,
-                input_float=input_float,
-                clock_alignment=clock_alignment,
-            )
-            reasons.extend(operator_reasons)
-        except RecordingGainLinearityError as exc:
-            reasons.append(f"safety_operator_build:{exc}")
-            return _finalize_gain_linearity_receipt(
-                payload=payload,
-                plan_ref=plan["file"],
-                raw_ref=raw_ref,
-                publication_ref=publication_ref,
-                analysis={
-                    "rows": [],
-                    "clock_alignment": [
-                        clock_alignment[index] for index in sorted(clock_alignment)
-                    ],
-                    "safety_operator": None,
-                    "failure_before_metrics": True,
-                },
-                reasons=[*authority_reasons, *reasons],
-            )
+        safety_operator: dict[str, Any] | None = None
+        operator_diagnostic: dict[str, Any] | None = None
+        if not ref_witness_reanalysis:
+            try:
+                safety_operator, operator_reasons = _build_safety_operators(
+                    payload=payload,
+                    source_float=source_float,
+                    input_float=input_float,
+                    clock_alignment=clock_alignment,
+                )
+                reasons.extend(operator_reasons)
+            except RecordingGainLinearityError as exc:
+                reasons.append(f"safety_operator_build:{exc}")
+                return _finalize_gain_linearity_receipt(
+                    payload=payload,
+                    plan_ref=plan["file"],
+                    raw_ref=raw_ref,
+                    publication_ref=publication_ref,
+                    analysis={
+                        "rows": [],
+                        "clock_alignment": [
+                            clock_alignment[index]
+                            for index in sorted(clock_alignment)
+                        ],
+                        "safety_operator": None,
+                        "failure_before_metrics": True,
+                    },
+                    reasons=[*authority_reasons, *reasons],
+                )
+        else:
+            # 기존 complex-FIR 임계는 낮추지 않는다. 재분석에서는 그 operator를
+            # authority로 사용하지 않고 결과만 diagnostic으로 보존한다.
+            try:
+                operator_diagnostic, diagnostic_reasons = _build_safety_operators(
+                    payload=payload,
+                    source_float=source_float,
+                    input_float=input_float,
+                    clock_alignment=clock_alignment,
+                )
+            except RecordingGainLinearityError as exc:
+                operator_diagnostic = {"build_error": str(exc)}
+            else:
+                operator_diagnostic = {
+                    "operator": operator_diagnostic,
+                    "threshold_failure_reasons": diagnostic_reasons,
+                    "authority": False,
+                }
         rows: list[dict[str, Any]] = []
         ess_gain: dict[str, list[tuple[int, float]]] = {"err": [], "ref": []}
         peak_ratios: dict[str, list[float]] = {"err": [], "ref": []}
@@ -2290,10 +2545,19 @@ def build_gain_linearity_receipt(
                         preflight_values=preflight_float[:, channel],
                     )
                     item.update(distortion)
-                    if distortion["thd_dbc"] > THD_IMD_GATE_DBC:
-                        reasons.append(f"{name}_thd_{level}_{row['pair_hz']}")
-                    if distortion["imd_dbc"] > THD_IMD_GATE_DBC:
-                        reasons.append(f"{name}_imd_{level}_{row['pair_hz']}")
+                    # Noise floor에서 distortion을 분리하지 못한 row의 raw
+                    # THD/IMD 숫자는 판정 가능한 물리값이 아니다. 그런 row는
+                    # INCONCLUSIVE/distortion_certified=false로만 남기고, 실제로
+                    # observable한 row에만 -30 dBc gate를 적용한다.
+                    if distortion["observable"] is True:
+                        if distortion["thd_dbc"] > THD_IMD_GATE_DBC:
+                            reasons.append(
+                                f"{name}_thd_{level}_{row['pair_hz']}"
+                            )
+                        if distortion["imd_dbc"] > THD_IMD_GATE_DBC:
+                            reasons.append(
+                                f"{name}_imd_{level}_{row['pair_hz']}"
+                            )
                 result["channels"][name] = item
             rows.append(result)
         compression: dict[str, Any] = {}
@@ -2319,6 +2583,12 @@ def build_gain_linearity_receipt(
             )
             for name, value in ratio_upper.items()
         }
+        supported_max = min(LEVELS_MILLIONTHS[-1], *empirical_upper.values())
+        if ref_witness_reanalysis:
+            safety_operator = _build_peak_safety_envelope(
+                peak_gain_upper=ratio_upper,
+                supported_max_amplitude_millionths=supported_max,
+            )
         distortion_channels = [
             channel
             for row in rows
@@ -2331,15 +2601,19 @@ def build_gain_linearity_receipt(
         analysis = {
             "rows": rows,
             "group_peak_safety": group_peaks,
-            "clock_alignment": [clock_alignment[index] for index in sorted(clock_alignment)],
+            "clock_alignment": [
+                clock_alignment[index] for index in sorted(clock_alignment)
+            ],
+            "clock_alignment_method": (
+                TIMELINE_METHOD if ref_witness_reanalysis else "affine_repeat_response_v1"
+            ),
             "compression": compression,
             "peak_gain_upper_with_uncertainty": ratio_upper,
             "empirical_upper_amplitude_millionths": empirical_upper,
             "tested_max_amplitude_millionths": LEVELS_MILLIONTHS[-1],
-            "supported_max_amplitude_millionths": min(
-                LEVELS_MILLIONTHS[-1], *empirical_upper.values()
-            ),
+            "supported_max_amplitude_millionths": supported_max,
             "safety_operator": safety_operator,
+            "complex_operator_diagnostic": operator_diagnostic,
             "safety_operator_is_anc_plant_authority": False,
             # 이 probe의 낮은 acoustic level에서는 THD/IMD를 noise로부터 항상
             # 분리할 수 없다. INCONCLUSIVE를 THD PASS로 승격하지 않는다. 대신
@@ -2365,6 +2639,32 @@ def build_gain_linearity_receipt(
         publication_ref=publication_ref,
         analysis=analysis,
         reasons=[*authority_reasons, *reasons],
+        capture_provenance=(capture_provenance if ref_witness_reanalysis else None),
+        analysis_provenance=analysis_provenance,
+    )
+
+
+def build_gain_linearity_reanalysis_receipt(
+    *,
+    repo_root: str | Path,
+    raw_path: str,
+    expected_raw_sha256: str,
+    plan_path: str,
+    expected_plan_sha256: str,
+    publication_path: str,
+    expected_publication_sha256: str,
+) -> dict[str, Any]:
+    """Immutable old raw를 현행 clean analyzer로 REF-witness 재분석한다."""
+
+    return build_gain_linearity_receipt(
+        repo_root=repo_root,
+        raw_path=raw_path,
+        expected_raw_sha256=expected_raw_sha256,
+        plan_path=plan_path,
+        expected_plan_sha256=expected_plan_sha256,
+        publication_path=publication_path,
+        expected_publication_sha256=expected_publication_sha256,
+        ref_witness_reanalysis=True,
     )
 
 
@@ -2404,6 +2704,46 @@ def issue_gain_linearity_receipt(
     return target, _sha256_bytes(data), payload
 
 
+def issue_gain_linearity_reanalysis_receipt(
+    *,
+    repo_root: str | Path,
+    output_path: str,
+    raw_path: str,
+    expected_raw_sha256: str,
+    plan_path: str,
+    expected_plan_sha256: str,
+    publication_path: str,
+    expected_publication_sha256: str,
+) -> tuple[Path, str, dict[str, Any]]:
+    """새 경로에만 no-replace REF-witness 재분석 receipt를 발행한다."""
+
+    root = Path(repo_root).resolve()
+    relative = _relative(output_path, label="gain-linearity reanalysis receipt path")
+    payload = build_gain_linearity_reanalysis_receipt(
+        repo_root=root,
+        raw_path=raw_path,
+        expected_raw_sha256=expected_raw_sha256,
+        plan_path=plan_path,
+        expected_plan_sha256=expected_plan_sha256,
+        publication_path=publication_path,
+        expected_publication_sha256=expected_publication_sha256,
+    )
+    data = _pretty_json_bytes(payload)
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o664)
+    except FileExistsError as exc:
+        raise RecordingGainLinearityError(
+            f"재분석 receipt는 no-replace입니다: {relative}"
+        ) from exc
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return target, _sha256_bytes(data), payload
+
+
 def validate_gain_linearity_receipt(
     *, repo_root: str | Path, receipt_path: str, expected_sha256: str
 ) -> dict[str, Any]:
@@ -2427,19 +2767,42 @@ def validate_gain_linearity_receipt(
     publication_ref = payload.get("capture_publication")
     if publication_ref is not None and not isinstance(publication_ref, Mapping):
         raise RecordingGainLinearityError("receipt capture_publication schema 불일치")
-    rebuilt = build_gain_linearity_receipt(
-        repo_root=root,
-        raw_path=str(payload["raw"]["path"]),
-        expected_raw_sha256=str(payload["raw"]["sha256"]),
-        plan_path=str(payload["plan"]["path"]),
-        expected_plan_sha256=str(payload["plan"]["sha256"]),
-        publication_path=(
+    schema = payload.get("schema")
+    kwargs = {
+        "repo_root": root,
+        "raw_path": str(payload["raw"]["path"]),
+        "expected_raw_sha256": str(payload["raw"]["sha256"]),
+        "plan_path": str(payload["plan"]["path"]),
+        "expected_plan_sha256": str(payload["plan"]["sha256"]),
+        "publication_path": (
             None if publication_ref is None else str(publication_ref["path"])
         ),
-        expected_publication_sha256=(
+        "expected_publication_sha256": (
             None if publication_ref is None else str(publication_ref["sha256"])
         ),
-    )
+    }
+    if schema == GAIN_LINEARITY_REANALYSIS_RECEIPT_SCHEMA:
+        if publication_ref is None:
+            raise RecordingGainLinearityError(
+                "REF-witness 재분석 receipt에는 capture publication이 필요합니다"
+            )
+        capture_provenance = payload.get("capture_provenance")
+        analysis_provenance = payload.get("analysis_provenance")
+        if (
+            not isinstance(capture_provenance, Mapping)
+            or not isinstance(analysis_provenance, Mapping)
+            or set(analysis_provenance) != _EXECUTION_KEYS
+            or payload.get("source_commit")
+            != analysis_provenance.get("repository_commit")
+        ):
+            raise RecordingGainLinearityError("재분석 capture/analysis provenance 불일치")
+        rebuilt = build_gain_linearity_receipt(
+            **kwargs, ref_witness_reanalysis=True
+        )
+    elif schema == GAIN_LINEARITY_RECEIPT_SCHEMA:
+        rebuilt = build_gain_linearity_receipt(**kwargs)
+    else:
+        raise RecordingGainLinearityError("gain-linearity receipt schema 불일치")
     if payload != rebuilt:
         raise RecordingGainLinearityError("gain-linearity receipt 독립 재계산 불일치")
     capture_publication = None
@@ -2477,15 +2840,19 @@ __all__ = [
     "ADC_ABSOLUTE_PEAK_CEILING",
     "ADC_CERTIFICATION_PEAK",
     "GAIN_LINEARITY_PLAN_SCHEMA",
+    "GAIN_LINEARITY_PEAK_ENVELOPE_SCHEMA",
     "GAIN_LINEARITY_PUBLICATION_SCHEMA",
     "GAIN_LINEARITY_RAW_SCHEMA",
+    "GAIN_LINEARITY_REANALYSIS_RECEIPT_SCHEMA",
     "GAIN_LINEARITY_RECEIPT_SCHEMA",
     "LEVELS_MILLIONTHS",
     "PREDICTIVE_STOP_PEAK",
     "RecordingGainLinearityError",
     "build_gain_linearity_capture_publication_payload",
     "build_gain_linearity_plan",
+    "build_gain_linearity_reanalysis_receipt",
     "build_gain_linearity_receipt",
+    "issue_gain_linearity_reanalysis_receipt",
     "issue_gain_linearity_receipt",
     "load_gain_linearity_plan",
     "next_level_stop_decision",

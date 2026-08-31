@@ -789,3 +789,109 @@ def test_record_duct_blocks_wrong_physical_fingerprint_before_audio_open(
         record_duct._validate_source_gain_authority(
             args, collection_plan=collection, require_clean_execution=False
         )
+
+
+def test_ref_witness_peak_envelope_binds_source_plan_to_analysis_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _mock_strict_authority(monkeypatch)
+    root, plan_sha, strict_sha = _repo(tmp_path, strict_gain=10.0)
+    receipt = root / "results/reanalysis_receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text("{}\n", encoding="utf-8")
+    summary = _physical_receipt_summary(root, receipt)
+    channels = {
+        name: {
+            "peak_gain_upper_with_uncertainty": upper,
+            "uncertainty_factor": 1.25,
+            "valid_through_amplitude_millionths": 6_000,
+            "prediction": "upper_peak=gain_upper*rendered_source_peak",
+        }
+        for name, upper in (("err", 1.0), ("ref", 2.0))
+    }
+    envelope = {
+        "schema": gain.GAIN_LINEARITY_PEAK_ENVELOPE_SCHEMA,
+        "role": "source_gain_peak_envelope_only_not_anc_plant_authority",
+        "fit_levels_millionths": [3_000, 4_000, 5_000],
+        "independent_holdout_level_millionths": 6_000,
+        "tested_max_amplitude_millionths": 6_000,
+        "supported_max_amplitude_millionths": 6_000,
+        "complex_operator_thresholds_relaxed": False,
+        "complex_operator_used_as_authority": False,
+        "channels": channels,
+    }
+    envelope["operator_sha256"] = gain._seal(envelope)
+    summary["payload"]["source_commit"] = "b" * 40
+    summary["payload"]["analysis"]["safety_operator"] = envelope
+    monkeypatch.setattr(
+        gain, "validate_gain_linearity_receipt", lambda **_kwargs: summary
+    )
+
+    payload = gain.build_recording_source_gain_plan(
+        repo_root=root,
+        source_plan="data/source_plan.csv",
+        expected_source_plan_sha256=plan_sha,
+        strict_primary="assets/strict_primary.npz",
+        expected_strict_primary_sha256=strict_sha,
+        gain_linearity_receipt="results/reanalysis_receipt.json",
+        expected_gain_linearity_receipt_sha256=_sha256(receipt),
+    )
+    assert payload["canonical_live_eligible"] is True
+    assert payload["contract"]["gain_linearity_source_commit"] == "b" * 40
+    assert payload["contract"]["prediction_authority"].endswith(
+        "measured_err_ref_peak_envelope"
+    )
+    assert payload["rows"][0]["selected_physical_prediction"]["ref"][
+        "prediction_kind"
+    ] == "measured_peak_envelope"
+
+    plan = root / "results/source_gain_reanalysis.json"
+    plan.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    validated = gain.validate_recording_source_gain_plan(
+        repo_root=root,
+        plan_path="results/source_gain_reanalysis.json",
+        expected_sha256=_sha256(plan),
+    )
+    with pytest.raises(gain.RecordingSourceGainError, match="current execution"):
+        gain.build_recording_source_gain_session_binding(
+            validated, source_row_number=2, expected_source_commit="a" * 40
+        )
+    binding = gain.build_recording_source_gain_session_binding(
+        validated, source_row_number=2, expected_source_commit="b" * 40
+    )
+    assert binding["source_commit"] == "b" * 40
+
+
+def test_peak_envelope_cannot_relax_complex_operator_thresholds():
+    envelope = {
+        "schema": gain.GAIN_LINEARITY_PEAK_ENVELOPE_SCHEMA,
+        "role": "source_gain_peak_envelope_only_not_anc_plant_authority",
+        "fit_levels_millionths": [3_000, 4_000, 5_000],
+        "independent_holdout_level_millionths": 6_000,
+        "tested_max_amplitude_millionths": 6_000,
+        "supported_max_amplitude_millionths": 6_000,
+        "complex_operator_thresholds_relaxed": True,
+        "complex_operator_used_as_authority": False,
+        "channels": {
+            name: {
+                "peak_gain_upper_with_uncertainty": 1.0,
+                "uncertainty_factor": 1.25,
+                "valid_through_amplitude_millionths": 6_000,
+                "prediction": "upper_peak=gain_upper*rendered_source_peak",
+            }
+            for name in ("err", "ref")
+        },
+    }
+    envelope["operator_sha256"] = gain._seal(envelope)
+    analysis = {
+        "safety_operator": envelope,
+        "supported_max_amplitude_millionths": 6_000,
+        "tested_max_amplitude_millionths": 6_000,
+        "distortion_certified": False,
+        "physical_authority_scope": gain.GAIN_LINEARITY_AUTHORITY_SCOPE,
+    }
+    with pytest.raises(gain.RecordingSourceGainError, match="peak envelope"):
+        gain._physical_operator_contract(analysis)

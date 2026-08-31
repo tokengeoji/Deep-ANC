@@ -41,6 +41,7 @@ def test_completion_and_failure_cannot_both_publish(
     torch.save({"cfg": {}}, checkpoint)
     checkpoint_sha = contract.snapshot_regular_file(checkpoint).sha256
     experiment_sha = "e" * 64
+    model_input_sha = "b" * 64
     capability_sha = "a" * 64
     selection_path = tmp_path / "selection.json"
     contract.write_json_exclusive(
@@ -52,12 +53,14 @@ def test_completion_and_failure_cannot_both_publish(
                 "checkpoint_sha256": checkpoint_sha,
             },
             "experiment_contract_sha256": experiment_sha,
+            "model_input_contract_sha256": model_input_sha,
         },
     )
     selection_snapshot = contract.snapshot_regular_file(selection_path)
     running = {
         "capability_sha256": capability_sha,
         "experiment_contract_sha256": experiment_sha,
+        "model_input_contract_sha256": model_input_sha,
         "seed_neutral_campaign_sha256": "d" * 64,
         "selected_checkpoint_sha256": checkpoint_sha,
         "manifest_sha256": manifest_snapshot.sha256,
@@ -70,6 +73,7 @@ def test_completion_and_failure_cannot_both_publish(
         output / "metrics.npz",
         checkpoint_sha256=np.asarray(checkpoint_sha),
         experiment_contract_sha256=np.asarray(experiment_sha),
+        model_input_contract_sha256=np.asarray(model_input_sha),
         selection_sha256=np.asarray(selection_snapshot.sha256),
         test_capability_sha256=np.asarray(capability_sha),
         test_consumed_marker_sha256=np.asarray(running_snapshot.sha256),

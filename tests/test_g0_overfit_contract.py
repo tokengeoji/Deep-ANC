@@ -9,6 +9,11 @@ import pytest
 import torch
 
 from deep_anc.config import load_train_config
+from deep_anc.model_input import (
+    canonical_stage1_model_input_contract,
+    canonical_stage1_model_input_payload,
+    resolve_stage1_model_input_contract,
+)
 
 from deep_anc.train.trainer import (
     validate_finite_batch,
@@ -71,6 +76,56 @@ def test_g0_alpha_specific_loss_identity_is_materialized_for_pre_pilot_receipt()
     assert "loss.lambda_dnh=0.000375" in overrides
 
 
+def test_only_authoritative_g0_keeps_canonical_ref_only_input_contract(monkeypatch):
+    module = _module()
+    diagnostic = module.build_parser().parse_args([])
+    diagnostic_overrides = module.build_diagnostic_overrides(
+        diagnostic, "/tmp/diagnostic"
+    )
+    assert "data_model_input_contract_config=null" in diagnostic_overrides
+
+    authoritative = module.build_parser().parse_args(
+        [
+            "--evidence-dir",
+            "/tmp/g0-evidence",
+            "--bootstrap-receipt-sha256",
+            "a" * 64,
+            "--loss-alpha",
+            "0.7",
+            "--loss-lambda-dnh",
+            "0.00075",
+        ]
+    )
+    authoritative_overrides = module.build_diagnostic_overrides(
+        authoritative, "/tmp/authoritative"
+    )
+    assert "data_model_input_contract_config=null" not in authoritative_overrides
+
+    # 실제 bootstrap bytes 검증은 transfer-contract 전용 테스트가 담당한다. 여기서는
+    # official G0의 resolved config가 path뿐 아니라 exact payload/SHA까지 유지하는
+    # 경계만 검증한다.
+    def _bind(data, *, repo_root):
+        data.update(
+            transfer_manifest="data/manifests/test_transfer.json",
+            transfer_manifest_sha256="b" * 64,
+            recorded_transfer_aggregate_sha256="c" * 64,
+        )
+
+    monkeypatch.setattr(
+        "deep_anc.data.transfer_contract.bind_recorded_transfer_config", _bind
+    )
+    cfg = load_train_config(
+        authoritative.config,
+        module.build_diagnostic_overrides(authoritative, "/tmp/authoritative"),
+    )
+    contract = resolve_stage1_model_input_contract(cfg["data"])
+    assert contract is not None
+    assert cfg["data"]["model_input_contract"] == (
+        canonical_stage1_model_input_payload()
+    )
+    assert cfg["model_input_contract_sha256"] == contract.digest()
+
+
 def test_g0_contract_and_fixed_batch_hashes_are_stable_and_content_addressed():
     module = _module()
     first = {"x": torch.tensor([[1.0, 2.0]]), "d": torch.tensor([[3.0, 4.0]])}
@@ -96,6 +151,11 @@ def test_g0_canonical_input_is_resolved_as_noneligible_diagnostic(tmp_path):
     assert cfg["init_eligible"] is False
     assert cfg["contract_run_dir"] is False
     assert cfg["schedule"]["total_steps"] == 3
+    # 참조 경로 override는 서브 YAML 병합 전 1차 pass에서 적용되어야 한다.
+    # path만 null이고 이미 병합된 payload/SHA가 남는 반쪽 opt-out을 금지한다.
+    assert cfg["data_model_input_contract_config"] is None
+    assert "model_input_contract" not in cfg["data"]
+    assert "model_input_contract_sha256" not in cfg
     assert "experiment_contract_sha256" not in cfg
 
 
@@ -103,6 +163,18 @@ def test_g0_minus_six_db_boundary_is_a_failure():
     with pytest.raises(ValueError, match=">= 엄격 합격선"):
         validate_g0_nmse({"nmse_trusted_db": -6.0})
     assert validate_g0_nmse({"nmse_trusted_db": -6.000001}) < -6.0
+
+
+def test_combined_finite_batch_ref_only_gate_rejects_exact_channel_leak():
+    contract = canonical_stage1_model_input_contract()
+    batch = {
+        "x": torch.tensor([[[0.1, -0.1], [0.0, 0.0]]]),
+        "d": torch.tensor([[[0.2, -0.2]]]),
+    }
+    validate_finite_batch(batch, model_input_contract=contract)
+    batch["x"][0, 1, 1] = 1.0e-12
+    with pytest.raises(ValueError, match="ERR feature"):
+        validate_finite_batch(batch, model_input_contract=contract)
 
 
 @pytest.mark.parametrize("location", ["input", "output", "loss", "nmse", "gradient", "parameter"])

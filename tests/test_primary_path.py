@@ -14,6 +14,7 @@ from deep_anc.data.primary_path import resolve_digital_primary_path
 from deep_anc.data.synth_dataset import SynthANCDataset
 from deep_anc.dsp.secondary_path import load_secondary_path
 from deep_anc.dsp.timing import PlantDelays
+from deep_anc.model_input import canonical_stage1_model_input_payload
 from deep_anc.train.trainer import (
     cfg_snapshot,
     resolve_run_until_step,
@@ -413,3 +414,41 @@ def test_dataset_acoustic_mode_ignores_digital_primary_policy(configs):
     np.testing.assert_allclose(
         item["d"][0].numpy(), _expected_impulse_path(ds.segment, p_err, 0), atol=1e-6
     )
+
+
+@pytest.mark.parametrize("split", ["train", "val"])
+def test_stage1_synthetic_contract_keeps_ref_and_forces_err_exact_zero(
+    configs, split
+):
+    data, duct = deepcopy(configs)
+    data = _dataset_config(data, "rir_surrogate")
+    data["model_input_contract"] = canonical_stage1_model_input_payload()
+    ds = SynthANCDataset(
+        data,
+        duct,
+        split=split,
+        seed=1,
+        rir_bank=_rir_bank(),
+    )
+
+    item = _impulse_item(ds)
+    assert np.any(item["x"][0].numpy() != 0.0)
+    assert np.all(item["x"][1].numpy() == 0.0)
+    assert ds.model_input_contract is not None
+
+
+def test_legacy_synthetic_without_input_contract_keeps_err_context(configs):
+    data, duct = deepcopy(configs)
+    data = _dataset_config(data, "rir_surrogate", reference_mode="acoustic")
+    data["source_mix_ratio_acoustic"] = {"synthetic": 1.0}
+    ds = SynthANCDataset(
+        data,
+        duct,
+        split="train",
+        seed=1,
+        rir_bank=_rir_bank(),
+    )
+
+    item = _impulse_item(ds)
+    assert ds.model_input_contract is None
+    assert np.any(item["x"][1].numpy() != 0.0)

@@ -73,7 +73,7 @@ acoustic-ref는 예측 가능한 주기성 비중을 높인 전용 비율
 | S 플랜트 섭동 | delay `[0,0]`, gain/tilt 0, all-pass off | 모델이 관측하지 못하는 독립 위상 랜덤화가 gradient를 상쇄하지 않도록 공칭 plant 고정 |
 | 마이크 자기잡음 | SNR 5~30dB | INMP441 잡음 바닥 모사 |
 | DC hum | 20% | 50/60Hz와 2차 고조파 모사 |
-| 채널 dropout | ref 15% / err 15%, 동시 금지 | ref-only / err-only 운용 폴백 학습 |
+| 채널 dropout | legacy/일반 diagnostic만 ref 15% / err 15%, 동시 금지 | canonical Stage-1은 별도 exact 계약으로 ref 0% / err 100%(ERR exact zero) |
 | 피드백 지연 | err_in에 512~1024샘플 | open-loop 피드백 근사 및 이후 closed-loop 캡처 지연 |
 
 과거 실행은 대규모 delay/all-pass와 비선형을 처음부터 매 batch에 독립 적용했다.

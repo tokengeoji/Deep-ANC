@@ -1418,6 +1418,9 @@ def _g4_metrics(
         "checkpoint_sha256": np.asarray(sha256_file(checkpoint)),
         "manifest_sha256": np.asarray(sha256_file(manifest)),
         "experiment_contract_sha256": np.asarray(experiment_contract_sha256),
+        "model_input_contract_sha256": np.asarray(
+            str(checkpoint_cfg.get("model_input_contract_sha256", ""))
+        ),
         "selection_sha256": np.asarray(selection_sha256),
         "test_capability_sha256": np.asarray(test_capability_sha256),
         "test_consumed_marker_sha256": np.asarray(
@@ -1965,6 +1968,7 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
         "manifest": str(manifest),
         "manifest_sha256": sha256_file(manifest),
         "experiment_contract_sha256": contract_sha,
+        "model_input_contract_sha256": cfg["model_input_contract_sha256"],
         "seed_neutral_campaign_sha256": campaign_sha,
         "seed": 20260803,
         "decision": val_decision,
@@ -1975,6 +1979,9 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
             "metrics_sha256": sha256_file(val_metrics),
             "seed": 20260803,
             "seed_neutral_campaign_sha256": campaign_sha,
+            "model_input_contract_sha256": cfg[
+                "model_input_contract_sha256"
+            ],
             "decision": val_decision,
         },
         "candidates": [],

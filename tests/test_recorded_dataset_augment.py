@@ -23,6 +23,7 @@ from deep_anc.data.recorded_dataset import (
     common_eq_kernel,
 )
 from deep_anc.dsp.timing import PlantDelays, TrainingTimingContract
+from deep_anc.model_input import canonical_stage1_model_input_payload
 
 FS = 48000
 SEGMENT_SECONDS = 0.25
@@ -296,6 +297,36 @@ def test_augmentation_is_off_by_default(tmp_path):
     batch = next(iter(dataset))
     assert batch["x"].shape == (2, dataset.segment)
     assert batch["d"].shape == (1, dataset.segment)
+
+
+@pytest.mark.parametrize("split", ["train", "val"])
+def test_stage1_recorded_contract_keeps_ref_and_forces_err_exact_zero(
+    tmp_path, split
+):
+    root = tmp_path / "recorded"
+    entry = _write_session(root, f"20260806_ref_only_{split}")
+    entry["split"] = split
+    cfg = _cfg(model_input_contract=canonical_stage1_model_input_payload())
+    dataset = RecordedANCDataset(
+        _manifest(tmp_path, [entry]), cfg, split=split, seed=7
+    )
+
+    item = next(iter(dataset))
+    assert np.any(item["x"][0].numpy() != 0.0)
+    assert np.all(item["x"][1].numpy() == 0.0)
+    assert dataset.describe()["model_input_contract_sha256"] == (
+        dataset.model_input_contract.digest()
+    )
+
+
+def test_legacy_recorded_without_input_contract_keeps_err_context(tmp_path):
+    root = tmp_path / "recorded"
+    entry = _write_session(root, "20260806_legacy_err_context")
+    dataset = RecordedANCDataset(_manifest(tmp_path, [entry]), _cfg(), split="train")
+
+    item = next(iter(dataset))
+    assert dataset.model_input_contract is None
+    assert np.any(item["x"][1].numpy() != 0.0)
 
 
 @pytest.mark.parametrize(

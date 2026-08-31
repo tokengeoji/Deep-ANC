@@ -1,0 +1,50 @@
+# Stage-2 2 kHz scratch pretrain/fine-tune 전체 profile의 읽기 전용 진입점이다.
+# 현재 새 P/S·manifest·criterion receipt·external contract·scratch checkpoint가 없으므로
+# checker의 유일하게 올바른 판정은 BLOCKED다. 이 YAML을 train.py에 직접 넣지 않는다.
+schema: stage2_2khz_campaign_profile_v1
+role: admission_preflight_no_trainer_no_gpu_no_audio
+
+control_band_contract:
+  id: broadband_2khz_octave_88_2828_v1
+  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+
+profiles:
+  duct:
+    path: configs/stage2_2khz_duct.yaml
+    sha256: 59e0b66757747249d16773046974b33e71d0b4b0e0c1ef68fd1b110b5429ae83
+  data:
+    path: configs/stage2_2khz_data.yaml
+    sha256: 38d94e79a42897c585692aebac7fb59c49bfb5f882a4314db6c3a973d87e74f0
+  evaluation:
+    path: configs/stage2_2khz_eval.yaml
+    sha256: 9e688813df40b70e956a0bfdb93ca435daebf333f80584df850ba4fc8e51ae8d
+  canonical_pretrain:
+    path: configs/stage2_2khz_train_pretrain.yaml
+    sha256: 84de407574723b66ddb66ce3898f225efdd89d21c6056d4c1b7f02db0c96de26
+  canonical_finetune:
+    path: configs/stage2_2khz_train_finetune.yaml
+    sha256: 5482c4bb948f74d5083e2b13182c2d3cf91aa5b81f7867e5ceb04eb0229dfa75
+
+external_contracts:
+  canonical_pretrain:
+    path: null
+    sha256: null
+  canonical_finetune:
+    path: null
+    sha256: null
+
+canonical_pretrain_checkpoint:
+  checkpoint:
+    path: null
+    sha256: null
+  binding:
+    path: null
+    sha256: null
+
+release_policy:
+  generic_stage1_trainer_allowed: false
+  legacy_init_or_resume_allowed: false
+  automatic_resume_allowed: false
+  scratch_pretrain_required: true
+  run_directory_before_ready_allowed: false
+  gpu_before_ready_allowed: false

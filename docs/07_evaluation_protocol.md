@@ -42,9 +42,13 @@ trusted 수치만 제시하거나 fullband 평균으로 trusted 대역 개선을
 
 > [!CAUTION]
 > **이 규칙이 실제로 깨진 적이 있다.** 2026-08-04 판 README/docs12 는 실기 ANC 절에
-> trusted 대역 4줄만 싣고, 같은 `metrics.csv` 에 기록된 **2–8 kHz 15–22 dB 증폭**을
-> 한 줄도 싣지 않았다. 6개 시나리오 중 유일하게 무해한 `voice_in_noise` 만 그림으로
-> 대표해 실었다. **대역 밖 옥타브를 함께 싣지 않은 감쇠 주장은 이 프로토콜 위반이다.**
+> trusted 대역 4줄만 싣고, 같은 `metrics.csv`의 source-energy 자격을 검증하지 않은
+> **2–8 kHz 음수 수치**를 누락했다. 2026-08-31 raw 재감사에서는 이 대역 대부분에
+> 재생 source가 없어 해당 값을 정식 ANC 증폭량으로 쓰는 것도 잘못임을 확인했다.
+> 다만 300 Hz 자극 중 control과 ERR에 4/8 kHz 에너지가 새로 생긴 유해 출력 진단은
+> 유효하다. 상세 판정은 [legacy raw 재감사](66_20260831_legacy_pretrain_raw_audit.md)를
+> 따른다. **source-valid 대역과 대역 밖 유해 출력 진단을 함께 싣지 않은 감쇠 주장은
+> 이 프로토콜 위반이다.**
 
 ## 2. 시나리오 (configs/eval.yaml — 오프라인/실기 공통)
 

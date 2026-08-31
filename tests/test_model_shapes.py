@@ -1,6 +1,9 @@
 """모델 검증 — 파라미터 규모, 인과성, 스트리밍/오프라인 등가성, GLSTM 이중 경로."""
 
 import numpy as np
+import subprocess
+import sys
+
 import pytest
 import torch
 import yaml
@@ -10,6 +13,10 @@ from deep_anc.models import build_model
 from deep_anc.models.glstm import GLSTM
 from deep_anc.models.hybrid_anc import parameter_count
 from deep_anc.models.streaming import ExportWrapper, flatten_states, state_names
+from deep_anc.model_input import (
+    canonical_stage1_model_input_contract,
+    validate_stage1_ref_only_tensor,
+)
 
 
 def _load(name):
@@ -80,6 +87,57 @@ def test_streaming_equivalence(name):
             outs.append(yb)
         y_str = torch.cat(outs, dim=-1)
     assert (y_off - y_str).abs().max().item() < 1e-5
+
+
+def test_tiny_ref_only_input_is_offline_streaming_equivalent_and_fail_closed():
+    torch.manual_seed(17)
+    model = build_model(_load("model_tiny")).eval()
+    reference = torch.randn(1, 1, 256 * 4) * 0.02
+    x = torch.cat([reference, torch.zeros_like(reference)], dim=1)
+    contract = canonical_stage1_model_input_contract()
+    validate_stage1_ref_only_tensor(x, contract, label="ref-only fixture")
+    with torch.no_grad():
+        offline = model(x)
+        states = model.init_states(1, "cpu")
+        streamed = []
+        for start in range(0, x.shape[-1], 256):
+            block, states = model.streaming_step(x[..., start : start + 256], states)
+            streamed.append(block)
+    assert (offline - torch.cat(streamed, dim=-1)).abs().max().item() < 1e-5
+
+    leaked = x.clone()
+    leaked[:, 1, 100] = 1.0e-12
+    with pytest.raises(ValueError, match="ERR feature"):
+        validate_stage1_ref_only_tensor(leaked, contract, label="leaked fixture")
+
+    bad_ref = x.clone()
+    bad_ref[:, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="x_ref.*NaN/Inf"):
+        validate_stage1_ref_only_tensor(bad_ref, contract, label="bad ref fixture")
+
+    bad_err = x.clone()
+    bad_err[:, 1, 0] = float("inf")
+    with pytest.raises(ValueError, match="ERR feature"):
+        validate_stage1_ref_only_tensor(bad_err, contract, label="bad err fixture")
+
+
+def test_model_input_contract_import_does_not_eager_load_torch():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            (
+                "import sys; import deep_anc.model_input; "
+                "raise SystemExit(1 if 'torch' in sys.modules else 0)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_glstm_offline_vs_manual():

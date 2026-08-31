@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from ..audio_io import float32_to_pcm_int16
 from ..dsp.control_band_contract import BroadbandFullOctaveContractV3
 from ..dsp.timing import TrainingTimingContract
+from ..model_input import RefOnlyModelInputContract
 from .noise_gen import DigitalReferenceBuffer
 
 
@@ -130,41 +131,6 @@ class CanonicalErrZeroReceipt(BaseModel):
             "canonical_population_sha256", self.canonical_population_sha256
         )
         _require_sha256("item_receipts_sha256", self.item_receipts_sha256)
-        return self
-
-    def digest(self) -> str:
-        return _canonical_digest(self.model_dump(mode="json"))
-
-
-class RefOnlyModelInputContract(BaseModel):
-    """APE 입력을 모델 feature에서 제거한 exact 2-channel compatibility 규약."""
-
-    model_config = _FROZEN
-
-    schema_version: Literal["digital_reference_err_zero_input_v1"] = (
-        "digital_reference_err_zero_input_v1"
-    )
-    mode: Literal["digital_reference_only_err_exact_zero"] = (
-        "digital_reference_only_err_exact_zero"
-    )
-    model_channel_order: tuple[
-        Literal["digital_reference"], Literal["error_exact_zero"]
-    ] = ("digital_reference", "error_exact_zero")
-    reference_dropout_probability: float = 0.0
-    error_dropout_probability: float
-    ape_input_role: Literal["raw_safety_evaluation_witness_only"] = (
-        "raw_safety_evaluation_witness_only"
-    )
-    ape_may_pace_output: Literal[False] = False
-    ape_may_supply_model_feature: Literal[False] = False
-
-    @model_validator(mode="after")
-    def _validate_mode(self) -> "RefOnlyModelInputContract":
-        if float(self.reference_dropout_probability) != 0.0:
-            raise ValueError("ref-only admission은 reference_dropout=0만 허용합니다")
-        error_dropout = float(self.error_dropout_probability)
-        if not math.isfinite(error_dropout) or not 0.0 <= error_dropout <= 1.0:
-            raise ValueError("error_dropout_probability는 [0, 1]이어야 합니다")
         return self
 
     def digest(self) -> str:

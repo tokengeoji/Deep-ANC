@@ -43,6 +43,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.config import REPO_ROOT, load_train_config  # noqa: E402
+from deep_anc.model_input import resolve_stage1_model_input_contract  # noqa: E402
 from deep_anc.train.finetune_readiness import (  # noqa: E402
     audit_finetune_readiness,
     render_audit_markdown,
@@ -327,6 +328,7 @@ def finalize_cross_seed_selection(
     bundles: list[dict] = []
     seeds: set[int] = set()
     campaigns: set[str] = set()
+    model_input_shas: set[str] = set()
     validation_root = Path(REPO_ROOT if repo_root is None else repo_root)
     for path in selection_paths:
         payload, snapshot = read_json_snapshot(path)
@@ -368,6 +370,18 @@ def finalize_cross_seed_selection(
         validate_checkpoint_recorded_manifest(
             saved_cfg, embedded, manifest_snapshot
         )
+        model_input_contract = resolve_stage1_model_input_contract(
+            saved_cfg.get("data") if isinstance(saved_cfg.get("data"), dict) else None
+        )
+        if model_input_contract is None:
+            raise ValueError("cross-seed checkpoint에 REF-only input 계약이 없습니다")
+        model_input_sha = model_input_contract.digest()
+        if (
+            saved_cfg.get("model_input_contract_sha256") != model_input_sha
+            or payload.get("model_input_contract_sha256") != model_input_sha
+            or selected.get("model_input_contract_sha256") != model_input_sha
+        ):
+            raise ValueError("cross-seed model input contract SHA가 selection과 다릅니다")
         if saved_cfg.get("seed") != seed or selected.get("seed") != seed:
             raise ValueError("cross-seed selection/checkpoint seed가 다릅니다")
         calculated_campaign = seed_neutral_campaign_sha256(saved_cfg)
@@ -396,16 +410,21 @@ def finalize_cross_seed_selection(
                 "experiment_contract_sha256": str(
                     _npz_scalar(data, "experiment_contract_sha256")
                 ),
+                "model_input_contract_sha256": str(
+                    _npz_scalar(data, "model_input_contract_sha256")
+                ),
             }
         if evaluated != {
             "split": "val",
             "checkpoint_sha256": checkpoint_snapshot.sha256,
             "manifest_sha256": manifest_snapshot.sha256,
             "experiment_contract_sha256": embedded["sha256"],
+            "model_input_contract_sha256": model_input_sha,
         }:
             raise ValueError("cross-seed val metrics provenance가 selection과 다릅니다")
         seeds.add(seed)
         campaigns.add(declared_campaign)
+        model_input_shas.add(model_input_sha)
         bundles.append(
             {
                 "path": str(snapshot.path),
@@ -424,6 +443,8 @@ def finalize_cross_seed_selection(
         )
     if len(campaigns) != 1:
         raise ValueError("두 seed selection이 같은 seed-neutral campaign이 아닙니다")
+    if len(model_input_shas) != 1:
+        raise ValueError("두 seed selection의 model input contract가 다릅니다")
     first_seed = next(item for item in bundles if item["seed"] == 20260803)
     if first_seed["payload"]["selected"]["decision"].get("status") != "borderline":
         raise ValueError(
@@ -459,6 +480,7 @@ def finalize_cross_seed_selection(
         "manifest": source["manifest"],
         "manifest_sha256": source["manifest_sha256"],
         "experiment_contract_sha256": source["experiment_contract_sha256"],
+        "model_input_contract_sha256": source["model_input_contract_sha256"],
         "seed_neutral_campaign_sha256": next(iter(campaigns)),
         "seed": int(winner["seed"]),
         "selected": source["selected"],
@@ -727,6 +749,7 @@ def freeze_recorded_val_selection(
     rows = []
     candidate_seeds: set[int] = set()
     campaign_shas: set[str] = set()
+    model_input_shas: set[str] = set()
     for checkpoint, evaluation_dir in candidates:
         metrics_path = evaluation_dir / "metrics.npz"
         if not checkpoint.is_file() or not metrics_path.is_file():
@@ -750,6 +773,21 @@ def freeze_recorded_val_selection(
         validate_checkpoint_recorded_manifest(
             state["cfg"], embedded, manifest_snapshot
         )
+        model_input_contract = resolve_stage1_model_input_contract(
+            state["cfg"].get("data")
+            if isinstance(state["cfg"].get("data"), dict)
+            else None
+        )
+        if model_input_contract is None:
+            raise ValueError(
+                f"{checkpoint}: canonical fine-tune REF-only input 계약이 없습니다"
+            )
+        model_input_sha = model_input_contract.digest()
+        if state["cfg"].get("model_input_contract_sha256") != model_input_sha:
+            raise ValueError(
+                f"{checkpoint}: model input contract SHA가 resolved payload와 다릅니다"
+            )
+        model_input_shas.add(model_input_sha)
         seed = state["cfg"].get("seed")
         if not isinstance(seed, int) or seed not in OFFICIAL_FINETUNE_SEEDS:
             raise ValueError(f"{checkpoint}: 공식 fine-tune seed가 아닙니다: {seed!r}")
@@ -764,6 +802,7 @@ def freeze_recorded_val_selection(
                 "checkpoint_sha256",
                 "manifest_sha256",
                 "experiment_contract_sha256",
+                "model_input_contract_sha256",
             }
             missing = sorted(required - set(data.files))
             if missing:
@@ -780,6 +819,9 @@ def freeze_recorded_val_selection(
             evaluated_contract_sha = str(
                 np.asarray(data["experiment_contract_sha256"]).reshape(-1)[0]
             )
+            evaluated_model_input_sha = str(
+                np.asarray(data["model_input_contract_sha256"]).reshape(-1)[0]
+            )
         decision = classify_recorded_val_metrics(
             metrics_snapshot.content,
             manifest_bytes=manifest_snapshot.content,
@@ -795,6 +837,8 @@ def freeze_recorded_val_selection(
             raise ValueError(f"{metrics_path}: manifest SHA가 현재 val과 다릅니다")
         if evaluated_contract_sha != contract_sha:
             raise ValueError(f"{metrics_path}: experiment contract SHA가 다릅니다")
+        if evaluated_model_input_sha != model_input_sha:
+            raise ValueError(f"{metrics_path}: model input contract SHA가 다릅니다")
         rows.append(
             {
                 "checkpoint": str(checkpoint.resolve()),
@@ -805,6 +849,7 @@ def freeze_recorded_val_selection(
                 "selection_metric_db": metric,
                 "seed": seed,
                 "seed_neutral_campaign_sha256": campaign_sha,
+                "model_input_contract_sha256": model_input_sha,
                 "decision": decision,
             }
         )
@@ -814,6 +859,8 @@ def freeze_recorded_val_selection(
         raise ValueError(f"한 run의 recorded-val 후보 seed가 서로 다릅니다: {candidate_seeds}")
     if len(campaign_shas) != 1:
         raise ValueError("한 run의 후보 seed-neutral campaign digest가 서로 다릅니다")
+    if len(model_input_shas) != 1:
+        raise ValueError("한 run의 후보 model input contract digest가 서로 다릅니다")
     clear = [row for row in rows if row["decision"]["status"] == "clear_pass"]
     borderline = [row for row in rows if row["decision"]["status"] == "borderline"]
     pool = clear or borderline or rows
@@ -832,6 +879,7 @@ def freeze_recorded_val_selection(
         "manifest": str(manifest_path.resolve()),
         "manifest_sha256": manifest_sha,
         "experiment_contract_sha256": contract_sha,
+        "model_input_contract_sha256": next(iter(model_input_shas)),
         "seed_neutral_campaign_sha256": next(iter(campaign_shas)),
         "seed": next(iter(candidate_seeds)),
         "decision": selected["decision"],

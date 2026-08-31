@@ -27,6 +27,10 @@ from deep_anc.eval.trusted_subbands import (
     MIN_GROUPS_PER_FAMILY,
     validate_strict_trusted_subband_metrics,
 )
+from deep_anc.model_input import (
+    canonical_stage1_model_input_contract,
+    canonical_stage1_model_input_payload,
+)
 
 
 FS = 8_000
@@ -117,6 +121,11 @@ def test_resolved_checkpoint_rejects_surrogate_and_lead_alias_mismatch():
     with pytest.raises(ValueError, match="measured_primary_path"):
         validate_resolved_checkpoint(state)
     assert validate_resolved_checkpoint(state, allow_surrogate=True)[1] == 3
+
+    cfg["model_input_contract_sha256"] = "a" * 64
+    with pytest.raises(ValueError, match="있지만 data.model_input_contract가 없습니다"):
+        validate_resolved_checkpoint(state, allow_surrogate=True)
+    del cfg["model_input_contract_sha256"]
 
     cfg["digital_reference_lead_samples"] = 4
     with pytest.raises(ValueError, match="alias 불일치"):
@@ -335,6 +344,7 @@ def _timing_data() -> dict:
         "recorded_lead_mode": "timeline",
         "digital_reference_lead_samples": 1,
         "training_timing_contract": timing.model_dump(),
+        "model_input_contract": canonical_stage1_model_input_payload(),
         "closed_loop": {"feedback_delay_samples": [1, 1]},
     }
 
@@ -365,7 +375,40 @@ def test_official_recorded_eval_uses_aligned_source_and_per_session_timeline_lea
     assert segment.recorded_delay_samples == 2.0
     assert segment.source_timeline == "source_aligned.wav"
     assert len(segment.timing_contract_sha256) == 64
+    assert (
+        segment.model_input_contract_sha256
+        == canonical_stage1_model_input_contract().digest()
+    )
     np.testing.assert_allclose(segment.x[0], aligned[3:11], atol=1e-6)
+    np.testing.assert_array_equal(segment.x[1], np.zeros_like(segment.x[1]))
+
+
+def test_ref_only_recorded_evaluator_rejects_nonzero_err_even_after_iteration():
+    samples = 256
+    reference = _tone(samples, 500.0)
+    contract = canonical_stage1_model_input_contract()
+    segment = RecordedSegment(
+        x=np.stack([reference, np.ones_like(reference)]),
+        d=reference,
+        session_id="s1",
+        group_id="g1",
+        source_family="speech",
+        start_sample=0,
+        model_input_contract_sha256=contract.digest(),
+    )
+    plant = DifferentiableSecondaryPath(_secondary(delay=0))
+
+    with pytest.raises(ValueError, match="ERR feature는 exact zero"):
+        evaluate_recorded_segments(
+            AdvanceCancelModel(),
+            plant,
+            [segment],
+            sample_rate=FS,
+            trusted_band_hz=(100.0, 1_000.0),
+            octave_bands_hz=[500.0],
+            batch_size=1,
+            model_input_contract=contract,
+        )
 
 
 def test_official_recorded_eval_rejects_source_wav_or_missing_timeline(tmp_path):

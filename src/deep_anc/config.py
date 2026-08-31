@@ -16,6 +16,10 @@ from typing import Any
 
 import yaml
 
+from .model_input import (
+    canonical_stage1_model_input_payload,
+    resolve_stage1_model_input_contract,
+)
 from .train.a100_pretrain_smoke import A100_PRETRAIN_SMOKE_ROLE
 
 # 저장소 루트 (src/deep_anc/config.py 기준 두 단계 위)
@@ -28,6 +32,8 @@ DEFAULT_HANDOFF_SAMPLES = 256
 
 CANONICAL_FINETUNE_POLICY_VERSION = "canonical_finetune_v1"
 CANONICAL_PRETRAIN_POLICY_VERSION = "canonical_pretrain_v1"
+CANONICAL_STAGE1_MODEL_INPUT_CONFIG = "configs/stage1_ref_only_input.yaml"
+CANONICAL_STAGE1_MODEL_INPUT = canonical_stage1_model_input_payload()
 A100_PRETRAIN_SMOKE_POLICY_VERSION = "a100_pretrain_smoke_v1"
 CANONICAL_PRIMARY_SEED = 20260803
 CANONICAL_SECONDARY_SEED = 20260903
@@ -149,6 +155,7 @@ CANONICAL_DATA_DISTRIBUTION = {
     "sample_rate": 48000,
     "segment_seconds": 1.5,
     "reference_mode": "digital",
+    "model_input_contract": CANONICAL_STAGE1_MODEL_INPUT,
     "recorded_lead_mode": "timeline",
     "recorded_sampling": "family_plant_domain_component_session_balanced",
     "source_mix_ratio": CANONICAL_SOURCE_MIX_RATIO,
@@ -231,6 +238,7 @@ CANONICAL_FINETUNE_POLICY = {
     "required_world_size": 1,
     "stage": "open_loop",
     "model_config": "configs/model_tiny.yaml",
+    "data_model_input_contract_config": CANONICAL_STAGE1_MODEL_INPUT_CONFIG,
     "batch_size": 16,
     "num_workers": 8,
     "prefetch_factor": 4,
@@ -303,6 +311,7 @@ CANONICAL_PRETRAIN_POLICY = {
     "init_eligible": True,
     "stage": "open_loop",
     "model_config": "configs/model_tiny.yaml",
+    "data_model_input_contract_config": CANONICAL_STAGE1_MODEL_INPUT_CONFIG,
     "batch_size": 96,
     "num_workers": 14,
     "prefetch_factor": 4,
@@ -366,6 +375,33 @@ def apply_overrides(cfg: dict, overrides: list[str]) -> dict:
     return out
 
 
+def _bind_stage1_model_input_contract(cfg: dict) -> None:
+    """선택적 Stage-1 입력 계약을 materialize하고 digest를 결속한다.
+
+    별도 config에 두어 ``data_sim.yaml``의 legacy 사용자는 과거 ERR-context와
+    channel-dropout 분포를 유지한다. Canonical policy만 exact 파일과 resolved
+    payload를 요구한다.
+    """
+
+    data = cfg.get("data")
+    if not isinstance(data, dict):
+        return
+    contract = resolve_stage1_model_input_contract(data)
+    declared_sha = cfg.get("model_input_contract_sha256")
+    if contract is None:
+        if declared_sha is not None:
+            raise ValueError(
+                "model_input_contract_sha256가 있지만 data.model_input_contract가 없습니다"
+            )
+        return
+    digest = contract.digest()
+    if declared_sha is not None and declared_sha != digest:
+        raise ValueError(
+            "model_input_contract_sha256가 resolved data input contract와 다릅니다"
+        )
+    cfg["model_input_contract_sha256"] = digest
+
+
 def load_train_config(path: str | Path, overrides: list[str] | None = None) -> dict:
     """학습 설정 로드 + 참조된 model/data/duct 설정을 함께 해석.
 
@@ -392,8 +428,18 @@ def load_train_config(path: str | Path, overrides: list[str] | None = None) -> d
     cfg["model"] = load_yaml(cfg["model_config"])
     cfg["data"] = load_yaml(cfg["data_config"])
     cfg["duct"] = load_yaml(cfg["duct_config"])
+    model_input_config = cfg.get("data_model_input_contract_config")
+    if model_input_config not in (None, ""):
+        if not isinstance(model_input_config, str):
+            raise ValueError("data_model_input_contract_config는 경로 문자열이어야 합니다")
+        if "model_input_contract" in cfg["data"]:
+            raise ValueError(
+                "data config와 별도 input-contract config에 중복 선언이 있습니다"
+            )
+        cfg["data"]["model_input_contract"] = load_yaml(model_input_config)
     if overrides:
         cfg = apply_overrides(cfg, overrides)
+    _bind_stage1_model_input_contract(cfg)
     if declared_canonical_finetune:
         _enforce_canonical_finetune_policy(cfg)
     if declared_canonical_pretrain:
@@ -926,6 +972,17 @@ def _collect_common_training_policy_mismatches(
         if data.get(key) != required:
             mismatches.append(
                 f"data.{key}={data.get(key)!r} (required {required!r})"
+            )
+    try:
+        model_input_contract = resolve_stage1_model_input_contract(data)
+    except (TypeError, ValueError) as exc:
+        mismatches.append(f"data.model_input_contract invalid: {exc}")
+    else:
+        if model_input_contract is None:
+            mismatches.append("data.model_input_contract=<missing>")
+        elif cfg.get("model_input_contract_sha256") != model_input_contract.digest():
+            mismatches.append(
+                "model_input_contract_sha256가 canonical REF-only payload와 다릅니다"
             )
     # 이 값은 SynthANCDataset에서 누락 tag를 조용히 synthetic으로 대체한다. canonical
     # pretrain/finetune, 선택 pilot/probe, A100 smoke 어디에서도 허용하면 안 된다.

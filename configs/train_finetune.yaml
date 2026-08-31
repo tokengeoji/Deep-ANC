@@ -14,6 +14,7 @@ canonical_trust_policy: canonical_finetune_v1
 init_eligible: false
 model_config: configs/model_tiny.yaml
 data_config: configs/data_sim.yaml
+data_model_input_contract_config: configs/stage1_ref_only_input.yaml
 duct_config: configs/duct.yaml
 
 # 실측 세션 파인튜닝이 surrogate P(z)로 조용히 실행되는 사고를 막는다.

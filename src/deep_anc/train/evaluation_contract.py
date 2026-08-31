@@ -34,6 +34,7 @@ from ..dsp.do_no_harm import (
     OCTAVE_BAND_CENTERS_HZ,
 )
 from ..dsp.timing import TrainingTimingContract
+from ..model_input import resolve_stage1_model_input_contract
 from ..eval.trusted_subbands import (
     MIN_GROUPS_PER_FAMILY,
     cluster_bootstrap_ci,
@@ -709,6 +710,7 @@ def validate_persisted_g4_metrics(
     if canonical:
         required.update(
             {
+                "model_input_contract_sha256",
                 "recorded_sampling_contract_schema",
                 "recorded_sampling_canonical",
                 "recorded_sampling_model_hop",
@@ -813,6 +815,14 @@ def validate_persisted_g4_metrics(
             raise ValueError("canonical persisted G4에는 immutable manifest bytes/path가 필요합니다")
         if not isinstance(checkpoint_cfg, dict):
             raise ValueError("canonical persisted G4에는 immutable checkpoint cfg가 필요합니다")
+        model_input_sha = _canonical_model_input_sha(checkpoint_cfg)
+        if (
+            _g4_required_str_scalar(data, "model_input_contract_sha256")
+            != model_input_sha
+        ):
+            raise ValueError(
+                "canonical persisted G4 model input contract SHA가 checkpoint와 다릅니다"
+            )
         manifest_families, manifest_sha = _g4_validate_manifest_binding(
             data=data,
             segment_session=segment_session,
@@ -1446,6 +1456,22 @@ def _sha256_identity(value: object, *, name: str) -> str:
     return text
 
 
+def _canonical_model_input_sha(cfg: dict[str, Any]) -> str:
+    """canonical checkpoint의 resolved REF-only payload/digest를 검증한다."""
+
+    contract = resolve_stage1_model_input_contract(
+        cfg.get("data") if isinstance(cfg.get("data"), dict) else None
+    )
+    if contract is None:
+        raise ValueError("canonical checkpoint에 REF-only model input 계약이 없습니다")
+    digest = contract.digest()
+    if cfg.get("model_input_contract_sha256") != digest:
+        raise ValueError(
+            "canonical checkpoint model input contract SHA가 resolved payload와 다릅니다"
+        )
+    return digest
+
+
 def _npz_scalar(data: np.lib.npyio.NpzFile, key: str) -> object:
     if key not in data.files:
         raise ValueError(f"recorded-val G4 필드가 없습니다: {key}")
@@ -1762,6 +1788,14 @@ def _validate_selection_candidate(
     if embedded.get("sha256") != payload.get("experiment_contract_sha256"):
         raise ValueError("selection checkpoint embedded contract가 selection과 다릅니다")
     validate_checkpoint_recorded_manifest(saved_cfg, embedded, manifest)
+    model_input_sha = _canonical_model_input_sha(saved_cfg)
+    if (
+        payload.get("model_input_contract_sha256") != model_input_sha
+        or selected.get("model_input_contract_sha256") != model_input_sha
+    ):
+        raise ValueError(
+            "selection model input contract SHA가 checkpoint resolved payload와 다릅니다"
+        )
     seed = saved_cfg.get("seed")
     if (
         seed not in OFFICIAL_FINETUNE_SEEDS
@@ -1788,12 +1822,16 @@ def _validate_selection_candidate(
             "experiment_contract_sha256": str(
                 _npz_scalar(data, "experiment_contract_sha256")
             ),
+            "model_input_contract_sha256": str(
+                _npz_scalar(data, "model_input_contract_sha256")
+            ),
         }
     if provenance != {
         "split": "val",
         "checkpoint_sha256": checkpoint.sha256,
         "manifest_sha256": manifest.sha256,
         "experiment_contract_sha256": payload.get("experiment_contract_sha256"),
+        "model_input_contract_sha256": model_input_sha,
     }:
         raise ValueError("selection val metrics provenance가 checkpoint/manifest/contract와 다릅니다")
     decision = classify_recorded_val_metrics(
@@ -1856,6 +1894,10 @@ def validate_test_open_selection(
             raise ValueError("cross-seed bundle campaign digest가 다릅니다")
         if bundle.get("manifest_sha256") != payload.get("manifest_sha256"):
             raise ValueError("cross-seed bundle recorded manifest가 다릅니다")
+        if bundle.get("model_input_contract_sha256") != payload.get(
+            "model_input_contract_sha256"
+        ):
+            raise ValueError("cross-seed bundle model input contract가 다릅니다")
         current = _validate_selection_candidate(bundle, repo_root=repo_root)
         if bundle.get("decision") != current:
             raise ValueError("cross-seed bundle top-level decision이 metrics와 다릅니다")
@@ -1900,6 +1942,10 @@ def canonical_test_ledger_paths_from_payload(
         ),
         "manifest_sha256": _sha256_identity(
             selection.get("manifest_sha256"), name="manifest"
+        ),
+        "model_input_contract_sha256": _sha256_identity(
+            selection.get("model_input_contract_sha256"),
+            name="model input contract",
         ),
     }
     encoded = json.dumps(
@@ -2092,6 +2138,9 @@ def issue_test_capability(
         "experiment_contract_sha256": selection.get(
             "experiment_contract_sha256"
         ),
+        "model_input_contract_sha256": selection.get(
+            "model_input_contract_sha256"
+        ),
         "selected_checkpoint_sha256": selected.get("checkpoint_sha256"),
         "manifest_sha256": selection.get("manifest_sha256"),
         "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
@@ -2143,6 +2192,9 @@ def consume_test_capability(
             "seed_neutral_campaign_sha256"
         ),
         "experiment_contract_sha256": selection.get("experiment_contract_sha256"),
+        "model_input_contract_sha256": selection.get(
+            "model_input_contract_sha256"
+        ),
         "selected_checkpoint_sha256": selected.get("checkpoint_sha256"),
         "manifest_sha256": selection.get("manifest_sha256"),
         "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
@@ -2167,6 +2219,9 @@ def consume_test_capability(
         "selection_sha256": selection_snapshot.sha256,
         "capability_sha256": capability_snapshot.sha256,
         "experiment_contract_sha256": selection.get("experiment_contract_sha256"),
+        "model_input_contract_sha256": selection.get(
+            "model_input_contract_sha256"
+        ),
         "selected_checkpoint_sha256": checkpoint.sha256,
         "manifest_sha256": manifest.sha256,
         "consumed_at_unix_ns": time.time_ns(),
@@ -2210,6 +2265,9 @@ def _active_test_ledger(
         ),
         "experiment_contract_sha256": selection.get(
             "experiment_contract_sha256"
+        ),
+        "model_input_contract_sha256": selection.get(
+            "model_input_contract_sha256"
         ),
         "selected_checkpoint_sha256": selected.get("checkpoint_sha256"),
         "manifest_sha256": selection.get("manifest_sha256"),
@@ -2282,6 +2340,9 @@ def complete_test_evaluation(
             "experiment_contract_sha256": selection.get(
                 "experiment_contract_sha256"
             ),
+            "model_input_contract_sha256": selection.get(
+                "model_input_contract_sha256"
+            ),
             "selection_sha256": selection_snapshot.sha256,
             "test_capability_sha256": running.get("capability_sha256"),
             "test_consumed_marker_sha256": running_snapshot.sha256,
@@ -2311,6 +2372,9 @@ def complete_test_evaluation(
         "selection_sha256": selection_snapshot.sha256,
         "running_marker_sha256": running_snapshot.sha256,
         "experiment_contract_sha256": running.get("experiment_contract_sha256"),
+        "model_input_contract_sha256": running.get(
+            "model_input_contract_sha256"
+        ),
         "seed_neutral_campaign_sha256": running.get(
             "seed_neutral_campaign_sha256"
         ),
@@ -2370,6 +2434,9 @@ def fail_test_evaluation(
         "selection_sha256": selection_snapshot.sha256,
         "running_marker_sha256": running_snapshot.sha256,
         "experiment_contract_sha256": running.get("experiment_contract_sha256"),
+        "model_input_contract_sha256": running.get(
+            "model_input_contract_sha256"
+        ),
         "seed_neutral_campaign_sha256": running.get(
             "seed_neutral_campaign_sha256"
         ),

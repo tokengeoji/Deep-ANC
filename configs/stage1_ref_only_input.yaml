@@ -1,0 +1,13 @@
+# Stage-1 canonical digital-reference model input.
+#
+# 모델은 기존 2-channel shape를 유지하되 ch1은 확률적 dropout이 아니라 모든
+# train/val item에서 exact zero다. 비동기 APE ERR는 raw 안전/평가 witness로만 쓰고
+# output clock 또는 모델 feature를 공급하지 않는다.
+schema_version: digital_reference_err_zero_input_v1
+mode: digital_reference_only_err_exact_zero
+model_channel_order: [digital_reference, error_exact_zero]
+reference_dropout_probability: 0.0
+error_dropout_probability: 1.0
+ape_input_role: raw_safety_evaluation_witness_only
+ape_may_pace_output: false
+ape_may_supply_model_feature: false

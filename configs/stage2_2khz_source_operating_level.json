@@ -1,0 +1,40 @@
+{
+  "schema": "stage2_2khz_operating_level_contract_v1",
+  "contract_id": "stage2_2khz_source49_control98_v1",
+  "status": "PLANNED_VALUES_NOT_PHYSICAL_AUTHORITY",
+  "canonical_training_eligible": false,
+  "sample_format": {
+    "sample_rate_hz": 48000,
+    "encoding": "signed_pcm_normalized_by_32768",
+    "full_scale_abs": 1.0,
+    "pcm_denominator": 32768
+  },
+  "source_operating_peak_pcm": 49,
+  "source_operating_peak_abs": 0.001495361328125,
+  "source_operating_peak_dbfs": -56.505077098624085,
+  "actuator_limit_peak_pcm": 98,
+  "actuator_limit_abs": 0.00299072265625,
+  "actuator_limit_dbfs": -50.48447718534447,
+  "augmentation_gain_db": {
+    "distribution": "stateless_uniform_by_global_sample_index",
+    "minimum": -6.0,
+    "maximum": 0.0,
+    "per_sample_peak_normalization_before_gain_required": true,
+    "post_gain_hard_peak_cap_abs": 0.001495361328125
+  },
+  "feasibility_policy": {
+    "target_attenuation_db": 3.0,
+    "minimum_additional_headroom_db": 3.0,
+    "per_frequency_ps_ratio_is_necessary_not_sufficient": true,
+    "broadband_time_domain_peak_gate_required": true,
+    "training_or_evaluation_performance_claimed": false
+  },
+  "physical_authority_requires": {
+    "diagnostic_phase_raw_sha256": true,
+    "diagnostic_analysis_receipt_sha256": true,
+    "meter_raw_and_receipt_sha256": true,
+    "ps_phase_raw_boundary_and_sha256": true,
+    "no_replace_evidence_artifact": true
+  },
+  "canonical_payload_sha256": "60fda03899f46f28f4a15b6e8012d415e9baa0cd3ff762df2e0a4c2a877d0665"
+}

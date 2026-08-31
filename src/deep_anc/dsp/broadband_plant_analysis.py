@@ -18,6 +18,7 @@ import json
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from scipy.linalg import eigh, toeplitz
 from scipy.optimize import minimize_scalar
 
 
@@ -27,6 +28,236 @@ PANEL_STITCH_MAX_CONSTANT_PHASE_RADIANS = 0.05
 PANEL_STITCH_MAX_ABS_DELAY_SAMPLES = 16.0
 COMPACT_IDENTIFIABILITY_SCHEMA = "compact_fir_identifiability_diagnostic_v1"
 COMPACT_MAX_CONDITION_NUMBER = 1.0e8
+
+
+def exact_two_input_periodic_gram_audit(
+    role_period_rows: Mapping[str, Sequence[np.ndarray]],
+    *,
+    role_order: Sequence[str],
+    support_samples: int,
+    zeros_by_input: tuple[int, int] = (0, 0),
+    maximum_condition_number: float = 20.0,
+    crosscheck_tolerance: float = 1.0e-10,
+) -> dict[str, Any]:
+    """actual-int16 2-input periodic convolution의 exact ``X.T @ X``를 감사한다.
+
+    ``role_period_rows[role]``의 각 행은 서로 독립적으로 관측되는 물리 P/S 슬롯의
+    중앙 한 period다. 두 입력 channel을 한 행에서 동시에 추정하므로 반환 Gram의
+    크기는 ``(2 * support_samples)`` 제곱이다. 이 함수는 파일, audio backend 또는
+    전역 측정 상수를 참조하지 않는 순수 수치 primitive다.
+
+    condition은 design ``X``가 아니라 normal matrix ``X.T @ X``의 2-norm
+    condition이다. 네 deterministic probe에 대해 FFT circular convolution의 에너지와
+    adjoint normal vector를 직접 다시 계산하여 Toeplitz 조립의 부호/shift 오류도 막는다.
+    """
+
+    roles = tuple(role_order)
+    support = int(support_samples)
+    maximum = float(maximum_condition_number)
+    tolerance = float(crosscheck_tolerance)
+    if not roles or len(set(roles)) != len(roles):
+        raise ValueError("Gram audit role_order는 비어 있지 않은 unique 순서여야 합니다")
+    if support <= 0 or not math.isfinite(maximum) or maximum <= 1.0:
+        raise ValueError("Gram audit support/maximum condition이 잘못됐습니다")
+    if not math.isfinite(tolerance) or not 0.0 < tolerance <= 1.0e-6:
+        raise ValueError("Gram audit crosscheck tolerance가 잘못됐습니다")
+    raw_zeros = tuple(zeros_by_input)
+    if len(raw_zeros) != 2 or any(
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        for value in raw_zeros
+    ):
+        raise ValueError("Gram audit input shift는 exact integer pair여야 합니다")
+    zeros = tuple(int(value) for value in raw_zeros)
+
+    periods: dict[str, tuple[np.ndarray, ...]] = {}
+    period_samples: int | None = None
+    row_count: int | None = None
+    for role in roles:
+        if role not in role_period_rows:
+            raise ValueError(f"Gram audit role이 없습니다: {role}")
+        rows = tuple(np.asarray(value) for value in role_period_rows[role])
+        if not rows:
+            raise ValueError(f"Gram audit {role}에 관측 행이 없습니다")
+        if row_count is None:
+            row_count = len(rows)
+        elif len(rows) != row_count:
+            raise ValueError("Gram audit role별 관측 행 수가 다릅니다")
+        owned_rows: list[np.ndarray] = []
+        for row in rows:
+            if row.dtype != np.int16 or row.ndim != 2 or row.shape[1] != 2:
+                raise ValueError("Gram audit 입력은 actual int16 [period,2]여야 합니다")
+            if period_samples is None:
+                period_samples = int(row.shape[0])
+            if row.shape != (period_samples, 2):
+                raise ValueError("Gram audit의 모든 actual period shape가 같아야 합니다")
+            owned_rows.append(np.array(row, dtype=np.int16, copy=True, order="C"))
+        periods[role] = tuple(owned_rows)
+    assert period_samples is not None and row_count is not None
+    if period_samples < support or any(value < 0 or value >= period_samples for value in zeros):
+        raise ValueError("Gram audit period/support/input shift 범위가 잘못됐습니다")
+
+    def shifted(row: np.ndarray) -> np.ndarray:
+        source = row.astype(np.float64)
+        return np.column_stack(
+            [np.roll(source[:, channel], zeros[channel]) for channel in range(2)]
+        )
+
+    def correlation(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        return np.fft.ifft(
+            np.conj(np.fft.fft(left)) * np.fft.fft(right)
+        ).real
+
+    def gram_block(values: np.ndarray) -> np.ndarray:
+        offsets = np.arange(support)
+        # G[i,j] = sum_n x[n-i] y[n-j] = r_xy[i-j].
+        return toeplitz(
+            values[offsets % period_samples],
+            values[(-offsets) % period_samples],
+        )
+
+    dimension = 2 * support
+    gram = np.zeros((dimension, dimension), dtype=np.float64)
+    role_conditions: dict[str, float | None] = {}
+    role_eigenvalue_bounds: dict[str, dict[str, float | None]] = {}
+    for role in roles:
+        role_gram = np.zeros_like(gram)
+        for row in periods[role]:
+            shifted_row = shifted(row)
+            for left in range(2):
+                for right in range(2):
+                    block = gram_block(
+                        correlation(shifted_row[:, left], shifted_row[:, right])
+                    )
+                    role_gram[
+                        left * support : (left + 1) * support,
+                        right * support : (right + 1) * support,
+                    ] += block
+        role_gram = (role_gram + role_gram.T) * 0.5
+        lo = float(eigh(role_gram, subset_by_index=[0, 0], eigvals_only=True)[0])
+        hi = float(
+            eigh(
+                role_gram,
+                subset_by_index=[dimension - 1, dimension - 1],
+                eigvals_only=True,
+            )[0]
+        )
+        role_eigenvalue_bounds[role] = {
+            "minimum": lo if math.isfinite(lo) else None,
+            "maximum": hi if math.isfinite(hi) else None,
+        }
+        role_conditions[role] = (
+            hi / lo
+            if math.isfinite(lo) and math.isfinite(hi) and lo > 0.0
+            else None
+        )
+        gram += role_gram
+    gram = (gram + gram.T) * 0.5
+
+    probe_receipts: list[dict[str, Any]] = []
+    grid = np.arange(dimension, dtype=np.float64)
+    probes = (
+        np.sin(grid * 0.017) + 0.25 * np.cos(grid * 0.031),
+        np.cos(grid * 0.011) - 0.31 * np.sin(grid * 0.043),
+        np.where((grid.astype(np.int64) % 17) < 8, 1.0, -1.0),
+        np.exp(-grid / max(float(support), 1.0)) * np.cos(grid * 0.071),
+    )
+    for probe_index, probe in enumerate(probes):
+        probe_fir = probe.reshape(2, support)
+        probe_transfer = np.fft.rfft(probe_fir, n=period_samples, axis=1)
+        direct_energy = 0.0
+        direct_normal = np.zeros(dimension, dtype=np.float64)
+        for role in roles:
+            for row in periods[role]:
+                shifted_row = shifted(row)
+                prediction = np.fft.irfft(
+                    np.sum(
+                        np.fft.rfft(shifted_row, axis=0) * probe_transfer.T,
+                        axis=1,
+                    ),
+                    n=period_samples,
+                )
+                direct_energy += float(np.dot(prediction, prediction))
+                prediction_fft = np.fft.rfft(prediction)
+                for channel in range(2):
+                    adjoint = np.fft.irfft(
+                        np.conj(np.fft.rfft(shifted_row[:, channel]))
+                        * prediction_fft,
+                        n=period_samples,
+                    )
+                    direct_normal[
+                        channel * support : (channel + 1) * support
+                    ] += adjoint[:support]
+        gram_energy = float(probe @ gram @ probe)
+        gram_normal = gram @ probe
+        energy_error = abs(direct_energy - gram_energy) / max(
+            abs(direct_energy), abs(gram_energy), 1.0
+        )
+        normal_error = float(
+            np.linalg.norm(direct_normal - gram_normal)
+            / max(np.linalg.norm(direct_normal), np.linalg.norm(gram_normal), 1.0)
+        )
+        probe_receipts.append(
+            {
+                "probe_index": probe_index,
+                "quadratic_form_relative_error": energy_error,
+                "normal_vector_relative_error": normal_error,
+            }
+        )
+    quadratic_error = max(
+        row["quadratic_form_relative_error"] for row in probe_receipts
+    )
+    normal_error = max(
+        row["normal_vector_relative_error"] for row in probe_receipts
+    )
+
+    eigenvalues = np.asarray(eigh(gram, eigvals_only=True), dtype=np.float64)
+    lo = float(eigenvalues[0])
+    hi = float(eigenvalues[-1])
+    rank_tolerance = float(dimension * np.finfo(np.float64).eps * max(abs(hi), 1.0))
+    numeric_rank = int(np.count_nonzero(eigenvalues > rank_tolerance))
+    condition = (
+        hi / lo
+        if math.isfinite(lo) and math.isfinite(hi) and lo > 0.0
+        else None
+    )
+    role_passed = all(
+        value is not None and value <= maximum for value in role_conditions.values()
+    )
+    crosscheck_passed = max(quadratic_error, normal_error) <= tolerance
+    passed = bool(
+        numeric_rank == dimension
+        and condition is not None
+        and condition <= maximum
+        and role_passed
+        and crosscheck_passed
+    )
+    return {
+        "operator": "two_input_periodic_convolution_finite_support",
+        "actual_int16_input_required": True,
+        "period_samples": period_samples,
+        "support_samples": support,
+        "gram_dimension": dimension,
+        "row_count_per_role": row_count,
+        "role_order": list(roles),
+        "zeros_by_input_samples": list(zeros),
+        "shift_convention": "x_shifted[n]=x[(n-zeros_before_fir) mod period]",
+        "role_condition_numbers": role_conditions,
+        "role_eigenvalue_bounds": role_eigenvalue_bounds,
+        "numeric_rank": numeric_rank,
+        "full_numeric_rank": numeric_rank == dimension,
+        "rank_tolerance": rank_tolerance,
+        "minimum_eigenvalue": lo if math.isfinite(lo) else None,
+        "maximum_eigenvalue": hi if math.isfinite(hi) else None,
+        "periodic_normal_matrix_gram_condition_number": condition,
+        "maximum_condition_number": maximum,
+        "quadratic_form_relative_error": quadratic_error,
+        "normal_vector_relative_error": normal_error,
+        "quadratic_form_probe_receipts": probe_receipts,
+        "crosscheck_maximum_allowed": tolerance,
+        "crosscheck_passed": crosscheck_passed,
+        "passed": passed,
+    }
 
 
 def compact_fir_identifiability_receipt(

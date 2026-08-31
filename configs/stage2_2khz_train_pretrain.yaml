@@ -1,0 +1,102 @@
+# Generic Stage-1 train.py 입력이 아니다. 새 Stage-2 criterion과 raw-bound P/S,
+# manifest, external contract가 생긴 뒤 전용 adapter에서만 소비한다.
+schema: stage2_2khz_training_profile_v1
+role: canonical_pretrain
+steps: 100000
+seed: 20260803
+init_eligible: true
+
+control_band_contract:
+  id: broadband_2khz_octave_88_2828_v1
+  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+
+initialization:
+  mode: scratch
+  checkpoint_path: null
+  checkpoint_sha256: null
+  legacy_checkpoint_allowed: false
+  stage1_checkpoint_allowed: false
+
+resume_policy:
+  automatic_resume_allowed: false
+  explicit_same_external_contract_only: true
+  full_rng_optimizer_scheduler_state_required: true
+
+execution:
+  model_config:
+    path: configs/model_tiny_stage2_2khz.yaml
+    sha256: edcf270eef546ef0b3aaa537cf56ce2d5a6b942621354a4dc8de3cbea62cb0e2
+  reference_mode: digital
+  model_input_channels: 2
+  error_input_mode: zero
+  # A100 80GB의 우선 smoke 후보다. 메모리 추정으로 PASS하지 않으며 실제 200/500
+  # step에서 OOM/VRAM/throughput/data-wait를 봉인한 뒤에만 100k 채택 여부를 정한다.
+  batch_size: 96
+  target_samples: 16384
+  precision: bf16_forward_fp32_loss
+  data_pipeline:
+    schema: stage2_2khz_bounded_prefetch_v1
+    loader_workers: 14
+    prefetch_batches_per_worker: 4
+    bounded_prefetch_batches: 56
+    source_cache_items: 64
+    valid_start_candidates_per_source: 64
+    valid_start_precompute_from_actual_primary_path: true
+    source_sha256_reverified_before_cache: true
+    global_step_order_independent_of_worker_count: true
+    pin_memory: true
+    non_blocking_h2d: true
+    cache_race_allowed: false
+  telemetry:
+    schema: stage2_2khz_step_telemetry_v1
+    raw_per_step_required: true
+    data_wait_ms_required: true
+    h2d_ms_required: true
+    compute_step_ms_required: true
+    gpu_peak_memory_required: true
+    throughput_required: true
+    nvidia_smi_sample_every_steps: 10
+    smoke_thresholds_must_be_declared_from_observation: true
+    estimated_memory_pass_allowed: false
+  optimizer:
+    name: adamw
+    lr: 0.001
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+  schedule:
+    name: linear_warmup_cosine
+    warmup_steps: 1250
+    total_steps: 100000
+    min_lr: 0.00001
+  grad_clip_norm: 5.0
+  checkpoint_every_steps: 500
+  smoke_milestones: [200, 500]
+  required_world_size: 1
+  run_directory_schema: stage2_pretrain_external_sha_seed_v1
+  test_split_for_checkpoint_selection_allowed: false
+
+criterion:
+  schema: stage2_2khz_dedicated_criterion_v1
+  generic_stage1_criterion_allowed: false
+  objective_octaves_hz: [125.0, 250.0, 500.0, 1000.0, 2000.0]
+  one_point_six_khz_sentinel_band_hz: [1425.437949, 1795.939277]
+  one_point_six_khz_minimum_attenuation_db: 0.0
+  two_khz_minimum_attenuation_db: 3.0
+  do_no_harm_octaves_hz: [4000.0, 8000.0]
+  implementation_receipt:
+    path: null
+    sha256: null
+
+checkpoint_required_bindings:
+  - stage2_contract_id
+  - stage2_contract_sha256
+  - primary_path_sha256
+  - secondary_path_sha256
+  - plant_binding_sha256
+  - manifest_bundle_sha256
+  - training_profile_sha256
+  - evaluation_policy_sha256
+  - external_experiment_contract_sha256
+  - a100_environment_sha256
+  - smoke_acceptance_sha256
+  - scratch_pretrain

@@ -1,7 +1,7 @@
 # Output-clock-master / ref-only 런타임 기반 계약
 
-> 상태: **구조 기반 구현 완료, 실제 런타임 통합·물리 검증 BLOCKED**
-> 구현: `src/deep_anc/realtime/output_clock_master.py`
+> 상태: **Stage-1 학습 입력·구조 기반 구현 완료, 실제 학습·런타임 통합·물리 검증 BLOCKED**
+> 구현: `src/deep_anc/model_input.py`, `src/deep_anc/realtime/output_clock_master.py`
 > 이 문서는 AB13X/APE 장치를 열거나 소리를 내서 얻은 결과가 아니다.
 
 ## 1. 해결하려는 문제와 해결하지 않은 문제
@@ -34,6 +34,29 @@
 
 따라서 admission/receipt 모두 `physical_performance_pass=false`,
 `run_realtime_integrated=false`이며 물리 PASS로 승격될 수 없다.
+
+### 1.1 Stage-1 학습 입력 경계
+
+`configs/stage1_ref_only_input.yaml`은 canonical pretrain/fine-tune과 공식 G0가
+공유하는 exact input payload다. resolved config는 다음을 함께 보존한다.
+
+- `mode=digital_reference_only_err_exact_zero`
+- channel order `[digital_reference, error_exact_zero]`
+- `reference_dropout_probability=0.0`
+- `error_dropout_probability=1.0`
+- APE는 raw safety/evaluation witness only이며 pacing/feature 권한이 모두 false
+- 위 전체 payload의 `model_input_contract_sha256`
+
+합성·실측 dataset은 이 계약이 존재할 때 train/val 모두 REF를 유지하고 ERR feature를
+샘플 단위 exact zero로 만든다. Trainer는 dataset 구현을 신뢰해 건너뛰지 않고 매 train/val
+batch에서 nonzero ERR와 item 전체가 zero인 REF를 다시 거부한다. 이 payload와 SHA는 resolved
+config 전체를 통해 experiment contract와 checkpoint `cfg`에 함께 결속된다. mapping 누락,
+일부 key 누락, error probability 변경, broadband dropout과의 상충은 학습 시작 전에 실패한다.
+
+계약이 없는 legacy/일반 diagnostic dataset은 기존 15% ERR-dropout/15% REF-dropout 또는
+ERR-context 동작을 유지한다. 다만 canonical campaign receipt를 만드는 공식 G0는 실제 장기
+학습과 같은 ref-only 계약을 사용한다. 이 분리는 과거 artifact의 의미를 소급 변경하지
+않으면서 G0가 다른 입력 문제를 푸는 것을 막는다.
 
 ## 2. 출력 callback 시간축
 
@@ -155,8 +178,9 @@ SHA는 contiguous raw payload byte를 계산하고 dtype/shape는 schema가 별�
 8. 30초 이상 reserved pilot physical witness로 ADC↔DAC q/phase slope, change point, slip,
    stationarity를 재검산한다. NS/CS가 같은 DAC clock이라는 사실을 ADC↔DAC witness로
    오인하지 않는다.
-9. exact v3/ref-only로 새로 학습된 checkpoint의 absolute G0, validation,
-   offline-streaming equivalence가 실제 artifact로 존재해야 한다.
+9. Stage-1 ref-only 입력 코드 계약은 생겼지만, 그 계약으로 새로 계산한 absolute G0,
+   canonical checkpoint, recorded validation receipt는 아직 없다. offline/streaming 수치
+   등가 회귀는 통과해도 실제 checkpoint artifact의 동치 receipt를 대신하지 않는다.
 10. read-only/dry-run 테스트를 먼저 끝낸 뒤 사용자 승인, 볼륨 최소, 장치 무점유 확인을
     거쳐야만 실음 실험을 설계한다.
 
@@ -165,8 +189,8 @@ SHA는 contiguous raw payload byte를 계산하고 dtype/shape는 schema가 별�
 현재 말할 수 있는 것은 다음뿐이다.
 
 > AB13X 출력 clock 하나로 NS/CS와 global frame을 소유하고, digital reference `U_k`의
-> ref-only 결과를 정확히 다음 callback에 제출하는 구조를 순수 코드로 표현하고
-> fail-closed 단위 테스트할 수 있다.
+> ref-only 결과를 정확히 다음 callback에 제출하는 구조와, 그 구조와 같은 `[REF, 0]`
+> Stage-1 train/val 입력을 순수 코드로 표현하고 fail-closed 단위 테스트할 수 있다.
 
 현재 말할 수 없는 것은 다음이다.
 

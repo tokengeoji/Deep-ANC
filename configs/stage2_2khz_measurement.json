@@ -1,0 +1,65 @@
+{
+  "schema": "stage2_2khz_same_capture_config_v1",
+  "sample_rate_hz": 48000,
+  "block_size": 256,
+  "duration_seconds": {
+    "meter": 20.0,
+    "signal": 24.0
+  },
+  "playback": {
+    "card": "Audio",
+    "device": 0,
+    "channels": 2,
+    "format": "S16_LE",
+    "clock_mode": "adaptive",
+    "roles": [
+      "NS",
+      "CS"
+    ]
+  },
+  "capture": {
+    "card": "APE",
+    "device": 1,
+    "channels": 2,
+    "format": "S32_LE",
+    "roles": [
+      "ERR",
+      "REF"
+    ]
+  },
+  "usb_capture": {
+    "card": "Audio",
+    "device": 0,
+    "channels": 1,
+    "format": "S16_LE",
+    "clock_mode": "async",
+    "usable_as_ape_synchronous_witness": false
+  },
+  "independent_clock_evidence": {
+    "capture_witness_channels": 0,
+    "shared_hardware_frame_identity_proven": false,
+    "synchronous_electrical_tap_present": false
+  },
+  "authority_scope": {
+    "absolute_hardware_frame_clock": false,
+    "single_point_relative_ps_lead_physically_identifiable": true,
+    "spatial_quiet_zone": false
+  },
+  "live_capture_enabled": false,
+  "canonical_training_eligible": false,
+  "canonical_training_ineligible_reason": "stage2_v2_physical_integration_missing",
+  "artifacts": {
+    "plan": "results/stage2_2khz_ps_v1/measurement_plan.json",
+    "meter_raw": "results/stage2_2khz_ps_v1/meter_raw.npz",
+    "native_raw_capture": "results/stage2_2khz_ps_v1/native_raw_capture.npz",
+    "raw_capture": "results/stage2_2khz_ps_v1/raw_capture.npz",
+    "analysis": "results/stage2_2khz_ps_v1/analysis.npz",
+    "analysis_receipt": "results/stage2_2khz_ps_v1/analysis_receipt.json",
+    "analysis_arrays": "results/stage2_2khz_ps_v1/analysis_arrays.npz",
+    "relative_clock_receipt": "results/stage2_2khz_ps_v1/relative_clock_receipt.json",
+    "primary_candidate": "results/stage2_2khz_ps_v1/primary_path_candidate.npz",
+    "secondary_candidate": "results/stage2_2khz_ps_v1/secondary_path_candidate.npz",
+    "measurement_level_evidence": "results/stage2_2khz_ps_v1/measurement_level_evidence.json",
+    "plant_binding": "results/stage2_2khz_ps_v1/plant_binding.json"
+  }
+}

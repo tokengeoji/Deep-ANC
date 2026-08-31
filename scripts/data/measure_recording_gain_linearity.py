@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Source gain v3 bounded ESS/IMD/clock probe를 계획·캡처·분석한다.
 
-``--dry-run``과 ``--analyze-raw``는 sounddevice를 import/open하지 않는다. 실제 NS
-speaker 출력은 exact saved plan, clean expected commit, fresh hardware fingerprint와 모든
-확인 플래그를 갖춘 ``--execute-live``에서만 열린다. 한 level/slot 뒤 peak를 검사하여
-0.40 이상 또는 다음 level 예측 0.45 이상이면 더 높은 출력을 열지 않고 partial raw를
-immutable하게 보존한다.
+``--dry-run``, ``--analyze-raw``, ``--reanalyze-ref-witness``는 sounddevice를
+import/open하지 않는다. 실제 NS speaker 출력은 exact saved plan, clean expected commit,
+fresh hardware fingerprint와 모든 확인 플래그를 갖춘 ``--execute-live``에서만 열린다.
+한 level/slot 뒤 peak를 검사하여 0.40 이상 또는 다음 level 예측 0.45 이상이면 더 높은
+출력을 열지 않고 partial raw를 immutable하게 보존한다.
 """
 
 from __future__ import annotations
@@ -37,12 +37,14 @@ from deep_anc.audio_io import (  # noqa: E402
 )
 from deep_anc.config import load_yaml  # noqa: E402
 from deep_anc.data.recording_gain_linearity import (  # noqa: E402
+    GAIN_LINEARITY_ANALYZER_PATH,
     GAIN_LINEARITY_RAW_SCHEMA,
     INPUT_PREFLIGHT_SECONDS,
     RecordingGainLinearityError,
     build_gain_linearity_capture_publication_payload,
     build_gain_linearity_plan,
     callback_time_info_evidence,
+    issue_gain_linearity_reanalysis_receipt,
     issue_gain_linearity_receipt,
     load_gain_linearity_plan,
     next_level_stop_decision,
@@ -866,8 +868,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute-live", action="store_true")
     mode.add_argument("--analyze-raw", action="store_true")
+    mode.add_argument("--reanalyze-ref-witness", action="store_true")
     parser.add_argument("--hardware", default=DEFAULT_HARDWARE)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-capture-commit")
     parser.add_argument("--output", default=DEFAULT_PLAN)
     parser.add_argument("--plan")
     parser.add_argument("--plan-sha256")
@@ -890,7 +894,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.analyze_raw:
+        if args.analyze_raw or args.reanalyze_ref_witness:
             if not all(
                 (
                     args.raw,
@@ -903,16 +907,40 @@ def main(argv: list[str] | None = None) -> int:
                 )
             ):
                 parser.error(
-                    "--analyze-raw에는 raw/plan/publication path+SHA와 --receipt-out이 필요합니다"
+                    "raw 분석에는 raw/plan/publication path+SHA와 --receipt-out이 필요합니다"
                 )
             loaded = load_gain_linearity_plan(
                 repo_root=REPO_ROOT,
                 plan_path=_relative(_repo_path(args.plan)),
                 expected_sha256=args.plan_sha256,
             )
-            if loaded["payload"]["source_commit"] != args.expected_commit.lower():
-                raise RecordingGainLinearityError("analysis expected commit이 plan과 다릅니다")
-            path, digest, payload = issue_gain_linearity_receipt(
+            if args.reanalyze_ref_witness:
+                if not args.expected_capture_commit:
+                    parser.error(
+                        "--reanalyze-ref-witness에는 --expected-capture-commit이 필요합니다"
+                    )
+                if (
+                    loaded["payload"]["source_commit"]
+                    != args.expected_capture_commit.lower()
+                ):
+                    raise RecordingGainLinearityError(
+                        "reanalysis expected capture commit이 plan과 다릅니다"
+                    )
+                execution = repository_execution_identity(
+                    REPO_ROOT, GAIN_LINEARITY_ANALYZER_PATH
+                )
+                if execution["repository_commit"] != args.expected_commit.lower():
+                    raise RecordingGainLinearityError(
+                        "reanalysis analyzer commit이 외부 expected commit과 다릅니다"
+                    )
+                issuer = issue_gain_linearity_reanalysis_receipt
+            else:
+                if loaded["payload"]["source_commit"] != args.expected_commit.lower():
+                    raise RecordingGainLinearityError(
+                        "analysis expected commit이 plan과 다릅니다"
+                    )
+                issuer = issue_gain_linearity_receipt
+            path, digest, payload = issuer(
                 repo_root=REPO_ROOT,
                 output_path=_relative(_repo_path(args.receipt_out)),
                 raw_path=_relative(

@@ -25,6 +25,7 @@ from deep_anc.config import (
     REPO_ROOT,
     load_train_config,
     load_yaml,
+    validate_canonical_training_policy,
 )
 import deep_anc.config as config_module
 from deep_anc.data.resumable_stream import indexed_rng, worker_global_item_indices
@@ -62,6 +63,10 @@ from deep_anc.train.experiment_contract import (
     require_canonical_source_trust,
     stamp_experiment_contract,
     validate_resume_experiment,
+)
+from deep_anc.model_input import (
+    canonical_stage1_model_input_payload,
+    resolve_stage1_model_input_contract,
 )
 from deep_anc.train.finetune_readiness import audit_init_checkpoint
 from deep_anc.train.reproducibility import _publish_or_validate
@@ -545,6 +550,54 @@ def test_canonical_tiny_config_matches_the_base_training_contract():
     assert tiny["seed"] == 20260803
     assert tiny["required_world_size"] == 1
     assert "tiny_wide" not in tiny["model_config"]
+
+
+@pytest.mark.parametrize(
+    ("config_name", "overrides"),
+    [
+        ("train_pretrain_tiny.yaml", []),
+        ("train_finetune.yaml", ["data.digital_primary_path_mode=measured"]),
+    ],
+)
+def test_canonical_ref_only_input_is_resolved_and_bound_to_contract_and_checkpoint(
+    config_name, overrides
+):
+    cfg = _load_bound_canonical(REPO_ROOT / "configs" / config_name, overrides)
+    contract = resolve_stage1_model_input_contract(cfg["data"])
+    assert contract is not None
+    assert cfg["data_model_input_contract_config"] == (
+        "configs/stage1_ref_only_input.yaml"
+    )
+    assert cfg["data"]["model_input_contract"] == (
+        canonical_stage1_model_input_payload()
+    )
+    assert cfg["model_input_contract_sha256"] == contract.digest()
+
+    checkpoint_cfg = cfg_snapshot(cfg, trusted_band_hz=(150.0, 1_600.0))
+    assert checkpoint_cfg["model_input_contract_sha256"] == contract.digest()
+    validate_canonical_training_policy(checkpoint_cfg)
+
+    baseline = build_experiment_contract(cfg, repo_root=REPO_ROOT)
+    changed = deepcopy(cfg)
+    changed["data"]["model_input_contract"]["error_dropout_probability"] = 0.5
+    assert build_experiment_contract(changed, repo_root=REPO_ROOT)["sha256"] != baseline[
+        "sha256"
+    ]
+    with pytest.raises(ValueError, match="trust policy"):
+        validate_canonical_training_policy(changed)
+
+
+def test_canonical_ref_only_input_missing_or_conflicting_config_is_rejected():
+    with pytest.raises(ValueError, match="trust policy"):
+        _load_bound_canonical(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            ["data.model_input_contract=null"],
+        )
+    with pytest.raises(ValueError, match="Stage-1 canonical model input"):
+        _load_bound_canonical(
+            REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+            ["data.model_input_contract.error_dropout_probability=0.5"],
+        )
 
 
 def test_official_training_is_single_gpu_and_ddp_resume_fails_closed():

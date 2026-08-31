@@ -1,0 +1,48 @@
+# Stage-2 source/recorded population profile. 파일 수만 많거나 16 kHz로 업샘플한
+# 자료는 2 kHz octave physical coverage 증거가 아니다.
+schema: stage2_2khz_data_profile_v1
+role: stage2_lineage_and_frequency_coverage_only
+
+control_band_contract:
+  id: broadband_2khz_octave_88_2828_v1
+  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+
+required_source_families: [speech, music, environment, machine]
+required_splits: [train, val, test]
+minimum_independent_groups_per_family_octave: 4
+minimum_source_density_ratio: 0.25
+one_point_six_khz_sentinel_band_hz: [1425.437949, 1795.939277]
+minimum_independent_groups_per_family_sentinel: 4
+minimum_sentinel_target_density_ratio: 0.25
+minimum_native_nyquist_hz: 2828.4271247462
+recorded_synthetic_lineage_intersection_required: 0
+component_split_allowed: false
+synthetic_fallback_for_missing_manifest_allowed: false
+
+pretrain_distribution:
+  recorded_ratio: 0.0
+  public_synthetic_ratio: 1.0
+  family_balanced: true
+  component_balanced: true
+
+finetune_distribution:
+  recorded_ratio: 0.7
+  public_synthetic_ratio: 0.3
+  family_balanced: true
+  component_balanced: true
+  session_mixing_probability: 0.0
+  lead_jitter_samples: 0.0
+
+artifacts:
+  manifest_bundle:
+    path: null
+    sha256: null
+  lineage_receipt:
+    path: null
+    sha256: null
+  frequency_coverage_receipt:
+    path: null
+    sha256: null
+  transfer_bootstrap_receipt:
+    path: null
+    sha256: null

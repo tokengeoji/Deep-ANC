@@ -43,6 +43,7 @@ from deep_anc.data.recording_source_preflight import (
 from deep_anc.data.recording_gain_linearity import (
     ADC_CERTIFICATION_PEAK,
     GAIN_LINEARITY_AUTHORITY_SCOPE,
+    GAIN_LINEARITY_PEAK_ENVELOPE_SCHEMA,
     OPERATOR_FIR_LENGTH,
     OPERATOR_PEAK_PRE_ROLL_SAMPLES,
     OPERATOR_RELATIVE_SUBBAND_MIN_NORM_RATIO,
@@ -670,6 +671,59 @@ def _physical_operator_contract(analysis: Any) -> dict[str, Any]:
         )
     unsealed = dict(operator)
     seal = unsealed.pop("operator_sha256", None)
+    if operator.get("schema") == GAIN_LINEARITY_PEAK_ENVELOPE_SCHEMA:
+        if (
+            operator.get("role")
+            != "source_gain_peak_envelope_only_not_anc_plant_authority"
+            or operator.get("fit_levels_millionths") != [3_000, 4_000, 5_000]
+            or operator.get("independent_holdout_level_millionths") != tested
+            or operator.get("tested_max_amplitude_millionths") != tested
+            or operator.get("supported_max_amplitude_millionths") != supported
+            or operator.get("complex_operator_thresholds_relaxed") is not False
+            or operator.get("complex_operator_used_as_authority") is not False
+            or not isinstance(seal, str)
+            or _SHA256_RE.fullmatch(seal) is None
+            or seal != _seal(unsealed)
+        ):
+            raise RecordingSourceGainError(
+                "gain-linearity peak envelope seal/role 불일치"
+            )
+        channels = operator.get("channels")
+        if not isinstance(channels, Mapping) or set(channels) != {"err", "ref"}:
+            raise RecordingSourceGainError(
+                "gain-linearity peak envelope ERR/REF 집합 불일치"
+            )
+        result: dict[str, Any] = {}
+        for name in ("err", "ref"):
+            item = channels[name]
+            gain_upper = _finite(
+                item.get("peak_gain_upper_with_uncertainty")
+                if isinstance(item, Mapping)
+                else None,
+                label=f"{name} peak envelope gain",
+            )
+            if (
+                not isinstance(item, Mapping)
+                or gain_upper <= 0.0
+                or item.get("uncertainty_factor") != 1.25
+                or item.get("valid_through_amplitude_millionths") != tested
+                or item.get("prediction")
+                != "upper_peak=gain_upper*rendered_source_peak"
+            ):
+                raise RecordingSourceGainError(
+                    f"gain-linearity {name} peak envelope 계약 위반"
+                )
+            result[name] = {"peak_gain_upper_with_uncertainty": gain_upper}
+        return {
+            "operator_sha256": str(seal),
+            "role": str(operator["role"]),
+            "prediction_kind": "measured_peak_envelope",
+            "tested_max_amplitude_millionths": tested,
+            "supported_max_amplitude_millionths": supported,
+            "distortion_certified": False,
+            "physical_authority_scope": GAIN_LINEARITY_AUTHORITY_SCOPE,
+            "channels": result,
+        }
     if (
         operator.get("schema")
         != "recording_gain_safety_operator/v3_gainprobe006"
@@ -735,6 +789,7 @@ def _physical_operator_contract(analysis: Any) -> dict[str, Any]:
     return {
         "operator_sha256": str(seal),
         "role": str(operator["role"]),
+        "prediction_kind": "compact_fir_with_residual",
         "tested_max_amplitude_millionths": tested,
         "supported_max_amplitude_millionths": supported,
         "distortion_certified": False,
@@ -754,6 +809,23 @@ def _physical_prediction(
     result: dict[str, Any] = {}
     for name in ("err", "ref"):
         channel = operator["channels"][name]
+        if operator.get("prediction_kind") == "measured_peak_envelope":
+            upper = source_peak * float(
+                channel["peak_gain_upper_with_uncertainty"]
+            )
+            result[name] = {
+                "prediction_kind": "measured_peak_envelope",
+                "operator_fir_sha256": None,
+                "model_peak_linear": 0.0,
+                "model_rms_linear": 0.0,
+                "residual_peak_margin_linear": upper,
+                # RMS cannot exceed peak; use the same upper rather than inventing
+                # an unmeasured RMS transfer function.
+                "residual_rms_margin_linear": upper,
+                "upper_peak_linear": upper,
+                "upper_rms_linear": upper,
+            }
+            continue
         predicted = signal.fftconvolve(values, channel["fir"], mode="full")
         model_peak = float(np.max(np.abs(predicted)))
         model_rms = math.sqrt(float(np.sum(np.square(predicted))) / values.size)
@@ -1267,7 +1339,12 @@ def build_recording_source_gain_plan(
         ),
         "amplitude_encoding": "integer_millionths",
         "prediction_authority": (
-            "strict_primary_for_150_1600_snr_plus_gain_safety_err_ref_operator"
+            (
+                "strict_primary_for_150_1600_snr_plus_measured_err_ref_peak_envelope"
+                if physical_operator.get("prediction_kind")
+                == "measured_peak_envelope"
+                else "strict_primary_for_150_1600_snr_plus_gain_safety_err_ref_operator"
+            )
             if physical_operator is not None
             else "strict_primary_err_only"
         ),

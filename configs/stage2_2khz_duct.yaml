@@ -1,0 +1,48 @@
+# Stage-2 2 kHz 전용 물리 플랜트 profile이다. Stage-1 duct.yaml의 대역만
+# 2,828 Hz로 바꾸는 용도가 아니다. 새 same-capture P/S가 발행되기 전까지 null은
+# 정상적인 BLOCKED 상태이며, 수동 lead 또는 legacy strict P/S로 채우지 않는다.
+schema: stage2_2khz_duct_profile_v1
+role: stage2_physical_plant_only_no_audio
+
+control_band_contract:
+  id: broadband_2khz_octave_88_2828_v1
+  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+
+sample_rate_hz: 48000
+block_size: 256
+reference_mode: digital
+
+measurement_policy:
+  required_excitation_band_hz: [80.0, 2828.4271247462]
+  physical_identification_subbands_hz:
+    - [88.3883476483, 150.0]
+    - [150.0, 300.0]
+    - [300.0, 600.0]
+    - [600.0, 1000.0]
+    - [1000.0, 1600.0]
+    - [1600.0, 2828.4271247462]
+  minimum_subband_consistency: 0.95
+  maximum_timing_residual_samples: 0.270208
+  minimum_independent_epochs_per_role: 8
+  periodic_repeat_indices_allowed: false
+  require_same_capture: true
+  require_actual_submitted_pcm: true
+  require_raw_analysis_sha_binding: true
+  require_xrun_clip_status_slip_zero: true
+
+timing_policy:
+  handoff_extra_samples: 256
+  lead_source: PlantDelays.lead()
+  manual_lead_allowed: false
+  stage1_lead_reuse_allowed: false
+
+artifacts:
+  primary_path:
+    path: null
+    sha256: null
+  secondary_path:
+    path: null
+    sha256: null
+  plant_binding:
+    path: null
+    sha256: null

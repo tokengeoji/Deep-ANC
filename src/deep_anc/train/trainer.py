@@ -48,6 +48,10 @@ from ..data.synth_dataset import (
 from ..dsp.timing import PlantSettle, handoff_samples_from_config
 from ..models import build_model
 from ..losses.broadband_loss import CausalFIRPath
+from ..model_input import (
+    resolve_stage1_model_input_contract,
+    validate_stage1_ref_only_tensor,
+)
 from .checkpoint import (
     load_checkpoint,
     read_checkpoint_snapshot,
@@ -493,7 +497,7 @@ def _require_finite_named_tensors(
     raise FloatingPointError("G0 finite 계약 위반: 집계 finite 검사가 실패했습니다")
 
 
-def validate_finite_batch(batch: dict) -> None:
+def validate_finite_batch(batch: dict, *, model_input_contract=None) -> None:
     """모든 tensor 학습 입력을 forward 전에 fail-closed 검사한다."""
 
     if not isinstance(batch, dict) or not batch:
@@ -502,6 +506,16 @@ def validate_finite_batch(batch: dict) -> None:
     for name, value in batch.items():
         if isinstance(value, torch.Tensor):
             tensors += 1
+            if name == "x" and model_input_contract is not None:
+                # REF-only 검사는 ERR exact-zero와 REF finite/nonzero를 이미 채널별
+                # reduction으로 확인한다. x 전체 finite scan을 중복하면 canonical
+                # A100 batch의 CPU 공급이 불필요하게 느려진다.
+                validate_stage1_ref_only_tensor(
+                    value,
+                    model_input_contract,
+                    label="canonical batch.x",
+                )
+                continue
             _require_finite_tensor(f"input.{name}", value)
     if tensors == 0:
         raise FloatingPointError("G0 finite 계약 위반: batch에 tensor 입력이 없습니다")
@@ -739,6 +753,22 @@ class Trainer:
         seed = int(cfg.get("seed", 0)) + self.rank
 
         self.stage = str(cfg.get("stage", "open_loop"))
+        self.model_input_contract = resolve_stage1_model_input_contract(
+            cfg.get("data") or {}
+        )
+        if self.model_input_contract is not None:
+            if self.stage != "open_loop":
+                raise RuntimeError(
+                    "ref-only Stage-1 input contract는 open_loop 전용입니다 — "
+                    "closed-loop는 ERR feedback을 다시 모델 feature로 만들기 때문입니다"
+                )
+            if (
+                cfg.get("model_input_contract_sha256")
+                != self.model_input_contract.digest()
+            ):
+                raise ValueError(
+                    "Trainer model-input contract SHA가 resolved config와 다릅니다"
+                )
         if (
             self._criterion_admission.causal_authority is not None
             and self.stage != "open_loop"
@@ -1398,7 +1428,10 @@ class Trainer:
 
     def _forward_loss(self, batch: dict) -> tuple[torch.Tensor, dict]:
         self._validate_causal_batch_prefix(batch)
-        validate_finite_batch(batch)
+        validate_finite_batch(
+            batch,
+            model_input_contract=self.model_input_contract,
+        )
         x = batch["x"].to(self.device, non_blocking=True)
         d = batch["d"].to(self.device, non_blocking=True)
         if self.stage == "closed_loop":
@@ -1474,9 +1507,12 @@ class Trainer:
         self.criterion.eval()
         with torch.no_grad():
             self._validate_causal_batch_prefix(self.val_batch)
+            validate_finite_batch(
+                self.val_batch,
+                model_input_contract=self.model_input_contract,
+            )
             x = self.val_batch["x"].to(self.device)
             d = self.val_batch["d"].to(self.device)
-            validate_finite_batch({"x": x, "d": d})
             raw = self.model.module if hasattr(self.model, "module") else self.model
             y = raw(x)
             validate_finite_output(y)

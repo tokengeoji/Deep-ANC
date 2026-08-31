@@ -58,6 +58,28 @@ v2 결과를 125 Hz 옥타브 PASS로 승격하지 않는다.
    node, stale commit/freeze/receipt, dirty tree 검사는 corpus scan·manifest 생성·GPU 학습보다
    앞에서 fail-closed해야 한다. Elice 실패를 고쳤다면 재현 fixture와 재개 지점을
    `docs/05_training_elice.md` 및 `HANDOFF.md`에 남기기 전에는 완료로 보지 않는다.
+10. **노트북 병렬 작업은 append-only receipt로만 인수한다.** `notebook_todo.md`가 있는
+   커밋에서는 `HANDOFF.md`를 읽은 직후, `rclone`과 교환 스크립트를 사용할 수 있으면 아래
+   read-only 명령으로 노트북 진행 상태를 확인한다. 현재 dirty HEAD가 아니라 **정확한
+   `origin/dev` 40자리 SHA**만 조회하며, 다른 커밋의 PASS를 섞지 않는다. 조회 실패나
+   미완료는 명시적으로 보고하되 Drive 내용을 수정·삭제하지 않는다.
+
+   ```bash
+   EXPECTED_COMMIT="$(git rev-parse origin/dev)"
+   .venv/bin/python scripts/data/notebook_exchange.py read \
+     --expected-commit "$EXPECTED_COMMIT"
+   ```
+
+   노트북 Agent는 [notebook_todo.md](notebook_todo.md)만 따라 작업하고 각 phase를
+   content-addressed artifact + append-only status로 발행한다. `latest.json`, overwrite,
+   `rclone sync/delete/purge`는 금지한다.
+11. **실기 문제는 raw-first 반복으로 해결한다 (2026-08-31 사용자 지시).** 장시간 합성
+   fixture만 고치며 실제 장비 확인을 미루지 않는다. 안전한 최소 경계가 준비되면
+   `무음 dry-run → 짧은 실제 raw 캡처 → raw-first 불변 저장/SHA → 오프라인 분석 → 필요한
+   코드만 수정 → 같은 raw 재분석` 순서를 기본으로 한다. 합성 fixture는 장치 손상,
+   잘못된 파일·채널 및 자명한 수치 결함을 막는 용도이며 실제 P/S·clock·phase·감쇠 판정의
+   대체물이 아니다. 실패 raw도 삭제하거나 임계값을 낮추지 않는다. 재출력이 정말 필요할
+   때만 새 no-replace generation으로 실행하며, 출력 전 안전 규칙 3은 그대로 지킨다.
 
 ## 환경 요약
 

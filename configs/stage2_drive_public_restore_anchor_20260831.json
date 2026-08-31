@@ -1,0 +1,83 @@
+{
+  "authority": "partial_public_restore_transport_anchor_not_training_authority",
+  "evidence_sha256": "1bd1e7264b5f48206584e449116c072d90933b66f611d73775bca26d7d517360",
+  "fixed_archive_cache_status_at_audit": "BLOCKED_ARCHIVE_CACHE_ABSENT",
+  "legacy_manifest_sha256": {
+    "data/manifests/esc50.jsonl": "e31fc19cfae4405b9d4bd02f2f76452bb7988d50bbdbc63b9ea4b4daed7e163e",
+    "data/manifests/music.jsonl": "8565bd13808eee2734594902697820aef7bb93326fafa0e586c2c54120aca609",
+    "data/manifests/speech.jsonl": "e7522510478e5f24cbd0352183589808e3c1321f81e7c7464e87ecc960abfa4c"
+  },
+  "recorded_population_required_for_this_restore": false,
+  "restore_byte_count": 9480223737,
+  "restore_cohorts": [
+    {
+      "byte_count": 8235886703,
+      "extension_counts": {
+        "": 1,
+        ".csv": 1,
+        ".mp3": 8000,
+        ".txt": 1
+      },
+      "file_count": 8003,
+      "name": "fma_music",
+      "path_size_sha256_projection_sha256": "7c104d5ff9c2fbd22b27e75d867f637e31e2a2b63e64473d1509041dd5fe7319",
+      "prefix": "data/raw/music/",
+      "required_extension": ".mp3",
+      "required_extension_byte_count": 7975016002,
+      "required_extension_file_count": 8000,
+      "stage2_family_role": "music",
+      "status": "PASS_EXACT_REMOTE_METADATA_AND_MANIFEST_SHA"
+    },
+    {
+      "byte_count": 360289905,
+      "extension_counts": {
+        ".flac": 2703,
+        ".txt": 102
+      },
+      "file_count": 2805,
+      "name": "librispeech_speech",
+      "path_size_sha256_projection_sha256": "859bcbeaa8f3ace90fee7b823ef8a2caefd25c2009ef7116ff809c8df52a8cb7",
+      "prefix": "data/raw/speech/",
+      "required_extension": ".flac",
+      "required_extension_byte_count": 359034309,
+      "required_extension_file_count": 2703,
+      "stage2_family_role": "speech",
+      "status": "PASS_EXACT_REMOTE_METADATA_AND_MANIFEST_SHA"
+    },
+    {
+      "byte_count": 884047129,
+      "extension_counts": {
+        "": 2,
+        ".csv": 1,
+        ".gif": 1,
+        ".ini": 1,
+        ".md": 1,
+        ".py": 1,
+        ".txt": 1,
+        ".wav": 2000,
+        ".xlsx": 1,
+        ".yml": 2
+      },
+      "file_count": 2011,
+      "name": "esc50_environment",
+      "path_size_sha256_projection_sha256": "5b9e606c64974e5ef0c4d834ed98338eee279ab6f7019b38199dd1b98f9cfb83",
+      "prefix": "data/raw/noise/esc50/",
+      "required_extension": ".wav",
+      "required_extension_byte_count": 882088000,
+      "required_extension_file_count": 2000,
+      "stage2_family_role": "environment_diagnostic_not_machine_session_lineage",
+      "status": "PASS_EXACT_REMOTE_METADATA_AND_MANIFEST_SHA"
+    }
+  ],
+  "restore_file_count": 12819,
+  "restore_projection_sha256": "39ad10859eb432822b2030c8033bc6621946a0846b72612272bd1ae64afcf78e",
+  "schema": "stage2_drive_public_restore_anchor_v1",
+  "snapshot_byte_count": 17439445191,
+  "snapshot_file_count": 13428,
+  "snapshot_manifest_relative_path": "data_backup_manifest.sha256",
+  "snapshot_manifest_sha256": "1dd9fef8d796cc1f27fbf5d434d640c8b80554e16f04b6bfac0d3403c748bea2",
+  "snapshot_projection_sha256": "7ff53f692532d57c6c1d2acbb737ed72003b294b703750119eaef3ebc78c1888",
+  "snapshot_remote_root": "gdrive:DeepANC/jetson_data_backup_20260827",
+  "source_audit_evidence_sha256": "f1ca93f2dcd024051201b5d331feffc76a8aea9182457f25e1ff09dfb825b37a",
+  "stage2_public_pretrain_ready": false
+}

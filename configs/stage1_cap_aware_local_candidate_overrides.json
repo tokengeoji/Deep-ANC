@@ -1,0 +1,121 @@
+{
+  "schema": "recording_source_conditioning_candidate_overrides/v1",
+  "role": "local_exact_cap_candidate_set_not_canonical_generation_or_natural_evaluation_evidence",
+  "canonical_live_eligible": false,
+  "source_plan": {
+    "path": "data/source_plans/recorded_additions/stage1-coverage-v2.csv",
+    "sha256": "f1b3d63fa1e455bac723a7a323aede0b602486c955bcb945281dc129cc7bc574"
+  },
+  "strict_primary": {
+    "path": "assets/measured/primary_path_il_strict_5dc06fdd.npz",
+    "sha256": "23fa43f1ec46d5bca6bdad53938b81bb2d2c85afc4eee35e83c555b6c4f0c598"
+  },
+  "amplitude_millionths": 5788,
+  "lineage_authority_evidence_sha256": "744a35adabeb34711daa1b3d2ca422111ce3ef1791ea0bb067130fe67598f649",
+  "overrides": [
+    {
+      "source_row_number": 2,
+      "expected_origin_path": "data/source_pool/environment/environment_006.wav",
+      "expected_origin_sha256": "534a84da9df73e225fb107d3a7a4ccc5ac8a38549c5101e745c0c28bc487258f",
+      "path": "data/source_pool/environment/environment_006.wav",
+      "source_file_sha256": "534a84da9df73e225fb107d3a7a4ccc5ac8a38549c5101e745c0c28bc487258f",
+      "start_seconds": 35.0,
+      "source_family": "environment",
+      "group_id": "environment-water-drops",
+      "lineage_key": "environment-source-lineage-6edef9c5d066",
+      "split": "train",
+      "authority_kind": "source_pool_component"
+    },
+    {
+      "source_row_number": 3,
+      "expected_origin_path": "data/source_pool_v2/environment/environment_012.wav",
+      "expected_origin_sha256": "b79a377bf2397ceb8052a719c67bb4d45f993ee2635c671bb812335ad2d4a580",
+      "path": "data/source_pool_v2/environment/environment_014.wav",
+      "source_file_sha256": "c3aeacb4ce2182d145eaad0a5412b57bd94189f2a4893ae8d3f94f1452b14f37",
+      "start_seconds": 30.0,
+      "source_family": "environment",
+      "group_id": "environment-toilet-flush-05",
+      "lineage_key": "environment-source-lineage-3ef08934832f",
+      "split": "val",
+      "authority_kind": "source_pool_component"
+    },
+    {
+      "source_row_number": 4,
+      "expected_origin_path": "data/source_pool_v2/environment/environment_004.wav",
+      "expected_origin_sha256": "666a423076170d30dcfde94129003a785ef3bd6c1b78b864127a944411a0a120",
+      "path": "data/source_pool/environment/environment_003.wav",
+      "source_file_sha256": "8f572431b34ceaec5b604b8cde7dbb4ec660a395effafef87227e22ad4fe61b2",
+      "start_seconds": 44.5,
+      "source_family": "environment",
+      "group_id": "environment-crickets",
+      "lineage_key": "environment-source-lineage-8b2e19db47be",
+      "split": "test",
+      "authority_kind": "source_pool_component"
+    },
+    {
+      "source_row_number": 5,
+      "expected_origin_path": "data/source_pool_v2/environment/environment_017.wav",
+      "expected_origin_sha256": "05e5b3268c0dcece44929c5b2df7d2a8b0fcb4674526c7a294867147d1342f9d",
+      "path": "data/source_pool/environment/environment_008.wav",
+      "source_file_sha256": "e384d3e1d400fa489d05e80380c2660a54f26373c3ff0ecd31efd30b8ace5f43",
+      "start_seconds": 53.25,
+      "source_family": "environment",
+      "group_id": "environment-church-bells",
+      "lineage_key": "environment-source-lineage-02cf8abfb8bf",
+      "split": "test",
+      "authority_kind": "source_pool_component"
+    },
+    {
+      "source_row_number": 7,
+      "expected_origin_path": "data/source_pool_v2/music/music_007.wav",
+      "expected_origin_sha256": "431dbbdf31de5fc91807d84a2505aa430aee82ca267a90a538fd20a755974ec3",
+      "path": "data/source_pool_v2/music/music_007.wav",
+      "source_file_sha256": "431dbbdf31de5fc91807d84a2505aa430aee82ca267a90a538fd20a755974ec3",
+      "start_seconds": 43.0,
+      "source_family": "music",
+      "group_id": "music-057",
+      "lineage_key": "music-source-lineage-a68e94bca05c",
+      "split": "test",
+      "authority_kind": "source_pool_component"
+    },
+    {
+      "source_row_number": 11,
+      "expected_origin_path": "data/source_plans/recorded_additions/demand_environment_selections/stage1-coverage-v2/canonical/sources/environment-demand-dkitchen-ch01-f7e2a2868219-185600ms-peaknorm.wav",
+      "expected_origin_sha256": "bc193c07d161b7ab99d022119ae50f25d2deba7ae6360994e46d04bb51705dd8",
+      "path": "data/source_pool_v2/environment/environment_012.wav",
+      "source_file_sha256": "b79a377bf2397ceb8052a719c67bb4d45f993ee2635c671bb812335ad2d4a580",
+      "start_seconds": 55.0,
+      "source_family": "environment",
+      "group_id": "environment-pouring-water-01",
+      "lineage_key": "environment-source-lineage-59a79bf4d19d",
+      "split": "test",
+      "authority_kind": "source_pool_component"
+    },
+    {
+      "source_row_number": 13,
+      "expected_origin_path": "data/source_plans/recorded_additions/dns_speech_selections/stage1-coverage-v2/sources/speech-dns-02-a9448260f449-repeat-trim.wav",
+      "expected_origin_sha256": "eca5a15fa571c6921b2fdfa7cde90a2e17d519a74e495e214c393cb6600125c6",
+      "path": "data/raw/speech/LibriSpeech/dev-clean/251/136532/251-136532-0006.flac",
+      "source_file_sha256": "68a2e3166c521f57b082a8f59bea144be88ba91c9894cf154a5bcabadb3a72ef",
+      "start_seconds": 0.0,
+      "source_family": "speech",
+      "group_id": "speech-librispeech-lineage-9d15bab1e798",
+      "lineage_key": "speech-librispeech-lineage-9d15bab1e798",
+      "split": "train",
+      "authority_kind": "librispeech_component"
+    },
+    {
+      "source_row_number": 16,
+      "expected_origin_path": "data/source_plans/recorded_additions/dns_speech_selections/stage1-coverage-v2/sources/speech-dns-05-5e34ea54ed79-repeat-trim.wav",
+      "expected_origin_sha256": "e36da0cd17d61b30e162987a7090208a305303ebd7423fa2cd100c007a032310",
+      "path": "data/raw/speech/LibriSpeech/dev-clean/5694/64029/5694-64029-0016.flac",
+      "source_file_sha256": "5fd04e27dda53aa571500df4c2200669b3fd56201e48c69cf4e1a57c2cfe1ad5",
+      "start_seconds": 0.0,
+      "source_family": "speech",
+      "group_id": "speech-librispeech-lineage-5b00feb25f31",
+      "lineage_key": "speech-librispeech-lineage-5b00feb25f31",
+      "split": "test",
+      "authority_kind": "librispeech_component"
+    }
+  ]
+}

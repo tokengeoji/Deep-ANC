@@ -1,0 +1,49 @@
+# Generic Stage-1 train.py 입력이 아니다. exact Stage-2 scratch 100k completion만
+# weight-only init으로 허용하며 legacy/Stage-1 checkpoint 전이는 금지한다.
+schema: stage2_2khz_training_profile_v1
+role: canonical_finetune
+steps: 50000
+seed: 20260803
+init_eligible: false
+
+control_band_contract:
+  id: broadband_2khz_octave_88_2828_v1
+  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+
+initialization:
+  mode: completed_stage2_scratch_pretrain_weight_only
+  checkpoint_path: null
+  checkpoint_sha256: null
+  legacy_checkpoint_allowed: false
+  stage1_checkpoint_allowed: false
+
+resume_policy:
+  automatic_resume_allowed: false
+  explicit_same_external_contract_only: true
+  full_rng_optimizer_scheduler_state_required: true
+
+criterion:
+  schema: stage2_2khz_dedicated_criterion_v1
+  generic_stage1_criterion_allowed: false
+  objective_octaves_hz: [125.0, 250.0, 500.0, 1000.0, 2000.0]
+  one_point_six_khz_sentinel_band_hz: [1425.437949, 1795.939277]
+  one_point_six_khz_minimum_attenuation_db: 0.0
+  two_khz_minimum_attenuation_db: 3.0
+  do_no_harm_octaves_hz: [4000.0, 8000.0]
+  implementation_receipt:
+    path: null
+    sha256: null
+
+checkpoint_required_bindings:
+  - stage2_contract_id
+  - stage2_contract_sha256
+  - primary_path_sha256
+  - secondary_path_sha256
+  - plant_binding_sha256
+  - manifest_bundle_sha256
+  - training_profile_sha256
+  - evaluation_policy_sha256
+  - external_experiment_contract_sha256
+  - a100_environment_sha256
+  - smoke_acceptance_sha256
+  - scratch_pretrain

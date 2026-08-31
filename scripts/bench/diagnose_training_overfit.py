@@ -296,6 +296,10 @@ def build_diagnostic_overrides(args: argparse.Namespace, ckpt_dir: str) -> list[
         f"data.level_dbfs=[{float(args.level_dbfs)}, {float(args.level_dbfs)}]",
         f"ckpt_dir={json.dumps(str(ckpt_dir))}",
     ]
+    # 일반 diagnostic은 과거 ERR-context 분포를 보존한다. campaign authority를 만드는
+    # 공식 G0만 canonical train/pilot과 동일한 REF-only input-contract file을 유지한다.
+    if getattr(args, "evidence_dir", None) is None:
+        overrides.append("data_model_input_contract_config=null")
     if args.lead_samples is not None:
         overrides.append(
             f"data.digital_reference_lead_samples={int(args.lead_samples)}"

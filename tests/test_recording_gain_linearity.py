@@ -9,6 +9,7 @@ import signal as os_signal
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -882,7 +883,7 @@ def test_receipt_dynamic_supported_cap_never_exceeds_independent_6k_holdout(
         assert channel["residual_bound"]["valid_through_amplitude_millionths"] == 6000
 
 
-def test_distortion_below_noise_is_inconclusive_not_pass(
+def test_distortion_below_noise_does_not_add_distortion_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     payload, pcm, plan_path, plan_sha = _plan(tmp_path)
@@ -918,8 +919,11 @@ def test_distortion_below_noise_is_inconclusive_not_pass(
         expected_plan_sha256=plan_sha,
         **_publication_args(tmp_path, raw_path),
     )
+    # 이 fixture는 해당 IMD slot 안의 clock pilot도 지우므로 별도의 clock/operator
+    # 사유로는 FAIL이다. 다만 관측 불가능한 distortion 자체가 failure reason을
+    # 만들면 안 된다.
     assert receipt["status"] == "FAIL"
-    assert any(
+    assert not any(
         "_thd_" in reason or "_imd_" in reason
         for reason in receipt["failure_reasons"]
     )
@@ -955,8 +959,11 @@ def test_unobservable_distortion_is_not_certified_but_operator_can_bound_adc_saf
         linearity,
         "_distortion_metrics",
         lambda *_args, **_kwargs: {
-            "thd_dbc": -40.0,
-            "imd_dbc": -41.0,
+            # Raw ratio alone is over the nominal gate, but the noise floor
+            # makes it unobservable. It must remain INCONCLUSIVE rather than
+            # fail the deliberately peak-safety-only receipt.
+            "thd_dbc": -20.0,
+            "imd_dbc": -19.0,
             "fundamental_snr_db": 20.0,
             "observable": False,
             "verdict": "INCONCLUSIVE",
@@ -982,6 +989,49 @@ def test_unobservable_distortion_is_not_certified_but_operator_can_bound_adc_saf
     assert analysis["distortion_observability"][
         "inconclusive_is_not_thd_pass"
     ] is True
+
+
+def test_observable_distortion_over_gate_fails_peak_safety_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    payload, pcm, plan_path, plan_sha = _plan(tmp_path)
+    raw_path, raw_sha = _raw(tmp_path, payload, pcm, plan_path, plan_sha)
+    monkeypatch.setattr(
+        linearity,
+        "repository_execution_identity",
+        lambda *_args: {
+            "repository_commit": payload["source_commit"],
+            "repository_branch": "DETACHED",
+            "repository_dirty": False,
+            "script_path": linearity.GAIN_LINEARITY_SCRIPT_PATH,
+            "script_file_sha256": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        linearity,
+        "_distortion_metrics",
+        lambda *_args, **_kwargs: {
+            "thd_dbc": -20.0,
+            "imd_dbc": -19.0,
+            "fundamental_snr_db": 60.0,
+            "observable": True,
+            "verdict": "FAIL",
+        },
+    )
+    receipt = linearity.build_gain_linearity_receipt(
+        repo_root=tmp_path,
+        raw_path=raw_path,
+        expected_raw_sha256=raw_sha,
+        plan_path=plan_path,
+        expected_plan_sha256=plan_sha,
+        **_publication_args(tmp_path, raw_path),
+    )
+    assert receipt["status"] == "FAIL"
+    assert any("_thd_" in reason for reason in receipt["failure_reasons"])
+    assert any("_imd_" in reason for reason in receipt["failure_reasons"])
+    assert receipt["analysis"]["distortion_observability"][
+        "observable_channel_row_count"
+    ] == 24
 
 
 def test_repeated_pilots_recover_group_common_400ppm_without_erasing_relative_delay(
@@ -1228,6 +1278,82 @@ def test_cli_parser_has_one_plan_sha_option_and_help_is_renderable():
     assert sum(
         "--plan-sha256" in action.option_strings for action in parser._actions
     ) == 1
+
+
+def test_cli_ref_witness_reanalysis_separates_capture_and_analyzer_commits_without_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    module_name = "measure_recording_gain_linearity_reanalysis_cli_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name, ROOT / "scripts/data/measure_recording_gain_linearity.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    capture_commit = "a" * 40
+    analyzer_commit = "b" * 40
+    monkeypatch.setattr(
+        module,
+        "load_gain_linearity_plan",
+        lambda **_kwargs: {
+            "payload": {"source_commit": capture_commit},
+            "file": {"path": "results/plan.json", "sha256": "c" * 64},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "repository_execution_identity",
+        lambda *_args: {"repository_commit": analyzer_commit},
+    )
+    issued = []
+
+    def _issue(**kwargs):
+        issued.append(kwargs)
+        return (
+            tmp_path / "results/new-v5.json",
+            "d" * 64,
+            {"status": "PASS", "failure_reasons": []},
+        )
+
+    monkeypatch.setattr(module, "issue_gain_linearity_reanalysis_receipt", _issue)
+    imported = []
+    original_import = module.importlib.import_module
+
+    def _guarded_import(name, *args, **kwargs):
+        imported.append(name)
+        if name == "sounddevice":
+            raise AssertionError("reanalysis imported sounddevice")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(module.importlib, "import_module", _guarded_import)
+    result = module.main(
+        [
+            "--reanalyze-ref-witness",
+            "--expected-commit",
+            analyzer_commit,
+            "--expected-capture-commit",
+            capture_commit,
+            "--raw",
+            "results/raw.npz",
+            "--raw-sha256",
+            "e" * 64,
+            "--plan",
+            "results/plan.json",
+            "--plan-sha256",
+            "c" * 64,
+            "--publication",
+            "results/publication.json",
+            "--publication-sha256",
+            "f" * 64,
+            "--receipt-out",
+            "results/new-v5.json",
+        ]
+    )
+    assert result == 0
+    assert len(issued) == 1
+    assert imported == []
 
 
 def test_global_live_deadline_reserves_next_output_before_open():
@@ -1558,3 +1684,143 @@ def test_late_sidecar_or_publication_preclaim_preserves_raw_but_blocks_authority
     assert result["raw_ref"]["final_published"] is True
     assert result[error_key] is not None
     assert result["publication_ref"] is None
+
+
+def test_ref_witness_reanalysis_separates_capture_and_analysis_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    payload, pcm, plan_path, plan_sha = _plan(tmp_path)
+    raw_path, raw_sha = _raw(tmp_path, payload, pcm, plan_path, plan_sha)
+    publication = _publication_args(tmp_path, raw_path)
+    analysis_execution = {
+        "repository_commit": "b" * 40,
+        "repository_branch": "dev",
+        "repository_dirty": False,
+        "script_path": linearity.GAIN_LINEARITY_ANALYZER_PATH,
+        "script_file_sha256": "d" * 64,
+    }
+    monkeypatch.setattr(
+        linearity, "_analysis_execution_identity", lambda _root: analysis_execution
+    )
+    monkeypatch.setattr(
+        linearity, "_verify_historical_capture_execution", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        linearity,
+        "_group_clock_alignment",
+        lambda **_kwargs: pytest.fail("재분석이 affine clock 경로를 호출했습니다"),
+    )
+
+    receipt = linearity.build_gain_linearity_reanalysis_receipt(
+        repo_root=tmp_path,
+        raw_path=raw_path,
+        expected_raw_sha256=raw_sha,
+        plan_path=plan_path,
+        expected_plan_sha256=plan_sha,
+        **publication,
+    )
+
+    assert receipt["schema"] == linearity.GAIN_LINEARITY_REANALYSIS_RECEIPT_SCHEMA
+    assert receipt["status"] == "PASS"
+    assert receipt["source_commit"] == "b" * 40
+    assert receipt["capture_provenance"]["source_commit"] == "a" * 40
+    assert receipt["analysis_provenance"] == analysis_execution
+    assert receipt["analysis"]["clock_alignment_method"] == linearity.TIMELINE_METHOD
+    assert all(
+        row["affine_q_used"] is False
+        and row["valid_windows"] >= linearity.MIN_STREAM_DELAY_VALID_WINDOWS
+        for row in receipt["analysis"]["clock_alignment"]
+    )
+    envelope = receipt["analysis"]["safety_operator"]
+    assert envelope["schema"] == linearity.GAIN_LINEARITY_PEAK_ENVELOPE_SCHEMA
+    assert envelope["complex_operator_thresholds_relaxed"] is False
+    assert envelope["complex_operator_used_as_authority"] is False
+
+
+def test_reanalysis_receipt_uses_new_noreplace_path_and_preserves_old_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    old = tmp_path / "results/old_fail_receipt.json"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"immutable-old-fail\n")
+    monkeypatch.setattr(
+        linearity,
+        "build_gain_linearity_reanalysis_receipt",
+        lambda **_kwargs: {"schema": "fixture", "status": "PASS"},
+    )
+    kwargs = {
+        "repo_root": tmp_path,
+        "output_path": "results/new_reanalysis_receipt.json",
+        "raw_path": "results/raw.npz",
+        "expected_raw_sha256": "a" * 64,
+        "plan_path": "results/plan.json",
+        "expected_plan_sha256": "b" * 64,
+        "publication_path": "results/capture_publication.json",
+        "expected_publication_sha256": "c" * 64,
+    }
+    target, _digest, _payload = (
+        linearity.issue_gain_linearity_reanalysis_receipt(**kwargs)
+    )
+    assert target.name == "new_reanalysis_receipt.json"
+    assert old.read_bytes() == b"immutable-old-fail\n"
+    with pytest.raises(linearity.RecordingGainLinearityError, match="no-replace"):
+        linearity.issue_gain_linearity_reanalysis_receipt(**kwargs)
+
+
+def test_reanalysis_rejects_replace_or_dirty_analyzer_before_historical_blob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    historical_called = False
+
+    def reject_analyzer(_root):
+        raise RuntimeError("git replacement object가 있는 checkout")
+
+    def historical_should_not_run(*_args):
+        nonlocal historical_called
+        historical_called = True
+
+    monkeypatch.setattr(linearity, "_analysis_execution_identity", reject_analyzer)
+    monkeypatch.setattr(
+        linearity, "_verify_historical_capture_execution", historical_should_not_run
+    )
+    with pytest.raises(RuntimeError, match="replacement object"):
+        linearity.build_gain_linearity_reanalysis_receipt(
+            repo_root=tmp_path,
+            raw_path="results/raw.npz",
+            expected_raw_sha256="a" * 64,
+            plan_path="results/plan.json",
+            expected_plan_sha256="b" * 64,
+            publication_path="results/capture_publication.json",
+            expected_publication_sha256="c" * 64,
+        )
+    assert historical_called is False
+
+
+def test_historical_capture_blob_lookup_disables_replace_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    script_bytes = b"historical capture executable\n"
+    observed: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        observed["env"] = kwargs.get("env")
+        return SimpleNamespace(stdout=script_bytes)
+
+    monkeypatch.setattr(linearity.subprocess, "run", fake_run)
+    linearity._verify_historical_capture_execution(
+        tmp_path,
+        {
+            "repository_commit": "a" * 40,
+            "repository_branch": "dev",
+            "repository_dirty": False,
+            "script_path": linearity.GAIN_LINEARITY_SCRIPT_PATH,
+            "script_file_sha256": hashlib.sha256(script_bytes).hexdigest(),
+        },
+    )
+
+    assert observed["command"][-1] == (
+        "a" * 40 + ":" + linearity.GAIN_LINEARITY_SCRIPT_PATH
+    )
+    assert isinstance(observed["env"], dict)
+    assert observed["env"]["GIT_NO_REPLACE_OBJECTS"] == "1"

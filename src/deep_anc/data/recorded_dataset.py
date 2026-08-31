@@ -43,6 +43,10 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from torch.utils.data import IterableDataset, get_worker_info
 
 from ..dsp.timing import TrainingTimingContract
+from ..model_input import (
+    apply_stage1_ref_only_numpy,
+    resolve_stage1_model_input_contract,
+)
 from .broadband_batch_sampler import (
     MIN_TARGET_D_DENSITY_RATIO,
     QUALIFIED_SAMPLING_MODE,
@@ -340,6 +344,7 @@ class RecordedANCDataset(IterableDataset):
         raw_segment = int(round(float(data_cfg["segment_seconds"]) * self.fs))
         self.segment = max(256, (raw_segment // 256) * 256)
         self.reference_mode = str(data_cfg.get("reference_mode", "digital"))
+        self.model_input_contract = resolve_stage1_model_input_contract(data_cfg)
         self._recorded_level_calibration: RecordedLevelCalibration | None = None
         calibration_path = data_cfg.get("recorded_level_calibration")
         calibration_sha = data_cfg.get("recorded_level_calibration_sha256")
@@ -1135,6 +1140,9 @@ class RecordedANCDataset(IterableDataset):
                     < self.broadband_error_dropout_probability
                 ):
                     err_in = np.zeros_like(err_in)
+            x_ref, err_in = apply_stage1_ref_only_numpy(
+                x_ref, err_in, self.model_input_contract
+            )
             x = np.stack([x_ref, err_in]).astype(np.float32)
             yield {
                 "x": torch.from_numpy(x),
@@ -1160,6 +1168,16 @@ class RecordedANCDataset(IterableDataset):
             "segment_samples": self.segment,
             "broadband_valid_prefix_samples": self.broadband_valid_prefix_samples,
             "reference_mode": self.reference_mode,
+            "model_input_contract": (
+                None
+                if self.model_input_contract is None
+                else self.model_input_contract.model_dump(mode="json")
+            ),
+            "model_input_contract_sha256": (
+                None
+                if self.model_input_contract is None
+                else self.model_input_contract.digest()
+            ),
             "require_aligned_source": self.require_aligned_source,
             "lead_mode": self.lead_mode,
             "sampling_mode": self.sampling_mode,

@@ -279,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
             device=context.device,
             batch_size=args.batch_size,
             warmup_samples=warmup_samples,
+            model_input_contract=context.model_input_contract,
         )
         out_dir.parent.mkdir(parents=True, exist_ok=True)
         temporary_name = tempfile.mkdtemp(

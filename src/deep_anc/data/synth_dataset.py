@@ -37,6 +37,10 @@ from ..dsp.duct_sim import build_rir_bank
 from ..dsp.filters import fft_filter
 from ..dsp.secondary_path import load_secondary_path
 from ..dsp.timing import PlantDelays, TrainingTimingContract
+from ..model_input import (
+    apply_stage1_ref_only_numpy,
+    resolve_stage1_model_input_contract,
+)
 from .manifest_contract import validate_manifest_generation
 from .broadband_batch_sampler import (
     MIN_TARGET_D_DENSITY_RATIO,
@@ -195,6 +199,7 @@ class SynthANCDataset(IterableDataset):
         self.reference_mode = str(data_cfg.get("reference_mode", "digital"))
         if self.reference_mode not in ("digital", "acoustic"):
             raise ValueError(f"reference_mode: {self.reference_mode}")
+        self.model_input_contract = resolve_stage1_model_input_contract(data_cfg)
         if self.broadband_batch_qualified and self.reference_mode != "digital":
             raise ValueError("광대역 canonical synthetic 경로는 digital reference만 허용합니다")
         configured_lead = data_cfg.get("digital_reference_lead_samples")
@@ -528,14 +533,19 @@ class SynthANCDataset(IterableDataset):
             x_ref += hum
             err_in += hum
 
-        dropout = rng.random()
-        if dropout < self.broadband_error_dropout_probability:
-            err_in = np.zeros_like(err_in)
-        elif dropout < (
-            self.broadband_error_dropout_probability
-            + self.broadband_reference_dropout_probability
-        ):
-            x_ref = np.zeros_like(x_ref)
+        if self.model_input_contract is None:
+            dropout = rng.random()
+            if dropout < self.broadband_error_dropout_probability:
+                err_in = np.zeros_like(err_in)
+            elif dropout < (
+                self.broadband_error_dropout_probability
+                + self.broadband_reference_dropout_probability
+            ):
+                x_ref = np.zeros_like(x_ref)
+        else:
+            x_ref, err_in = apply_stage1_ref_only_numpy(
+                x_ref, err_in, self.model_input_contract
+            )
 
         return {
             "x": torch.from_numpy(np.stack([x_ref, err_in]).astype(np.float32)),
@@ -605,12 +615,18 @@ class SynthANCDataset(IterableDataset):
             x_ref += hum
             err_in += hum
 
-        # 채널 dropout — ref-only / err-only 운용 대비 (동시 제거는 금지)
-        u = rng.random()
-        if u < 0.15:
-            err_in = np.zeros_like(err_in)
-        elif u < 0.30:
-            x_ref = np.zeros_like(x_ref)
+        if self.model_input_contract is None:
+            # Legacy/diagnostic channel dropout. Canonical Stage-1은 위 공용
+            # input contract를 명시하므로 이 확률 경로에 들어오지 않는다.
+            u = rng.random()
+            if u < 0.15:
+                err_in = np.zeros_like(err_in)
+            elif u < 0.30:
+                x_ref = np.zeros_like(x_ref)
+        else:
+            x_ref, err_in = apply_stage1_ref_only_numpy(
+                x_ref, err_in, self.model_input_contract
+            )
 
         x = np.stack([x_ref, err_in]).astype(np.float32)   # [2, T]
         return {

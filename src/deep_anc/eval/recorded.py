@@ -46,6 +46,12 @@ from ..dsp.timing import (
     handoff_samples_from_config,
 )
 from ..models import build_model
+from ..model_input import (
+    RefOnlyModelInputContract,
+    apply_stage1_ref_only_numpy,
+    resolve_stage1_model_input_contract,
+    validate_stage1_ref_only_tensor,
+)
 from ..train.trainer import validate_training_physics
 from ..train.evaluation_contract import snapshot_regular_file
 from ..train.experiment_contract import validate_embedded_experiment_contract
@@ -97,6 +103,8 @@ class RecordedEvalContext:
     secondary_path: SecondaryPathData
     secondary_handoff_samples: int
     checkpoint_sha256: str = ""
+    model_input_contract: RefOnlyModelInputContract | None = None
+    model_input_contract_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,6 +121,7 @@ class RecordedSegment:
     recorded_delay_samples: float = -1.0
     timing_contract_sha256: str = ""
     source_timeline: str = "legacy"
+    model_input_contract_sha256: str = ""
 
 
 def _config_path(value: str | Path) -> Path:
@@ -134,6 +143,43 @@ def _sha256_if_file(value: str | Path) -> str:
                 break
             digest.update(block)
     return digest.hexdigest()
+
+
+def _resolve_checkpoint_model_input_contract(
+    cfg: dict,
+) -> RefOnlyModelInputContract | None:
+    """체크포인트의 resolved 입력 payload와 최상위 digest를 함께 검증한다.
+
+    구형 diagnostic checkpoint는 입력 계약 자체가 없으므로 과거 2채널 동작을
+    보존한다. 반면 canonical fine-tune은 REF-only payload와 그 digest 중 하나라도
+    빠지면 공식 recorded 평가를 열지 않는다.
+    """
+
+    data_cfg = cfg.get("data")
+    contract = resolve_stage1_model_input_contract(
+        data_cfg if isinstance(data_cfg, dict) else None
+    )
+    declared_sha = cfg.get("model_input_contract_sha256")
+    canonical = str(cfg.get("experiment_role", "")) == "canonical_finetune"
+    if contract is None:
+        if declared_sha is not None:
+            raise ValueError(
+                "checkpoint model_input_contract_sha256가 있지만 "
+                "data.model_input_contract가 없습니다"
+            )
+        if canonical:
+            raise ValueError(
+                "canonical fine-tune checkpoint에 data.model_input_contract가 없습니다"
+            )
+        # legacy/diagnostic checkpoint의 기존 ERR-context 동작을 그대로 보존한다.
+        return None
+    digest = contract.digest()
+    if declared_sha != digest:
+        raise ValueError(
+            "checkpoint model_input_contract_sha256가 resolved "
+            "data.model_input_contract digest와 다릅니다"
+        )
+    return contract
 
 
 def validate_resolved_checkpoint(
@@ -166,6 +212,7 @@ def validate_resolved_checkpoint(
         )
 
     data_cfg = cfg["data"]
+    _resolve_checkpoint_model_input_contract(cfg)
     reference_mode = str(data_cfg.get("reference_mode", "digital"))
     if reference_mode not in {"digital", "acoustic"}:
         raise ValueError(
@@ -236,6 +283,10 @@ def load_recorded_eval_context(
         state, allow_surrogate=allow_surrogate
     )
     data_cfg = cfg["data"]
+    model_input_contract = _resolve_checkpoint_model_input_contract(cfg)
+    model_input_contract_sha = (
+        model_input_contract.digest() if model_input_contract is not None else ""
+    )
     duct_cfg = cfg["duct"]
     fs = int(data_cfg["sample_rate"])
     if fs <= 0:
@@ -340,6 +391,8 @@ def load_recorded_eval_context(
         secondary_path=secondary,
         secondary_handoff_samples=handoff,
         checkpoint_sha256=str(checkpoint_sha256),
+        model_input_contract=model_input_contract,
+        model_input_contract_sha256=model_input_contract_sha,
     )
 
 
@@ -628,6 +681,10 @@ def iter_recorded_segments(
     edge_trim = int(round(edge_trim_seconds * fs))
 
     reference_mode = str(data_cfg.get("reference_mode", "digital"))
+    model_input_contract = resolve_stage1_model_input_contract(data_cfg)
+    model_input_contract_sha = (
+        model_input_contract.digest() if model_input_contract is not None else ""
+    )
     constant_lead = int(data_cfg.get("digital_reference_lead_samples", 0))
     timing_contract: TrainingTimingContract | None = None
     timing_contract_sha = ""
@@ -695,6 +752,9 @@ def iter_recorded_segments(
             err_input = delayed_err[start:stop]
             if x_ref.size != segment or err_input.size != segment or d.size != segment:
                 raise RuntimeError(f"{entry['path']}: segment 길이 계산 오류")
+            x_ref, err_input = apply_stage1_ref_only_numpy(
+                x_ref, err_input, model_input_contract
+            )
             x = np.ascontiguousarray(
                 np.stack([x_ref, err_input]), dtype=np.float32
             )
@@ -709,6 +769,7 @@ def iter_recorded_segments(
                 recorded_delay_samples=float(recorded_delay),
                 timing_contract_sha256=timing_contract_sha,
                 source_timeline=source_timeline,
+                model_input_contract_sha256=model_input_contract_sha,
             )
 
 
@@ -738,6 +799,7 @@ def evaluate_recorded_segments(
     device: str | torch.device = "cpu",
     batch_size: int = 8,
     warmup_samples: int = 0,
+    model_input_contract: RefOnlyModelInputContract | None = None,
 ) -> dict:
     """segment iterable을 배치 평가하고 작은 메트릭 배열만 메모리에 보존한다."""
 
@@ -779,11 +841,17 @@ def evaluate_recorded_segments(
     per_segment_subband_values: list[list[float]] = []
     per_segment_subband_coverage: list[list[bool]] = []
     per_segment_subband_density: list[list[float]] = []
+    model_input_contract_sha = (
+        model_input_contract.digest() if model_input_contract is not None else ""
+    )
 
     def evaluate_batch(batch: list[RecordedSegment]) -> None:
         x_np = np.stack([segment.x for segment in batch])
         d_np = np.stack([segment.d for segment in batch])
         x = torch.from_numpy(x_np).to(device)
+        validate_stage1_ref_only_tensor(
+            x, model_input_contract, label="recorded evaluation input"
+        )
         d = torch.from_numpy(d_np[:, None, :]).to(device)
         with torch.no_grad():
             y = model(x)
@@ -875,6 +943,13 @@ def evaluate_recorded_segments(
             )
         if not np.all(np.isfinite(segment.x)) or not np.all(np.isfinite(segment.d)):
             raise ValueError("recorded segment에 NaN/Inf가 있습니다")
+        if model_input_contract is not None:
+            if segment.model_input_contract_sha256 != model_input_contract_sha:
+                raise ValueError(
+                    "recorded segment model-input contract SHA가 평가 계약과 다릅니다"
+                )
+            if np.count_nonzero(segment.x[1]) != 0:
+                raise ValueError("recorded segment ERR feature는 exact zero여야 합니다")
         if expected_samples is None:
             expected_samples = int(segment.d.size)
         elif int(segment.d.size) != expected_samples:
@@ -1012,6 +1087,7 @@ def evaluate_recorded_segments(
         "fullband": _distribution(fullband_array),
         "gap_mean_db": float(np.mean(gap_array)),
         "warmup_samples": warmup_samples,
+        "model_input_contract_sha256": model_input_contract_sha,
         "per_segment_trusted_db": trusted_array,
         "per_segment_fullband_db": fullband_array,
         "per_segment_gap_db": gap_array,
@@ -1430,6 +1506,22 @@ def write_recorded_metrics(
             "평가 결과 segment_samples가 sampling 요청/hop 유도값과 다릅니다"
         )
     canonical_sampling = bool(canonical_sampling)
+    context_model_input_sha = str(context.model_input_contract_sha256 or "")
+    expected_context_model_input_sha = (
+        context.model_input_contract.digest()
+        if context.model_input_contract is not None
+        else ""
+    )
+    if context_model_input_sha != expected_context_model_input_sha:
+        raise ValueError(
+            "recorded evaluation context의 model-input contract SHA가 payload와 다릅니다"
+        )
+    if str(result.get("model_input_contract_sha256", "")) != (
+        context_model_input_sha
+    ):
+        raise ValueError(
+            "recorded evaluation result의 model-input contract SHA가 checkpoint와 다릅니다"
+        )
     plant_settle_samples = _plant_settle_samples(context)
     if canonical_sampling:
         canonical_edge_trim = int(
@@ -1693,6 +1785,8 @@ def write_recorded_metrics(
         f"- 체크포인트 SHA-256: `{checkpoint_sha256 or 'unavailable'}`",
         f"- Manifest: `{Path(manifest)}` (`{split}`)",
         f"- Manifest SHA-256: `{manifest_sha256 or 'unavailable'}`",
+        f"- Model input contract SHA-256: "
+        f"`{context_model_input_sha or 'legacy-diagnostic-unbound'}`",
         f"- 물리 상태: `{context.physics_status}`",
         f"- 세션/그룹/세그먼트: {result['n_sessions']}/{result['n_groups']}/{result['n_segments']}",
         f"- 세그먼트 길이: {result['segment_samples']} samples; 지표 구간: "
@@ -1908,6 +2002,8 @@ def write_recorded_metrics(
             np.asarray(STRICT_TRUSTED_BAND_HZ, dtype=np.float64),
         )
         and context.physics_status == "measured_primary_path"
+        and context.model_input_contract is not None
+        and bool(context_model_input_sha)
         and not bool(allow_surrogate)
         and canonical_sampling
         and split in {"val", "test"}
@@ -1921,6 +2017,9 @@ def write_recorded_metrics(
             checkpoint_sha256=np.asarray(checkpoint_sha256, dtype=np.str_),
             experiment_contract_sha256=np.asarray(
                 experiment_contract_sha256, dtype=np.str_
+            ),
+            model_input_contract_sha256=np.asarray(
+                context_model_input_sha, dtype=np.str_
             ),
             selection_sha256=np.asarray(selection_sha256, dtype=np.str_),
             test_capability_sha256=np.asarray(

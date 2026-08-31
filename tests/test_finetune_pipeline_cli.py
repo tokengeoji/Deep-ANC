@@ -66,6 +66,10 @@ from deep_anc.eval.recorded_sampling import (  # noqa: E402
     effective_segment_samples,
 )
 from deep_anc.dsp.timing import PlantDelays, TrainingTimingContract  # noqa: E402
+from deep_anc.model_input import (  # noqa: E402
+    canonical_stage1_model_input_contract,
+    canonical_stage1_model_input_payload,
+)
 from deep_anc.train.evaluation_contract import (  # noqa: E402
     canonical_test_ledger_paths,
     canonical_test_ledger_event_paths_from_payload,
@@ -231,6 +235,7 @@ def _canonical_sampling_checkpoint_cfg(**updates) -> dict:
             sample_rate=48_000,
         ),
     )
+    model_input_contract = canonical_stage1_model_input_contract()
     cfg = {
         "model": {"name": "toy", "hop": 128},
         "data": {
@@ -240,6 +245,7 @@ def _canonical_sampling_checkpoint_cfg(**updates) -> dict:
             "recorded_lead_mode": "timeline",
             "digital_reference_lead_samples": 0,
             "training_timing_contract": timing.model_dump(),
+            "model_input_contract": canonical_stage1_model_input_payload(),
             "closed_loop": {
                 "feedback_delay_samples": [0, 0],
                 "warmup_seconds": 0.0,
@@ -247,6 +253,7 @@ def _canonical_sampling_checkpoint_cfg(**updates) -> dict:
         },
         "digital_reference_lead_samples": 0,
         "loss_start_sample": 0,
+        "model_input_contract_sha256": model_input_contract.digest(),
     }
     cfg.update(updates)
     return cfg
@@ -544,6 +551,9 @@ def _recorded_val_metric_payload(
         "checkpoint_sha256": np.asarray(pipeline._sha256_file(checkpoint)),
         "manifest_sha256": np.asarray(pipeline._sha256_file(manifest)),
         "experiment_contract_sha256": np.asarray(contract_sha),
+        "model_input_contract_sha256": np.asarray(
+            canonical_stage1_model_input_contract().digest()
+        ),
         "selection_sha256": np.asarray(selection_sha256),
         "test_capability_sha256": np.asarray(test_capability_sha256),
         "test_consumed_marker_sha256": np.asarray(
@@ -1181,6 +1191,7 @@ def test_test_ledger_phases_and_atomic_directory_publication(tmp_path):
     [
         "checkpoint_sha256",
         "experiment_contract_sha256",
+        "model_input_contract_sha256",
         "selection_sha256",
         "test_capability_sha256",
         "test_consumed_marker_sha256",
@@ -1189,7 +1200,7 @@ def test_test_ledger_phases_and_atomic_directory_publication(tmp_path):
 def test_test_completion_rejects_each_tampered_metrics_provenance(
     tmp_path, provenance_field
 ):
-    """NPZ가 one-shot ledger의 다섯 identity 중 하나라도 바꾸면 완료하지 않는다."""
+    """NPZ가 one-shot ledger identity 중 하나라도 바꾸면 완료하지 않는다."""
 
     (
         selection_path,
@@ -1222,6 +1233,7 @@ def test_test_completion_rejects_each_tampered_metrics_provenance(
     [
         ("seed_neutral_campaign_sha256", None),
         ("experiment_contract_sha256", "experiment_contract_sha256"),
+        ("model_input_contract_sha256", "model_input_contract_sha256"),
         ("selected_checkpoint_sha256", "checkpoint_sha256"),
         ("manifest_sha256", "manifest_sha256"),
     ],
@@ -1933,6 +1945,7 @@ def test_test_capability_rejects_selection_missing_required_source_family(tmp_pa
         "manifest": str(manifest.absolute()),
         "manifest_sha256": pipeline._sha256_file(manifest),
         "experiment_contract_sha256": stamped["experiment_contract_sha256"],
+        "model_input_contract_sha256": stamped["model_input_contract_sha256"],
         "seed_neutral_campaign_sha256": campaign_sha,
         "seed": 20260803,
         "decision": forged_decision,
@@ -1943,6 +1956,9 @@ def test_test_capability_rejects_selection_missing_required_source_family(tmp_pa
             "metrics_sha256": pipeline._sha256_file(metrics),
             "seed": 20260803,
             "seed_neutral_campaign_sha256": campaign_sha,
+            "model_input_contract_sha256": stamped[
+                "model_input_contract_sha256"
+            ],
             "decision": forged_decision,
         },
     }
@@ -2455,6 +2471,42 @@ def test_recorded_val_selection_rejects_candidate_embedded_contract_mismatch(tmp
             selection_path=tmp_path / "selection.json",
             manifest_path=manifest,
             experiment_contract_sha256="f" * 64,
+        )
+
+
+@pytest.mark.parametrize("tamper", ["missing", "digest_mismatch"])
+def test_recorded_val_selection_requires_checkpoint_ref_only_contract(
+    tmp_path, tamper
+):
+    """공식 val 선택은 checkpoint 입력 계약 누락/불일치를 성능 계산 전에 막는다."""
+
+    manifest = tmp_path / "recorded.jsonl"
+    _write_canonical_recorded_manifest(manifest, splits=("val",))
+    cfg = _canonical_sampling_checkpoint_cfg(
+        **{
+            "experiment_role": "selection_test",
+            "seed": 20260803,
+            "recorded_manifest": str(manifest.absolute()),
+        }
+    )
+    if tamper == "missing":
+        del cfg["data"]["model_input_contract"]
+        del cfg["model_input_contract_sha256"]
+    else:
+        cfg["model_input_contract_sha256"] = "f" * 64
+    stamped = stamp_experiment_contract(cfg, repo_root=tmp_path)
+    checkpoint = tmp_path / f"{tamper}.pt"
+    torch.save({"cfg": stamped, "model": {"weight": torch.ones(1)}}, checkpoint)
+    evaluation = tmp_path / f"val-{tamper}"
+    evaluation.mkdir()
+    np.savez_compressed(evaluation / "metrics.npz", placeholder=np.asarray(1))
+
+    with pytest.raises(ValueError, match="REF-only input 계약|model input contract SHA"):
+        pipeline.freeze_recorded_val_selection(
+            candidates=[(checkpoint, evaluation)],
+            selection_path=tmp_path / f"selection-{tamper}.json",
+            manifest_path=manifest,
+            experiment_contract_sha256=stamped["experiment_contract_sha256"],
         )
 
 

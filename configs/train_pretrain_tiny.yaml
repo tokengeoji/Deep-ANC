@@ -7,6 +7,7 @@ canonical_trust_policy: canonical_pretrain_v1
 init_eligible: true
 model_config: configs/model_tiny.yaml
 data_config: configs/data_sim.yaml
+data_model_input_contract_config: configs/stage1_ref_only_input.yaml
 duct_config: configs/duct.yaml
 
 batch_size: 96

@@ -15,11 +15,11 @@ from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 import numpy as np
-from scipy.linalg import eigh, toeplitz
 from scipy.optimize import minimize_scalar
 from scipy.interpolate import CubicSpline
 
 from .control_band_contract import BroadbandFullOctaveContractV3
+from .broadband_plant_analysis import exact_two_input_periodic_gram_audit
 from .fullband_causal_v4 import continuous_pilot_period
 from .measurement_level import expected_meter_output_pcm
 
@@ -346,20 +346,6 @@ def _validate_canonical_plan_and_pcm_v5(
     return expected_plan, expected_pcm
 
 
-def _periodic_cross_correlation(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    return np.fft.ifft(
-        np.conj(np.fft.fft(left.astype(np.float64)))
-        * np.fft.fft(right.astype(np.float64))
-    ).real
-
-
-def _toeplitz_gram_block(correlation: np.ndarray, support: int) -> np.ndarray:
-    # G[i,j] = sum_n x[n-i] y[n-j] = r_xy[i-j].
-    first_col = correlation[np.arange(support) % PERIOD]
-    first_row = correlation[(-np.arange(support)) % PERIOD]
-    return toeplitz(first_col, first_row)
-
-
 def _exact_condition_audit_with_shifts_v5(
     plan: Mapping[str, Any],
     submitted_pcm: np.ndarray,
@@ -385,103 +371,36 @@ def _exact_condition_audit_with_shifts_v5(
         "actual_submitted_pcm_sha256"
     ):
         raise ValueError("plan과 exact actual-int16 submitted PCM이 일치하지 않습니다")
-    gram = np.zeros((2 * support, 2 * support), dtype=np.float64)
-    role_conditions: dict[str, float] = {}
+    role_rows: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    layout = list(plan["layout"])
     for role in ("fit_a", "fit_b"):
-        role_gram = np.zeros_like(gram)
+        rows: list[np.ndarray] = []
         for path in ("primary", "secondary"):
-            period = _central_role_period(submitted, list(plan["layout"]), path, role)
-            shifted_period = np.column_stack(
-                [np.roll(period[:, channel], zeros[channel]) for channel in range(2)]
+            match = [
+                row
+                for row in layout
+                if row.get("path") == path and row.get("role") == role
+            ]
+            if len(match) != 1:
+                raise ValueError(f"{path}/{role} 중앙 period가 정확히 하나가 아닙니다")
+            row = match[0]
+            rows.append(
+                np.asarray(
+                    submitted[
+                        row["central_start_frame"] : row["central_stop_frame"]
+                    ],
+                    dtype=np.int16,
+                )
             )
-            for left in range(2):
-                for right in range(2):
-                    correlation = _periodic_cross_correlation(
-                        shifted_period[:, left], shifted_period[:, right]
-                    )
-                    block = _toeplitz_gram_block(correlation, support)
-                    role_gram[
-                        left * support : (left + 1) * support,
-                        right * support : (right + 1) * support,
-                    ] += block
-        role_gram = (role_gram + role_gram.T) * 0.5
-        lo = float(eigh(role_gram, subset_by_index=[0, 0], eigvals_only=True)[0])
-        hi = float(
-            eigh(
-                role_gram,
-                subset_by_index=[2 * support - 1, 2 * support - 1],
-                eigvals_only=True,
-            )[0]
-        )
-        if not np.isfinite(lo) or not np.isfinite(hi) or lo <= 0.0:
-            raise ValueError("exact shifted Gram 고유값이 finite positive가 아닙니다")
-        role_conditions[role] = hi / lo
-        gram += role_gram
-    gram = (gram + gram.T) * 0.5
-    probe_errors = []
-    grid = np.arange(2 * support, dtype=np.float64)
-    for probe_index, probe in enumerate((
-        np.sin(grid * 0.017) + 0.25 * np.cos(grid * 0.031),
-        np.cos(grid * 0.011) - 0.31 * np.sin(grid * 0.043),
-        np.where((grid.astype(np.int64) % 17) < 8, 1.0, -1.0),
-        np.exp(-grid / max(float(support), 1.0)) * np.cos(grid * 0.071),
-    )):
-        probe_fir = probe.reshape(2, support)
-        probe_transfer = np.fft.rfft(probe_fir, n=PERIOD, axis=1)
-        direct_prediction_energy = 0.0
-        direct_normal_vector = np.zeros(2 * support, dtype=np.float64)
-        for role in ("fit_a", "fit_b"):
-            for path in ("primary", "secondary"):
-                period = _central_role_period(submitted, list(plan["layout"]), path, role)
-                shifted_period = np.column_stack(
-                    [np.roll(period[:, channel], zeros[channel]) for channel in range(2)]
-                )
-                prediction = np.fft.irfft(
-                    np.sum(np.fft.rfft(shifted_period, axis=0) * probe_transfer.T, axis=1),
-                    n=PERIOD,
-                )
-                direct_prediction_energy += float(np.dot(prediction, prediction))
-                prediction_fft = np.fft.rfft(prediction)
-                for channel in range(2):
-                    adjoint_period = np.fft.irfft(
-                        np.conj(np.fft.rfft(shifted_period[:, channel]))
-                        * prediction_fft,
-                        n=PERIOD,
-                    )
-                    direct_normal_vector[
-                        channel * support:(channel + 1) * support
-                    ] += adjoint_period[:support]
-        gram_prediction_energy = float(probe @ gram @ probe)
-        gram_normal_vector = gram @ probe
-        vector_relative_error = float(
-            np.linalg.norm(direct_normal_vector - gram_normal_vector)
-            / max(np.linalg.norm(direct_normal_vector), np.linalg.norm(gram_normal_vector), 1.0)
-        )
-        relative_error = abs(direct_prediction_energy - gram_prediction_energy) / max(
-            abs(direct_prediction_energy), abs(gram_prediction_energy), 1.0
-        )
-        probe_errors.append({
-            "probe_index": probe_index,
-            "quadratic_form_relative_error": relative_error,
-            "normal_vector_relative_error": vector_relative_error,
-        })
-    quadratic_relative_error = max(row["quadratic_form_relative_error"] for row in probe_errors)
-    normal_vector_relative_error = max(row["normal_vector_relative_error"] for row in probe_errors)
-    if max(quadratic_relative_error, normal_vector_relative_error) > 1.0e-10:
-        raise ValueError("exact shifted Gram과 실제 circular operator가 일치하지 않습니다")
-    lo = float(eigh(gram, subset_by_index=[0, 0], eigvals_only=True)[0])
-    hi = float(
-        eigh(
-            gram,
-            subset_by_index=[2 * support - 1, 2 * support - 1],
-            eigvals_only=True,
-        )[0]
+        role_rows[role] = (rows[0], rows[1])
+    audit = exact_two_input_periodic_gram_audit(
+        role_rows,
+        role_order=("fit_a", "fit_b"),
+        support_samples=support,
+        zeros_by_input=zeros,
+        maximum_condition_number=MAX_CONDITION,
+        crosscheck_tolerance=1.0e-10,
     )
-    if not np.isfinite(lo) or not np.isfinite(hi) or lo <= 0.0:
-        raise ValueError("joint exact shifted Gram 고유값이 finite positive가 아닙니다")
-    # 여기서 보고하는 condition은 kappa_2(A)가 아니라
-    # periodic normal-matrix Gram의 kappa_2(G)=lambda_max/lambda_min=kappa_2(A)^2다.
-    condition = hi / lo
     operator_definition = {
         "operator": "two_row_two_input_periodic_convolution_finite_support",
         "period_samples": PERIOD,
@@ -502,28 +421,37 @@ def _exact_condition_audit_with_shifts_v5(
         "actual_submitted_pcm_sha256": _array_sha256(submitted),
         "operator_definition": operator_definition,
         "operator_definition_sha256": _payload_sha256(operator_definition),
-        "operator_quadratic_form_relative_error": quadratic_relative_error,
-        "operator_quadratic_form_probe_receipts": probe_errors,
-        "operator_normal_vector_relative_error": normal_vector_relative_error,
+        "operator_quadratic_form_relative_error": audit[
+            "quadratic_form_relative_error"
+        ],
+        "operator_quadratic_form_probe_receipts": audit[
+            "quadratic_form_probe_receipts"
+        ],
+        "operator_normal_vector_relative_error": audit["normal_vector_relative_error"],
         "operator_quadratic_form_maximum_allowed": 1.0e-10,
-        "operator_quadratic_form_crosscheck_passed": True,
+        "operator_quadratic_form_crosscheck_passed": audit["crosscheck_passed"],
         "zeros_before_fir_samples": [zeros[0], zeros[1]],
         "fit_roles": ["fit_a", "fit_b"],
-        "role_condition_numbers": role_conditions,
-        "periodic_normal_matrix_gram_condition_number": condition,
-        "joint_fit_condition_number": condition,
+        "role_condition_numbers": audit["role_condition_numbers"],
+        "periodic_normal_matrix_gram_condition_number": audit[
+            "periodic_normal_matrix_gram_condition_number"
+        ],
+        "joint_fit_condition_number": audit[
+            "periodic_normal_matrix_gram_condition_number"
+        ],
         "condition_scope": "exact finite-support periodic normal matrix X^T X; not an acoustic transfer condition",
-        "minimum_eigenvalue": lo,
-        "maximum_eigenvalue": hi,
+        "minimum_eigenvalue": audit["minimum_eigenvalue"],
+        "maximum_eigenvalue": audit["maximum_eigenvalue"],
         "maximum_allowed": MAX_CONDITION,
-        "passed": bool(condition <= MAX_CONDITION and all(v <= MAX_CONDITION for v in role_conditions.values())),
+        "passed": audit["passed"],
         "longer_supports": {
-            str(value): "NOT_AUDITED_NO_CLAIM" for value in SUPPORTS if value != support
+            str(value): "NOT_AUDITED_NO_CLAIM"
+            for value in SUPPORTS
+            if value != support
         },
     }
     receipt["canonical_payload_sha256"] = _payload_sha256(receipt)
     return receipt
-
 
 def exact_condition_audit_v5(
     plan: Mapping[str, Any], submitted_pcm: np.ndarray, *, support: int = 1_024

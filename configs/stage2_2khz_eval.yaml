@@ -1,0 +1,56 @@
+# Stage-2 physical single-point 평가 정책. 3 dB는 2 kHz octave의 합격 하한이고
+# 최적화 상한이 아니다. 모든 cell 합격 뒤 최저 gate margin을 먼저 키운다.
+schema: stage2_2khz_evaluation_policy_v1
+role: stage2_single_point_raw_off_on_evaluation
+
+control_band_contract:
+  id: broadband_2khz_octave_88_2828_v1
+  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+
+objective_octaves_hz: [125.0, 250.0, 500.0, 1000.0, 2000.0]
+low_mid_attenuation_threshold_db: 0.0
+low_mid_threshold_comparator: strictly_greater_than
+two_khz_attenuation_threshold_db: 3.0
+two_khz_threshold_comparator: greater_than_or_equal
+required_statistics: [family_mean, family_worst10_mean, family_cluster_ci95_lower]
+minimum_independent_groups_per_family_octave: 4
+minimum_source_density_ratio: 0.25
+
+# 2 kHz octave 평균이 좋아도 1.6 kHz 전이부만 near-zero인 모델은 실패다.
+# contract digest는 유지하고 auxiliary one-third-octave source-valid gate로 검사한다.
+one_point_six_khz_sentinel:
+  band_hz: [1425.437949, 1795.939277]
+  attenuation_threshold_db: 0.0
+  comparator: strictly_greater_than
+  required_statistics: [family_mean, family_worst10_mean, family_cluster_ci95_lower]
+  minimum_independent_groups_per_family: 4
+  minimum_source_density_ratio: 0.25
+
+do_no_harm:
+  observation_octaves_hz: [4000.0, 8000.0]
+  worst10_amplification_limit_db: 1.0
+  comparator: strictly_less_than
+
+runtime_gate:
+  inference_p99_ms_strictly_less_than: 3.0
+  inference_max_ms_strictly_less_than: 5.333333333333333
+  deadline_miss: 0
+  xrun: 0
+  fallback: 0
+  ring_drop_add: 0
+  sample_slip: 0
+  timing_residual_frames: 0
+  excess_backlog: 0
+
+checkpoint_selection:
+  all_frequency_family_dnh_runtime_gates_required: true
+  primary_order: maximize_minimum_frequency_family_dnh_runtime_gate_margin
+  secondary_order: maximize_two_khz_family_equal_mean_attenuation_db
+  three_db_is_minimum_not_optimization_target: true
+  one_point_six_khz_sentinel_runtime_exact_zero_required: true
+  test_data_for_selection_allowed: false
+
+claim_scope:
+  physical_single_point_only: true
+  spatial_quiet_zone_claim_allowed: false
+  full_octave_v3_claim_allowed: false

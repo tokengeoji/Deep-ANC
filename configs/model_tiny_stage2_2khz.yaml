@@ -1,0 +1,27 @@
+# HybridANCNet-tiny Stage-2 — 98 PCM measured actuator admission에 결속.
+name: hybrid_anc_tiny_stage2_2khz
+hop: 128
+win: 384
+in_channels: 2
+io_scale: 0.02
+
+encoder:
+  channels: 128
+
+tcn:
+  repeats: 2
+  dilations: [1, 2, 4, 8]
+  hidden: 256
+  kernel: 3
+
+glstm:
+  groups: 1
+  hidden_per_group: 192
+  insert_after_repeat: 2
+
+attention:
+  enabled: false
+
+limiter:
+  # Stage-2 P/S submitted actual-int16 peak 상한 98/32768. legacy 0.2 금지.
+  limit: 0.00299072265625
