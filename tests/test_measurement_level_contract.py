@@ -91,6 +91,19 @@ def test_meter_verdict_uses_contract_bounds():
     )
 
 
+def test_meter_verdict_exposes_exact_boundary_margin_without_relaxing_gate():
+    maximum = OFFICIAL_MEASUREMENT_LEVEL.meter_max_dbfs
+
+    at_boundary = set_amp_level.verdict(maximum)
+    just_outside = set_amp_level.verdict(np.nextafter(maximum, np.inf))
+
+    assert "맞았습니다" in at_boundary
+    assert "경계 여유 0.0000 dB" in at_boundary
+    assert "내리세요" in just_outside
+    assert f"상한 {maximum:+.4f}" in just_outside
+    assert "목표 대비 +2.0 dB" in just_outside
+
+
 def _hardware():
     return {
         "audio": {

@@ -112,16 +112,29 @@ def band_rms_dbfs(x: np.ndarray) -> float:
 
 def verdict(level: float) -> str:
     if level < OFFICIAL_MEASUREMENT_LEVEL.meter_min_dbfs:
+        below_min = OFFICIAL_MEASUREMENT_LEVEL.meter_min_dbfs - level
         return (
             f"↑ 올리세요 "
-            f"({OFFICIAL_MEASUREMENT_LEVEL.meter_target_dbfs - level:+.1f} dB 부족)"
+            f"(하한 {OFFICIAL_MEASUREMENT_LEVEL.meter_min_dbfs:+.4f} 대비 "
+            f"{below_min:.4f} dB 부족; 목표 대비 "
+            f"{OFFICIAL_MEASUREMENT_LEVEL.meter_target_dbfs - level:+.1f} dB)"
         )
     if level > OFFICIAL_MEASUREMENT_LEVEL.meter_max_dbfs:
+        above_max = level - OFFICIAL_MEASUREMENT_LEVEL.meter_max_dbfs
         return (
             f"↓ 내리세요 "
-            f"({level - OFFICIAL_MEASUREMENT_LEVEL.meter_target_dbfs:+.1f} dB 초과)"
+            f"(상한 {OFFICIAL_MEASUREMENT_LEVEL.meter_max_dbfs:+.4f} 대비 "
+            f"{above_max:.4f} dB 초과; 목표 대비 "
+            f"{level - OFFICIAL_MEASUREMENT_LEVEL.meter_target_dbfs:+.1f} dB)"
         )
-    return "✅ 맞았습니다 — 여기서 멈추세요"
+    margin = min(
+        level - OFFICIAL_MEASUREMENT_LEVEL.meter_min_dbfs,
+        OFFICIAL_MEASUREMENT_LEVEL.meter_max_dbfs - level,
+    )
+    return (
+        "✅ 맞았습니다 — 여기서 멈추세요 "
+        f"(가장 가까운 경계 여유 {margin:.4f} dB)"
+    )
 
 
 def strict_followup_command(
@@ -1045,7 +1058,7 @@ def measure(args) -> int:
         )
         return 1
     assert final is not None
-    print(f"\n마지막 구간 중앙값 {final:+.1f} dBFS — {verdict(final)}")
+    print(f"\n마지막 구간 중앙값 {final:+.4f} dBFS — {verdict(final)}")
     if target_pass:
         assert bootstrap_paths is not None
         raw_rel = bootstrap_paths["raw"].relative_to(REPO_ROOT)
