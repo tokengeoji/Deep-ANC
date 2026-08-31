@@ -165,7 +165,17 @@ def test_compact_digital_config_injects_lead_from_timing_contract_only():
     "mode_overrides, expected",
     [
         (["data.digital_primary_path_mode=rir_surrogate", "data.digital_reference_lead_samples=7"], 7),
-        (["data.reference_mode=acoustic", "data.digital_reference_lead_samples=0"], 0),
+        # canonical REF-only payload은 digital-reference 전용이다. acoustic
+        # diagnostic은 그 payload를 묵시적으로 재사용할 수 없고, top-level
+        # input-contract 경로를 명시적으로 해제해야만 한다.
+        (
+            [
+                "data_model_input_contract_config=null",
+                "data.reference_mode=acoustic",
+                "data.digital_reference_lead_samples=0",
+            ],
+            0,
+        ),
     ],
 )
 def test_noncompact_timing_modes_keep_their_explicit_legacy_lead(
@@ -182,6 +192,28 @@ def test_noncompact_timing_modes_keep_their_explicit_legacy_lead(
     )
     assert cfg["data"]["digital_reference_lead_samples"] == expected
     assert "training_timing_contract" not in cfg["data"]
+
+
+def test_acoustic_diagnostic_requires_explicit_ref_only_input_opt_out():
+    """acoustic 진단이 canonical output-clock input 계약을 묵시적으로 약화하지 않는다."""
+
+    common = [
+        "experiment_role=diagnostic_overfit",
+        "init_eligible=false",
+        "contract_run_dir=false",
+        "data.reference_mode=acoustic",
+        "data.digital_reference_lead_samples=0",
+    ]
+    with pytest.raises(ValueError, match="reference_mode=digital 전용"):
+        load_train_config(REPO_ROOT / "configs/train_pretrain_tiny.yaml", common)
+
+    cfg = load_train_config(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        ["data_model_input_contract_config=null", *common],
+    )
+    assert cfg["data_model_input_contract_config"] is None
+    assert "model_input_contract" not in cfg["data"]
+    assert "model_input_contract_sha256" not in cfg
 
 
 def test_compare_fxlms_is_explicit_legacy_only_and_never_reads_manual_delay():

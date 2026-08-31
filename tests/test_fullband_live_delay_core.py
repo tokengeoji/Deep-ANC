@@ -6,6 +6,7 @@ import time
 import numpy as np
 import pytest
 from scipy.interpolate import CubicSpline
+from scipy.linalg import toeplitz
 from scipy.signal import fftconvolve
 
 from deep_anc.audio_duplex_v5 import (
@@ -13,7 +14,6 @@ from deep_anc.audio_duplex_v5 import (
     capture_duplex_v5,
 )
 import deep_anc.dsp.fullband_live_delay_core as live_core
-import deep_anc.dsp.fullband_causal_v5 as causal_v5
 from deep_anc.dsp.fullband_causal_v5 import BLOCK, FS, build_plan_v5
 from deep_anc.dsp.fullband_live_delay_core import (
     EXPECTED_PCM_SHA256,
@@ -206,6 +206,22 @@ def _small_shifted_gram(
     rows_by_role: dict[str, np.ndarray], *, support: int,
     zeros: tuple[int, int], shift_by_row: bool = False,
 ) -> np.ndarray:
+    """Production circular operator와 독립적으로 조립한 작은 normal Gram."""
+
+    def periodic_cross_correlation(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        return np.fft.ifft(
+            np.conj(np.fft.fft(left.astype(np.float64)))
+            * np.fft.fft(right.astype(np.float64))
+        ).real
+
+    def toeplitz_gram_block(correlation: np.ndarray) -> np.ndarray:
+        offsets = np.arange(support)
+        # G[i,j] = sum_n x[n-i] y[n-j] = r_xy[i-j].
+        return toeplitz(
+            correlation[offsets % correlation.size],
+            correlation[(-offsets) % correlation.size],
+        )
+
     gram = np.zeros((2 * support, 2 * support), dtype=np.float64)
     for rows in rows_by_role.values():
         shifted = np.empty_like(rows)
@@ -216,7 +232,7 @@ def _small_shifted_gram(
         for left in range(2):
             for right in range(2):
                 correlation = sum(
-                    causal_v5._periodic_cross_correlation(
+                    periodic_cross_correlation(
                         shifted[row, :, left], shifted[row, :, right]
                     )
                     for row in range(2)
@@ -224,7 +240,7 @@ def _small_shifted_gram(
                 gram[
                     left * support:(left + 1) * support,
                     right * support:(right + 1) * support,
-                ] += causal_v5._toeplitz_gram_block(correlation, support)
+                ] += toeplitz_gram_block(correlation)
     return (gram + gram.T) * 0.5
 
 
