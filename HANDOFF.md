@@ -56,11 +56,11 @@ DAC를 다시 시도하지 않고 `ADMAIF1 ↔ I2S1 ↔ RT5640/J511` common-cloc
   그러므로 앰프 line input이 Jetson J511로 물리적으로 연결·감지됐다는 증거는 아직 없다.
   USB DAC 출력 측정의 재시도나 임계값 완화는 금지한다.
 - Elice는 실제 접속으로 A100 80GB 1장, torch `2.5.1+cu121`, CUDA 12.1,
-  `/home/elicer` 가용 약 247 GiB, clean `6034fe12227b82778793a6fe6e34450b5f6442ca`
-  checkout을 확인했다. GPU job은 0이다. 이 문서가 가리키는 새 exact `dev` tip을
-  push한 뒤에만 Elice에서 exact SHA checkout → `bash scripts/elice/setup_env.sh`로
-  environment freeze를 재발행한다. bootstrap/pretrain은 새 physical P/S가 유효해질
-  때까지 시작하지 않는다.
+  `/home/elicer` 가용 약 247 GiB를 확인했고, **현재 pushed `dev` tip**으로 clean
+  checkout한 뒤 `bash scripts/elice/setup_env.sh`를 성공적으로 실행했다. environment
+  freeze에는 Deep-ANC editable VCS commit과 exact torch wheel이 결속돼 있다. historical
+  SHA를 추측하지 말고 학습 직전에 remote `git rev-parse HEAD`와 freeze를 다시 대조한다.
+  GPU job은 0이며 bootstrap/pretrain은 새 physical P/S가 유효해질 때까지 시작하지 않는다.
 - Drive에는
   `DeepANC/jetson_measurements_20260901/stage2_output_master_diagnostic_20260831T163906_937061Z_011514f5b0f3f856/`
   아래 `diagnostic_raw.npz`(8,148,254 B), `clock_receipt.json`(37,688 B),
