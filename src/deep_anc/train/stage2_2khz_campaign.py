@@ -96,6 +96,27 @@ _FINETUNE_ARTIFACT_REQUIREMENTS = (
     "recorded_val_only_checkpoint_selection_and_test_once_receipt",
 )
 
+# 전체 campaign blocker 목록은 forensic 호환을 위해 유지하되, scratch pretrain을
+# 여는 데 필요한 항목과 100k 이후 fine-tune 항목을 별도 표면에 노출한다. 운영자가
+# checkpoint/fine-tune 미완료를 보고 "pretrain도 못 시작한다"고 오인하지 않게 한다.
+_PRETRAIN_CHECK_IDS = frozenset(
+    {
+        "artifact_duct_primary_path",
+        "artifact_duct_secondary_path",
+        "artifact_duct_plant_binding",
+        "artifact_data_manifest_bundle",
+        "artifact_data_lineage_receipt",
+        "artifact_data_frequency_coverage_receipt",
+        "artifact_data_transfer_bootstrap_receipt",
+        "artifact_canonical_pretrain_criterion_implementation_receipt",
+        "artifact_canonical_pretrain_model_config",
+        "external_contract_canonical_pretrain",
+        "canonical_pretrain_external_contract_cross_binding",
+        "typed_stage2_pretrain_execution",
+        "typed_stage2_execution_provenance",
+    }
+)
+
 
 def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
@@ -1010,6 +1031,12 @@ def audit_stage2_2khz_campaign(
     )
 
     blocked = [str(check["id"]) for check in checks if check["status"] != "PASS"]
+    pretrain_blocked = [
+        check_id for check_id in blocked if check_id in _PRETRAIN_CHECK_IDS
+    ]
+    post_pretrain_blocked = [
+        check_id for check_id in blocked if check_id not in _PRETRAIN_CHECK_IDS
+    ]
     status = (
         "READY_PRETRAIN"
         if typed_pretrain_ready and pretrain_external_valid
@@ -1046,6 +1073,12 @@ def audit_stage2_2khz_campaign(
         "runs_directory_created": False,
         "checks": checks,
         "blockers": blocked,
+        "pretrain_blockers": pretrain_blocked,
+        "post_pretrain_blockers": post_pretrain_blocked,
+        "pretrain_blocking_requirements": list(_PRETRAIN_ARTIFACT_REQUIREMENTS),
+        "post_pretrain_blocking_requirements": list(
+            _FINETUNE_ARTIFACT_REQUIREMENTS
+        ),
         "blocking_requirements": (
             list(_FINETUNE_ARTIFACT_REQUIREMENTS)
             if typed_pretrain_ready and pretrain_external_valid

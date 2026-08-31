@@ -282,6 +282,38 @@ def validate_output_master_success_telemetry(
         raise Stage2MeasurementV2Error(
             "output-master input-clock raw/mask/pre-post-roll contract가 다릅니다"
         )
+    start_marker = telemetry.get("input_frame_cursor_at_output_start")
+    complete_marker = telemetry.get("input_frame_cursor_at_output_complete")
+    pre_observed = telemetry.get("pre_roll_observed_input_frames")
+    post_observed = telemetry.get("post_roll_observed_input_frames")
+    marker_values = (start_marker, complete_marker, pre_observed, post_observed)
+    if any(
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        for value in marker_values
+    ):
+        raise Stage2MeasurementV2Error(
+            "output-master input/output software marker가 exact int가 아닙니다"
+        )
+    start_marker = int(start_marker)
+    complete_marker = int(complete_marker)
+    pre_observed = int(pre_observed)
+    post_observed = int(post_observed)
+    # 이 marker는 hardware latency/clock identity가 아니라 input callback cursor의
+    # software snapshot이다. 따라서 raw callback axis와 pre/post 구간에 exact하게
+    # 결속하되, async input과 output의 중간 frame 수가 같다고 주장하지 않는다.
+    if (
+        start_marker % BLOCK_SIZE
+        or complete_marker % BLOCK_SIZE
+        or not (0 <= start_marker <= complete_marker <= len(captured))
+        or pre_observed != start_marker
+        or post_observed != len(captured) - complete_marker
+        or pre_observed < PRE_ROLL_FRAMES
+        or post_observed < POST_ROLL_FRAMES
+    ):
+        raise Stage2MeasurementV2Error(
+            "output-master input callback axis/pre-output-post marker 결속이 다릅니다"
+        )
     _validate_callback_axis(telemetry, role="input", expected_frames=len(captured))
     _validate_callback_axis(telemetry, role="output", expected_frames=len(expected))
     elapsed = float(telemetry.get("capture_monotonic_elapsed_seconds", math.nan))
@@ -300,6 +332,11 @@ def validate_output_master_success_telemetry(
         "captured_input_pcm_sha256": _array_sha256(captured),
         "input_callback_count": len(telemetry["input_callback_sequence"]),
         "output_callback_count": len(telemetry["output_callback_sequence"]),
+        "input_frame_cursor_at_output_start": start_marker,
+        "input_frame_cursor_at_output_complete": complete_marker,
+        "pre_roll_observed_input_frames": pre_observed,
+        "post_roll_observed_input_frames": post_observed,
+        "software_markers_are_absolute_hardware_latency_authority": False,
         "callback_status_nonzero_count": 0,
         "xrun_count": 0,
     }

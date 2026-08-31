@@ -20,16 +20,22 @@ import math
 import os
 import re
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import soundfile as sf
+import torch
+import yaml
 from scipy.signal import welch
 
 from ..data.public_lineage import validate_recorded_clip_lineage
-from ..data.stage2_public_recorded_lineage_audit import audit_lineage_rows
+from ..data.stage2_pretrain_data_issuer import (
+    stage2_recorded_public_intersection,
+    validate_elice_bootstrap_inputs,
+)
 from ..dsp.stage2_2khz_contract import (
     STAGE2_2KHZ_SOURCE_FAMILIES,
     Stage2TwoKilohertzContract,
@@ -47,10 +53,12 @@ from .stage2_2khz_execution import (
     STAGE2_2KHZ_TRAINER_ADAPTER_SCHEMA,
     Stage2FamilyComponentBatchSampler,
     Stage2SamplerRecord,
+    require_stage2_actuator_limit,
 )
 from .stage2_2khz_git_authority import (
     verify_source_commit_ancestor,
     verify_tracked_head_authority,
+    verify_tracked_head_file,
 )
 
 
@@ -58,9 +66,13 @@ STAGE2_PUBLIC_MANIFEST_BUNDLE_SCHEMA = "stage2_2khz_public_manifest_bundle_v1"
 STAGE2_PUBLIC_LINEAGE_RECEIPT_SCHEMA = "stage2_2khz_public_lineage_receipt_v2"
 STAGE2_PUBLIC_COVERAGE_RECEIPT_SCHEMA = "stage2_2khz_public_frequency_coverage_v2"
 STAGE2_TRANSFER_BOOTSTRAP_RECEIPT_SCHEMA = "stage2_2khz_transfer_bootstrap_receipt_v1"
-STAGE2_DNH_CALIBRATION_RECEIPT_SCHEMA = "stage2_2khz_dnh_gradient_calibration_v1"
+# v1은 NPZ의 SHA만 기록해 typed admission이 실제 tensor를 다시 열어
+# gradient를 재계산할 수 없었다. v2는 held NPZ의 path+SHA를 함께 봉인했고,
+# v3는 calibration NPZ의 model config/initial-state SHA도 criterion/profile 및
+# actual fresh-model state 재계산에 결속한다.
+STAGE2_DNH_CALIBRATION_RECEIPT_SCHEMA = "stage2_2khz_dnh_gradient_calibration_v3"
 STAGE2_CRITERION_IMPLEMENTATION_RECEIPT_SCHEMA = (
-    "stage2_2khz_criterion_implementation_receipt_v1"
+    "stage2_2khz_criterion_implementation_receipt_v2"
 )
 STAGE2_PRETRAIN_TYPED_ADMISSION_SCHEMA = "stage2_2khz_typed_pretrain_admission_v1"
 STAGE2_PUBLIC_DATA_AUTHORITY_SCHEMA = "stage2_2khz_public_data_git_authority_v1"
@@ -80,6 +92,7 @@ _RECORDED_HOLDOUT_PATH = "data/manifests/recorded_holdout.json"
 _RECORDED_SYNTHETIC_INTERSECTION_ALGORITHM = (
     "transitive_basename_content_sha256_lineage_keys_v1"
 )
+_CANONICAL_PRETRAIN_PROFILE_PATH = "configs/stage2_2khz_train_pretrain.yaml"
 
 
 def _require_sha256(value: object, *, label: str) -> str:
@@ -166,6 +179,175 @@ def _json(content: bytes, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} root는 mapping이어야 합니다")
     return value
+
+
+def _yaml_mapping(content: bytes, *, label: str) -> dict[str, Any]:
+    """tracked profile/model YAML을 mapping으로만 읽는다."""
+
+    try:
+        value = yaml.safe_load(content.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"{label}는 UTF-8 YAML이어야 합니다") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} root는 mapping이어야 합니다")
+    return value
+
+
+def _artifact_ref(value: object, *, label: str) -> tuple[str, str]:
+    """path/SHA 쌍의 모양과 SHA 문법을 한 곳에서 강제한다."""
+
+    if not isinstance(value, Mapping) or set(value) != {"path", "sha256"}:
+        raise ValueError(f"{label} ref가 exact하지 않습니다")
+    path = value.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{label}.path가 비었습니다")
+    return path, _require_sha256(value.get("sha256"), label=f"{label}.sha256")
+
+
+def _canonical_pretrain_model_ref(
+    root: Path,
+) -> tuple[tuple[str, str], int, int]:
+    """actual tracked canonical profile에서 model/seed/batch를 재도출한다.
+
+    criterion이 자기 자신을 가리키는 profile SHA를 들고 있으면 implementation
+    receipt path 때문에 순환 결속이 생긴다. 대신 admission은 이미 exact-clean
+    origin/dev authority를 확인한 동일 checkout에서 canonical pretrain profile의
+    model ref, seed, batch를 다시 읽어 criterion과 비교한다.
+    """
+
+    profile_bytes, _profile_sha, _head = verify_tracked_head_file(
+        root, _CANONICAL_PRETRAIN_PROFILE_PATH
+    )
+    profile = _yaml_mapping(profile_bytes, label="Stage-2 canonical pretrain profile")
+    execution = profile.get("execution")
+    if not isinstance(execution, Mapping):
+        raise ValueError("Stage-2 canonical pretrain execution profile이 없습니다")
+    model_ref = _artifact_ref(
+        execution.get("model_config"),
+        label="Stage-2 canonical pretrain model config",
+    )
+    seed = profile.get("seed")
+    batch_size = execution.get("batch_size")
+    if type(seed) is not int or int(seed) != 20260803:
+        raise ValueError("Stage-2 canonical pretrain profile seed가 exact하지 않습니다")
+    if type(batch_size) is not int or int(batch_size) != 96:
+        raise ValueError("Stage-2 canonical pretrain profile batch_size가 exact하지 않습니다")
+    return model_ref, int(seed), int(batch_size)
+
+
+def _fresh_calibration_model(
+    model_config: Mapping[str, Any], *, seed: int
+) -> tuple[torch.nn.Module, str]:
+    """actual model config+seed로 fresh scratch model/state digest를 만든다.
+
+    JSON receipt의 state SHA 숫자를 믿지 않는다. CPU RNG state도 fork로 복원해
+    admission caller의 RNG 상태를 바꾸지 않으며 CUDA context를 만들지 않는다.
+    """
+
+    if not isinstance(model_config, Mapping):
+        raise ValueError("Stage-2 model config는 mapping이어야 합니다")
+    if type(seed) is not int or int(seed) != 20260803:
+        raise ValueError("Stage-2 model initialization seed가 canonical과 다릅니다")
+    try:
+        in_channels = int(model_config.get("in_channels", 0))
+        hop = int(model_config.get("hop", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Stage-2 model config channel/hop가 정수가 아닙니다") from exc
+    if in_channels != 2 or hop != 128:
+        raise ValueError("Stage-2 calibrated model은 2-channel/hop=128 Tiny여야 합니다")
+    require_stage2_actuator_limit(model_config)
+
+    # issuer -> admission constants import cycle을 module import 시 만들지 않는다.
+    from ..models import build_model  # pylint: disable=import-outside-toplevel
+    from .stage2_2khz_pretrain_issuer import (  # pylint: disable=import-outside-toplevel
+        model_initial_state_sha256,
+    )
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(seed))
+        model = build_model(dict(model_config)).cpu().eval()
+        return model, model_initial_state_sha256(model)
+
+
+def _rebuild_model_initial_state_sha256(
+    model_config: Mapping[str, Any], *, seed: int
+) -> str:
+    """fresh scratch parameter/buffer SHA만 필요한 caller용 wrapper."""
+
+    _model, digest = _fresh_calibration_model(model_config, seed=seed)
+    return digest
+
+
+def _require_rebuilt_model_initial_state_sha256(
+    model_config: Mapping[str, Any], *, seed: int, expected_sha256: str
+) -> None:
+    """fresh model state가 declared calibration state와 exact한지 fail-closed 검사한다."""
+
+    expected = _require_sha256(
+        expected_sha256, label="criterion model initial state SHA"
+    )
+    actual = _rebuild_model_initial_state_sha256(model_config, seed=seed)
+    if actual != expected:
+        raise ValueError(
+            "Stage-2 calibration model initial-state SHA가 actual config+seed 재계산과 다릅니다"
+        )
+
+
+def _validate_calibration_model_binding(
+    *,
+    root: Path,
+    snapshot_metadata: Mapping[str, Any],
+    criterion_model_config_ref: tuple[str, str],
+    criterion_model_initial_state_sha256: str,
+    criterion_seed: int,
+    criterion_batch_size: int,
+) -> None:
+    """calibration NPZ의 model provenance를 profile/actual model로 재검증한다."""
+
+    profile_model_ref, profile_seed, profile_batch_size = _canonical_pretrain_model_ref(
+        root
+    )
+    if criterion_model_config_ref != profile_model_ref:
+        raise ValueError(
+            "Stage-2 criterion model config가 canonical pretrain profile과 다릅니다"
+        )
+    if criterion_seed != profile_seed or criterion_batch_size != profile_batch_size:
+        raise ValueError("Stage-2 criterion seed/batch가 canonical pretrain profile과 다릅니다")
+
+    model_path, model_bytes, model_sha = _ref(
+        root,
+        path=criterion_model_config_ref[0],
+        sha256=criterion_model_config_ref[1],
+        label="Stage-2 criterion model config",
+    )
+    # profile ref만 검증하고 working tree bytes를 재사용하지 않는다. exact-clean
+    # tracked blob 자체와 held snapshot이 모두 같은 bytes여야 한다.
+    tracked_bytes, tracked_sha, _tracked_head = verify_tracked_head_file(
+        root, criterion_model_config_ref[0]
+    )
+    if tracked_sha != model_sha or tracked_bytes != model_bytes:
+        raise ValueError("Stage-2 criterion model config tracked/held bytes가 다릅니다")
+    del model_path
+    model_config = _yaml_mapping(model_bytes, label="Stage-2 criterion model config")
+
+    expected_config_sha = _require_sha256(
+        criterion_model_config_ref[1], label="criterion model config SHA"
+    )
+    expected_initial_state_sha = _require_sha256(
+        criterion_model_initial_state_sha256,
+        label="criterion model initial state SHA",
+    )
+    if snapshot_metadata["model_config_sha256"] != expected_config_sha:
+        raise ValueError("Stage-2 calibration batch model config SHA가 criterion/profile과 다릅니다")
+    if snapshot_metadata["model_initial_state_sha256"] != expected_initial_state_sha:
+        raise ValueError(
+            "Stage-2 calibration batch model initial-state SHA가 criterion과 다릅니다"
+        )
+    _require_rebuilt_model_initial_state_sha256(
+        model_config,
+        seed=criterion_seed,
+        expected_sha256=expected_initial_state_sha,
+    )
 
 
 def _contract_entry() -> dict[str, str]:
@@ -324,6 +506,7 @@ def _recompute_qualified_sources(
     *,
     records: Sequence[Stage2SamplerRecord],
     sources: Sequence[Stage2PretrainSource],
+    workers: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """actual manifest rows와 동일 source bytes에서 qualified set 전체를 유도한다."""
 
@@ -349,7 +532,21 @@ def _recompute_qualified_sources(
         for split in _SPLITS
     }
     threshold = float(contract.minimum_source_density_ratio)
-    for dataset_index in sorted(records_by_index):
+    ordered_indices = sorted(records_by_index)
+    if workers is None:
+        worker_count = min(16, max(1, int(os.cpu_count() or 1)))
+    elif (
+        isinstance(workers, bool)
+        or not isinstance(workers, int)
+        or not 1 <= workers <= 16
+    ):
+        raise ValueError("Stage-2 admission workers는 1..16 integer여야 합니다")
+    else:
+        worker_count = workers
+
+    def analyze(
+        dataset_index: int,
+    ) -> tuple[Stage2SamplerRecord, Stage2PretrainSource, tuple[float, ...], float]:
         record = records_by_index[dataset_index]
         source = sources_by_index[dataset_index]
         _, content, actual_sha = _ref(
@@ -365,12 +562,23 @@ def _recompute_qualified_sources(
             expected_sample_rate=source.native_sample_rate,
             contract=contract,
         )
-        entry = _coverage_entry(record, source)
-        for band_index, ratio in enumerate(ratios):
-            if ratio >= threshold:
-                octave[record.split][record.source_family][band_index].append(entry)
-        if sentinel_ratio >= threshold:
-            sentinel[record.split][record.source_family].append(entry)
+        return record, source, ratios, sentinel_ratio
+
+    # 입력 dataset_index 순서를 map이 보존하므로 worker scheduling과 무관하게
+    # receipt qualified-source 배열과 예외 surface 순서가 결정론적이다.
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="stage2-admission-density",
+    ) as executor:
+        for record, source, ratios, sentinel_ratio in executor.map(
+            analyze, ordered_indices
+        ):
+            entry = _coverage_entry(record, source)
+            for band_index, ratio in enumerate(ratios):
+                if ratio >= threshold:
+                    octave[record.split][record.source_family][band_index].append(entry)
+            if sentinel_ratio >= threshold:
+                sentinel[record.split][record.source_family].append(entry)
 
     minimum = int(contract.minimum_groups_per_family_octave)
     for split in _SPLITS:
@@ -449,6 +657,8 @@ def _validate_manifest_bundle(
     source_sha_splits: dict[str, set[str]] = {}
     source_sha_components: dict[str, set[str]] = {}
     lineage_splits: dict[str, set[str]] = {}
+    lineage_components: dict[str, set[str]] = {}
+    component_families: dict[str, set[str]] = {}
     for row in items:
         keys = {
             "dataset_index",
@@ -503,10 +713,12 @@ def _validate_manifest_bundle(
         split = str(row["split"])
         component = str(row["component_id"])
         component_splits.setdefault(component, set()).add(split)
+        component_families.setdefault(component, set()).add(str(row["source_family"]))
         source_sha_splits.setdefault(source_sha, set()).add(split)
         source_sha_components.setdefault(source_sha, set()).add(component)
         for key in lineage:
             lineage_splits.setdefault(key, set()).add(split)
+            lineage_components.setdefault(key, set()).add(component)
         records.append(
             Stage2SamplerRecord(
                 dataset_index=index,
@@ -543,6 +755,24 @@ def _validate_manifest_bundle(
         raise ValueError(
             "Stage-2 public manifest 동일 source bytes SHA가 여러 component_id로 "
             f"분할됐습니다: {duplicate_component_identity[0]}"
+        )
+    crossing_family = sorted(
+        component
+        for component, families in component_families.items()
+        if len(families) > 1
+    )
+    if crossing_family:
+        raise ValueError(
+            "Stage-2 public manifest component가 source family를 가로지릅니다: "
+            f"{crossing_family[0]}"
+        )
+    duplicate_lineage_identity = sorted(
+        key for key, components in lineage_components.items() if len(components) > 1
+    )
+    if duplicate_lineage_identity:
+        raise ValueError(
+            "Stage-2 public manifest original lineage key가 여러 component_id에 있습니다: "
+            f"{duplicate_lineage_identity[0]}"
         )
     cells = {
         (split, family): {
@@ -599,39 +829,9 @@ def _validate_recorded_synthetic_lineage(
     items = manifest_payload.get("items")
     if not isinstance(items, list) or not items:
         raise ValueError("Stage-2 public manifest item이 비었습니다")
-    public_rows = [
-        {
-            "split": str(row["split"]),
-            "basename": Path(str(row["path"])).name.casefold(),
-            "content_sha256": str(row["content_sha256"]),
-            "lineage_keys": list(row["lineage_keys"]),
-        }
-        for row in items
-    ]
-    recorded_identity_rows = [
-        {
-            "basename": row["clip"],
-            "content_sha256": row["content_sha256"],
-            "lineage_keys": list(row["lineage_keys"]),
-        }
-        for row in recorded_rows
-    ]
-    overlap = audit_lineage_rows(
-        recorded_rows=recorded_identity_rows,
-        public_rows_by_manifest={"stage2_public_manifest_bundle": public_rows},
-    )
-    inventories = overlap.get("inventories")
-    if not isinstance(inventories, list) or len(inventories) != 1:
-        raise ValueError("Stage-2 recorded/synthetic lineage audit projection이 불완전합니다")
-    inventory = inventories[0]
-    if (
-        not isinstance(inventory, dict)
-        or int(inventory.get("components_crossing_public_splits", -1)) != 0
-        or int(inventory.get("public_rows_in_cross_split_components", -1)) != 0
-    ):
-        raise ValueError("Stage-2 public lineage transitive component가 split을 가로집니다")
-    actual_intersection = int(
-        overlap.get("total_transitive_recorded_component_rows", -1)
+    actual_intersection = stage2_recorded_public_intersection(
+        recorded_rows=recorded_rows,
+        public_items=items,
     )
     declared_intersection = lineage_receipt.get(
         "recorded_synthetic_lineage_intersection_count"
@@ -683,6 +883,8 @@ def _validate_data_receipts(
     coverage_ref: tuple[str, str],
     bootstrap_ref: tuple[str, str],
     source_inventory_commit_sha: str,
+    workers: int | None = None,
+    require_stage2_physical_transfer: bool = False,
 ) -> tuple[str, str, str]:
     contract = Stage2TwoKilohertzContract.canonical()
     _, lineage_bytes, lineage_sha = _ref(
@@ -772,6 +974,7 @@ def _validate_data_receipts(
         root,
         records=manifest_records,
         sources=manifest_sources,
+        workers=workers,
     )
     if coverage["qualified_sources_by_split_family_octave"] != qualified_octave:
         raise ValueError(
@@ -794,13 +997,80 @@ def _validate_data_receipts(
         label="Stage-2 transfer bootstrap receipt",
     )
     bootstrap = _json(bootstrap_bytes, label="Stage-2 transfer bootstrap receipt")
+    bootstrap_keys = {
+        "schema",
+        "status",
+        "canonical_pretrain_eligible",
+        "control_band_contract_sha256",
+        "manifest_bundle_sha256",
+        "elice_bootstrap_receipt",
+        "existing_instance_cache_reused",
+        "all_declared_source_bytes_rehashed",
+        "stale_run_or_checkpoint_auto_resume_allowed",
+        "scratch_new_run_directory_required",
+        "source_inventory_commit_sha",
+    }
+    if set(bootstrap) != bootstrap_keys:
+        raise ValueError("Stage-2 transfer/bootstrap receipt key 집합이 exact하지 않습니다")
+    origin_ref = bootstrap.get("elice_bootstrap_receipt")
+    if (
+        not isinstance(origin_ref, dict)
+        or set(origin_ref) != {"path", "sha256"}
+        or not isinstance(origin_ref.get("path"), str)
+        or not origin_ref["path"]
+        or type(bootstrap.get("existing_instance_cache_reused")) is not bool
+    ):
+        raise ValueError("Stage-2 transfer/bootstrap Elice cache provenance ref가 exact하지 않습니다")
+    origin_sha = _require_sha256(
+        origin_ref.get("sha256"), label="Elice bootstrap receipt SHA"
+    )
+    try:
+        origin_bootstrap = validate_elice_bootstrap_inputs(
+            root,
+            source_inventory_commit_sha=source_inventory_commit_sha,
+            bootstrap_receipt_path=str(origin_ref["path"]),
+            expected_bootstrap_receipt_sha256=origin_sha,
+            require_stage2_physical_transfer=require_stage2_physical_transfer,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Stage-2 transfer/bootstrap Elice cache provenance를 재검증할 수 없습니다"
+        ) from exc
+    if origin_bootstrap["bootstrap_receipt"]["path"] != origin_ref["path"]:
+        raise ValueError(
+            "Stage-2 transfer/bootstrap Elice bootstrap receipt path가 canonical relative path가 아닙니다"
+        )
+    if require_stage2_physical_transfer:
+        transferred_physical = origin_bootstrap.get("stage2_2khz_physical_transfer")
+        if (
+            not isinstance(transferred_physical, Mapping)
+            or set(transferred_physical) != {"plant_binding", "physical_authority"}
+            or not isinstance(transferred_physical.get("plant_binding"), Mapping)
+            or set(transferred_physical["plant_binding"]) != {"path", "sha256"}
+            or not isinstance(transferred_physical["physical_authority"], Mapping)
+            or set(transferred_physical["physical_authority"]) != {"path", "sha256"}
+            or transferred_physical["plant_binding"].get("sha256")
+            != _require_sha256(
+                plant_binding_file_sha256,
+                label="Stage-2 transfer physical plant binding SHA",
+            )
+        ):
+            raise ValueError(
+                "Stage-2 transfer/bootstrap physical typed role이 canonical plant binding과 다릅니다"
+            )
     expected_bootstrap = {
         "schema": STAGE2_TRANSFER_BOOTSTRAP_RECEIPT_SCHEMA,
         "status": "PASS",
         "canonical_pretrain_eligible": True,
         "control_band_contract_sha256": contract.digest(),
         "manifest_bundle_sha256": manifest_sha,
-        "existing_instance_cache_reused": True,
+        "elice_bootstrap_receipt": {
+            "path": str(origin_ref["path"]),
+            "sha256": origin_sha,
+        },
+        "existing_instance_cache_reused": bool(
+            origin_bootstrap["archive_cache_reused"]
+        ),
         "all_declared_source_bytes_rehashed": True,
         "stale_run_or_checkpoint_auto_resume_allowed": False,
         "scratch_new_run_directory_required": True,
@@ -819,6 +1089,8 @@ def _load_self_attested_stage2_pretrain_data_binding_for_test(
     coverage_ref: tuple[str, str],
     bootstrap_ref: tuple[str, str],
     plant_binding_file_sha256: str,
+    workers: int | None = None,
+    require_stage2_physical_transfer: bool = False,
 ) -> Stage2PretrainDataBinding:
     root = Path(repository_root).resolve(strict=True)
     manifest, records, sources, manifest_sha = _validate_manifest_bundle(
@@ -836,6 +1108,8 @@ def _load_self_attested_stage2_pretrain_data_binding_for_test(
         lineage_ref=lineage_ref,
         coverage_ref=coverage_ref,
         bootstrap_ref=bootstrap_ref,
+        workers=workers,
+        require_stage2_physical_transfer=require_stage2_physical_transfer,
     )
     return Stage2PretrainDataBinding(
         manifest_bundle_sha256=manifest_sha,
@@ -844,6 +1118,36 @@ def _load_self_attested_stage2_pretrain_data_binding_for_test(
         transfer_bootstrap_receipt_sha256=bootstrap_sha,
         records=records,
         sources=sources,
+    )
+
+
+def validate_stage2_pretrain_data_candidate(
+    *,
+    repository_root: str | Path,
+    manifest_ref: tuple[str, str],
+    lineage_ref: tuple[str, str],
+    coverage_ref: tuple[str, str],
+    bootstrap_ref: tuple[str, str],
+    plant_binding_file_sha256: str,
+    workers: int | None = None,
+) -> Stage2PretrainDataBinding:
+    """issuer 직후 candidate bytes를 재검증하되 학습 authority는 부여하지 않는다.
+
+    production issuer는 아직 Git에 review/commit되지 않은 새 artifact를 검사해야 하므로
+    tracked authority loader를 호출할 수 없다. 이 함수는 동일한 actual source decode,
+    holdout lineage와 receipt exact 검증을 모두 수행하지만 반환값만으로 trainer를 열 수
+    없으며, 이후 :func:`load_stage2_pretrain_data_binding`의 tracked human authority가
+    별도로 필요하다.
+    """
+
+    return _load_self_attested_stage2_pretrain_data_binding_for_test(
+        repository_root=repository_root,
+        manifest_ref=manifest_ref,
+        lineage_ref=lineage_ref,
+        coverage_ref=coverage_ref,
+        bootstrap_ref=bootstrap_ref,
+        plant_binding_file_sha256=plant_binding_file_sha256,
+        workers=workers,
     )
 
 
@@ -918,6 +1222,7 @@ def load_stage2_pretrain_data_binding(
         coverage_ref=coverage_ref,
         bootstrap_ref=bootstrap_ref,
         plant_binding_file_sha256=plant_binding_file_sha256,
+        require_stage2_physical_transfer=True,
     )
 
 
@@ -1019,6 +1324,8 @@ def load_stage2_pretrain_typed_admission(
         "scratch_runner_implementation",
         "sampler_receipt",
         "dnh_calibration_receipt",
+        "model_config",
+        "model_initial_state_sha256",
         "batch_size",
         "seed",
         "generic_stage1_loss_used",
@@ -1069,6 +1376,19 @@ def load_stage2_pretrain_typed_admission(
 
     sampler_ref = criterion["sampler_receipt"]
     dnh_ref = criterion["dnh_calibration_receipt"]
+    criterion_model_config_ref = _artifact_ref(
+        criterion["model_config"], label="Stage-2 criterion model config"
+    )
+    criterion_model_initial_state_sha = _require_sha256(
+        criterion["model_initial_state_sha256"],
+        label="Stage-2 criterion model initial state SHA",
+    )
+    criterion_seed = criterion["seed"]
+    criterion_batch_size = criterion["batch_size"]
+    if type(criterion_seed) is not int or int(criterion_seed) != 20260803:
+        raise ValueError("Stage-2 criterion seed가 canonical과 다릅니다")
+    if type(criterion_batch_size) is not int or int(criterion_batch_size) != 96:
+        raise ValueError("Stage-2 criterion batch_size가 canonical과 다릅니다")
     for entry, label in ((sampler_ref, "sampler receipt"), (dnh_ref, "DNH receipt")):
         if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
             raise ValueError(f"Stage-2 {label} ref가 exact하지 않습니다")
@@ -1080,8 +1400,8 @@ def load_stage2_pretrain_typed_admission(
     )
     sampler = Stage2FamilyComponentBatchSampler(
         data.records,
-        batch_size=int(criterion["batch_size"]),
-        seed=int(criterion["seed"]),
+        batch_size=criterion_batch_size,
+        seed=criterion_seed,
         split="train",
         manifest_bundle_sha256=data.manifest_bundle_sha256,
         sampler_receipt_sha256=sampler_sha,
@@ -1106,9 +1426,11 @@ def load_stage2_pretrain_typed_admission(
         "sampler_receipt_sha256",
         "actual_causal_secondary_output",
         "actual_family_balanced_batch",
+        "model_config_sha256",
+        "model_initial_state_sha256",
         "lambda_dnh",
         "output_y_gradient_share",
-        "calibration_batch_sha256",
+        "calibration_batch",
     }
     if not isinstance(dnh, dict) or set(dnh) != expected_dnh_keys:
         raise ValueError("Stage-2 DNH receipt key 집합이 exact하지 않습니다")
@@ -1122,6 +1444,8 @@ def load_stage2_pretrain_typed_admission(
         "sampler_receipt_sha256": sampler_sha,
         "actual_causal_secondary_output": True,
         "actual_family_balanced_batch": True,
+        "model_config_sha256": criterion_model_config_ref[1],
+        "model_initial_state_sha256": criterion_model_initial_state_sha,
     }
     for key, expected in fixed_dnh.items():
         if dnh[key] != expected:
@@ -1130,7 +1454,58 @@ def load_stage2_pretrain_typed_admission(
     lambda_dnh = float(dnh["lambda_dnh"])
     if not 0.2 <= gradient_share <= 0.4 or not math.isfinite(lambda_dnh) or lambda_dnh <= 0.0:
         raise ValueError("Stage-2 DNH gradient share/lambda가 admission 범위 밖입니다")
-    _require_sha256(dnh["calibration_batch_sha256"], label="DNH calibration batch SHA")
+    calibration_ref = dnh["calibration_batch"]
+    if not isinstance(calibration_ref, dict) or set(calibration_ref) != {"path", "sha256"}:
+        raise ValueError("Stage-2 DNH calibration batch ref가 exact하지 않습니다")
+    _batch_path, batch_bytes, batch_sha = _ref(
+        root,
+        path=calibration_ref["path"],
+        sha256=calibration_ref["sha256"],
+        label="Stage-2 DNH actual calibration batch",
+    )
+
+    # issuer가 만든 숫자를 믿지 않는다. _ref의 nofollow/stable snapshot bytes에서
+    # tensor metadata, stored S*y, 그리고 full-objective gradient를 다시 계산한다.
+    # local import는 issuer↔admission schema import cycle을 import-time에 만들지 않는다.
+    from .stage2_2khz_pretrain_issuer import (  # pylint: disable=import-outside-toplevel
+        calibrate_dnh_from_reloaded_batch,
+        load_calibration_batch_bytes,
+    )
+
+    snapshot = load_calibration_batch_bytes(batch_bytes, expected_sha256=batch_sha)
+    expected_snapshot_metadata = {
+        "control_band_contract_sha256": contract.digest(),
+        "plant_binding_file_sha256": plant_binding_ref[1],
+        "plant_binding_runtime_sha256": binding.digest(),
+        "primary_path_sha256": binding.primary_path_sha256,
+        "secondary_path_sha256": binding.secondary_path_sha256,
+        "manifest_bundle_sha256": data.manifest_bundle_sha256,
+        "sampler_receipt_sha256": sampler_sha,
+    }
+    for key, expected in expected_snapshot_metadata.items():
+        if snapshot.metadata[key] != expected:
+            raise ValueError(f"Stage-2 DNH calibration batch {key}가 typed artifact와 다릅니다")
+    if int(np.asarray(snapshot.arrays["y_target"]).shape[0]) != criterion_batch_size:
+        raise ValueError("Stage-2 DNH calibration batch size가 criterion과 다릅니다")
+    _validate_calibration_model_binding(
+        root=root,
+        snapshot_metadata=snapshot.metadata,
+        criterion_model_config_ref=criterion_model_config_ref,
+        criterion_model_initial_state_sha256=criterion_model_initial_state_sha,
+        criterion_seed=criterion_seed,
+        criterion_batch_size=criterion_batch_size,
+    )
+    recalibrated = calibrate_dnh_from_reloaded_batch(snapshot, binding=binding)
+    recalibrated_share = float(recalibrated["output_y_gradient_share"])
+    recalibrated_lambda = float(recalibrated["lambda_dnh"])
+    if not math.isclose(
+        gradient_share, recalibrated_share, rel_tol=1e-10, abs_tol=1e-12
+    ) or not math.isclose(
+        lambda_dnh, recalibrated_lambda, rel_tol=1e-10, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "Stage-2 DNH receipt scalar가 actual calibration NPZ 재계산과 다릅니다"
+        )
     loss_config = Stage2TwoKilohertzLossConfig(
         control_band_contract=contract,
         control_band_contract_sha256=contract.digest(),

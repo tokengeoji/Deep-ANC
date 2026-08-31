@@ -294,6 +294,37 @@ def test_inventory_rejects_manifest_self_reference() -> None:
         )
 
 
+def test_inventory_accepts_stage2_physical_schema_v3_file_list() -> None:
+    raw_payload: dict[str, Any] = {
+        "schema_version": 3,
+        "files": [
+            {
+                "path": "results/stage2_2khz_ps_v3/plant_binding.json",
+                "sha256": "a" * 64,
+                "size": 17,
+            },
+            {
+                "path": "authority/stage2_2khz_physical.json",
+                "sha256": "b" * 64,
+                "size": 19,
+            },
+        ],
+    }
+    raw = json.dumps(raw_payload).encode()
+
+    schema, inventory = push._load_inventory(
+        raw,
+        manifest_sha256=hashlib.sha256(raw).hexdigest(),
+        manifest_size=len(raw),
+    )
+
+    assert schema == 3
+    assert [entry.path for entry in inventory] == [
+        "authority/stage2_2khz_physical.json",
+        "results/stage2_2khz_ps_v3/plant_binding.json",
+    ]
+
+
 def test_elice_guide_separates_v1_selector_and_v2_training_bootstrap() -> None:
     guide = (push.REPO_ROOT / "docs/05_training_elice.md").read_text(encoding="utf-8")
     cursor = 0

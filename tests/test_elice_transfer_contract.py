@@ -25,6 +25,7 @@ from deep_anc.data.transfer_contract import (
     TransferContractError,
     _canonical_recorded_aggregate,
     bind_recorded_transfer_config,
+    require_stage2_2khz_physical_transfer_manifest,
     validate_transfer_manifest,
 )
 from deep_anc.data.recorded_dataset import RecordedANCDataset
@@ -889,6 +890,124 @@ def test_transfer_manifest_validates_exact_82_session_bundle(tmp_path: Path) -> 
     assert summary["file_count"] == len(files)
 
 
+def test_stage2_physical_transfer_requires_roles_pointer_and_actual_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def add(relative: str, content: bytes) -> dict[str, object]:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        return {
+            "path": relative,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+
+    binding = add(
+        "results/stage2_2khz_ps_v3/plant_binding.json",
+        b"fixture physical binding",
+    )
+    authority = add(
+        "authority/stage2_2khz_physical.json",
+        b"fixture tracked authority",
+    )
+    payload = {"stage2_2khz_physical": {
+        "plant_binding": {"path": binding["path"], "sha256": binding["sha256"]},
+        "physical_authority": {
+            "path": authority["path"],
+            "sha256": authority["sha256"],
+        },
+    }}
+    calls: list[tuple[Path, str, str]] = []
+
+    def verify(*, repo_root: Path, binding_path: str, binding_sha256: str) -> None:
+        calls.append((repo_root, binding_path, binding_sha256))
+
+    monkeypatch.setattr(
+        transfer_contract,
+        "_load_stage2_2khz_physical_binding_for_transfer",
+        verify,
+    )
+
+    physical = transfer_contract._validate_stage2_2khz_physical_transfer(  # noqa: SLF001
+        repo_root=tmp_path,
+        payload=payload,
+        by_role={
+            "stage2_2khz_plant_binding": [str(binding["path"])],
+            "stage2_2khz_physical_authority": [str(authority["path"])],
+        },
+        entry_by_path={
+            str(binding["path"]): binding,
+            str(authority["path"]): authority,
+        },
+    )
+
+    assert physical == payload["stage2_2khz_physical"]
+    assert calls == [(tmp_path, str(binding["path"]), str(binding["sha256"]))]
+
+
+def test_stage2_canonical_admission_rejects_legacy_v1_transfer(
+    tmp_path: Path,
+) -> None:
+    manifest, digest, _files = _write_transfer_bundle(tmp_path)
+
+    with pytest.raises(TransferContractError, match="schema v3 physical transfer"):
+        require_stage2_2khz_physical_transfer_manifest(
+            manifest,
+            repo_root=tmp_path,
+            expected_sha256=digest,
+        )
+
+
+def test_stage2_physical_transfer_rejects_resealed_pointer_sha_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def add(relative: str, content: bytes) -> dict[str, object]:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        return {
+            "path": relative,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+
+    binding = add(
+        "results/stage2_2khz_ps_v3/plant_binding.json",
+        b"fixture physical binding",
+    )
+    authority = add(
+        "authority/stage2_2khz_physical.json",
+        b"fixture tracked authority",
+    )
+    payload = {"stage2_2khz_physical": {
+        "plant_binding": {"path": binding["path"], "sha256": "0" * 64},
+        "physical_authority": {
+            "path": authority["path"],
+            "sha256": authority["sha256"],
+        },
+    }}
+    monkeypatch.setattr(
+        transfer_contract,
+        "_load_stage2_2khz_physical_binding_for_transfer",
+        lambda **_kwargs: None,
+    )
+
+    with pytest.raises(TransferContractError, match="typed role path/SHA"):
+        transfer_contract._validate_stage2_2khz_physical_transfer(  # noqa: SLF001
+            repo_root=tmp_path,
+            payload=payload,
+            by_role={
+                "stage2_2khz_plant_binding": [str(binding["path"])],
+                "stage2_2khz_physical_authority": [str(authority["path"])],
+            },
+            entry_by_path={
+                str(binding["path"]): binding,
+                str(authority["path"]): authority,
+            },
+        )
+
+
 def test_transfer_manifest_detects_file_tampering_from_same_declared_path(
     tmp_path: Path,
 ) -> None:
@@ -980,6 +1099,88 @@ def test_builder_scans_recorded_and_publishes_no_replace_canonical_json(
     assert manifest.read_bytes() == data
     with pytest.raises(TransferContractError, match="overwrite"):
         builder._publish_no_replace(manifest, data + b" ", repo_root=tmp_path)
+
+
+def test_builder_refuses_stage2_physical_transfer_without_combined_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _load_builder()
+    monkeypatch.setattr(
+        builder,
+        "_stage2_physical_support",
+        lambda _args, *, repo_root: {
+            "plant_binding": {
+                "path": "results/stage2_2khz_ps_v3/plant_binding.json",
+                "sha256": "a" * 64,
+            },
+            "physical_authority": {
+                "path": "authority/stage2_2khz_physical.json",
+                "sha256": "b" * 64,
+            },
+        },
+    )
+
+    with pytest.raises(TransferContractError, match="combined recorded generation"):
+        builder.build_payload(
+            Namespace(recorded_generation=None),
+            repo_root=tmp_path,
+        )
+
+
+def test_builder_wraps_v2_with_stage2_typed_roles_and_rechecks_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _load_builder()
+    binding_path = "results/stage2_2khz_ps_v3/plant_binding.json"
+    authority_path = "authority/stage2_2khz_physical.json"
+    binding_bytes = b"fixture binding"
+    authority_bytes = b"fixture authority"
+    (tmp_path / binding_path).parent.mkdir(parents=True)
+    (tmp_path / binding_path).write_bytes(binding_bytes)
+    (tmp_path / authority_path).parent.mkdir(parents=True)
+    (tmp_path / authority_path).write_bytes(authority_bytes)
+    physical = {
+        "plant_binding": {
+            "path": binding_path,
+            "sha256": hashlib.sha256(binding_bytes).hexdigest(),
+        },
+        "physical_authority": {
+            "path": authority_path,
+            "sha256": hashlib.sha256(authority_bytes).hexdigest(),
+        },
+    }
+    monkeypatch.setattr(
+        builder,
+        "_stage2_physical_support",
+        lambda _args, *, repo_root: physical,
+    )
+    monkeypatch.setattr(
+        builder,
+        "_build_payload_v2",
+        lambda _args, *, repo_root: {"schema_version": 2, "files": []},
+    )
+
+    payload = builder.build_payload(
+        Namespace(recorded_generation="data/manifests/recorded_generations/fixture.json"),
+        repo_root=tmp_path,
+    )
+
+    assert payload["schema_version"] == 3
+    assert payload["stage2_2khz_physical"] == physical
+    assert {
+        (entry["path"], entry["role"])
+        for entry in payload["files"]
+    } == {
+        (binding_path, "stage2_2khz_plant_binding"),
+        (authority_path, "stage2_2khz_physical_authority"),
+    }
+
+    physical["plant_binding"]["sha256"] = "0" * 64
+    with pytest.raises(TransferContractError, match="support ref SHA"):
+        builder.build_payload(
+            Namespace(recorded_generation="data/manifests/recorded_generations/fixture.json"),
+            repo_root=tmp_path,
+        )
 
 
 def test_builder_rotates_schema_v1_to_v2_with_content_addressed_history(

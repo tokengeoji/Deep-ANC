@@ -191,6 +191,7 @@ def analyse_stage2_v2_diagnostic_preflight(
     captured_diagnostic_pcm: np.ndarray,
     *,
     transport_counters: Mapping[str, int],
+    quiet_start_frame: int = 0,
 ) -> dict[str, Any]:
     """phase-1 raw만으로 두 output의 49/98 PCM level/THD를 fail-closed 판정한다."""
 
@@ -210,7 +211,17 @@ def analyse_stage2_v2_diagnostic_preflight(
         diagnostic_peak < MAX_DIAGNOSTIC_ADC_PEAK_ABS
         and np.all(np.abs(captured) < ABSOLUTE_ADC_SAFETY_LIMIT)
     )
-    quiet = captured[:24_000]
+    if (
+        isinstance(quiet_start_frame, (bool, np.bool_))
+        or not isinstance(quiet_start_frame, (int, np.integer))
+        or int(quiet_start_frame) < 0
+        or int(quiet_start_frame) + 24_000 > phase_stop
+    ):
+        raise Stage2MeasurementV2Error(
+            "diagnostic quiet window start가 exact non-negative frame이 아닙니다"
+        )
+    quiet_start = int(quiet_start_frame)
+    quiet = captured[quiet_start : quiet_start + 24_000]
     rows: list[dict[str, Any]] = []
     grouped: dict[tuple[str, int, int], dict[int, dict[str, Any]]] = {}
     for row in owned_plan["nonlinearity_diagnostics"]["slots"]:
@@ -293,6 +304,7 @@ def analyse_stage2_v2_diagnostic_preflight(
             np.asarray(captured_diagnostic_pcm)
         ),
         "diagnostic_phase_frames": phase_stop,
+        "quiet_window_frame_range": [quiet_start, quiet_start + 24_000],
         "transport_counters": expected_counters,
         "thresholds": {
             "minimum_fundamental_snr_db": MIN_FUNDAMENTAL_SNR_DB,
@@ -566,6 +578,8 @@ def analyse_stage2_v2_capture(
     diagnostic_transport_counters: Mapping[str, int],
     ps_transport_counters: Mapping[str, int],
     operating_level_evidence: Mapping[str, Any],
+    diagnostic_quiet_start_frame: int = 0,
+    ps_output_grid_transform_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """서로 다른 ADC clock stream인 diagnostic/PS raw에서 candidate P/S를 계산한다."""
 
@@ -600,6 +614,7 @@ def analyse_stage2_v2_capture(
         owned_submitted,
         diagnostic_raw,
         transport_counters=diagnostic_transport_counters,
+        quiet_start_frame=diagnostic_quiet_start_frame,
     )
     if diagnostic_receipt["passed"] is not True:
         raise Stage2MeasurementV2Error("recomputed diagnostic raw gate가 실패했습니다")
@@ -609,22 +624,52 @@ def analyse_stage2_v2_capture(
         "callback_status": 0,
     }:
         raise Stage2MeasurementV2Error("PS transport counter가 exact zero가 아닙니다")
-    clock = estimate_stage2_v2_common_clock(owned_plan, owned_submitted, ps_raw)
-    corrected_ps = _capture_on_dac_grid(
-        _finite_capture(ps_raw, minimum_frames=len(ps_raw)),
-        float(clock["estimated_rate_ratio"]),
-        len(ps_raw),
-    )
+    if ps_output_grid_transform_receipt is None:
+        clock = estimate_stage2_v2_common_clock(owned_plan, owned_submitted, ps_raw)
+        corrected_ps = _capture_on_dac_grid(
+            _finite_capture(ps_raw, minimum_frames=len(ps_raw)),
+            float(clock["estimated_rate_ratio"]),
+            len(ps_raw),
+        )
+    else:
+        if not isinstance(ps_output_grid_transform_receipt, Mapping):
+            raise Stage2MeasurementV2Error(
+                "PS output-grid transform receipt가 mapping이 아닙니다"
+            )
+        clock = dict(ps_output_grid_transform_receipt)
+        supplied_sha = clock.pop("canonical_payload_sha256", None)
+        if (
+            supplied_sha != _payload_sha256(clock)
+            or clock.get("schema")
+            != "stage2_2khz_output_master_ps_dac_grid_transform_v1"
+            or clock.get("source_signal_plan_sha256")
+            != owned_plan["canonical_payload_sha256"]
+            or clock.get("output_grid_pcm_sha256") != _array_sha256(ps_raw)
+            or int(clock.get("output_grid_frames", -1)) != len(ps_raw)
+            or clock.get("input_output_frame_identity_claimed") is not False
+            or clock.get("absolute_hardware_clock_authority_claimed") is not False
+            or clock.get("relative_ps_time_gauge_only") is not True
+            or clock.get("passed") is not True
+        ):
+            raise Stage2MeasurementV2Error(
+                "PS output-grid transform receipt SHA/plan/raw/scope가 다릅니다"
+            )
+        clock["canonical_payload_sha256"] = supplied_sha
+        corrected_ps = _finite_capture(ps_raw, minimum_frames=len(ps_raw))
     maximum_operator_stop = max(
         int(row["central_stop_frame"]) - boundary
         for row in owned_plan["layout"]
         if row.get("kind") == "pe_slot"
     )
-    available_clock_frames = int(
-        np.count_nonzero(
-            np.arange(len(ps_raw), dtype=np.float64)
-            / float(clock["estimated_rate_ratio"])
-            <= len(ps_raw) - 1
+    available_clock_frames = (
+        len(ps_raw)
+        if ps_output_grid_transform_receipt is not None
+        else int(
+            np.count_nonzero(
+                np.arange(len(ps_raw), dtype=np.float64)
+                / float(clock["estimated_rate_ratio"])
+                <= len(ps_raw) - 1
+            )
         )
     )
     if maximum_operator_stop > available_clock_frames:

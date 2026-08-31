@@ -314,7 +314,7 @@ def test_bootstrap_uses_transfer_validated_recorded_manifest_for_all_evidence():
     prepare_call = text.index('"$VENV_PYTHON" scripts/data/prepare_noise_pool.py')
     validate_call = text.index('"$VENV_PYTHON" scripts/data/validate_noise_pool.py')
     prepare_block = text[prepare_call - 500 : validate_call]
-    assert 'if [ "$RECORDED_TRANSFER_SCHEMA" = "2" ]; then' in prepare_block
+    assert 'if [[ "$RECORDED_TRANSFER_SCHEMA" =~ ^(2|3)$ ]]; then' in prepare_block
     assert '--recorded-generation "$RECORDED_GENERATION"' in prepare_block
     assert (
         '--expected-recorded-generation-sha256 "$RECORDED_GENERATION_SHA256"'
@@ -461,6 +461,12 @@ def test_early_pytest_gate_stops_when_collection_fails(tmp_path: Path):
             True,
         ),
         (
+            "v3",
+            "3",
+            "data/manifests/recorded_generations/generation-99/recorded.jsonl",
+            True,
+        ),
+        (
             "v2-wrong-count",
             "",
             "",
@@ -528,6 +534,7 @@ def validate_transfer_manifest(path, *, repo_root, expected_sha256):
         )
         sessions = 82 if mode == "v2-wrong-count" else 99
     return {
+        "schema_version": 1 if mode == "v1" else (3 if mode == "v3" else 2),
         "_validated_recorded_manifest_snapshot": FileSnapshot(
             Path(repo_root) / relative
         ),

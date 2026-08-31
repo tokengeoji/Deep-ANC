@@ -477,6 +477,41 @@ def _complete_typed_pretrain_only_chain(root: Path) -> tuple[dict, Path]:
             "source_inventory_commit_sha": "a" * 40,
         },
     )
+    elice_transfer_sha = _write_json(
+        root,
+        "data/manifests/elice_transfer_manifest.json",
+        {"fixture": "transfer"},
+    )
+    freeze_sha = _write(
+        root,
+        ".venv/environment-freeze.txt",
+        b"fixture environment freeze\n",
+    )
+    elice_bootstrap_sha = _write_json(
+        root,
+        "data/manifests/elice_bootstrap_receipt.json",
+        {
+            "schema_version": 3,
+            "expected_commit": "a" * 40,
+            "canonical_holdout": {
+                "path": "data/manifests/recorded_holdout.json",
+                "sha256": recorded_holdout_sha,
+            },
+            "transfer_manifest": {
+                "path": "data/manifests/elice_transfer_manifest.json",
+                "sha256": elice_transfer_sha,
+            },
+            "recorded_aggregate_sha256": "4" * 64,
+            "archive_cache_consumption": None,
+            "recorded_subband_coverage": {"fixture": "not-consumed-here"},
+            "environment": {
+                "freeze_receipt": ".venv/environment-freeze.txt",
+                "freeze_receipt_sha256": freeze_sha,
+                "torch_version": "2.5.1+cu121",
+                "torch_cuda": "12.1",
+            },
+        },
+    )
     bootstrap_sha = _write_json(
         root,
         "artifacts/stage2-bootstrap.json",
@@ -486,7 +521,11 @@ def _complete_typed_pretrain_only_chain(root: Path) -> tuple[dict, Path]:
             "canonical_pretrain_eligible": True,
             "control_band_contract_sha256": contract.digest(),
             "manifest_bundle_sha256": manifest_sha,
-            "existing_instance_cache_reused": True,
+            "elice_bootstrap_receipt": {
+                "path": "data/manifests/elice_bootstrap_receipt.json",
+                "sha256": elice_bootstrap_sha,
+            },
+            "existing_instance_cache_reused": False,
             "all_declared_source_bytes_rehashed": True,
             "stale_run_or_checkpoint_auto_resume_allowed": False,
             "scratch_new_run_directory_required": True,
@@ -524,6 +563,11 @@ def _complete_typed_pretrain_only_chain(root: Path) -> tuple[dict, Path]:
         "artifacts/stage2-sampler.json",
         provisional_sampler.expected_receipt_payload(),
     )
+    model_config_path = str(
+        profiles["canonical_pretrain"]["execution"]["model_config"]["path"]
+    )
+    model_config_sha = _sha((root / model_config_path).read_bytes())
+    fixture_model_initial_state_sha = "6" * 64
     dnh_sha = _write_json(
         root,
         "artifacts/stage2-dnh.json",
@@ -537,9 +581,14 @@ def _complete_typed_pretrain_only_chain(root: Path) -> tuple[dict, Path]:
             "sampler_receipt_sha256": sampler_sha,
             "actual_causal_secondary_output": True,
             "actual_family_balanced_batch": True,
+            "model_config_sha256": model_config_sha,
+            "model_initial_state_sha256": fixture_model_initial_state_sha,
             "lambda_dnh": 0.001,
             "output_y_gradient_share": 0.3,
-            "calibration_batch_sha256": "5" * 64,
+            "calibration_batch": {
+                "path": "artifacts/stage2-calibration.npz",
+                "sha256": "5" * 64,
+            },
         },
     )
     implementation = (
@@ -574,6 +623,11 @@ def _complete_typed_pretrain_only_chain(root: Path) -> tuple[dict, Path]:
             "path": "artifacts/stage2-dnh.json",
             "sha256": dnh_sha,
         },
+        "model_config": {
+            "path": model_config_path,
+            "sha256": model_config_sha,
+        },
+        "model_initial_state_sha256": fixture_model_initial_state_sha,
         "batch_size": 96,
         "seed": 20260803,
         "generic_stage1_loss_used": False,
@@ -690,6 +744,16 @@ def test_default_stage2_profile_is_blocked_before_gpu_or_run_directory() -> None
     assert report["checkpoint_selection_secondary"].startswith(
         "maximize_two_khz"
     )
+    assert "artifact_duct_primary_path" in report["pretrain_blockers"]
+    assert "artifact_data_manifest_bundle" in report["pretrain_blockers"]
+    assert "canonical_pretrain_checkpoint" not in report["pretrain_blockers"]
+    assert "canonical_pretrain_checkpoint" in report["post_pretrain_blockers"]
+    assert report["pretrain_blocking_requirements"]
+    assert report["post_pretrain_blocking_requirements"]
+    assert set(report["blockers"]) == {
+        *report["pretrain_blockers"],
+        *report["post_pretrain_blockers"],
+    }
 
 
 def test_complete_self_attested_chain_binds_contract_ps_train_eval_but_stays_blocked(
@@ -718,6 +782,11 @@ def test_self_attested_typed_pretrain_chain_cannot_become_ready(
     assert report["canonical_finetune_ready"] is False
     assert "typed_stage2_pretrain_execution" in report["blockers"]
     assert "typed_stage2_finetune_recorded_70_30_execution" in report["blockers"]
+    assert "typed_stage2_pretrain_execution" in report["pretrain_blockers"]
+    assert (
+        "typed_stage2_finetune_recorded_70_30_execution"
+        in report["post_pretrain_blockers"]
+    )
 
 
 def test_actual_manifest_lineage_crossing_is_rejected_without_trusting_receipt(

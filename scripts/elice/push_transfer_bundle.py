@@ -227,8 +227,8 @@ def _load_inventory(
     if not isinstance(payload, Mapping) or type(payload.get("schema_version")) is not int:
         raise PushTransferError("transfer manifest schema_version이 없습니다")
     schema_version = int(payload["schema_version"])
-    if schema_version not in {1, 2}:
-        raise PushTransferError("transfer manifest schema_version은 1 또는 2여야 합니다")
+    if schema_version not in {1, 2, 3}:
+        raise PushTransferError("transfer manifest schema_version은 1, 2 또는 3이어야 합니다")
     raw_files = payload.get("files")
     if not isinstance(raw_files, list) or not raw_files:
         raise PushTransferError("transfer manifest files가 비었습니다")

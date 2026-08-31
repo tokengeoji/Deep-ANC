@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Stage-2 2 kHz DPSS P/S two-phase live capture.
+"""Stage-2 2 kHz legacy combined-duplex diagnostic capture.
 
-dry-run은 audio backend를 import하지 않는다. live는 fresh 20초 meter, clean exact
-commit, 현재 hardware/device, fresh no-replace targets를 먼저 검증한다. 11.605초
-diagnostic stream raw를 fsync/no-replace 발행하고 49/98 PCM linearity·THD·ADC gate를
-통과한 경우에만 별도 12.395초 P/S stream을 연다. full P/S 분석은 raw 보존 뒤 offline이다.
+이 파일의 combined PortAudio callback frame index는 USB DAC와 APE ADC의 hardware
+frame identity가 아니다. 보존된 v2 raw는 진단 자료일 뿐 P/S/plant/training authority가
+아니다. dry-run만 유지하며 ``--execute-live``는 backend import 전에 닫힌다. 새 경로는
+``measure_paths_stage2_2khz_v3.py``의 output-master admission을 사용한다.
 """
 
 from __future__ import annotations
@@ -69,6 +69,7 @@ DEFAULT_CONFIG = "configs/stage2_2khz_measurement.json"
 DEFAULT_HARDWARE = "configs/hardware_jetson.yaml"
 LIVE_AUDIO_LOCK_PURPOSE = "stage2_2khz_v2_two_phase_capture"
 WATCHDOG_GRACE_SECONDS = 2.0
+LEGACY_COMBINED_LIVE_AUTHORITY_DISABLED = True
 _REQUIRED_CONFIRMATIONS = {
     "speaker_output",
     "user_present",
@@ -400,6 +401,14 @@ def _execute_live(
     expected_meter_raw_sha256: str | None = None,
 ) -> int:
     del config
+    if LEGACY_COMBINED_LIVE_AUTHORITY_DISABLED:
+        print(
+            "[BLOCKED_LEGACY_COMBINED] USB DAC/APE cross-clock combined callback raw는 "
+            "P/S authority가 아닙니다. output-master v3 admission을 사용하세요. "
+            "sounddevice import/open=0; output=0",
+            file=sys.stderr,
+        )
+        return 2
     if set(confirmations) != _REQUIRED_CONFIRMATIONS or any(
         value is not True for value in confirmations.values()
     ):

@@ -337,6 +337,40 @@ bash scripts/elice/bootstrap_all.sh \
   --no-update
 ```
 
+full bootstrap이 six-manifest와 receipt를 모두 발행한 뒤 Stage-2 공개 사전학습
+입력 후보 4종은 다음 명령으로 만든다. 이 명령은 실제 manifest row가 가리키는 모든
+audio bytes를 다시 SHA/decode/Welch하고, recorded holdout과 transitive lineage 교집합,
+plant binding 및 bootstrap receipt를 독립 재검증한다. 기본 worker 수는
+`min(16, cpu_count)`이며 `--workers 1..16`으로 제한할 수 있다.
+
+```bash
+PLANT=<새_output_master_v3_authority_PASS_plant_binding_상대경로>
+PLANT_SHA=<외부_신뢰_채널에서_확인한_64자리_SHA256>
+
+.venv/bin/python -I -B scripts/data/issue_stage2_pretrain_data.py \
+  --expected-commit "$EXPECTED_COMMIT" \
+  --plant-binding "$PLANT" \
+  --expected-plant-binding-sha256 "$PLANT_SHA" \
+  --output-dir "data/manifests/stage2_2khz/$EXPECTED_COMMIT" \
+  --workers 16
+```
+
+출력은 `publication_intent.json`부터 no-replace로 쓰고, 모든 artifact를 다시 읽어
+validator가 통과한 뒤에만 `publication_complete.json`을 마지막으로 쓴다. 중단된
+directory는 삭제·덮어쓰기하지 말고 새 attempt 경로를 사용한다. completion도 아직
+학습 권위가 아니다. Jetson에서 human review 후 4개 입력 ref와 SHA를
+`authority/stage2_2khz_public_data.json`에 결속해 새 clean commit으로 push해야 tracked
+pretrain admission이 열린다.
+
+여기서 `PLANT`는 새 output-master v3 측정과 human authority를 모두 통과한 strict
+binding만 허용한다. legacy/v1/v2/combined binding 또는 아직 physical authority가 없는
+candidate로 issuer를 먼저 실행할 수 없다.
+
+외부 archive cache 세 anchor가 없으면 cache 인자를 넣지 않는다. plain full bootstrap은
+official provider에서 10개 archive 약 18.23 GB를 받아 계속 진행하며, 완성된 extracted
+raw는 같은 인스턴스의 다음 clean commit에서 재사용할 수 있다. archive object가 있다는
+이유만으로 과거 commit-bound cache manifest를 새 commit에 재봉인하는 것은 금지한다.
+
 완료 decoder audit JSON을 Drive/별도 채널에서 복원했지만 새 인스턴스에 public raw가 아직
 없는 경우에도 `--cache-preflight-only`를 쓰지 않는다. audit의 semantic/file SHA 두 개를
 붙인 **full bootstrap**을 실행한다. full bootstrap은 official source에서 빠진 raw를 먼저

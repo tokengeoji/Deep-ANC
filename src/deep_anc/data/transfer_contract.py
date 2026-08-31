@@ -12,7 +12,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Mapping
 
 from .holdout_contract import (
     FileSnapshot,
@@ -36,6 +36,11 @@ from .source_trust import (
 
 TRANSFER_SCHEMA_VERSION = 1
 TRANSFER_GENERATION_SCHEMA_VERSION = 2
+TRANSFER_STAGE2_PHYSICAL_SCHEMA_VERSION = 3
+_GENERATION_TRANSFER_SCHEMA_VERSIONS = frozenset(
+    {TRANSFER_GENERATION_SCHEMA_VERSION, TRANSFER_STAGE2_PHYSICAL_SCHEMA_VERSION}
+)
+_STAGE2_PHYSICAL_AUTHORITY_PATH = "authority/stage2_2khz_physical.json"
 EXPECTED_RECORDED_SESSIONS = 82
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -116,6 +121,8 @@ _ROLES = frozenset(
         "source_pool_v1_csv",
         "source_pool_v2_csv",
         "provenance_report",
+        "stage2_2khz_plant_binding",
+        "stage2_2khz_physical_authority",
     }
 )
 _ROLE_PREFIXES = {
@@ -149,6 +156,8 @@ _ROLE_PREFIXES = {
     "source_pool_v1_csv": "data/source_pool/",
     "source_pool_v2_csv": "data/source_pool_v2/",
     "provenance_report": "results/provenance/",
+    "stage2_2khz_plant_binding": "results/",
+    "stage2_2khz_physical_authority": "authority/",
 }
 
 
@@ -388,6 +397,101 @@ def _walk_recorded_tree(root: Path, *, repo_root: Path) -> tuple[set[str], int]:
     return files, len(top_level_sessions)
 
 
+def _stage2_transfer_ref(entry: Mapping[str, object], *, label: str) -> dict[str, str]:
+    """검증된 ``files`` entry를 Stage-2 path/SHA reference로 축소한다."""
+
+    path = entry.get("path")
+    digest = entry.get("sha256")
+    if not isinstance(path, str) or not isinstance(digest, str):
+        raise TransferContractError(f"Stage-2 {label} transfer entry가 유효하지 않습니다")
+    return {"path": path, "sha256": digest}
+
+
+def _load_stage2_2khz_physical_binding_for_transfer(
+    *,
+    repo_root: Path,
+    binding_path: str,
+    binding_sha256: str,
+) -> None:
+    """schema-v3 transfer가 실제 physical authority까지 다시 여는 경계.
+
+    import를 지연해 일반 recorded transfer schema가 Stage-2 torch/numpy 경계에
+    의존하지 않도록 한다. 이 loader는 tracked authority, binding, P/S NPZ, raw,
+    analysis, level, relative-clock receipt를 모두 재검증한다.
+    """
+
+    from ..train.stage2_2khz_binding import (  # pylint: disable=import-outside-toplevel
+        load_stage2_2khz_plant_binding,
+    )
+
+    binding = load_stage2_2khz_plant_binding(
+        binding_path,
+        repository_root=repo_root,
+        expected_binding_file_sha256=binding_sha256,
+    )
+    if binding.fixture_only:
+        raise TransferContractError(
+            "fixture/diagnostic Stage-2 plant binding은 Elice canonical transfer에 넣을 수 없습니다"
+        )
+
+
+def _validate_stage2_2khz_physical_transfer(
+    *,
+    repo_root: Path,
+    payload: Mapping[str, object],
+    by_role: Mapping[str, list[str]],
+    entry_by_path: Mapping[str, Mapping[str, object]],
+) -> dict[str, dict[str, str]]:
+    """schema-v3 physical P/S pair를 typed role과 actual authority로 결속한다."""
+
+    if len(by_role["stage2_2khz_plant_binding"]) != 1:
+        raise TransferContractError(
+            "schema v3 Stage-2 plant binding role은 정확히 1개여야 합니다"
+        )
+    if by_role["stage2_2khz_physical_authority"] != [
+        _STAGE2_PHYSICAL_AUTHORITY_PATH
+    ]:
+        raise TransferContractError(
+            "schema v3 Stage-2 physical authority role은 canonical authority 파일 1개여야 합니다"
+        )
+    physical = payload.get("stage2_2khz_physical")
+    if not isinstance(physical, dict) or set(physical) != {
+        "plant_binding",
+        "physical_authority",
+    }:
+        raise TransferContractError(
+            "schema v3 stage2_2khz_physical pointer 구조가 exact하지 않습니다"
+        )
+
+    binding_path = by_role["stage2_2khz_plant_binding"][0]
+    authority_path = by_role["stage2_2khz_physical_authority"][0]
+    binding_entry = entry_by_path[binding_path]
+    authority_entry = entry_by_path[authority_path]
+    expected = {
+        "plant_binding": _stage2_transfer_ref(
+            binding_entry, label="plant binding"
+        ),
+        "physical_authority": _stage2_transfer_ref(
+            authority_entry, label="physical authority"
+        ),
+    }
+    if physical != expected:
+        raise TransferContractError(
+            "schema v3 Stage-2 physical pointer와 typed role path/SHA가 다릅니다"
+        )
+    try:
+        _load_stage2_2khz_physical_binding_for_transfer(
+            repo_root=repo_root,
+            binding_path=binding_path,
+            binding_sha256=expected["plant_binding"]["sha256"],
+        )
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        raise TransferContractError(
+            "schema v3 Stage-2 physical authority/binding actual bytes 검증에 실패했습니다"
+        ) from exc
+    return expected
+
+
 def validate_transfer_manifest(
     path: str | Path,
     *,
@@ -423,9 +527,13 @@ def validate_transfer_manifest(
     if (
         type(schema_version) is not int
         or schema_version
-        not in {TRANSFER_SCHEMA_VERSION, TRANSFER_GENERATION_SCHEMA_VERSION}
+        not in {
+            TRANSFER_SCHEMA_VERSION,
+            TRANSFER_GENERATION_SCHEMA_VERSION,
+            TRANSFER_STAGE2_PHYSICAL_SCHEMA_VERSION,
+        }
     ):
-        raise TransferContractError("transfer manifest schema_version은 1 또는 2여야 합니다")
+        raise TransferContractError("transfer manifest schema_version은 1, 2 또는 3이어야 합니다")
     raw_files = payload.get("files")
     if not isinstance(raw_files, list) or not raw_files:
         raise TransferContractError("transfer manifest files가 비었습니다")
@@ -451,7 +559,7 @@ def validate_transfer_manifest(
         if role not in _ROLES:
             raise TransferContractError(f"files[{index}].role이 허용 목록 밖입니다: {role!r}")
         role_prefix_ok = relative.startswith(_ROLE_PREFIXES[str(role)])
-        if role == "recorded" and schema_version == TRANSFER_GENERATION_SCHEMA_VERSION:
+        if role == "recorded" and schema_version in _GENERATION_TRANSFER_SCHEMA_VERSIONS:
             role_prefix_ok = relative.startswith("data/recorded/") or relative.startswith(
                 "data/recorded_additions/"
             )
@@ -499,6 +607,29 @@ def validate_transfer_manifest(
     for role in ("strict_ps_raw", "strict_ps_analysis"):
         if not by_role[role]:
             raise TransferContractError(f"{role} 증거가 하나 이상 필요합니다")
+    stage2_physical_transfer: dict[str, dict[str, str]] | None = None
+    if schema_version == TRANSFER_STAGE2_PHYSICAL_SCHEMA_VERSION:
+        # Stage-2 canonical pretrain은 parent 82세션만 든 v1을 절대 승격하지
+        # 않는다. v3는 v2 combined generation을 그대로 포함한 뒤 physical
+        # P/S authority를 추가한 schema다.
+        stage2_physical_transfer = _validate_stage2_2khz_physical_transfer(
+            repo_root=root,
+            payload=payload,
+            by_role=by_role,
+            entry_by_path={
+                str(entry["path"]): entry
+                for entry in entries
+            },
+        )
+    elif (
+        by_role["stage2_2khz_plant_binding"]
+        or by_role["stage2_2khz_physical_authority"]
+        or payload.get("stage2_2khz_physical") is not None
+    ):
+        raise TransferContractError(
+            "schema v1/v2 transfer에는 Stage-2 physical typed role/pointer를 넣을 수 없습니다"
+        )
+
     if schema_version == TRANSFER_SCHEMA_VERSION:
         if by_role["recorded_manifest"] != [PARENT_MANIFEST]:
             raise TransferContractError(
@@ -762,7 +893,7 @@ def validate_transfer_manifest(
                 "recorded level calibration audio ref는 exact 164개여야 합니다"
             )
     generation_summary: dict[str, Any] | None = None
-    if schema_version == TRANSFER_GENERATION_SCHEMA_VERSION:
+    if schema_version in _GENERATION_TRANSFER_SCHEMA_VERSIONS:
         generation_pointer = payload.get("recorded_generation")
         if generation_pointer != by_role["recorded_generation"][0]:
             raise TransferContractError("recorded_generation pointer와 role이 다릅니다")
@@ -1275,6 +1406,7 @@ def validate_transfer_manifest(
             f"expected={expected_recorded}, declared={recorded}"
         )
     return {
+        "schema_version": schema_version,
         "manifest_sha256": manifest.sha256,
         "file_count": len(entries),
         "total_bytes": sum(int(entry["size"]) for entry in entries),
@@ -1304,6 +1436,43 @@ def validate_transfer_manifest(
             str(entry["path"]): validated_file_snapshots[str(entry["path"])]
             for entry in recorded_entries
         },
+        "stage2_2khz_physical": stage2_physical_transfer,
+    }
+
+
+def require_stage2_2khz_physical_transfer_manifest(
+    path: str | Path,
+    *,
+    repo_root: str | Path,
+    expected_sha256: str,
+) -> dict[str, dict[str, str]]:
+    """Stage-2 canonical admission 전용 schema-v3 physical transfer 경계.
+
+    일반 recorded 학습용 schema v1/v2는 계속 검증할 수 있지만, Stage-2 2 kHz
+    canonical issuer/admission에는 쓸 수 없다. 이를 별도 API로 만들어 legacy
+    manifest가 타입만 맞는 bootstrap receipt를 통해 승격되는 경로를 막는다.
+    """
+
+    summary = validate_transfer_manifest(
+        path,
+        repo_root=repo_root,
+        expected_sha256=expected_sha256,
+    )
+    if summary.get("schema_version") != TRANSFER_STAGE2_PHYSICAL_SCHEMA_VERSION:
+        raise TransferContractError(
+            "Stage-2 canonical admission에는 schema v3 physical transfer manifest가 필요합니다"
+        )
+    physical = summary.get("stage2_2khz_physical")
+    if not isinstance(physical, dict) or set(physical) != {
+        "plant_binding",
+        "physical_authority",
+    }:
+        raise TransferContractError(
+            "Stage-2 physical transfer 검증 결과가 불완전합니다"
+        )
+    return {
+        "plant_binding": dict(physical["plant_binding"]),
+        "physical_authority": dict(physical["physical_authority"]),
     }
 
 

@@ -69,9 +69,11 @@ ADAPTER_PATH = "scripts/data/capture_stage2_output_master_diagnostic.py"
 LIVE_AUDIO_LOCK_PURPOSE = "stage2_2khz_output_master_diagnostic_only"
 _EXTRA_CRITICAL_FILES = (
     ADAPTER_PATH,
+    "scripts/data/measure_paths_stage2_2khz_v3.py",
     "src/deep_anc/audio_duplex_stage2.py",
     "src/deep_anc/dsp/stage2_2khz_diagnostic_clock.py",
     "src/deep_anc/dsp/stage2_2khz_output_master_diagnostic.py",
+    "src/deep_anc/dsp/stage2_2khz_output_master_ps_v3.py",
 )
 
 

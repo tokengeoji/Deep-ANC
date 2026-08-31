@@ -19,6 +19,9 @@ from deep_anc.dsp.stage2_2khz_measurement import (
     _band_equalized_aperiodic_code,
 )
 from deep_anc.dsp.stage2_2khz_measurement_v2 import (
+    DPSS_APPLIED_LOWER_GUARD_HZ,
+    DPSS_REPRESENTATION_BAND_HZ,
+    DPSS_REPRESENTATION_GUARD_HZ,
     GRAM_DIMENSION,
     LIVE_SAFETY_STATUS,
     MAX_GRAM_CONDITION,
@@ -28,6 +31,7 @@ from deep_anc.dsp.stage2_2khz_measurement_v2 import (
     Stage2HoldoutAccessLedger,
     audit_stage2_v2_live_safe_dpss_gram,
     audit_stage2_v2_shifted_gram,
+    build_stage2_bandlimited_dpss_basis,
     build_stage2_v2_live_safe_fallback_plan,
     build_stage2_v2_signal_plan,
     validate_stage2_v2_signal_plan,
@@ -173,7 +177,18 @@ def test_old_88_2828_actual_int16_design_fails_unrestricted_1024_condition() -> 
 
 def test_live_safe_dpss_fallback_is_identifiable_but_not_training_authority() -> None:
     plan, pcm = build_stage2_v2_live_safe_fallback_plan()
+    _basis, basis_receipt = build_stage2_bandlimited_dpss_basis()
     assert pcm.shape == (1_152_000, 2)
+    assert plan["schema"] == "stage2_2khz_time_separated_lower_guard_dpss_plan_v2"
+    assert basis_receipt["schema"] == (
+        "stage2_2khz_lower_guard_bandlimited_dpss_basis_v2"
+    )
+    assert DPSS_REPRESENTATION_GUARD_HZ == 100.0
+    assert DPSS_APPLIED_LOWER_GUARD_HZ == 80.0
+    assert DPSS_REPRESENTATION_BAND_HZ == (0.0, 2828.4271247462)
+    assert basis_receipt["representation_band_hz"] == [0.0, 2828.4271247462]
+    assert basis_receipt["upper_representation_extension_hz"] == 0.0
+    assert basis_receipt["authority_thresholds_or_excitation_relaxed"] is False
     assert plan["live_safety"]["near_nyquist_targeted_pe_present"] is False
     assert plan["live_safety"]["audio_execution_allowed_by_this_plan"] is False
     assert plan["gram_contract"]["unrestricted_1024tap_fit_allowed"] is False

@@ -27,6 +27,7 @@ from deep_anc.data.holdout_contract import (  # noqa: E402
 )
 from deep_anc.data.transfer_contract import (  # noqa: E402
     EXPECTED_RECORDED_SESSIONS,
+    TRANSFER_STAGE2_PHYSICAL_SCHEMA_VERSION,
     TransferContractError,
     _canonical_recorded_aggregate,
     _walk_recorded_tree,
@@ -143,6 +144,74 @@ def _entry(relative: str, role: str, *, repo_root: Path) -> dict[str, object]:
         "role": role,
         "sha256": snapshot.sha256,
         "size": snapshot.size,
+    }
+
+
+def _stage2_physical_support(
+    args: argparse.Namespace, *, repo_root: Path
+) -> dict[str, dict[str, str]] | None:
+    """Stage-2 strict P/S binding과 tracked authority를 한 쌍으로 봉인한다.
+
+    이 builder는 physical artifact를 생성하지 않는다. 실제 raw-derived binding과
+    ``authority/stage2_2khz_physical.json``이 이미 존재하고 서로 SHA가 맞으며,
+    production loader가 raw/P/S까지 재검증할 때만 schema-v3를 만들 수 있다.
+    """
+
+    binding_arg = getattr(args, "stage2_plant_binding", None)
+    authority_arg = getattr(args, "stage2_physical_authority", None)
+    if binding_arg is None and authority_arg is None:
+        return None
+    if binding_arg is None:
+        raise TransferContractError(
+            "--stage2-physical-authority에는 --stage2-plant-binding이 함께 필요합니다"
+        )
+
+    from deep_anc.train.stage2_2khz_binding import (  # noqa: PLC0415
+        STAGE2_2KHZ_PHYSICAL_AUTHORITY_PATH,
+        load_stage2_2khz_plant_binding,
+    )
+
+    binding = _relative(
+        str(binding_arg),
+        field="stage2_plant_binding",
+        prefix="results/",
+    )
+    authority = _relative(
+        str(authority_arg or STAGE2_2KHZ_PHYSICAL_AUTHORITY_PATH),
+        field="stage2_physical_authority",
+        prefix="authority/",
+    )
+    if authority != STAGE2_2KHZ_PHYSICAL_AUTHORITY_PATH:
+        raise TransferContractError(
+            "Stage-2 physical authority는 authority/stage2_2khz_physical.json으로 고정됩니다"
+        )
+    binding_entry = _entry(binding, "stage2_2khz_plant_binding", repo_root=repo_root)
+    authority_entry = _entry(
+        authority, "stage2_2khz_physical_authority", repo_root=repo_root
+    )
+    try:
+        typed = load_stage2_2khz_plant_binding(
+            repo_root / binding,
+            repository_root=repo_root,
+            expected_binding_file_sha256=str(binding_entry["sha256"]),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise TransferContractError(
+            "Stage-2 physical authority/binding actual bytes 검증에 실패했습니다"
+        ) from exc
+    if typed.fixture_only:
+        raise TransferContractError(
+            "fixture/diagnostic Stage-2 plant binding은 Elice canonical transfer에 넣을 수 없습니다"
+        )
+    return {
+        "plant_binding": {
+            "path": str(binding_entry["path"]),
+            "sha256": str(binding_entry["sha256"]),
+        },
+        "physical_authority": {
+            "path": str(authority_entry["path"]),
+            "sha256": str(authority_entry["sha256"]),
+        },
     }
 
 
@@ -613,6 +682,40 @@ def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
 
 
 def build_payload(args: argparse.Namespace, *, repo_root: Path) -> dict[str, object]:
+    stage2_physical = _stage2_physical_support(args, repo_root=repo_root)
+    if stage2_physical is not None:
+        if not getattr(args, "recorded_generation", None):
+            raise TransferContractError(
+                "Stage-2 schema-v3 transfer에는 combined recorded generation(v2)이 필요합니다"
+            )
+        payload = _build_payload_v2(args, repo_root=repo_root)
+        files = payload.get("files")
+        if not isinstance(files, list):
+            raise TransferContractError("schema-v2 transfer files가 유효하지 않습니다")
+        staged = [dict(item) for item in files]
+        for role, reference in (
+            ("stage2_2khz_plant_binding", stage2_physical["plant_binding"]),
+            (
+                "stage2_2khz_physical_authority",
+                stage2_physical["physical_authority"],
+            ),
+        ):
+            relative = str(reference["path"])
+            if any(str(item.get("path")) == relative for item in staged):
+                raise TransferContractError(
+                    "Stage-2 physical artifact가 기존 transfer role과 경로를 공유합니다"
+                )
+            entry = _entry(relative, role, repo_root=repo_root)
+            if entry["sha256"] != reference["sha256"]:
+                raise TransferContractError(
+                    "Stage-2 physical support ref SHA가 actual transfer artifact와 다릅니다"
+                )
+            staged.append(entry)
+        staged.sort(key=lambda item: str(item["path"]))
+        payload["schema_version"] = TRANSFER_STAGE2_PHYSICAL_SCHEMA_VERSION
+        payload["files"] = staged
+        payload["stage2_2khz_physical"] = stage2_physical
+        return payload
     if getattr(args, "recorded_generation", None):
         return _build_payload_v2(args, repo_root=repo_root)
     return _build_payload_v1(args, repo_root=repo_root)
@@ -624,8 +727,8 @@ def _manifest_schema(data: bytes, *, label: str) -> int:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TransferContractError(f"{label} JSON을 읽을 수 없습니다") from exc
     schema = payload.get("schema_version") if isinstance(payload, dict) else None
-    if type(schema) is not int or schema not in {1, 2}:
-        raise TransferContractError(f"{label} schema_version은 1 또는 2여야 합니다")
+    if type(schema) is not int or schema not in {1, 2, 3}:
+        raise TransferContractError(f"{label} schema_version은 1, 2 또는 3이어야 합니다")
     return schema
 
 
@@ -728,9 +831,9 @@ def _publish_no_replace(
                 existing.data, label="기존 transfer manifest"
             )
             new_schema = _manifest_schema(data, label="새 transfer manifest")
-            if (old_schema, new_schema) != (1, 2):
+            if (old_schema, new_schema) not in {(1, 2), (1, 3), (2, 3)}:
                 raise TransferContractError(
-                    "transfer manifest 회전은 검증된 schema v1→v2 전이에만 허용됩니다"
+                    "transfer manifest 회전은 검증된 schema v1→v2/v3 또는 v2→v3 전이에만 허용됩니다"
                 )
             validate_transfer_manifest(
                 path,
@@ -829,6 +932,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--stage2-plant-binding",
+        default=None,
+        help=(
+            "strict Stage-2 physical P/S의 raw-derived plant_binding.json. 지정하면 "
+            "combined generation 기반 schema v3 transfer만 허용합니다"
+        ),
+    )
+    parser.add_argument(
+        "--stage2-physical-authority",
+        default=None,
+        help=(
+            "기본값: stage2 plant binding 사용 시 authority/stage2_2khz_physical.json. "
+            "다른 경로는 허용하지 않습니다"
+        ),
+    )
+    parser.add_argument(
         "--lineage-tracks",
         default="data/raw/music/fma_metadata/tracks.csv",
     )
@@ -845,8 +964,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--rotate-existing-transfer-sha256",
         default=None,
         help=(
-            "기존 schema-v1 canonical manifest를 content-addressed history로 보존하고 "
-            "schema-v2로 원자 전환할 때 요구되는 기존 파일 SHA-256"
+            "기존 schema-v1/v2 canonical manifest를 content-addressed history로 보존하고 "
+            "검증된 schema-v2/v3로 원자 전환할 때 요구되는 기존 파일 SHA-256"
         ),
     )
     return parser

@@ -86,8 +86,24 @@ LIVE_SAFE_FALLBACK_STATUS = (
     "SIGNAL_ONLY_BANDLIMITED_DPSS_DESIGN_PHYSICAL_PREFLIGHT_STILL_REQUIRED"
 )
 LIVE_SAFE_BAND_HZ = (80.0, 2828.4271247462)
-DPSS_HALF_BANDWIDTH_HZ = (LIVE_SAFE_BAND_HZ[1] - LIVE_SAFE_BAND_HZ[0]) / 2.0
-DPSS_CENTER_HZ = (LIVE_SAFE_BAND_HZ[1] + LIVE_SAFE_BAND_HZ[0]) / 2.0
+# DPSS representation transition을 authority edge와 정확히 겹치면, exact LTI조차
+# 88.388--150 Hz untouched holdout에서 2.5 dB 이상 축소된다. excitation/authority와
+# threshold는 그대로 두고 representation subspace 하단에만 최대 100 Hz guard를 둔다.
+# DC 아래로 확장하지 않으므로 현재 actual guard는 80 Hz이고 upper edge는 그대로다.
+DPSS_REPRESENTATION_GUARD_HZ = 100.0
+DPSS_REPRESENTATION_BAND_HZ = (
+    max(0.0, LIVE_SAFE_BAND_HZ[0] - DPSS_REPRESENTATION_GUARD_HZ),
+    LIVE_SAFE_BAND_HZ[1],
+)
+DPSS_APPLIED_LOWER_GUARD_HZ = (
+    LIVE_SAFE_BAND_HZ[0] - DPSS_REPRESENTATION_BAND_HZ[0]
+)
+DPSS_HALF_BANDWIDTH_HZ = (
+    DPSS_REPRESENTATION_BAND_HZ[1] - DPSS_REPRESENTATION_BAND_HZ[0]
+) / 2.0
+DPSS_CENTER_HZ = (
+    DPSS_REPRESENTATION_BAND_HZ[1] + DPSS_REPRESENTATION_BAND_HZ[0]
+) / 2.0
 DPSS_TIME_HALF_BANDWIDTH = SUPPORT_SAMPLES * DPSS_HALF_BANDWIDTH_HZ / SAMPLE_RATE
 DPSS_COMPLEX_TAPER_COUNT = 56
 DPSS_REAL_DOF_PER_PATH = 2 * DPSS_COMPLEX_TAPER_COUNT
@@ -159,10 +175,15 @@ def build_stage2_bandlimited_dpss_basis() -> tuple[np.ndarray, dict[str, Any]]:
         raise AssertionError("Stage-2 DPSS QR basis가 orthonormal하지 않습니다")
     basis = np.ascontiguousarray(basis, dtype=np.float64)
     receipt = {
-        "schema": "stage2_2khz_bandlimited_dpss_basis_v1",
+        "schema": "stage2_2khz_lower_guard_bandlimited_dpss_basis_v2",
         "support_samples": SUPPORT_SAMPLES,
         "sample_rate_hz": SAMPLE_RATE,
         "authority_band_hz": list(LIVE_SAFE_BAND_HZ),
+        "representation_guard_hz": DPSS_REPRESENTATION_GUARD_HZ,
+        "applied_lower_guard_hz": DPSS_APPLIED_LOWER_GUARD_HZ,
+        "representation_band_hz": list(DPSS_REPRESENTATION_BAND_HZ),
+        "upper_representation_extension_hz": 0.0,
+        "authority_thresholds_or_excitation_relaxed": False,
         "center_hz": DPSS_CENTER_HZ,
         "half_bandwidth_hz": DPSS_HALF_BANDWIDTH_HZ,
         "time_half_bandwidth": DPSS_TIME_HALF_BANDWIDTH,
@@ -893,7 +914,7 @@ def build_stage2_v2_live_safe_fallback_plan() -> tuple[dict[str, Any], np.ndarra
         "concatenated_single_stream_clock_claim_forbidden": True,
         "automatic_retry_allowed": False,
     }
-    plan["schema"] = "stage2_2khz_time_separated_bandlimited_dpss_plan_v1"
+    plan["schema"] = "stage2_2khz_time_separated_lower_guard_dpss_plan_v2"
     plan["role"] = "signal_only_live_safe_fallback_no_audio_authority"
     plan["actual_submitted_pcm"]["sha256"] = _array_sha256(pcm)
     plan["actual_submitted_pcm"]["peak_pcm"] = int(
@@ -1108,7 +1129,7 @@ class Stage2HoldoutAccessLedger:
             canonical, _ = validate_stage2_v2_signal_plan(
                 plan, build_stage2_v2_signal_plan()[1]
             )
-        elif plan.get("schema") == "stage2_2khz_time_separated_bandlimited_dpss_plan_v1":
+        elif plan.get("schema") == "stage2_2khz_time_separated_lower_guard_dpss_plan_v2":
             canonical, _ = validate_stage2_v2_live_safe_fallback_plan(
                 plan, build_stage2_v2_live_safe_fallback_plan()[1]
             )
@@ -1204,6 +1225,9 @@ class Stage2HoldoutAccessLedger:
 __all__ = [
     "ACCESS_LEDGER_SCHEMA",
     "DIAGNOSTIC_LEVELS_PCM",
+    "DPSS_APPLIED_LOWER_GUARD_HZ",
+    "DPSS_REPRESENTATION_BAND_HZ",
+    "DPSS_REPRESENTATION_GUARD_HZ",
     "GRAM_DIMENSION",
     "GRAM_SCHEMA",
     "LIVE_SAFETY_STATUS",

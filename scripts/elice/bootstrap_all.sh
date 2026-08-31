@@ -981,13 +981,12 @@ try:
         raise TransferContractError(
             "transfer 검증 결과에 recorded manifest bytes snapshot이 없습니다"
         )
-    if generation is None:
-        schema_version = 1
+    schema_version = summary.get("schema_version")
+    if schema_version == 1 and generation is None:
         expected_sessions = EXPECTED_RECORDED_SESSIONS
         generation_relative = "-"
         generation_sha256 = "-"
-    elif isinstance(generation, FileSnapshot):
-        schema_version = 2
+    elif schema_version in (2, 3) and isinstance(generation, FileSnapshot):
         expected_sessions = COMBINED_SESSION_COUNT
         try:
             generation_relative = generation.path.relative_to(root).as_posix()
@@ -998,7 +997,7 @@ try:
         generation_sha256 = generation.sha256
     else:
         raise TransferContractError(
-            "transfer 검증 결과의 recorded generation snapshot이 유효하지 않습니다"
+            "transfer 검증 결과의 schema/recorded generation snapshot 조합이 유효하지 않습니다"
         )
     session_count = summary.get("recorded_session_count")
     if type(session_count) is not int or session_count != expected_sessions:
@@ -1047,14 +1046,14 @@ PY
   IFS=$'\t' read -r schema_version selected_manifest selected_manifest_sha256 \
     session_count validated_transfer_sha256 file_count generation_path \
     generation_sha256 extra <<<"$resolved"
-  if [[ ! "$schema_version" =~ ^(1|2)$ ]] || [ -z "$selected_manifest" ] || \
+  if [[ ! "$schema_version" =~ ^(1|2|3)$ ]] || [ -z "$selected_manifest" ] || \
      [[ ! "$selected_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] || \
      [[ ! "$session_count" =~ ^[0-9]+$ ]] || \
      [ "$validated_transfer_sha256" != "$EXPECTED_TRANSFER_MANIFEST_SHA256" ] || \
      [[ ! "$file_count" =~ ^[0-9]+$ ]] || [ -n "$extra" ] || \
      { [ "$schema_version" = "1" ] && \
        { [ "$generation_path" != "-" ] || [ "$generation_sha256" != "-" ]; }; } || \
-     { [ "$schema_version" = "2" ] && \
+     { [[ "$schema_version" =~ ^(2|3)$ ]] && \
        { [ -z "$generation_path" ] || \
          [[ ! "$generation_sha256" =~ ^[0-9a-f]{64}$ ]]; }; }; then
     echo "[오류] transfer validator의 recorded manifest 선택 결과가 유효하지 않습니다." >&2
@@ -2452,7 +2451,7 @@ if ! verify_archive_cache_consumed_raw_binding "$DECODER_AUDIT_REPORT"; then
   exit 1
 fi
 recorded_generation_prepare_args=()
-if [ "$RECORDED_TRANSFER_SCHEMA" = "2" ]; then
+if [[ "$RECORDED_TRANSFER_SCHEMA" =~ ^(2|3)$ ]]; then
   recorded_generation_prepare_args=(
     --recorded-generation "$RECORDED_GENERATION"
     --expected-recorded-generation-sha256 "$RECORDED_GENERATION_SHA256"
@@ -2798,5 +2797,6 @@ then
   exit 1
 fi
 echo "학습 CLI에 data.bootstrap_receipt와 위 bootstrap receipt SHA-256을 외부 trust anchor로 전달하세요."
+echo "Stage-2 공개 입력 후보는 docs/05_training_elice.md의 issue_stage2_pretrain_data.py 명령으로 actual raw를 재검증해 별도 발행하세요."
 echo "readiness와 G0/smoke를 별도 명령으로 통과한 뒤 승인된 tiny campaign만 실행하세요."
 echo "이 부트스트랩은 legacy base/tiny 학습을 자동 시작하지 않습니다."
