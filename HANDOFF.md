@@ -28,6 +28,58 @@ DAC를 다시 시도하지 않고 `ADMAIF1 ↔ I2S1 ↔ RT5640/J511` common-cloc
 연결·무음 검증한 뒤 fresh meter부터 시작한다. 상세 분석과 재측정 금지 경계는
 [`docs/75_20260901_stage2_output_master_clock_failure.md`](docs/75_20260901_stage2_output_master_clock_failure.md)를 따른다.
 
+## 소프트웨어·Elice 상태 갱신 (2026-09-01)
+
+아래의 2026-08-31 기록은 당시 상태를 보존한 역사 기록이다. 이 절이 현행 작업선의
+소프트웨어/원격환경 상태를 우선한다.
+
+- `dev`에는 다음 검증된 준비 commit이 추가됐다.
+  `1f9e44f`(Stage-2 200→500 smoke의 no-replace/명시 재개 등가),
+  `d2e78c4`(RT5640 zero-duplex 직접 CLI와 Stage-2 audio-entry registry),
+  `6e2ae84`(현행 contract에 맞춘 회귀),
+  `7b3e87d`(RT5640/J511 전용 Stage-2 S32 정적·capture fail-closed 경계).
+  2026-09-01 전체 pytest는 exit 0이었다. acoustic diagnostic manifest 부재를 알리는
+  기존 RuntimeWarning 2건은 남지만 canonical 학습을 열지 않는 경고이며 PASS로 승격하지
+  않는다.
+- 새 RT5640 Stage-2 경로는 `APE PCM1` ERR/REF 입력과 `APE PCM0` J511 출력,
+  `S32_LE`/48 kHz/256 frame만 허용한다. Q15 제출 plan은 정확히 16 bit left-shift한
+  S32로만 전송 후보가 되며 USB AB13X, output-master split-clock, S16 receipt는
+  provenance에서 명시적으로 금지한다. 두 CLI의 default dry-run은 backend/ALSA PCM
+  open, speaker output, raw write를 모두 0으로 검증한다.
+- 이는 **실측 P/S 또는 학습 권한이 아니다.** 현재 plan은
+  `signal_only_no_audio_no_training_authority`라 live option도 backend import 전
+  `BLOCKED`된다. actual Stage-2 P/S plan, J511 read-only `HP`/`HS` 3회 확인,
+  post-start S32 route/hw_params receipt, raw-first capture와 shared-q/fixed-LTI
+  analysis가 생길 때까지 plant binding, pretrain, fine-tune은 열지 않는다.
+- 방금 read-only 현장 확인에서는 모든 PCM substream이 `closed`였고 PulseAudio는
+  control node만 열고 있었다. 그러나 `CVB-RT Jack-state`는 세 번 모두 `None`이었다.
+  그러므로 앰프 line input이 Jetson J511로 물리적으로 연결·감지됐다는 증거는 아직 없다.
+  USB DAC 출력 측정의 재시도나 임계값 완화는 금지한다.
+- Elice는 실제 접속으로 A100 80GB 1장, torch `2.5.1+cu121`, CUDA 12.1,
+  `/home/elicer` 가용 약 247 GiB, clean `6034fe12227b82778793a6fe6e34450b5f6442ca`
+  checkout을 확인했다. GPU job은 0이다. 이 문서가 가리키는 새 exact `dev` tip을
+  push한 뒤에만 Elice에서 exact SHA checkout → `bash scripts/elice/setup_env.sh`로
+  environment freeze를 재발행한다. bootstrap/pretrain은 새 physical P/S가 유효해질
+  때까지 시작하지 않는다.
+- Drive에는
+  `DeepANC/jetson_measurements_20260901/stage2_output_master_diagnostic_20260831T163906_937061Z_011514f5b0f3f856/`
+  아래 `diagnostic_raw.npz`(8,148,254 B), `clock_receipt.json`(37,688 B),
+  `meter_raw.npz`(5,779,992 B), receipt(232 B)가 존재함을 connector metadata로
+  재확인했다. 로컬 raw SHA는 위 긴급 현장 갱신의 값이 권위이며, Drive의 byte-level
+  `rclone check`은 이전 rate-limit 해제 뒤 read-only로 한 번만 수행한다. 로컬 원본은
+  그 전까지 삭제하지 않는다.
+
+### 다음 실제 측정 창의 단일 순서
+
+1. 앰프 입력을 AB13X USB DAC가 아니라 Jetson J511로 옮긴 뒤, 소리 없이 J511 상태가
+   `HP` 또는 `HS`인지 3회 확인한다. `None`이면 케이블/TRS-TRRS adapter/jack 접촉을
+   해결하며 mixer/pinmux를 추측으로 변경하지 않는다.
+2. PCM 전역 비점유와 새 S32 dry-run을 재확인한다. 그 뒤에만 actual P/S plan과
+   same-card disarmed capture adapter를 별도 review/commit한다.
+3. 그 adapter의 무음 dry-run이 통과하면 한 번의 짧은 fresh meter→P/S 출력 창을
+   설계한다. raw를 먼저 고정하고, 분석/plant binding/pretrain은 raw receipt가 PASS한
+   뒤에만 수행한다.
+
 ## 현재 권위 상태 (2026-08-31)
 
 **학습은 아직 시작하지 않았다.** canonical surrogate pretrain 100k, measured fine-tune
