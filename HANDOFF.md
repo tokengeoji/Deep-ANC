@@ -1,7 +1,104 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-08-30. 현행 통합 개발 브랜치: `dev`.
+> 최종 갱신: 2026-08-31. 현행 통합 개발 브랜치: `dev`.
+
+## 현재 권위 상태 (2026-08-31)
+
+**학습은 아직 시작하지 않았다.** canonical surrogate pretrain 100k, measured fine-tune
+50k, canonical checkpoint, G4, 현장 ANC OFF/ON raw는 모두 0이다. Elice 크레딧이 끝나
+기존 인스턴스도 종료됐으며, 로컬의 2026-08-02~05 checkpoint는 legacy/diagnostic-only다.
+
+현재 복구·백업 상태는 다음과 같다.
+
+- GitHub는 `main`과 `dev`만 유지한다. 2026-08-31 작업 시작 readback에서 local/origin
+  `dev`는 `b074c136086f1b227d05e57b958e8b5d69956508`, local/origin `main`은
+  `67572b14436f65c917f3cd4bb18e64b121898fa1`로 exact였다. 이 아래의 새 가드레일은 전체
+  테스트 후 `dev`에 별도 clean commit으로 push한다. raw/checkpoint/private key/rclone
+  config는 Git에 넣지 않는다.
+- Drive의 `DeepANC/jetson_data_backup_20260827/data`는 원격 readback 기준
+  13,428파일/17,439,445,191 regular-file bytes다. 고정 manifest 13,428행의 SHA-256은
+  `1dd9fef8d796cc1f27fbf5d434d640c8b80554e16f04b6bfac0d3403c748bea2`이고, 현재
+  transfer가 참조하는 `data/` 337개는 missing/SHA mismatch가 모두 0이다.
+- `DeepANC/bootstrap_cache_b074`에는 완료 decoder audit 90,424,631바이트와 current
+  transfer authority 11개를 별도로 no-replace 보존했다. audit file SHA-256은
+  `ed3b379827f1a38b170f3ab394a689e8164a0251d8f5ff84642f61765a15c9e8`, 내부 semantic
+  SHA는 `0b39019a347f3a555d73c45b455e47b62f51a2faf52138c664eb85ddc1e56975`다.
+  반면 2026-08-30 Elice tar는 10조각 중 part 5가 없으므로 완전 복구본이 아니다.
+- 종료된 Elice에서 전체 pytest와 public raw decoder audit은 완료됐지만, 최신 DNS/DEMAND
+  selector는 Jetson으로 이관되지 않았다. 새 인스턴스의 새 exact commit에서 다시 발행한다.
+
+다음 Elice bootstrap은 비싼 작업 전에 exact source/holdout/transfer, A100 80GB,
+128 GiB storage, 전체 test collection과 핵심 Elice 회귀를 먼저 검사한다. fresh 인스턴스는
+public raw와 venv가 없으므로 `--cache-preflight-only`가 아니라 decoder audit의 두 외부 SHA를
+붙인 full bootstrap을 실행한다. `--cache-preflight-only`는 raw와 exact venv가 이미 있는 재개
+인스턴스에서만 쓴다. `--status-root`에는 단계별 atomic JSON을 남기며 실패한 cache를 자동
+수선하거나 full decode로 조용히 fallback하지 않는다. 상세 백업·복원 anchor는
+[`docs/64_20260831_training_backup_bootstrap_status.md`](docs/64_20260831_training_backup_bootstrap_status.md)에
+있다.
+
+Stage-1 실측 추가 수집도 아직 0/19다. 첫 실패 raw를 독립 재계산한 결과 공통 시간축
+hunting과 source별 약 22.82 dB의 strict-P 예측 peak 편차가 있어, fixed amplitude `0.06`을
+19개에 일괄 적용하는 것은 안전 authority가 아니다. 무출력 source-gain v1은 source별 ERR
+상한/하한을 계산하지만 REF 상한과 실제 다중레벨 선형성 receipt가 없으므로 live를 열지
+않는다. 다음 물리 단계는 단 한 번의 bounded 다중레벨/동기 probe로 REF와 선형성 authority를
+만든 뒤 source별 gain을 결속하는 것이다. 이 PASS 전에는 19개 batch를 실행하지 않는다.
+
+현재 strict Stage-1 timing은 P delay 1386, S delay 1245, handoff 256에서
+`PlantDelays.lead()=115`로 닫혀 있다. 그러나 최신 natural raw의 REF→ERR coherence²
+`0.8337`은 historical minimum `0.9643`보다 낮고 low/high coherence도 각각 약
+`0.598/0.338`이므로, 이를 2/4/8 kHz 또는 realtime 성능 authority로 승격하지 않는다.
+광대역 목표와 latency fail-closed 조건은 그대로 유지한다.
+
+### 2026-08-31 통합 가드레일 완료 상태
+
+이 절을 포함한 `dev` tip에서 통합 focused test, 변경 Python `py_compile`, Elice shell
+`bash -n`, static pytest/SHA reference audit와 전체 pytest를 다시 실행했다. 최종 전체
+pytest는 **0 FAIL**이고 선택적 실기 test 3개만 skip됐다. 로컬 public manifest 4종이 없는
+진단 fixture에서 발생한 두 RuntimeWarning은 Elice bootstrap 전 누락 source를 조용히 합성
+대체하지 못하게 하는 의도된 경고다.
+
+이번 통합으로 다음 소프트웨어 경계를 닫았다.
+
+- 새 Elice의 권위 경로는 schema-v1 bootstrap/selector → Jetson 19-session authority →
+  schema-v2 bootstrap/training 두 단계다. `push_transfer_bundle.py`가 exact commit과
+  상대경로/SHA를 no-delete rsync로 전달하고, `run_canonical_campaign.py`가
+  G0 → output-gradient → 20k pilot → 5k measured probe → raw val winner → resume smoke →
+  fresh 100k → readiness 17/17 → 50k 순서를 한 단계씩만 연다.
+- 경계 결과에서만 seed `20260903` prerequisite를 별도로 발행한다. direct cross-seed CLI와
+  test capability도 각 후보의 `canonical_finetune` 50k completion, 같은 seed의
+  `canonical_pretrain` 100k completion/init, primary campaign 또는 secondary prerequisite를
+  raw checkpoint에서 다시 검증한다. 첫 seed의 init을 두 번째 seed가 재사용하는 경로는
+  차단됐다.
+- recorded additions 현행 no-replace generation은
+  `stage1-coverage-v3-gain012`다. 과거 `stage1-coverage-v2`와 amplitude `0.06`은
+  diagnostic-only로 보존한다. canonical direct CLI, batch, generation, transfer 어느
+  경로에서도 v2 source-gain plan과 gain-linearity PASS receipt 없이 legacy session을
+  `current_strict`로 승격할 수 없다.
+- 물리 gain/linearity probe는 `.003/.006/.009/.012` 네 bounded level, NS ch0 only,
+  CS ch1 exact zero다. 무출력 dry-run 계산은 audible `14.762333초`, output-open `24초`,
+  input preflight를 포함한 connected hard upper `35초`다. plan/source/hardware/campaign/
+  strict P/S/linearity authority를 held inode/SHA로 고정하고 stream을 연 뒤 다시 검증한
+  다음에만 explicit start한다. 실패 raw는 분석보다 먼저 immutable하게 보존한다.
+- 현 로컬 source-pool 9행은 measured cap `0.012`의 exact precondition을 통과한다.
+  기존 disk CSV는 stale하고 현재 external DNS/DEMAND 선택 일부가 같은 cap에서 실패하므로,
+  다음 Elice에서 public raw selector를 새 generation으로 재발행해야 한다. additions plan은
+  gain receipt를 소비해 **19/19 feasible**일 때만 생성되며 임계값을 낮추지 않는다.
+
+커밋 뒤 다음 실제 순서는 하나다.
+
+1. 모든 PCM과 외부 작업의 장치 점유를 다시 확인하고, exact clean commit으로 위 probe의
+   no-audio dry-run plan을 no-replace 발행한다.
+2. 사용자 지시에 따라 스피커·마이크의 물리 연결은 준비 완료까지 유지할 수 있지만, 출력
+   창 밖에서는 PCM을 닫고 두 DAC 채널을 exact zero로 둔다. 한 번의 최대 35초 창만 실행하고
+   자동 재시도하지 않는다.
+3. raw SHA를 고정한 뒤 오프라인 분석으로 PASS receipt를 발행한다. FAIL이면 raw를 보존하고
+   원인을 먼저 고치며 19-session batch로 진행하지 않는다.
+4. PASS artifact를 Drive에 상대경로/SHA readback으로 추가 백업한다. 그 뒤에만 새 Elice를
+   열어 fresh public raw selector와 `stage1-coverage-v3-gain012` 19/19 plan을 만든다.
+
+아직 canonical checkpoint, G4 또는 실제 덕트 ANC OFF/ON raw가 없으므로 현재 모델의 감쇠 dB,
+2/4/8 kHz ANC 성능, unseen-source 일반화 또는 Tiny/Base 우위를 숫자로 주장하지 않는다.
 
 ## 0. 통합 상태와 절대 판정 (2026-08-29)
 
@@ -687,6 +784,46 @@ source→ERR `0.708/0.419`에 그쳐 acceptance를 회복하지 못했다. 따�
 선택이나 단순 renderer 오류가 아니라 **재연결 뒤 물리 경로 또는 독립 USB DAC--ADC 시간축의
 비정상 변동**일 가능성이 높다. raw를 승격하거나 gate를 낮추지 않는다. 다음 출력은 이 raw의
 오프라인 forensic이 끝나고, 원인을 구분하는 단 한 번의 bounded probe가 정해진 뒤에만 한다.
+
+### 0.20 2026-08-31 canonical campaign one-step 진입점과 2-seed authority
+
+Elice에서 stage 이름/run directory를 사람이 다시 입력하지 않도록
+`scripts/train/run_canonical_campaign.py`를 추가했다. 저장소 밖 SHA-256 봉인 schema-v2 contract와
+상태 JSON을 받아 bootstrap→pre-G0 16/17→모든 G0/gradient→각 20k→각 recorded val→각 5k
+measured probe→각 recorded val→raw winner→selected-20k gradient→resume smoke→ledger→100k→
+readiness 17/17→50k→raw terminal authority를 **호출당 한 단계만** 진행한다. legacy runner와
+임의 shell은 whitelist에 없고, partial run은 exact `last.pt` path와 외부 SHA가 함께 없으면
+재개하지 않는다. bootstrap 직후 system interpreter의 stale `sys.prefix`로 post-inspection하지
+않고 `REINVOKE_WITH_EXACT_VENV_REQUIRED`를 기록하며 child exit code를 보존한다.
+
+dry-run state 기록과 child 실행 사이에는 clean exact source/contract를 다시 검사하고 campaign
+entrypoint·command target의 path/SHA/size와 argv seal을 대조한다. 이 구간의 tracked script
+mutation 회귀에서 child 미실행과 `PRE_EXECUTION_AUTHORITY_CHANGED`를 확인했다. fine-tune
+`status.json`은 계속 advisory이며, COMPLETE는 exact completion contract SHA, raw val selection,
+single-use capability/running/completed ledger, val/test metrics와 fresh completion audit/report가
+모두 일치할 때만 반환한다.
+
+공식 seed 정책도 실행 경로로 닫았다.
+
+- primary external contract는 exact seed `20260803`, `second_seed:null`이다.
+- primary raw val이 numeric/CI `borderline`일 때만 state가 별도 seed `20260903` contract에 넣을
+  primary contract path/SHA, immutable selection SHA와 seed-neutral digest를 출력한다.
+  `inconclusive_data`는 second seed가 아니라 targeted recording blocker다.
+- secondary는 primary G0/pilot/probe/v7 ledger를 재발행하지 않는다. primary raw chain과 test
+  ledger 4종 미개봉을 다시 검증하고 seed `20260903` fresh A100 resume smoke를 수행한다.
+- primary ledger/selection SHA와 secondary smoke receipt/environment/telemetry를
+  `results/training_prerequisites/second_seed/<neutral>/seed_20260903.json` 별도 no-replace
+  prerequisite에 결속한다. 이 path/SHA 없이는 bare 20260903 canonical pretrain config도 막힌다.
+- fresh 20260903 100k의 `best.pt`만 같은 seed의 50k init으로 전달한다. cross-seed finalizer는
+  수기 caller override를 받지 않고 raw winner checkpoint embedded cfg에서 seed/init/bootstrap/loss를
+  재구성해 exact contract를 대조한 뒤 campaign-wide test를 정확히 한 번 연다.
+
+이번 범위의 campaign/second-seed/smoke/checkpoint/fine-tune-pipeline focused suite는 244개를
+통과했다. 이는 전체 저장소 pytest 완료 주장이 아니며 root 통합 뒤 전체 suite를 다시 실행한다.
+실제 학습 blocker도 바뀌지 않았다. 로컬 추가 수집은 여전히 0/19이고 authoritative combined
+101-session generation, transfer schema v2와 그 exact bootstrap receipt가 아직 없으므로 현재
+상태기계는 GPU G0/100k/50k를 열어서는 안 된다. schema-v2 contract/명령 예시는
+`docs/05_training_elice.md` §0.1을 따른다.
 
 ## I. 보존된 광대역 준비 기록
 
@@ -1521,7 +1658,8 @@ lineage 복구 후 15/17, 추가 녹음으로 coverage PASS 후 init 하나만 F
 7. canonical init 지정 뒤 readiness 17/17을 확인하고 open-loop, recorded 70% + synthetic 30%,
    bf16 forward + FP32 loss, 50k fine-tune을 실행한다.
 8. checkpoint 선택은 recorded val만 사용한다. 선택을 고정한 뒤 test를 정확히 한 번 연다.
-   경계 0.3 dB 이내 또는 INCONCLUSIVE일 때만 seed `20260903`의 100k+50k를 한 번 더 한다.
+   raw numeric/CI `borderline`일 때만 seed `20260903`의 fresh 100k+50k를 한 번 더 한다.
+   `inconclusive_data`는 second seed가 아니라 지목된 family/subband 추가 수집 대상이다.
 
 공식 test G4는 trusted 150–1600 Hz 평균/모든 family 평균/최악 10%/family cluster-bootstrap
 95% CI 상단이 모두 0 dB 미만, fullband 평균 ≤0 dB, 대역 밖 octave 최악 10% 증폭 <1 dB이며

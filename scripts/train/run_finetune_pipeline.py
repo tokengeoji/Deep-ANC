@@ -56,6 +56,7 @@ from deep_anc.train.evaluation_contract import (  # noqa: E402
     read_json_snapshot,
     seed_neutral_campaign_sha256 as _seed_neutral_campaign_sha256,
     snapshot_regular_file,
+    validate_recorded_val_selection,
     validate_checkpoint_recorded_manifest,
     write_json_exclusive,
 )
@@ -314,7 +315,10 @@ def classify_recorded_val_metrics(
 
 
 def finalize_cross_seed_selection(
-    *, selection_paths: list[Path], final_selection_path: Path
+    *,
+    selection_paths: list[Path],
+    final_selection_path: Path,
+    repo_root: str | Path | None = None,
 ) -> dict:
     """공식 두 seed의 val-only bundle에서 G4 PASS 최소여유 최대 모델을 고정한다."""
 
@@ -323,6 +327,7 @@ def finalize_cross_seed_selection(
     bundles: list[dict] = []
     seeds: set[int] = set()
     campaigns: set[str] = set()
+    validation_root = Path(REPO_ROOT if repo_root is None else repo_root)
     for path in selection_paths:
         payload, snapshot = read_json_snapshot(path)
         selected = payload.get("selected")
@@ -337,6 +342,9 @@ def finalize_cross_seed_selection(
             raise ValueError(f"cross-seed selection bundle 구조가 잘못됐습니다: {path}")
         if seed not in OFFICIAL_FINETUNE_SEEDS or seed in seeds:
             raise ValueError(f"cross-seed 공식 seed가 중복/범위 밖입니다: {seed}")
+        authoritative_decision = validate_recorded_val_selection(
+            payload, repo_root=validation_root
+        )
         checkpoint_snapshot = snapshot_regular_file(selected.get("checkpoint", ""))
         manifest_snapshot = snapshot_regular_file(payload.get("manifest", ""))
         metrics_snapshot = snapshot_regular_file(
@@ -374,7 +382,11 @@ def finalize_cross_seed_selection(
             manifest_path=manifest_snapshot.path,
             checkpoint_cfg=saved_cfg,
         )
-        if decision != current_decision or payload.get("decision") != current_decision:
+        if (
+            authoritative_decision != current_decision
+            or decision != current_decision
+            or payload.get("decision") != current_decision
+        ):
             raise ValueError("cross-seed val decision이 metrics bytes와 다릅니다")
         with np.load(io.BytesIO(metrics_snapshot.content), allow_pickle=False) as data:
             evaluated = {
@@ -553,6 +565,11 @@ def _run_cross_seed_command(
 def run_cross_seed_campaign(args: argparse.Namespace) -> int:
     """두 val bundle을 고정한 뒤 capability→test 1회→completion을 연속 실행한다."""
 
+    if args.overrides:
+        raise ValueError(
+            "cross-seed finalize는 caller --set을 받지 않습니다. winner checkpoint의 "
+            "embedded cfg에서 seed/init/bootstrap/loss를 exact 재구성합니다"
+        )
     if len(args.cross_seed_selection) != 2 or not args.cross_seed_final_selection:
         raise ValueError(
             "cross-seed 모드는 --cross-seed-selection 두 개와 "
@@ -571,6 +588,7 @@ def run_cross_seed_campaign(args: argparse.Namespace) -> int:
         selection = finalize_cross_seed_selection(
             selection_paths=[Path(value) for value in args.cross_seed_selection],
             final_selection_path=final_path,
+            repo_root=REPO_ROOT,
         )
         selected = selection["selected"]
         selected_checkpoint = Path(selected["checkpoint"])
@@ -582,9 +600,29 @@ def run_cross_seed_campaign(args: argparse.Namespace) -> int:
         )
         saved_cfg = state["cfg"]
         winner_seed = int(selection["seed"])
+        saved_data = saved_cfg.get("data")
+        saved_loss = saved_cfg.get("loss")
+        if not isinstance(saved_data, dict) or not isinstance(saved_loss, dict):
+            raise ValueError("cross-seed winner checkpoint cfg의 data/loss가 없습니다")
+        init_checkpoint = saved_cfg.get("init_ckpt")
+        bootstrap_sha = saved_data.get("bootstrap_receipt_sha256")
+        alpha = saved_loss.get("nmse_cvar_alpha")
+        lambda_dnh = saved_loss.get("lambda_dnh")
+        if not isinstance(init_checkpoint, str) or not init_checkpoint.strip():
+            raise ValueError("cross-seed winner cfg에 canonical pretrain init path가 없습니다")
+        if not isinstance(bootstrap_sha, str) or len(bootstrap_sha) != 64:
+            raise ValueError("cross-seed winner cfg에 bootstrap SHA-256이 없습니다")
+        winner_overrides = [
+            "data.digital_primary_path_mode=measured",
+            f"init_ckpt={json.dumps(init_checkpoint)}",
+            f"data.bootstrap_receipt_sha256={bootstrap_sha}",
+            f"loss.nmse_cvar_alpha={json.dumps(alpha)}",
+            f"loss.lambda_dnh={json.dumps(lambda_dnh)}",
+            f"seed={winner_seed}",
+        ]
         resolved_cfg = load_train_config(
             _resolved_input_path(args.config),
-            [*args.overrides, f"seed={winner_seed}"],
+            winner_overrides,
         )
         if (
             resolved_cfg.get("experiment_contract_sha256")
@@ -601,9 +639,13 @@ def run_cross_seed_campaign(args: argparse.Namespace) -> int:
             metrics_sha256=str(selected["metrics_sha256"]),
         )
 
-        capability_path, consumed_path = canonical_test_ledger_paths(final_path)
+        capability_path, consumed_path = canonical_test_ledger_paths(
+            final_path, repo_root=REPO_ROOT
+        )
         token = issue_test_capability(
-            selection_path=final_path, capability_path=capability_path
+            selection_path=final_path,
+            capability_path=capability_path,
+            repo_root=REPO_ROOT,
         )
         test_dir = selected_run / "eval_recorded_test"
         python = sys.executable
@@ -631,7 +673,7 @@ def run_cross_seed_campaign(args: argparse.Namespace) -> int:
         completion_out = final_path.parent / "completion"
         override_args = [
             part
-            for value in [*args.overrides, f"seed={winner_seed}"]
+            for value in winner_overrides
             for part in ("--set", value)
         ]
         _run_cross_seed_command(

@@ -433,16 +433,56 @@ def _build_payload_v2(args: argparse.Namespace, *, repo_root: Path) -> dict[str,
         "meter_raw": "recording_level_meter_raw",
         "meter_receipt": "recording_level_meter_receipt",
     }
+    gain_roles = {
+        "source_gain_plan": "recording_source_gain_plan",
+        "gain_linearity_receipt": "recording_gain_linearity_receipt",
+        "gain_linearity_plan": "recording_gain_linearity_plan",
+        "gain_linearity_raw": "recording_gain_linearity_raw",
+    }
+    gain_campaign_keys = {
+        "campaign_id",
+        "campaign",
+        "meter_raw",
+        "meter_receipt",
+        "hardware_config",
+    } | set(gain_roles)
+    shared_gain_refs: dict[str, dict[str, object]] | None = None
     for index, campaign in enumerate(level_campaigns):
-        if not isinstance(campaign, dict) or set(campaign) != {
-            "campaign_id",
-            "campaign",
-            "meter_raw",
-            "meter_receipt",
-            "hardware_config",
-        }:
+        campaign_keys = frozenset(campaign) if isinstance(campaign, dict) else frozenset()
+        if campaign_keys != frozenset(gain_campaign_keys):
             raise TransferContractError(
-                f"recording level campaign summary #{index}가 불완전합니다"
+                f"recording level campaign summary #{index}에 canonical source-gain/"
+                "linearity authority 4종이 필수입니다"
+            )
+        current_gain_refs: dict[str, dict[str, object]] = {}
+        for field, role in gain_roles.items():
+            ref = campaign.get(field)
+            if not isinstance(ref, dict) or set(ref) != {"path", "sha256", "size"}:
+                raise TransferContractError(
+                    f"recording level campaign #{index} {field} ref가 불완전합니다"
+                )
+            entry = _entry(str(ref.get("path")), role, repo_root=repo_root)
+            if (
+                entry["sha256"] != ref.get("sha256")
+                or entry["size"] != ref.get("size")
+            ):
+                raise TransferContractError(
+                    f"recording level campaign #{index} {field} SHA/size 불일치"
+                )
+            current_gain_refs[field] = dict(ref)
+        if shared_gain_refs is None:
+            shared_gain_refs = current_gain_refs
+            files.extend(
+                _entry(
+                    str(current_gain_refs[field]["path"]),
+                    role,
+                    repo_root=repo_root,
+                )
+                for field, role in gain_roles.items()
+            )
+        elif current_gain_refs != shared_gain_refs:
+            raise TransferContractError(
+                "recording level campaign들의 source-gain/linearity authority가 다릅니다"
             )
         hardware_ref = campaign.get("hardware_config")
         if (

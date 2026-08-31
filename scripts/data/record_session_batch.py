@@ -59,6 +59,11 @@ from deep_anc.data.recording_level_campaign import (  # noqa: E402
     RecordingLevelCampaignError,
     validate_recording_level_campaign,
 )
+from deep_anc.data.recording_source_gain import (  # noqa: E402
+    PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS,
+    RecordingSourceGainError,
+    validate_recording_source_gain_plan,
+)
 from deep_anc.audio_io import MAX_RECORDING_OUTPUT_PEAK  # noqa: E402
 from deep_anc.eval.artifacts import write_csv  # noqa: E402
 
@@ -66,6 +71,7 @@ MAX_CLIP_RATIO = 0.0
 MIN_ERR_RMS_DBFS = -60.0
 MAX_ERR_PEAK = 0.95
 FAILURE_RECEIPT_MARKER = "DEEP_ANC_RECORD_DUCT_FAILURE_JSON="
+GRACEFUL_CHILD_STOP_SECONDS = 30.0
 
 # record_duct의 input-only probe(앞 1초 settle + 뒤 2초 판정)와 CPU idle witness.
 # 실제 출력 시간과 혼동하지 않도록 dry-run에서 별도 항목으로 표시한다.
@@ -87,6 +93,7 @@ class ChildFailureEvidence:
     artifact: Path
     receipt: Path
     receipt_sha256: str
+    raw_available: bool
 
 
 def _repo_path(value: str | Path) -> Path:
@@ -146,6 +153,87 @@ def _validate_batch_recording_level_campaign(
             "batch --hardware가 recording-level campaign config와 다릅니다"
         )
     return summary
+
+
+def _validate_batch_source_gain_plan(
+    args: argparse.Namespace,
+    *,
+    required: bool,
+    source_list_sha256: str,
+) -> dict | None:
+    """Canonical live 전에 source별 gain plan과 외부 SHA를 fail-closed한다.
+
+    schema-v1은 strict-P ERR 예측만 제공하고 REF/다중레벨 선형성 authority가 없으므로
+    정상적으로 ``canonical_live_eligible=false``다. 따라서 plan을 공급해도 live는
+    차단하며, fixed ``0.06`` batch가 다시 열리지 않는다.
+    """
+
+    path = args.source_gain_plan
+    expected_sha = args.source_gain_plan_sha256
+    if path is None and expected_sha is None:
+        if required:
+            raise RecordingSourceGainError(
+                "canonical additions live에는 source별 gain plan path/SHA가 필요합니다"
+            )
+        return None
+    if path is None or expected_sha is None:
+        raise RecordingSourceGainError(
+            "--source-gain-plan과 --source-gain-plan-sha256은 함께 필요합니다"
+        )
+    summary = validate_recording_source_gain_plan(
+        repo_root=REPO_ROOT,
+        plan_path=str(path),
+        expected_sha256=str(expected_sha).lower(),
+    )
+    payload = summary.get("payload")
+    source_ref = payload.get("source_plan") if isinstance(payload, dict) else None
+    if (
+        not isinstance(source_ref, dict)
+        or source_ref.get("sha256") != str(source_list_sha256).lower()
+    ):
+        raise RecordingSourceGainError(
+            "source gain plan이 이번 canonical source-list SHA와 다릅니다"
+        )
+    if required and summary.get("canonical_live_eligible") is not True:
+        blockers = payload.get("blocker_reasons") if isinstance(payload, dict) else None
+        raise RecordingSourceGainError(
+            "source gain schema-v1은 ERR-only 무출력 계획이며 canonical live authority가 "
+            f"아닙니다: blockers={blockers}"
+        )
+    return summary
+
+
+def _canonical_source_gain_by_row(summary: dict, entries: list[dict]) -> dict[int, float]:
+    """검증된 v2 payload의 integer-millionths를 exact canonical row에 매핑한다."""
+
+    if summary.get("canonical_live_eligible") is not True:
+        raise RecordingSourceGainError("canonical live eligible source-gain plan이 아닙니다")
+    payload = summary.get("payload")
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or len(rows) != len(entries):
+        raise RecordingSourceGainError("source-gain row 수가 canonical source plan과 다릅니다")
+    expected = {int(entry["source_row_number"]) for entry in entries}
+    result: dict[int, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RecordingSourceGainError("source-gain row가 mapping이 아닙니다")
+        row_number = row.get("source_row_number")
+        millionths = row.get("selected_amplitude_millionths")
+        if (
+            isinstance(row_number, bool)
+            or not isinstance(row_number, int)
+            or row_number not in expected
+            or row_number in result
+            or isinstance(millionths, bool)
+            or not isinstance(millionths, int)
+            or not 1 <= millionths <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
+            or row.get("feasible") is not True
+        ):
+            raise RecordingSourceGainError("source-gain row/amplitude 계약 위반")
+        result[row_number] = millionths / 1_000_000.0
+    if set(result) != expected:
+        raise RecordingSourceGainError("source-gain row 집합이 canonical plan과 다릅니다")
+    return result
 
 
 def analyse_session(session_dir: Path) -> dict:
@@ -568,7 +656,7 @@ def _pump_stream(stream, console, log_handle, log_lock: threading.Lock, sink: li
 
 
 def run_child_live(command: list[str], *, timeout_seconds: float, log_path: Path) -> ChildResult:
-    """stdout/stderr를 터미널과 no-replace 로그에 동시에 보존하며 hard timeout을 건다."""
+    """Timeout 시 SIGTERM partial-raw receipt를 기다린 뒤에만 SIGKILL한다."""
 
     if timeout_seconds <= 0.0 or not np.isfinite(timeout_seconds):
         raise ValueError("timeout_seconds는 양수 finite여야 합니다")
@@ -612,7 +700,7 @@ def run_child_live(command: list[str], *, timeout_seconds: float, log_path: Path
             )
             process.terminate()
             try:
-                returncode = process.wait(timeout=5.0)
+                returncode = process.wait(timeout=GRACEFUL_CHILD_STOP_SECONDS)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
@@ -700,6 +788,7 @@ def _read_child_failure_evidence(
                 or payload.get("status") != "failed_capture"
                 or payload.get("failure_stage") != stage
                 or payload.get("failure_reason") != reason
+                or type(payload.get("raw_available")) is not bool
             ):
                 continue
             return ChildFailureEvidence(
@@ -708,6 +797,7 @@ def _read_child_failure_evidence(
                 artifact=artifact,
                 receipt=receipt,
                 receipt_sha256=snapshot.sha256,
+                raw_available=bool(payload["raw_available"]),
             )
         except (OSError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             continue
@@ -753,8 +843,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=CANONICAL_RECORDING_AMPLITUDE,
         help=(
-            "file 재생 digital 진폭. canonical additions에서 exact 0.06을 "
-            "강제하지만 같은 physical SPL/amplifier gain을 의미하지 않습니다"
+            "diagnostic/legacy file 재생 digital 진폭. canonical v2에서는 이 값을 "
+            "출력에 쓰지 않고 기본 0.06을 unused legacy sentinel로만 검증한 뒤, "
+            "검증된 source-gain plan의 행별 <=0.012 값을 child에 전달합니다"
         ),
     )
     parser.add_argument("--limit", type=int, default=None, help="이번 실행에서 녹음할 최대 세션 수")
@@ -798,6 +889,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="campaign.json의 외부 SHA-256 anchor",
     )
     parser.add_argument("--confirm-same-amplifier-setting", action="store_true")
+    parser.add_argument(
+        "--source-gain-plan",
+        default=None,
+        help="strict-P 기반 source별 gain plan JSON 저장소 상대경로",
+    )
+    parser.add_argument(
+        "--source-gain-plan-sha256",
+        default=None,
+        help="source별 gain plan JSON의 외부 SHA-256 anchor",
+    )
     return parser
 
 
@@ -880,8 +981,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.amplitude != CANONICAL_RECORDING_AMPLITUDE:
             parser.error(
-                "canonical additions 재생 digital 진폭은 exact "
-                f"{CANONICAL_RECORDING_AMPLITUDE:.2f}이어야 합니다"
+                "canonical v2에서 --amplitude는 출력값이 아닌 unused legacy sentinel이며 "
+                f"기본 exact {CANONICAL_RECORDING_AMPLITUDE:.2f}로 두어야 합니다"
             )
         with sources_path.open(encoding="utf-8", newline="") as handle:
             fieldnames = tuple(csv.DictReader(handle).fieldnames or ())
@@ -931,6 +1032,23 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (OSError, RecordingLevelCampaignError, ValueError) as exc:
         parser.error(f"recording level campaign 검증 실패: {exc}")
+    try:
+        source_gain_plan = _validate_batch_source_gain_plan(
+            args,
+            required=canonical_rows is not None and not args.dry_run,
+            source_list_sha256=source_list_sha256,
+        )
+    except (OSError, RecordingSourceGainError, ValueError) as exc:
+        parser.error(f"recording source gain plan 검증 실패: {exc}")
+    source_gain_by_row: dict[int, float] = {}
+    if canonical_rows is not None and not args.dry_run:
+        try:
+            assert source_gain_plan is not None
+            source_gain_by_row = _canonical_source_gain_by_row(
+                source_gain_plan, entries
+            )
+        except (AssertionError, RecordingSourceGainError, ValueError) as exc:
+            parser.error(f"recording source gain row 매핑 실패: {exc}")
     pending = [entry for entry in entries if _plan_key(entry, source_list_sha256) not in done]
     if args.limit is not None:
         pending = pending[: args.limit]
@@ -951,18 +1069,22 @@ def main(argv: list[str] | None = None) -> int:
         f"예상 audible: {audible_seconds:.1f}초 ({audible_seconds / 60.0:.2f}분)\n"
         f"예상 output-open: {output_open_seconds:.1f}초\n"
         f"예상 connected 상한(분석/저장 제외): {connected_upper_seconds:.1f}초\n"
-        f"재생 amplitude: {args.amplitude:.2f} "
+        f"재생 amplitude: "
+        f"{'source-gain v2 per-row' if source_gain_by_row else f'{args.amplitude:.2f} diagnostic/dry-run'} "
         f"(공용 peak 안전 상한 {MAX_RECORDING_OUTPUT_PEAK:.2f})\n"
         f"세션 hard timeout: 각 seconds + settle + {args.session_timeout_overhead_seconds:.1f}초\n"
         f"자동 재시도: {'실패당 1회(opt-in)' if args.retry_once else '없음'}\n"
         f"recording-level campaign: "
-        f"{level_campaign['campaign_id'] if level_campaign is not None else 'diagnostic-unbound'}"
+        f"{level_campaign['campaign_id'] if level_campaign is not None else 'diagnostic-unbound'}\n"
+        f"source-gain plan: "
+        f"{source_gain_plan['plan_sha256'] if source_gain_plan is not None else 'not-supplied'}"
     )
     for index, entry in enumerate(pending, start=1):
         print(
             f"  {index:03d} row={entry['source_row_number']} split={entry['split']} "
             f"lineage={entry['lineage_key']} start={entry['start_seconds']:.3f}s "
             f"seconds={entry['seconds']:.1f} "
+            f"amplitude={source_gain_by_row.get(int(entry['source_row_number']), args.amplitude):.6f} "
             f"source={entry['path']} sha256={entry['source_file_sha256']}"
         )
     if args.dry_run:
@@ -984,13 +1106,23 @@ def main(argv: list[str] | None = None) -> int:
     run_had_failure = False
     started = time.monotonic()
     for index, entry in enumerate(pending, start=1):
+        row_amplitude = source_gain_by_row.get(
+            int(entry["source_row_number"]), float(args.amplitude)
+        )
+        if canonical_rows is not None and not (
+            0.0 < row_amplitude
+            <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS / 1_000_000.0
+        ):
+            raise RuntimeError(
+                "canonical child amplitude가 physical measured cap 0.012를 넘었습니다"
+            )
         command_prefix = [
             sys.executable,
             str(REPO_ROOT / "scripts/data/record_duct.py"),
             "--program", "file", "--file", entry["path"],
             "--hardware", str(args.hardware),
             "--file-start-seconds", str(entry["start_seconds"]),
-            "--seconds", str(entry["seconds"]), "--amplitude", str(args.amplitude),
+            "--seconds", str(entry["seconds"]), "--amplitude", str(row_amplitude),
             "--settle-seconds", str(args.settle_seconds),
             "--source-family", entry["source_family"], "--group-id", entry["group_id"],
             "--source-list", str(sources_path), "--source-list-sha256", source_list_sha256,
@@ -1009,7 +1141,16 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             )
         if canonical_rows is not None:
-            command_prefix.append("--require-recording-level-campaign")
+            command_prefix.extend(
+                [
+                    "--require-recording-level-campaign",
+                    "--source-gain-plan",
+                    str(args.source_gain_plan),
+                    "--source-gain-plan-sha256",
+                    str(args.source_gain_plan_sha256).lower(),
+                    "--require-source-gain-plan",
+                ]
+            )
         timeout_seconds = (
             float(entry["seconds"]) + float(args.settle_seconds)
             + float(args.session_timeout_overhead_seconds)
@@ -1070,10 +1211,12 @@ def main(argv: list[str] | None = None) -> int:
             "lineage_key": entry["lineage_key"], "preassigned_split": entry["split"],
             "start_seconds": entry["start_seconds"],
             "seconds": entry["seconds"],
+            "amplitude": row_amplitude,
             "source_path": entry["path"], "source_file_sha256": entry["source_file_sha256"],
             "source_list_sha256": source_list_sha256,
             "source_row_number": entry["source_row_number"], "returncode": result.returncode,
             "timed_out": result.timed_out, "session_id": "",
+            "raw_available": False,
         }
         if result.returncode != 0 or len(created) != 1:
             row["verdict"] = "record_failed"
@@ -1093,6 +1236,7 @@ def main(argv: list[str] | None = None) -> int:
                 row["failure_artifact"] = str(evidence.artifact)
                 row["failure_receipt"] = str(evidence.receipt)
                 row["failure_receipt_sha256"] = evidence.receipt_sha256
+                row["raw_available"] = evidence.raw_available
             if canonical_rows is not None and created:
                 quarantined = []
                 for session_id in created:
@@ -1115,6 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    [실패] {row['detail']}")
         else:
             session_dir = child_out_root / created[0]
+            row["raw_available"] = True
             try:
                 stats = analyse_session(session_dir)
                 ok, reason = qa_verdict(stats)
@@ -1178,8 +1323,10 @@ def main(argv: list[str] | None = None) -> int:
         write_csv(progress_path, rows)
         if canonical_rows is not None and row.get("verdict") != "ok":
             print(
-                "[중단] canonical 세션 실패 raw는 별도 failure root에 보존했습니다. "
-                "오프라인 분석 없이 다음 소스를 재생하지 않습니다.",
+                "[중단] canonical 실패 증거는 progress의 raw_available/"
+                "failure_receipt로 확인합니다. raw_available=false이면 보존 raw가 "
+                "없으며, 근거 없이 보존됐다고 간주하지 않습니다. 오프라인 분석 "
+                "없이 다음 소스를 재생하지 않습니다.",
                 file=sys.stderr,
             )
             print("출력 종료 — 지금 스피커를 분리하세요.", flush=True)

@@ -1712,6 +1712,18 @@ def test_source_plan_requires_and_preserves_external_receipt_sha(monkeypatch):
     }
 
 
+def test_source_plan_rejects_stale_fixed_gain_generation_before_receipt_reuse():
+    builder = _load_source_plan_builder()
+    assert builder.CANONICAL_GENERATION_ID == "stage1-coverage-v3-gain012"
+    assert selection.DNS_SELECTION_GENERATION_ID == builder.CANONICAL_GENERATION_ID
+    with pytest.raises(ValueError, match="현행 exact source plan generation-id"):
+        builder.build_rows(
+            "stage1-coverage-v2",
+            dns_selection_receipt_sha256="a" * 64,
+            demand_selection_receipt_sha256="b" * 64,
+        )
+
+
 def test_selector_requires_five_distinct_full_coverage_groups():
     scans = []
     for index, split in enumerate(("train", "train", "val", "test", "test")):

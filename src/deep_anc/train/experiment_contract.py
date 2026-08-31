@@ -143,6 +143,7 @@ def _artifact_paths(cfg: dict, root: Path) -> dict[str, Path]:
             data.get("recorded_broadband_val_batch_receipt"),
         ),
         ("campaign_prerequisite", cfg.get("campaign_prerequisite")),
+        ("second_seed_prerequisite", cfg.get("second_seed_prerequisite")),
         ("init_checkpoint", cfg.get("init_ckpt")),
     ):
         if value:

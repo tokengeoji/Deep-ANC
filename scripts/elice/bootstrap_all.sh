@@ -19,7 +19,10 @@
 # 일반 Elice 실행은 canonical provenance/recorded/RIR/strict P·S 전부를 포함한 transfer
 # manifest의 외부 전달 SHA-256도 요구한다. venv 전에는 manifest 자체의 immutable SHA
 # anchor만 확인하고, 환경이 완성된 직후 공개 raw 다운로드 전에 전체 semantic 검증을 한다.
-# --preflight-only는 code+holdout bundle만 본다.
+# --preflight-only는 code+holdout bundle만 본다. 이미 준비된 Elice cache를 실제로
+# 재사용할 수 있는지 확인할 때는 --cache-preflight-only와 완료 decoder audit의 두
+# 외부 SHA anchor를 함께 전달한다. 이 모드는 download/manifest/QA/full pytest/receipt를
+# 만들지 않고 existing venv/transfer/public raw/audit만 전수 검증한다.
 # 이 스크립트는 환경/데이터 준비 전용이며 어떤 학습 프로세스도 시작하지 않는다.
 # 이미 실행한 적이 있으면 완전성이 검증된 단계만 건너뛴다 (재실행 안전).
 #
@@ -53,6 +56,10 @@ EXPECTED_DECODER_AUDIT_FILE_SHA256=""
 EXPECTED_DECODER_AUDIT_FILE_SHA256_SEEN=0
 NO_UPDATE_SEEN=0
 PREFLIGHT_ONLY=0
+CACHE_PREFLIGHT_ONLY=0
+CACHE_PREFLIGHT_ONLY_SEEN=0
+STATUS_ROOT=""
+STATUS_ROOT_SEEN=0
 FULL_OCTAVE=0
 FULL_OCTAVE_SEEN=0
 FULL_OCTAVE_HIGHRATE_EVIDENCE=""
@@ -204,6 +211,35 @@ while [ "$#" -gt 0 ]; do
     --preflight-only)
       PREFLIGHT_ONLY=1
       ;;
+    --cache-preflight-only)
+      if [ "$CACHE_PREFLIGHT_ONLY_SEEN" -ne 0 ]; then
+        echo "[오류] --cache-preflight-only는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      CACHE_PREFLIGHT_ONLY_SEEN=1
+      CACHE_PREFLIGHT_ONLY=1
+      ;;
+    --status-root)
+      if [ "$STATUS_ROOT_SEEN" -ne 0 ]; then
+        echo "[오류] --status-root는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      STATUS_ROOT_SEEN=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "[오류] --status-root 뒤에 저장소 밖 기존 디렉터리 절대경로가 필요합니다." >&2
+        exit 2
+      fi
+      STATUS_ROOT=$1
+      ;;
+    --status-root=*)
+      if [ "$STATUS_ROOT_SEEN" -ne 0 ]; then
+        echo "[오류] --status-root는 한 번만 지정하세요." >&2
+        exit 2
+      fi
+      STATUS_ROOT_SEEN=1
+      STATUS_ROOT=${1#*=}
+      ;;
     --full-octave)
       if [ "$FULL_OCTAVE_SEEN" -ne 0 ]; then
         echo "[오류] --full-octave는 한 번만 지정하세요." >&2
@@ -272,6 +308,18 @@ if [[ ! "$EXPECTED_HOLDOUT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
   exit 2
 fi
 EXPECTED_HOLDOUT_SHA256=${EXPECTED_HOLDOUT_SHA256,,}
+if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ] && [ "$PREFLIGHT_ONLY" -eq 1 ]; then
+  echo "[오류] --cache-preflight-only와 --preflight-only는 함께 쓸 수 없습니다." >&2
+  exit 2
+fi
+if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ] && [ "$FULL_OCTAVE" -eq 1 ]; then
+  echo "[오류] --cache-preflight-only와 --full-octave는 함께 쓸 수 없습니다." >&2
+  exit 2
+fi
+if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ] && [ "$REUSE_DECODER_AUDIT" -ne 1 ]; then
+  echo "[오류] --cache-preflight-only에는 --reuse-decoder-audit과 완료 audit의 두 외부 SHA anchor가 필수입니다." >&2
+  exit 2
+fi
 if [ "$REUSE_DECODER_AUDIT" -eq 1 ]; then
   if [[ ! "$EXPECTED_DECODER_AUDIT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
     echo "[오류] audit 재사용에는 --expected-decoder-audit-sha256가 필요합니다." >&2
@@ -328,6 +376,144 @@ if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]; t
   echo "[오류] git 작업 트리가 아닙니다: $REPO" >&2
   exit 1
 fi
+
+# 선택적 stage status는 저장소/data tree와 완전히 분리된 기존 외부 디렉터리에만
+# 기록한다. 각 stage 파일은 running/final payload 모두 tempfile+fsync+replace로
+# 원자 갱신하며, EXIT trap이 성공·실패·signal의 마지막 종료코드를 보존한다.
+STATUS_RUN_ID="${EXPECTED_COMMIT}-$$"
+STATUS_STAGE=""
+STATUS_STAGE_STARTED=0
+STATUS_STAGE_STARTED_MONOTONIC=0
+if [ "$STATUS_ROOT_SEEN" -eq 1 ]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[오류] --status-root 검증에 system python3가 필요합니다." >&2
+    exit 1
+  fi
+  if ! STATUS_ROOT=$(PYTHONDONTWRITEBYTECODE=1 python3 -B - "$STATUS_ROOT" "$REPO" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+raw = sys.argv[1]
+repo = Path(sys.argv[2]).resolve(strict=True)
+candidate = Path(raw)
+if not candidate.is_absolute() or any(character in raw for character in "\t\r\n"):
+    raise SystemExit("--status-root는 제어문자 없는 절대경로여야 합니다")
+try:
+    info = candidate.lstat()
+except OSError as exc:
+    raise SystemExit(f"--status-root를 읽을 수 없습니다: {exc}") from exc
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+    raise SystemExit("--status-root는 symlink가 아닌 기존 디렉터리여야 합니다")
+resolved = candidate.resolve(strict=True)
+try:
+    resolved.relative_to(repo)
+except ValueError:
+    pass
+else:
+    raise SystemExit("--status-root는 저장소 밖에 있어야 합니다")
+if not os.access(resolved, os.W_OK | os.X_OK):
+    raise SystemExit("--status-root에 원자 파일을 쓸 권한이 없습니다")
+print(resolved)
+PY
+  ); then
+    echo "[오류] 외부 --status-root 검증 실패." >&2
+    exit 2
+  fi
+fi
+
+write_stage_status() {
+  local stage=$1
+  local state=$2
+  local started=$3
+  local ended=$4
+  local elapsed=$5
+  local exit_code=$6
+  [ -n "$STATUS_ROOT" ] || return 0
+  PYTHONDONTWRITEBYTECODE=1 python3 -B - \
+      "$STATUS_ROOT" "$STATUS_RUN_ID" "$stage" "$state" \
+      "$started" "$ended" "$elapsed" "$exit_code" "$EXPECTED_COMMIT" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+root = Path(sys.argv[1])
+run_id, stage, state = sys.argv[2:5]
+started = int(sys.argv[5])
+ended = None if sys.argv[6] == "-" else int(sys.argv[6])
+elapsed = int(sys.argv[7])
+exit_code = None if sys.argv[8] == "-" else int(sys.argv[8])
+expected_commit = sys.argv[9]
+payload = {
+    "schema_version": 1,
+    "run_id": run_id,
+    "stage": stage,
+    "state": state,
+    "started_at_epoch": started,
+    "ended_at_epoch": ended,
+    "elapsed_seconds": elapsed,
+    "exit_code": exit_code,
+    "expected_commit": expected_commit,
+}
+target = root / f"{run_id}.{stage}.json"
+with tempfile.NamedTemporaryFile(
+    mode="w", encoding="utf-8", dir=root, prefix=f".{target.name}.", delete=False
+) as handle:
+    temporary = Path(handle.name)
+    json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+try:
+    os.replace(temporary, target)
+except BaseException:
+    temporary.unlink(missing_ok=True)
+    raise
+PY
+}
+
+finish_status_stage() {
+  local exit_code=$1
+  local state=${2:-complete}
+  local ended elapsed
+  [ -n "$STATUS_STAGE" ] || return 0
+  ended=$(date +%s)
+  elapsed=$((SECONDS - STATUS_STAGE_STARTED_MONOTONIC))
+  if ! write_stage_status \
+      "$STATUS_STAGE" "$state" "$STATUS_STAGE_STARTED" "$ended" "$elapsed" "$exit_code"; then
+    return 1
+  fi
+  STATUS_STAGE=""
+}
+
+begin_status_stage() {
+  local stage=$1
+  if [ -n "$STATUS_STAGE" ]; then
+    finish_status_stage 0 complete || return 1
+  fi
+  STATUS_STAGE=$stage
+  STATUS_STAGE_STARTED=$(date +%s)
+  STATUS_STAGE_STARTED_MONOTONIC=$SECONDS
+  write_stage_status "$stage" running "$STATUS_STAGE_STARTED" - 0 -
+}
+
+bootstrap_exit_status() {
+  local exit_code=$?
+  trap - EXIT
+  if [ -n "$STATUS_STAGE" ]; then
+    if [ "$exit_code" -eq 0 ]; then
+      finish_status_stage 0 complete || true
+    else
+      finish_status_stage "$exit_code" failed || true
+    fi
+  fi
+  exit "$exit_code"
+}
+trap bootstrap_exit_status EXIT
+begin_status_stage source_preflight
 
 # pget 자체 잠금만으로는 wget .part, unzip 대상, manifest 생성을 보호할 수 없다.
 # 별도 lock 파일을 만들면 --preflight-only도 .git에 inode를 남긴다. 이미 존재하는 .git
@@ -881,29 +1067,41 @@ environment_complete() {
     validate_environment_receipt "$ENVIRONMENT_RECEIPT" && environment_probe
 }
 
+begin_status_stage environment
 echo "=== [1/6] 환경 (venv + torch cu121 + 패키지) ==="
-# 완료 마커가 있더라도 editable install은 현재 checkout을 따라가는 반면 과거 freeze
-# bytes에는 이전 commit이 남을 수 있다. import/CUDA가 exact한 기존 venv는 재설치하지
-# 않고 매 bootstrap source commit에서 freeze만 atomic 갱신·검증한다.
-if environment_probe; then
-  if ! write_environment_receipt; then
-    echo "[오류] 기존 exact 환경의 freeze를 현재 expected commit에 결속하지 못했습니다." >&2
+# cache preflight는 cache의 현재 상태만 읽어야 한다. stale freeze를 현재 commit으로
+# 다시 봉인하거나 setup marker/venv를 만들면 cache가 원래부터 재사용 가능했는지와
+# 이번 실행이 고친 것인지 구분할 수 없으므로 environment_complete만 검사한다.
+if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ]; then
+  if ! environment_complete; then
+    echo "[오류] cache preflight에는 이미 완성된 exact venv/environment freeze가 필요합니다. setup_env.sh나 receipt 갱신을 실행하지 않았습니다." >&2
     exit 1
   fi
-  if [ ! -f "$SETUP_MARKER" ]; then
-    touch "$SETUP_MARKER"
+  echo "[setup] cache preflight가 기존 exact 환경을 read-only로 확인했습니다."
+else
+  # 완료 마커가 있더라도 editable install은 현재 checkout을 따라가는 반면 과거 freeze
+  # bytes에는 이전 commit이 남을 수 있다. import/CUDA가 exact한 기존 venv는 재설치하지
+  # 않고 매 bootstrap source commit에서 freeze만 atomic 갱신·검증한다.
+  if environment_probe; then
+    if ! write_environment_receipt; then
+      echo "[오류] 기존 exact 환경의 freeze를 현재 expected commit에 결속하지 못했습니다." >&2
+      exit 1
+    fi
+    if [ ! -f "$SETUP_MARKER" ]; then
+      touch "$SETUP_MARKER"
+    fi
+    echo "[setup] 기존 exact 환경을 재사용하고 freeze를 expected commit에 갱신했습니다."
   fi
-  echo "[setup] 기존 exact 환경을 재사용하고 freeze를 expected commit에 갱신했습니다."
-fi
-if ! environment_complete; then
-  echo "[setup] 완료 마커/import/CUDA probe 중 하나가 유효하지 않아 환경을 구성합니다."
-  bash scripts/elice/setup_env.sh
+  if ! environment_complete; then
+    echo "[setup] 완료 마커/import/CUDA probe 중 하나가 유효하지 않아 환경을 구성합니다."
+    bash scripts/elice/setup_env.sh
+  fi
+  if ! environment_complete; then
+    echo "[오류] setup_env.sh 이후에도 Python/CUDA 환경 검증에 실패했습니다." >&2
+    exit 1
+  fi
 fi
 echo "[setup] reproducibility receipt: $ENVIRONMENT_RECEIPT"
-if ! environment_complete; then
-  echo "[오류] setup_env.sh 이후에도 Python/CUDA 환경 검증에 실패했습니다." >&2
-  exit 1
-fi
 
 # 외부 SHA로 고정한 manifest에 열거된 모든 transferred file의 exact SHA, schema,
 # recorded generation/DNS receipt와 canonical holdout 결속을 여기서 완전 검증한다.
@@ -914,12 +1112,37 @@ if ! verify_exact_checkout || ! verify_canonical_bundle || \
   exit 1
 fi
 
+# 전체 suite의 collection과 과거 Elice 비용 사고를 직접 막는 작은 회귀 묶음은
+# public download/full decoder audit보다 먼저 실행한다. 데이터가 아직 없는 새
+# 인스턴스에서도 돌아야 하므로 data-dependent QA/readiness는 여기에 넣지 않는다.
+# pytest cache provider를 끄면 이 조기 검증이 tracked/manifest tree에 새 cache를
+# 만들지 않는다. 전체 suite는 canonical manifest가 준비된 뒤 [5/6]에서 다시 돈다.
+run_early_pytest_gate() {
+  echo "=== [early gate] pytest collection + Elice 핵심 회귀 ==="
+  "$VENV_PYTHON" -B -m pytest -qq -p no:cacheprovider --collect-only || return 1
+  "$VENV_PYTHON" -B -m pytest -q -p no:cacheprovider \
+    tests/test_elice_scripts.py \
+    tests/test_realtime_start.py::test_runtime_artifact_cohort_ignores_training_only_runs_directory \
+    tests/test_realtime_start.py::test_engine_preflight_accepts_the_shipped_runtime_configs \
+    tests/test_public_decode_audit.py::test_reuse_cli_requires_external_file_and_semantic_sha_then_rehashes_raw \
+    tests/test_prepare_noise_pool.py::test_decoder_audit_path_index_is_cached_once_per_raw_root_context \
+    tests/test_prepare_noise_pool.py::test_failed_raw_inventory_verification_does_not_leave_a_path_index \
+    || return 1
+}
+
+begin_status_stage early_pytest
+if ! run_early_pytest_gate; then
+  echo "[오류] 조기 pytest collection/Elice 핵심 회귀 실패. public raw 다운로드·decoder audit을 시작하지 않습니다." >&2
+  exit 1
+fi
+
 # ``--full-octave``는 Stage-1 corpus bootstrap의 별칭이 아니다. high-rate machine
 # source가 없으면 16 kHz MIMII를 upsample한 tensor가 마지막 octave를 덮는 것처럼
 # 보일 수 있으므로, 환경만 준비한 뒤 public corpus download 전에 raw-bound evidence를
 # 먼저 직접 재검증한다. evidence PASS도 causal P/S·population·execution config를
 # 대체하지 않으므로 admission-only checker가 READY일 때만 아래 download 단계로 간다.
 if [ "$FULL_OCTAVE" -eq 1 ]; then
+  begin_status_stage full_octave_admission
   echo "=== [full-octave/0] high-rate machine source + admission gate ==="
   if ! "$VENV_PYTHON" scripts/data/audit_bsd35k_highrate_machine.py verify \
       --evidence "$FULL_OCTAVE_HIGHRATE_EVIDENCE" \
@@ -943,10 +1166,6 @@ FMA_METADATA_ARCHIVE_SHA256="d9527a5297a65da31c5676484d5047c3e2b8a8060ce72a46e26
 FMA_TRACKS_SIZE=260414445
 FMA_TRACKS_SHA256="f73260fd112b8cd42bcd4f7c8918fc66b19d9d4c7b97f4faedce524b59e95d6b"
 FMA_TRACK_COUNT=106574
-
-echo "=== [2/6] 데이터 다운로드 (병렬) ==="
-mkdir -p data/raw/noise
-cd data/raw/noise
 
 declare -A DL=(
   [shard000.tar.bz2]="$DNS_BASE/noise_fullband/datasets_fullband.noise_fullband.audioset_000.tar.bz2"
@@ -1126,6 +1345,69 @@ if count != expected:
     raise SystemExit(f"raw WAV exact count mismatch: {root}: {count} != {expected}")
 print(f"[raw] exact regular WAV count: {root}: {count}")
 PY
+}
+
+raw_mp3_tree_exact() {
+  local root=$1
+  local expected=$2
+  "$VENV_PYTHON" - "$root" "$expected" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected = int(sys.argv[2])
+if root.is_symlink() or not root.is_dir():
+    raise SystemExit(f"raw root is missing/symlink: {root}")
+paths = set()
+inodes = set()
+count = 0
+for current_text, directories, files in os.walk(root, followlinks=False):
+    current = Path(current_text)
+    for name in directories:
+        child = current / name
+        if child.is_symlink() or not stat.S_ISDIR(child.lstat().st_mode):
+            raise SystemExit(f"raw directory symlink/non-directory: {child}")
+    for name in files:
+        child = current / name
+        info = child.lstat()
+        if child.is_symlink() or not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"raw file symlink/non-regular: {child}")
+        if child.suffix.casefold() != ".mp3":
+            continue
+        relative = child.relative_to(root).as_posix().casefold()
+        inode = (int(info.st_dev), int(info.st_ino))
+        if relative in paths or inode in inodes:
+            raise SystemExit(f"duplicate raw MP3 path/inode: {child}")
+        paths.add(relative)
+        inodes.add(inode)
+        count += 1
+if count != expected:
+    raise SystemExit(f"raw MP3 exact count mismatch: {root}: {count} != {expected}")
+print(f"[raw] exact regular MP3 count: {root}: {count}")
+PY
+}
+
+verify_public_raw_cache() {
+  local environment
+  raw_wav_tree_exact "$REPO/data/raw/noise/dns_fullband" 16000 || return 1
+  raw_wav_tree_exact "$REPO/data/raw/noise/speech" 8065 || return 1
+  raw_wav_tree_exact "$REPO/data/raw/noise/esc50/ESC-50-master/audio" 2000 || return 1
+  [ -s "$REPO/data/raw/noise/esc50/ESC-50-master/meta/esc50.csv" ] || {
+    echo "[오류] cache ESC-50 metadata가 없습니다." >&2
+    return 1
+  }
+  for environment in "${DEMAND_ENVIRONMENTS[@]}"; do
+    raw_wav_tree_exact "$REPO/data/raw/noise/demand/$environment" 16 || return 1
+  done
+  raw_wav_tree_exact "$REPO/data/raw/noise/machine" 3600 || return 1
+  raw_mp3_tree_exact "$FMA_ROOT/fma_small" 8000 || return 1
+  if ! fma_metadata_complete || ! fma_audio_metadata_match; then
+    echo "[오류] cache FMA metadata/artist·album/audio ID 검증 실패" >&2
+    return 1
+  fi
+  echo "[cache preflight] public raw exact counts/metadata 확인 완료"
 }
 
 zip_valid() {
@@ -1348,6 +1630,37 @@ download_mimii() {
   rm -f "$archive"
 }
 
+if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ]; then
+  begin_status_stage cache_verification
+  echo "=== [cache preflight] existing public raw + decoder audit reuse ==="
+  if ! verify_public_raw_cache; then
+    echo "[오류] cache public raw exact-count/metadata 검증 실패. 다운로드나 manifest 생성을 시작하지 않습니다." >&2
+    exit 1
+  fi
+  if ! "$VENV_PYTHON" scripts/data/verify_decoder_audit_reuse.py \
+      --root . \
+      --audit "$DECODER_AUDIT_REPORT" \
+      --scan-root data/raw \
+      --expected-audit-sha256 "$EXPECTED_DECODER_AUDIT_SHA256" \
+      --expected-file-sha256 "$EXPECTED_DECODER_AUDIT_FILE_SHA256" \
+      --hash-workers "$RAW_HASH_WORKERS"; then
+    echo "[오류] cache decoder audit 외부 anchor/fingerprint/raw inventory 전수검증 실패. 다운로드나 manifest 생성을 시작하지 않습니다." >&2
+    exit 1
+  fi
+  if ! verify_exact_checkout || ! verify_canonical_bundle || \
+     ! environment_complete || ! verify_transfer_bundle "$VENV_PYTHON"; then
+    echo "[오류] cache 전수검증 중 exact code/holdout/environment/transfer가 바뀌었습니다." >&2
+    exit 1
+  fi
+  echo "[cache preflight] PASS — existing venv/transfer/public raw/decoder audit만 검증했습니다. download/manifest/QA/full pytest/bootstrap receipt는 실행·생성하지 않았습니다."
+  exit 0
+fi
+
+begin_status_stage public_download
+echo "=== [2/6] 데이터 다운로드 (병렬) ==="
+mkdir -p data/raw/noise
+cd data/raw/noise
+
 pids=()
 declare -A download_labels=()
 start_download() {
@@ -1430,6 +1743,7 @@ if ! esc50_complete || ! fma_complete || ! demand_complete || ! mimii_complete; 
   exit 1
 fi
 
+begin_status_stage raw_integrity
 echo "=== [3/6] DNS 샤드 무결성 검사 + 해제 ==="
 for f in "${!DEST[@]}"; do
   if [ -f "$f" ] && ! bzip2 -t "$f"; then
@@ -1536,6 +1850,7 @@ if ! raw_wav_tree_exact dns_fullband 16000 || ! raw_wav_tree_exact speech 8065; 
 fi
 cd "$REPO"
 
+begin_status_stage manifest_qa
 echo "=== [4/6] manifest + RIR 뱅크 + 데이터셋 QA ==="
 # 긴 다운로드 동안 tracked code나 별도 채널로 전달한 canonical bundle이 바뀌지
 # 않았는지 manifest 생성 직전에 다시 확인한다. prepare에도 같은 외부 SHA를 전달한다.
@@ -1633,9 +1948,11 @@ if [ "$coverage_status" -eq 1 ]; then
   echo "[차단 증거] recorded strict 부대역 coverage가 부족합니다. bootstrap은 증거 보존을 위해 계속하지만 readiness/학습은 FAIL이어야 합니다." >&2
 fi
 
+begin_status_stage full_pytest
 echo "=== [5/6] 검증 (pytest) ==="
 "$VENV_PYTHON" -B -m pytest -q
 
+begin_status_stage bootstrap_receipt
 echo "=== [6/6] 환경·데이터 준비 완료 (학습은 시작하지 않음) ==="
 if ! verify_exact_checkout || ! verify_canonical_bundle || ! environment_complete; then
   echo "[오류] 최종 bootstrap receipt 직전 code/holdout/environment가 바뀌었습니다." >&2

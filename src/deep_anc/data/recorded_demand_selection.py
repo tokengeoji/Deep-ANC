@@ -38,10 +38,10 @@ from .source_trust import (
 
 DEMAND_SELECTION_SCHEMA_VERSION = 2
 DEMAND_SELECTION_KIND = "recorded_demand_environment_selection"
-DEMAND_SELECTION_GENERATION_ID = "stage1-coverage-v2"
+DEMAND_SELECTION_GENERATION_ID = "stage1-coverage-v3-gain012"
 DEMAND_SELECTION_BUNDLE_ROOT = (
     "data/source_plans/recorded_additions/demand_environment_selections/"
-    "stage1-coverage-v2/canonical"
+    "stage1-coverage-v3-gain012/canonical"
 )
 DEMAND_SELECTION_RECEIPT = f"{DEMAND_SELECTION_BUNDLE_ROOT}/selection_receipt.json"
 DEMAND_SELECTION_PARENT_MANIFEST = (

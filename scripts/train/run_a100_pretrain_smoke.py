@@ -61,6 +61,7 @@ def _overrides(
     run_until_step: int,
     loss_alpha: float | None = None,
     loss_lambda_dnh: float | None = None,
+    seed: int = 20260803,
 ) -> list[str]:
     overrides = [
         f"experiment_role={A100_PRETRAIN_SMOKE_ROLE}",
@@ -68,10 +69,13 @@ def _overrides(
         "contract_run_dir=false",
         "campaign_prerequisite=null",
         "campaign_prerequisite_sha256=null",
+        "second_seed_prerequisite=null",
+        "second_seed_prerequisite_sha256=null",
         "init_ckpt=null",
         f"a100_smoke_run_label={label}",
         f"run_until_step={int(run_until_step)}",
         f"data.bootstrap_receipt_sha256={bootstrap_sha256}",
+        f"seed={int(seed)}",
     ]
     # smoke receipt는 canonical의 학습 의미를 증명한다. 따라서 pilot 승자가 기본
     # alpha=0.7이 아닐 때 YAML을 복사하거나 receipt를 다른 loss에 재사용하지 않고,
@@ -96,6 +100,7 @@ def _resolved_cfg(
     run_until_step: int,
     loss_alpha: float | None = None,
     loss_lambda_dnh: float | None = None,
+    seed: int = 20260803,
 ) -> dict:
     return load_train_config(
         config,
@@ -105,6 +110,7 @@ def _resolved_cfg(
             run_until_step=run_until_step,
             loss_alpha=loss_alpha,
             loss_lambda_dnh=loss_lambda_dnh,
+            seed=seed,
         ),
     )
 
@@ -118,6 +124,7 @@ def _run_train(
     cublas_workspace_config: str,
     loss_alpha: float | None = None,
     loss_lambda_dnh: float | None = None,
+    seed: int = 20260803,
     resume: Path | None = None,
 ) -> dict:
     cfg = _resolved_cfg(
@@ -127,6 +134,7 @@ def _run_train(
         run_until_step=run_until_step,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        seed=seed,
     )
     command = [
         sys.executable,
@@ -140,6 +148,7 @@ def _run_train(
         run_until_step=run_until_step,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        seed=seed,
     ):
         command.extend(["--set", override])
     if resume is not None:
@@ -231,6 +240,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="선택된 loss pilot의 alpha별 calibrated lambda_dnh",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        choices=(20260803, 20260903),
+        default=20260803,
+        help="공식 primary/secondary seed (secondary는 별도 fresh smoke target)",
+    )
+    parser.add_argument(
         "--cublas-workspace-config",
         choices=(":4096:8", ":16:8"),
         default=":4096:8",
@@ -252,6 +268,7 @@ def main() -> int:
     final_step = int(args.final_step)
     loss_alpha = float(args.loss_alpha)
     loss_lambda_dnh = float(args.loss_lambda_dnh)
+    seed = int(args.seed)
     if not math.isfinite(loss_lambda_dnh) or loss_lambda_dnh <= 0.0:
         raise ValueError("--loss-lambda-dnh는 finite 양수여야 합니다")
     if not 200 <= stop_step <= 500 or not stop_step < final_step <= 500:
@@ -267,6 +284,7 @@ def main() -> int:
         run_until_step=final_step,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        seed=seed,
     )
     target = str(preview["smoke_target_sha256"])
     target_root = smoke_run_directory(preview, repo_root=REPO_ROOT).parent
@@ -284,6 +302,7 @@ def main() -> int:
         cublas_workspace_config=args.cublas_workspace_config,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        seed=seed,
     )
     resumed_initial_cfg = _run_train(
         config,
@@ -293,6 +312,7 @@ def main() -> int:
         cublas_workspace_config=args.cublas_workspace_config,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        seed=seed,
     )
     full_dir = smoke_run_directory(full_cfg, repo_root=REPO_ROOT)
     resumed_dir = smoke_run_directory(resumed_initial_cfg, repo_root=REPO_ROOT)
@@ -318,6 +338,7 @@ def main() -> int:
         cublas_workspace_config=args.cublas_workspace_config,
         loss_alpha=loss_alpha,
         loss_lambda_dnh=loss_lambda_dnh,
+        seed=seed,
         resume=stop_checkpoint,
     )
     if str(resumed_cfg["smoke_target_sha256"]) != target:

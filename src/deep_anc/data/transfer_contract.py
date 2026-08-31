@@ -56,6 +56,10 @@ _ROLES = frozenset(
         "recording_level_campaign",
         "recording_level_meter_raw",
         "recording_level_meter_receipt",
+        "recording_source_gain_plan",
+        "recording_gain_linearity_receipt",
+        "recording_gain_linearity_plan",
+        "recording_gain_linearity_raw",
         "recorded_source_plan",
         "recorded_source_selection",
         "lineage_tracks",
@@ -83,6 +87,10 @@ _ROLE_PREFIXES = {
     "recording_level_campaign": "results/recording_level_campaigns/",
     "recording_level_meter_raw": "results/",
     "recording_level_meter_receipt": "results/",
+    "recording_source_gain_plan": "results/",
+    "recording_gain_linearity_receipt": "results/",
+    "recording_gain_linearity_plan": "results/",
+    "recording_gain_linearity_raw": "results/",
     "recorded_source_plan": "data/source_plans/recorded_additions/",
     "recorded_source_selection": "data/source_plans/recorded_additions/",
     "lineage_tracks": "data/raw/music/fma_metadata/",
@@ -456,6 +464,10 @@ def validate_transfer_manifest(
                 "recording_level_campaign",
                 "recording_level_meter_raw",
                 "recording_level_meter_receipt",
+                "recording_source_gain_plan",
+                "recording_gain_linearity_receipt",
+                "recording_gain_linearity_plan",
+                "recording_gain_linearity_raw",
                 "recorded_source_plan",
                 "recorded_source_selection",
             )
@@ -484,6 +496,20 @@ def validate_transfer_manifest(
         ):
             raise TransferContractError(
                 "schema v2 recording-level campaign/raw/receipt role은 같은 양수 개수여야 합니다"
+            )
+        gain_role_counts = {
+            role: len(by_role[role])
+            for role in (
+                "recording_source_gain_plan",
+                "recording_gain_linearity_receipt",
+                "recording_gain_linearity_plan",
+                "recording_gain_linearity_raw",
+            )
+        }
+        if set(gain_role_counts.values()) != {1}:
+            raise TransferContractError(
+                "schema v2 canonical additions에는 source-gain/linearity authority "
+                "4개 role이 각각 정확히 1개여야 합니다"
             )
     if by_role["lineage_tracks"] != ["data/raw/music/fma_metadata/tracks.csv"]:
         raise TransferContractError("lineage_tracks role은 canonical FMA tracks.csv 1개여야 합니다")
@@ -736,22 +762,48 @@ def validate_transfer_manifest(
         campaign_paths: list[str] = []
         meter_raw_paths: list[str] = []
         meter_receipt_paths: list[str] = []
+        gain_authority_paths: dict[str, set[str]] = {
+            "source_gain_plan": set(),
+            "gain_linearity_receipt": set(),
+            "gain_linearity_plan": set(),
+            "gain_linearity_raw": set(),
+        }
         seen_campaign_ids: set[str] = set()
         from .recording_level_campaign import (
             RecordingLevelCampaignError,
             validate_recording_level_campaign,
         )
+        from .recording_gain_linearity import (
+            RecordingGainLinearityError,
+            validate_gain_linearity_receipt,
+        )
+        from .recording_source_gain import (
+            RecordingSourceGainError,
+            validate_recording_source_gain_plan,
+        )
+
+        gain_role_for_field = {
+            "source_gain_plan": "recording_source_gain_plan",
+            "gain_linearity_receipt": "recording_gain_linearity_receipt",
+            "gain_linearity_plan": "recording_gain_linearity_plan",
+            "gain_linearity_raw": "recording_gain_linearity_raw",
+        }
+        gain_campaign_keys = {
+            "campaign_id",
+            "campaign",
+            "meter_raw",
+            "meter_receipt",
+            "hardware_config",
+        } | set(gain_role_for_field)
 
         for index, campaign_ref in enumerate(expected_campaigns):
-            if not isinstance(campaign_ref, dict) or set(campaign_ref) != {
-                "campaign_id",
-                "campaign",
-                "meter_raw",
-                "meter_receipt",
-                "hardware_config",
-            }:
+            campaign_keys = (
+                frozenset(campaign_ref) if isinstance(campaign_ref, dict) else frozenset()
+            )
+            if campaign_keys != frozenset(gain_campaign_keys):
                 raise TransferContractError(
-                    f"schema v2 recording level campaign #{index} summary가 불완전합니다"
+                    f"schema v2 recording level campaign #{index} summary에 "
+                    "source-gain/linearity authority 4종이 필수입니다"
                 )
             campaign_id = campaign_ref.get("campaign_id")
             if not isinstance(campaign_id, str) or campaign_id in seen_campaign_ids:
@@ -824,6 +876,77 @@ def validate_transfer_manifest(
                 raise TransferContractError(
                     "schema v2 recording level campaign refs가 campaign JSON에서 재유도되지 않습니다"
                 )
+            for field, role in gain_role_for_field.items():
+                ref = campaign_ref.get(field)
+                if (
+                    not isinstance(ref, dict)
+                    or set(ref) != {"path", "size", "sha256"}
+                ):
+                    raise TransferContractError(
+                        f"schema v2 recording level campaign #{index} {field} ref 오류"
+                    )
+                path = str(ref["path"])
+                entry = entry_by_path.get(path)
+                if (
+                    entry is None
+                    or entry.get("role") != role
+                    or entry.get("sha256") != ref.get("sha256")
+                    or entry.get("size") != ref.get("size")
+                ):
+                    raise TransferContractError(
+                        f"schema v2 {field} transfer role/path/SHA/size 불일치"
+                    )
+                gain_authority_paths[field].add(path)
+            try:
+                source_gain = validate_recording_source_gain_plan(
+                    repo_root=root,
+                    plan_path=str(campaign_ref["source_gain_plan"]["path"]),
+                    expected_sha256=str(
+                        campaign_ref["source_gain_plan"]["sha256"]
+                    ),
+                )
+                gain_linearity = validate_gain_linearity_receipt(
+                    repo_root=root,
+                    receipt_path=str(
+                        campaign_ref["gain_linearity_receipt"]["path"]
+                    ),
+                    expected_sha256=str(
+                        campaign_ref["gain_linearity_receipt"]["sha256"]
+                    ),
+                )
+            except (
+                OSError,
+                RecordingGainLinearityError,
+                RecordingSourceGainError,
+                ValueError,
+            ) as exc:
+                raise TransferContractError(
+                    f"schema v2 source-gain/linearity authority 재검증 실패: {exc}"
+                ) from exc
+            source_payload = source_gain.get("payload")
+            gain_payload = gain_linearity.get("payload")
+            if (
+                source_gain.get("canonical_live_eligible") is not True
+                or gain_linearity.get("passed") is not True
+                or not isinstance(source_payload, dict)
+                or not isinstance(gain_payload, dict)
+                or not isinstance(gain_payload.get("hardware"), dict)
+                or source_payload.get("gain_linearity_receipt")
+                != campaign_ref["gain_linearity_receipt"]
+                or gain_payload.get("plan") != campaign_ref["gain_linearity_plan"]
+                or gain_payload.get("raw") != campaign_ref["gain_linearity_raw"]
+                or source_payload.get("gain_linearity_hardware")
+                != gain_payload.get("hardware")
+                or gain_payload.get("hardware", {}).get("path")
+                != hardware_config.get("path")
+                or gain_payload.get("hardware", {}).get("sha256")
+                != hardware_config.get("sha256")
+                or gain_payload.get("hardware", {}).get("size")
+                != hardware_config.get("size")
+            ):
+                raise TransferContractError(
+                    "schema v2 source-gain/linearity/campaign hardware 결속 불일치"
+                )
         if (
             sorted(campaign_paths) != sorted(by_role["recording_level_campaign"])
             or sorted(meter_raw_paths)
@@ -833,6 +956,13 @@ def validate_transfer_manifest(
         ):
             raise TransferContractError(
                 "schema v2 recording-level campaign/raw/receipt role exact 집합이 generation과 다릅니다"
+            )
+        gain_role_paths = {
+            field: set(by_role[role]) for field, role in gain_role_for_field.items()
+        }
+        if gain_authority_paths != gain_role_paths:
+            raise TransferContractError(
+                "schema v2 gain authority role exact 집합이 generation campaign refs와 다릅니다"
             )
         source_selections = additions_summary.get("source_selection", {})
         if not isinstance(source_selections, dict):

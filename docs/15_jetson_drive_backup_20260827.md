@@ -1,7 +1,7 @@
 # Jetson 데이터 Google Drive 백업 기록
 
 최초 시작: 2026-08-27 (KST)<br>
-상태: **누락 343개만 순차 업로드 재개 — 검증 완료한 개별 public 원본만 부분 정리**
+상태: **2026-08-27 고정 snapshot 13,428/13,428 완료 — 이후 생성분은 별도 snapshot 필요**
 
 ## 백업 대상과 무결성 기준
 
@@ -95,6 +95,29 @@ Drive에 보존된 `data_backup_manifest.sha256`은 13,428행이고 파일 SHA-2
 
 현재 rclone shared Google Drive client ID의 2026년 폐기 예고와 요청률 변동도 관찰됐다.
 전송 속도 때문에 검증 단계를 줄이거나 전송 프로세스를 중복 실행하지 않는다.
+
+### 2026-08-30 완료 및 2026-08-31 원격 readback
+
+누락 343개 업로드 뒤 고정 목록과 Drive 상대경로 집합은 `13,428/13,428`, missing/extra
+각각 `0`이 됐다. 2026-08-31에는 화면이나 과거 로그가 아니라 Drive remote를 다시 읽어
+다음을 확인했다.
+
+| 확인 항목 | 원격 readback |
+|---|---:|
+| regular files | 13,428 |
+| regular-file bytes | 17,439,445,191 |
+| `data_backup_manifest.sha256` 행 | 13,428 |
+| manifest SHA-256 | `1dd9fef8d796cc1f27fbf5d434d640c8b80554e16f04b6bfac0d3403c748bea2` |
+| 현 82-session transfer의 `data/` 입력 | 337/337 path 존재, SHA mismatch 0 |
+
+최초 표의 `17,441,317,063`은 `du -sb data`가 포함한 directory metadata 집계이고,
+Drive의 값은 regular-file bytes 합계다. 차이 `1,871,872`바이트는 누락 파일이 아니다.
+
+이 완료 판정의 범위는 업로드 전 고정한 2026-08-27 snapshot뿐이다. 이후 Jetson에 생성된
+새 session/failure raw, `results/`, `runs/`, `assets/`를 자동으로 포함하지 않는다. 현 학습
+transfer의 data 밖 authority와 decoder audit은
+[`64_20260831_training_backup_bootstrap_status.md`](64_20260831_training_backup_bootstrap_status.md)의
+별도 no-replace 백업 범위를 따른다.
 
 ## 삭제·보존 정책
 

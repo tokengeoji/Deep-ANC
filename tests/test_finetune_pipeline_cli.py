@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -84,6 +85,140 @@ ARGS = [
     "--set",
     "data.digital_primary_path_mode=measured",
 ]
+
+
+@pytest.fixture(autouse=True)
+def _canonical_selection_authority_dependencies(monkeypatch):
+    """selection unit fixture도 canonical role/step/SHA chain을 실제로 구성한다.
+
+    전체 reproducibility 파일과 raw campaign ledger 자체는 각 전용 test module이
+    검증한다. 여기서는 공개 admission helper를 우회하지 않고 그 두 외부 validator의
+    반환 authority만 exact checkpoint bytes에서 재구성한다.
+    """
+
+    import deep_anc.config as config_module
+    import deep_anc.train.campaign_prerequisite as campaign_module
+    import deep_anc.train.completion_receipt as completion_module
+
+    marker = "_selection_authority_test_fixture"
+    original_policy = config_module.validate_canonical_training_policy
+    original_completion = completion_module.validate_completion_receipt
+    original_prerequisite = campaign_module.validate_canonical_pretrain_prerequisites
+    prerequisite_seeds: list[int] = []
+
+    def policy(cfg):
+        if cfg.get(marker) is True:
+            return None
+        return original_policy(cfg)
+
+    def completion(
+        ckpt_dir,
+        *,
+        expected_role=None,
+        expected_init_eligible=None,
+        repo_root=None,
+    ):
+        directory = Path(ckpt_dir)
+        best = directory / "best.pt"
+        if best.is_file():
+            state = torch.load(best, map_location="cpu", weights_only=False)
+            cfg = state.get("cfg") if isinstance(state, dict) else None
+            if isinstance(cfg, dict) and cfg.get(marker) is True:
+                role = cfg.get("experiment_role")
+                eligible = cfg.get("init_eligible") is True
+                assert role == expected_role
+                assert eligible is expected_init_eligible
+                steps = 100_000 if role == "canonical_pretrain" else 50_000
+                return {
+                    "experiment_role": role,
+                    "init_eligible": eligible,
+                    "experiment_contract_sha256": cfg.get(
+                        "experiment_contract_sha256"
+                    ),
+                    "schedule_total_steps": steps,
+                    "completed_step": steps,
+                    "best_checkpoint_sha256": pipeline._sha256_file(best),
+                }
+        return original_completion(
+            directory,
+            expected_role=expected_role,
+            expected_init_eligible=expected_init_eligible,
+            repo_root=repo_root,
+        )
+
+    def prerequisite(cfg, *, repo_root):
+        if cfg.get(marker) is True:
+            prerequisite_seeds.append(int(cfg["seed"]))
+            if cfg.get("seed") == 20260903:
+                assert cfg.get("second_seed_prerequisite")
+                assert cfg.get("second_seed_prerequisite_sha256")
+            return {}
+        return original_prerequisite(cfg, repo_root=repo_root)
+
+    monkeypatch.setattr(config_module, "validate_canonical_training_policy", policy)
+    monkeypatch.setattr(completion_module, "validate_completion_receipt", completion)
+    monkeypatch.setattr(
+        campaign_module, "validate_canonical_pretrain_prerequisites", prerequisite
+    )
+    yield prerequisite_seeds
+
+
+def _canonical_selection_checkpoint_cfg(
+    tmp_path: Path,
+    *,
+    manifest: Path,
+    seed: int,
+    name: str,
+    init_seed: int | None = None,
+    fine_role: str = "canonical_finetune",
+) -> tuple[dict, Path]:
+    """50k selection cfg와 그 init인 completed 100k best.pt test fixture."""
+
+    if init_seed is None:
+        init_seed = seed
+    marker = "_selection_authority_test_fixture"
+    pretrain_cfg = {
+        marker: True,
+        "experiment_role": "canonical_pretrain",
+        "init_eligible": True,
+        "seed": init_seed,
+        "campaign_prerequisite": (
+            "results/training_prerequisites/canonical_pretrain.json"
+        ),
+        "campaign_prerequisite_sha256": "a" * 64,
+    }
+    if init_seed == 20260903:
+        pretrain_cfg.update(
+            second_seed_prerequisite=(
+                "results/training_prerequisites/second_seed/"
+                + "b" * 64
+                + "/seed_20260903.json"
+            ),
+            second_seed_prerequisite_sha256="c" * 64,
+        )
+    pretrain_cfg = stamp_experiment_contract(pretrain_cfg, repo_root=tmp_path)
+    init_checkpoint = (
+        tmp_path / "runs" / f"pretrain-{name}-{init_seed}" / "ckpt" / "best.pt"
+    )
+    init_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"cfg": pretrain_cfg, "model": {"weight": torch.ones(1)}},
+        init_checkpoint,
+    )
+    fine_cfg = stamp_experiment_contract(
+        _canonical_sampling_checkpoint_cfg(
+            **{
+                marker: True,
+                "experiment_role": fine_role,
+                "init_eligible": False,
+                "seed": seed,
+                "recorded_manifest": str(manifest.absolute()),
+                "init_ckpt": str(init_checkpoint.absolute()),
+            }
+        ),
+        repo_root=tmp_path,
+    )
+    return fine_cfg, init_checkpoint
 
 
 def _canonical_sampling_checkpoint_cfg(**updates) -> dict:
@@ -432,6 +567,8 @@ def _make_val_selection(
         "machine",
     ),
     groups_per_family: int = 4,
+    init_seed: int | None = None,
+    fine_role: str = "canonical_finetune",
 ) -> tuple[Path, dict, Path]:
     if manifest is None:
         manifest = tmp_path / "recorded.jsonl"
@@ -441,15 +578,16 @@ def _make_val_selection(
         source_families=source_families,
         groups_per_family=groups_per_family,
     )
-    stamped = stamp_experiment_contract(
-        _canonical_sampling_checkpoint_cfg(**{
-            "experiment_role": "selection_test",
-            "seed": seed,
-            "recorded_manifest": str(manifest.absolute()),
-        }),
-        repo_root=tmp_path,
+    stamped, _ = _canonical_selection_checkpoint_cfg(
+        tmp_path,
+        manifest=manifest,
+        seed=seed,
+        name=name,
+        init_seed=init_seed,
+        fine_role=fine_role,
     )
-    checkpoint = tmp_path / f"{name}-{seed}.pt"
+    checkpoint = tmp_path / "runs" / f"finetune-{name}-{seed}" / "ckpt" / "best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"cfg": stamped, "model": {"weight": torch.ones(1)}}, checkpoint)
     evaluation = tmp_path / f"val-{name}-{seed}"
     evaluation.mkdir()
@@ -845,17 +983,16 @@ def test_recorded_val_selection_is_frozen_before_test_and_test_opens_once(tmp_pa
     manifest = tmp_path / "recorded.jsonl"
     _write_canonical_recorded_manifest(manifest, splits=("val",))
     candidates = []
-    stamped = stamp_experiment_contract(
-        _canonical_sampling_checkpoint_cfg(**{
-            "experiment_role": "selection_test",
-            "seed": 20260803,
-            "recorded_manifest": str(manifest.absolute()),
-        }),
-        repo_root=tmp_path,
+    stamped, _ = _canonical_selection_checkpoint_cfg(
+        tmp_path,
+        manifest=manifest,
+        seed=20260803,
+        name="ranking",
     )
     contract_sha = stamped["experiment_contract_sha256"]
     for name, metric in (("best", -2.0), ("last", -4.0)):
-        checkpoint = tmp_path / f"{name}.pt"
+        checkpoint = tmp_path / "runs" / f"finetune-{name}" / "ckpt" / "best.pt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"cfg": stamped, "model": {"weight": torch.ones(1)}}, checkpoint)
         evaluation = tmp_path / f"val-{name}"
         evaluation.mkdir()
@@ -878,7 +1015,7 @@ def test_recorded_val_selection_is_frozen_before_test_and_test_opens_once(tmp_pa
         manifest_path=manifest,
         experiment_contract_sha256=contract_sha,
     )
-    assert Path(selection["selected"]["checkpoint"]).name == "last.pt"
+    assert Path(selection["selected"]["checkpoint"]).parent.parent.name == "finetune-last"
     assert selection["selection_split"] == "val"
     with pytest.raises(FileExistsError, match="이미 있어"):
         pipeline.freeze_recorded_val_selection(
@@ -1765,15 +1902,14 @@ def test_test_capability_rejects_selection_missing_required_source_family(tmp_pa
     _write_canonical_recorded_manifest(
         manifest, splits=("val",), source_families=families
     )
-    stamped = stamp_experiment_contract(
-        _canonical_sampling_checkpoint_cfg(**{
-            "experiment_role": "selection_test",
-            "seed": 20260803,
-            "recorded_manifest": str(manifest.absolute()),
-        }),
-        repo_root=tmp_path,
+    stamped, _ = _canonical_selection_checkpoint_cfg(
+        tmp_path,
+        manifest=manifest,
+        seed=20260803,
+        name="missing-family",
     )
-    checkpoint = tmp_path / "best.pt"
+    checkpoint = tmp_path / "runs/finetune-missing-family/ckpt/best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"cfg": stamped, "model": {"weight": torch.ones(1)}}, checkpoint)
     evaluation = tmp_path / "val-best"
     evaluation.mkdir()
@@ -1828,15 +1964,14 @@ def test_strict_coverage_gap_is_inconclusive_data_and_cannot_open_test(tmp_path)
 
     manifest = tmp_path / "recorded.jsonl"
     _write_canonical_recorded_manifest(manifest, splits=("val",))
-    stamped = stamp_experiment_contract(
-        _canonical_sampling_checkpoint_cfg(**{
-            "experiment_role": "selection_test",
-            "seed": 20260803,
-            "recorded_manifest": str(manifest.absolute()),
-        }),
-        repo_root=tmp_path,
+    stamped, _ = _canonical_selection_checkpoint_cfg(
+        tmp_path,
+        manifest=manifest,
+        seed=20260803,
+        name="coverage-gap",
     )
-    checkpoint = tmp_path / "best.pt"
+    checkpoint = tmp_path / "runs/finetune-coverage-gap/ckpt/best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"cfg": stamped, "model": {"weight": torch.ones(1)}}, checkpoint)
     payload = _recorded_val_metric_payload(
         checkpoint=checkpoint,
@@ -1913,44 +2048,24 @@ def test_strict_coverage_gap_is_inconclusive_data_and_cannot_open_test(tmp_path)
     assert not capability.exists()
 
 
-def test_cross_seed_finalize_chooses_g4_pass_with_largest_minimum_margin(tmp_path):
+def test_cross_seed_finalize_chooses_g4_pass_with_largest_minimum_margin(
+    tmp_path, _canonical_selection_authority_dependencies
+):
     manifest = tmp_path / "recorded.jsonl"
-    _write_canonical_recorded_manifest(manifest, splits=("val",))
     paths = []
     for seed, margin in ((20260803, 0.1), (20260903, 0.8)):
-        stamped = stamp_experiment_contract(
-            _canonical_sampling_checkpoint_cfg(**{
-                "experiment_role": "selection_test",
-                "seed": seed,
-                "recorded_manifest": str(manifest.absolute()),
-            }),
-            repo_root=tmp_path,
+        selection_path, _, _ = _make_val_selection(
+            tmp_path,
+            seed=seed,
+            margin_db=margin,
+            name=f"cross-{seed}",
+            manifest=manifest,
         )
-        checkpoint = tmp_path / f"{seed}.pt"
-        torch.save({"cfg": stamped, "model": {"weight": torch.ones(1)}}, checkpoint)
-        evaluation = tmp_path / f"val-{seed}"
-        evaluation.mkdir()
-        np.savez_compressed(
-            evaluation / "metrics.npz",
-            **_recorded_val_metric_payload(
-                checkpoint=checkpoint,
-                manifest=manifest,
-                contract_sha=stamped["experiment_contract_sha256"],
-                margin_db=margin,
-                manifest_splits=None,
-            ),
-        )
-        path = tmp_path / f"selection-{seed}.json"
-        pipeline.freeze_recorded_val_selection(
-            candidates=[(checkpoint, evaluation)],
-            selection_path=path,
-            manifest_path=manifest,
-            experiment_contract_sha256=stamped["experiment_contract_sha256"],
-        )
-        paths.append(path)
+        paths.append(selection_path)
     final = pipeline.finalize_cross_seed_selection(
         selection_paths=paths,
         final_selection_path=tmp_path / "selection-final.json",
+        repo_root=tmp_path,
     )
     assert final["seed"] == 20260903
     assert final["decision"]["status"] == "cross_seed_final"
@@ -1958,7 +2073,186 @@ def test_cross_seed_finalize_chooses_g4_pass_with_largest_minimum_margin(tmp_pat
     assert pipeline.finalize_cross_seed_selection(
         selection_paths=paths,
         final_selection_path=tmp_path / "selection-final.json",
+        repo_root=tmp_path,
     ) == final
+    assert set(_canonical_selection_authority_dependencies) == {
+        20260803,
+        20260903,
+    }
+
+
+def test_cross_seed_finalize_rejects_selection_test_role(tmp_path):
+    """direct CLI도 이름만 selection_test인 checkpoint를 winner 후보로 받지 않는다."""
+
+    manifest = tmp_path / "recorded.jsonl"
+    primary, _, _ = _make_val_selection(
+        tmp_path,
+        seed=20260803,
+        margin_db=0.1,
+        name="wrong-role-primary",
+        manifest=manifest,
+    )
+    secondary, _, _ = _make_val_selection(
+        tmp_path,
+        seed=20260903,
+        margin_db=0.8,
+        name="wrong-role-secondary",
+        manifest=manifest,
+        fine_role="selection_test",
+    )
+    with pytest.raises(ValueError, match="canonical_finetune"):
+        pipeline.finalize_cross_seed_selection(
+            selection_paths=[primary, secondary],
+            final_selection_path=tmp_path / "wrong-role-final.json",
+            repo_root=tmp_path,
+        )
+
+
+def test_test_capability_rejects_selection_test_role(tmp_path):
+    """direct finalizer뿐 아니라 one-shot test capability도 같은 role gate를 쓴다."""
+
+    selection_path, _, _ = _make_val_selection(
+        tmp_path,
+        seed=20260803,
+        margin_db=1.0,
+        name="capability-wrong-role",
+        fine_role="selection_test",
+    )
+    capability, _ = canonical_test_ledger_paths(
+        selection_path, repo_root=tmp_path
+    )
+    with pytest.raises(ValueError, match="canonical_finetune"):
+        issue_test_capability(
+            selection_path=selection_path,
+            capability_path=capability,
+            repo_root=tmp_path,
+        )
+    assert not capability.exists()
+
+
+def test_cross_seed_finalize_rejects_secondary_using_primary_pretrain_init(tmp_path):
+    """seed-neutral digest가 같아도 20260903→20260803 init 재사용은 차단한다."""
+
+    manifest = tmp_path / "recorded.jsonl"
+    primary, _, _ = _make_val_selection(
+        tmp_path,
+        seed=20260803,
+        margin_db=0.1,
+        name="wrong-init-primary",
+        manifest=manifest,
+    )
+    secondary, _, _ = _make_val_selection(
+        tmp_path,
+        seed=20260903,
+        margin_db=0.8,
+        name="wrong-init-secondary",
+        manifest=manifest,
+        init_seed=20260803,
+    )
+    with pytest.raises(ValueError, match="동일 seed"):
+        pipeline.finalize_cross_seed_selection(
+            selection_paths=[primary, secondary],
+            final_selection_path=tmp_path / "wrong-init-final.json",
+            repo_root=tmp_path,
+        )
+
+
+def test_cross_seed_runner_reconstructs_winner_seed_and_init_from_checkpoint(
+    tmp_path, monkeypatch
+):
+    """caller의 primary init을 재사용하지 않고 secondary winner cfg를 복원한다."""
+
+    winner_contract = "a" * 64
+    secondary_init = tmp_path / "runs/secondary-pretrain/ckpt/best.pt"
+    primary_init = tmp_path / "runs/primary-pretrain/ckpt/best.pt"
+    selected_checkpoint = tmp_path / "runs/secondary-finetune/ckpt/best.pt"
+    selected_checkpoint.parent.mkdir(parents=True)
+    saved_cfg = {
+        "experiment_contract_sha256": winner_contract,
+        "seed": 20260903,
+        "init_ckpt": str(secondary_init),
+        "data": {"bootstrap_receipt_sha256": "b" * 64},
+        "loss": {"nmse_cvar_alpha": 0.85, "lambda_dnh": 0.00075},
+    }
+    torch.save({"cfg": saved_cfg}, selected_checkpoint)
+    manifest = tmp_path / "recorded.jsonl"
+    manifest.write_text("{}\n", encoding="utf-8")
+    evaluation = tmp_path / "secondary-val"
+    evaluation.mkdir()
+    (evaluation / "metrics.npz").write_bytes(b"val")
+    final_path = tmp_path / "cross/recorded_val_selection.json"
+    selection = {
+        "seed": 20260903,
+        "manifest": str(manifest),
+        "selected": {
+            "checkpoint": str(selected_checkpoint),
+            "evaluation_dir": str(evaluation),
+            "metrics_sha256": "c" * 64,
+        },
+    }
+
+    class NoopLock:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    loaded_overrides: list[list[str]] = []
+    child_commands: list[list[str]] = []
+    monkeypatch.setattr(pipeline, "ProcessLock", NoopLock)
+    monkeypatch.setattr(
+        pipeline,
+        "finalize_cross_seed_selection",
+        lambda **_kwargs: selection,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "load_train_config",
+        lambda _path, overrides: (
+            loaded_overrides.append(list(overrides))
+            or {"experiment_contract_sha256": winner_contract}
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline, "_publish_selected_val_directory", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "canonical_test_ledger_paths",
+        lambda _path, **_kwargs: (
+            tmp_path / "capability.json",
+            tmp_path / "consumed.json",
+        ),
+    )
+    monkeypatch.setattr(pipeline, "issue_test_capability", lambda **_kwargs: "token")
+    monkeypatch.setattr(
+        pipeline,
+        "_run_cross_seed_command",
+        lambda command, **_kwargs: child_commands.append(list(command)),
+    )
+    monkeypatch.setattr(pipeline, "REPO_ROOT", tmp_path)
+
+    args = SimpleNamespace(
+        cross_seed_selection=["primary.json", "secondary.json"],
+        cross_seed_final_selection=str(final_path),
+        overrides=[],
+        config="configs/train_finetune.yaml",
+    )
+    assert pipeline.run_cross_seed_campaign(args) == pipeline.EXIT_OK
+
+    assert len(loaded_overrides) == 1
+    overrides = loaded_overrides[0]
+    assert f"seed=20260903" in overrides
+    assert f'init_ckpt="{secondary_init}"' in overrides
+    assert all(str(primary_init) not in value for value in overrides)
+    assert len(child_commands) == 2
+    completion = child_commands[1]
+    assert f'init_ckpt="{secondary_init}"' in completion
+    assert str(primary_init) not in " ".join(completion)
 
 
 def test_selected_val_directory_is_atomic_no_replace_and_exact_reentry(tmp_path):
@@ -1988,15 +2282,14 @@ def test_selected_val_directory_is_atomic_no_replace_and_exact_reentry(tmp_path)
 def test_recorded_test_refuses_bytes_changed_after_val_selection(tmp_path, mutated):
     manifest = tmp_path / "recorded.jsonl"
     _write_canonical_recorded_manifest(manifest, splits=("val",))
-    checkpoint = tmp_path / "best.pt"
-    stamped = stamp_experiment_contract(
-        _canonical_sampling_checkpoint_cfg(**{
-            "experiment_role": "selection_test",
-            "seed": 20260803,
-            "recorded_manifest": str(manifest.absolute()),
-        }),
-        repo_root=tmp_path,
+    stamped, _ = _canonical_selection_checkpoint_cfg(
+        tmp_path,
+        manifest=manifest,
+        seed=20260803,
+        name=f"mutated-{mutated}",
     )
+    checkpoint = tmp_path / "runs" / f"finetune-mutated-{mutated}" / "ckpt/best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
     contract_sha = stamped["experiment_contract_sha256"]
     torch.save({"cfg": stamped, "model": {"weight": torch.ones(1)}}, checkpoint)
     evaluation = tmp_path / "val-best"

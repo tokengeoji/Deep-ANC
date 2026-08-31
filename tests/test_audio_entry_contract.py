@@ -73,6 +73,12 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
         True,
         "광대역 P/S 실측. 지연 import와 입력-only preflight 뒤에만 duplex를 연다",
     ),
+    "scripts/data/measure_recording_gain_linearity.py": (
+        True,
+        True,
+        "source-gain v2 bounded ESS/IMD 실측. public int32 input-only preflight와 "
+        "exact plan/SHA/hardware pre-open gate 뒤 0.012까지만 출력한다",
+    ),
     "scripts/data/calibrate_wideband.py": (True, True, "채널별 ESS 측정"),
     "scripts/data/set_amp_level.py": (True, True, "앰프 레벨 교정 미터"),
     # 벤치·진단 (실기 필요, 학습 산출물에 직접 들어가지 않음)

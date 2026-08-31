@@ -62,6 +62,12 @@ contract_run_dir: true
 # 저장소 기본값은 공식 run stamp 이전에 fail-closed한다.
 campaign_prerequisite: results/training_prerequisites/canonical_pretrain.json
 campaign_prerequisite_sha256: null
+# seed=20260903은 primary loss-selection evidence를 다시 발행하지 않는다. primary
+# borderline selection과 seed-specific A100 resume smoke를 함께 봉인한 별도
+# no-replace prerequisite가 있을 때만 canonical pretrain admission이 열린다.
+# seed=20260803 및 모든 derivative/smoke에서는 두 값이 반드시 null이다.
+second_seed_prerequisite: null
+second_seed_prerequisite_sha256: null
 ckpt_dir: runs
 resume: null
 seed: 20260803

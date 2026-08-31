@@ -43,12 +43,23 @@ from deep_anc.data.recorded_generation import (  # noqa: E402
     SOURCE_KIND_POOL,
     SOURCE_PLAN_FIELDS,
     SOURCE_PLAN_ROOT,
+    SOURCE_SELECTION_STRICT_PRIMARY_PATH,
+    SOURCE_SELECTION_STRICT_PRIMARY_SHA256,
     RecordedGenerationError,
     _canonical_external_composite_bytes,
     _canonical_source_selection_evidence,
     _canonical_source_lineage,
     _read_source_plan,
     validate_generation_id,
+)
+from deep_anc.data.recording_gain_linearity import (  # noqa: E402
+    RecordingGainLinearityError,
+    validate_gain_linearity_receipt,
+)
+from deep_anc.data.recording_source_gain import (  # noqa: E402
+    PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS,
+    RecordingSourceGainError,
+    audit_source_plan_at_measured_cap,
 )
 from deep_anc.data.recorded_demand_selection import (  # noqa: E402
     DEMAND_LINEAGE_KEY,
@@ -69,7 +80,7 @@ from deep_anc.data.recorded_dns_selection import (  # noqa: E402
     validate_dns_selection_receipt,
 )
 
-CANONICAL_GENERATION_ID = "stage1-coverage-v2"
+CANONICAL_GENERATION_ID = "stage1-coverage-v3-gain012"
 
 
 def _snapshot(relative: str, *, label: str):
@@ -250,7 +261,54 @@ def _render(rows: list[dict[str, str]]) -> bytes:
     return handle.getvalue().encode("utf-8")
 
 
-def _validate_bytes(raw: bytes, *, generation_id: str) -> None:
+def _measured_cap_from_receipt(
+    *, receipt_path: str, expected_receipt_sha256: str
+) -> int:
+    summary = validate_gain_linearity_receipt(
+        repo_root=REPO_ROOT,
+        receipt_path=receipt_path,
+        expected_sha256=expected_receipt_sha256,
+    )
+    if summary.get("passed") is not True:
+        raise ValueError("gain-linearity receipt가 PASS가 아닙니다")
+    analysis = summary["payload"].get("analysis")
+    cap = analysis.get("supported_max_amplitude_millionths") if isinstance(analysis, dict) else None
+    if (
+        isinstance(cap, bool)
+        or not isinstance(cap, int)
+        or not 1 <= cap <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
+    ):
+        raise ValueError("gain-linearity receipt measured amplitude cap이 유효하지 않습니다")
+    return cap
+
+
+def _require_all_rows_feasible(
+    *, relative_plan: str, plan_sha256: str, amplitude_millionths: int
+) -> dict[str, object]:
+    audit = audit_source_plan_at_measured_cap(
+        repo_root=REPO_ROOT,
+        source_plan=relative_plan,
+        expected_source_plan_sha256=plan_sha256,
+        strict_primary=SOURCE_SELECTION_STRICT_PRIMARY_PATH,
+        expected_strict_primary_sha256=SOURCE_SELECTION_STRICT_PRIMARY_SHA256,
+        amplitude_millionths=amplitude_millionths,
+    )
+    if audit["row_count"] != 19 or audit["feasible_row_count"] != 19:
+        concise = [
+            f"row={item['source_row_number']} path={item['path']} "
+            f"reasons={','.join(item['reasons'])}"
+            for item in audit["blockers"]
+        ]
+        raise ValueError(
+            "physical cap에서 source plan 19/19 feasible이 아닙니다: "
+            + "; ".join(concise)
+        )
+    return audit
+
+
+def _validate_bytes(
+    raw: bytes, *, generation_id: str, amplitude_millionths: int
+) -> dict[str, object]:
     staging_parent = REPO_ROOT / "results"
     reject_symlink_components(staging_parent, root=REPO_ROOT)
     with tempfile.TemporaryDirectory(
@@ -262,6 +320,11 @@ def _validate_bytes(raw: bytes, *, generation_id: str) -> None:
             repo_root=REPO_ROOT,
             relative=candidate.relative_to(REPO_ROOT).as_posix(),
             require_source_files=True,
+        )
+        return _require_all_rows_feasible(
+            relative_plan=candidate.relative_to(REPO_ROOT).as_posix(),
+            plan_sha256=hashlib.sha256(raw).hexdigest(),
+            amplitude_millionths=amplitude_millionths,
         )
 
 
@@ -306,6 +369,16 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="Elice DEMAND selector stdout에서 별도 전달한 receipt 파일 SHA-256",
     )
+    parser.add_argument(
+        "--gain-linearity-receipt",
+        required=True,
+        help="Jetson bounded physical gain/linearity PASS receipt의 저장소 상대경로",
+    )
+    parser.add_argument(
+        "--gain-linearity-receipt-sha256",
+        required=True,
+        help="gain-linearity receipt의 외부 전달 SHA-256",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check-only", action="store_true")
     mode.add_argument("--write", action="store_true")
@@ -322,6 +395,10 @@ def main(argv: list[str] | None = None) -> int:
         for option, value in (
             ("--dns-selection-receipt-sha256", dns_receipt_sha),
             ("--demand-selection-receipt-sha256", demand_receipt_sha),
+            (
+                "--gain-linearity-receipt-sha256",
+                str(args.gain_linearity_receipt_sha256).lower(),
+            ),
         ):
             if len(value) != 64 or any(
                 character not in "0123456789abcdef" for character in value
@@ -329,6 +406,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     f"{option}에는 외부 전달 64자리 SHA-256이 필요합니다"
                 )
+        gain_receipt_sha = str(args.gain_linearity_receipt_sha256).lower()
+        measured_cap = _measured_cap_from_receipt(
+            receipt_path=args.gain_linearity_receipt,
+            expected_receipt_sha256=gain_receipt_sha,
+        )
         destination = REPO_ROOT / SOURCE_PLAN_ROOT / f"{generation_id}.csv"
         if args.verify_existing:
             snapshot, rows, lineage_sha, selection_evidence = _read_source_plan(
@@ -372,6 +454,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "기존 source plan DEMAND 행이 외부 selection receipt SHA와 다릅니다"
                 )
+            cap_audit = _require_all_rows_feasible(
+                relative_plan=destination.relative_to(REPO_ROOT).as_posix(),
+                plan_sha256=raw_sha,
+                amplitude_millionths=measured_cap,
+            )
         else:
             rows = build_rows(
                 generation_id,
@@ -379,7 +466,11 @@ def main(argv: list[str] | None = None) -> int:
                 demand_selection_receipt_sha256=demand_receipt_sha,
             )
             raw = _render(rows)
-            _validate_bytes(raw, generation_id=generation_id)
+            cap_audit = _validate_bytes(
+                raw,
+                generation_id=generation_id,
+                amplitude_millionths=measured_cap,
+            )
             raw_sha = hashlib.sha256(raw).hexdigest()
             authority = _canonical_source_lineage(REPO_ROOT)
             lineage_sha = authority["evidence_sha256"]
@@ -396,7 +487,15 @@ def main(argv: list[str] | None = None) -> int:
                     relative=destination.relative_to(REPO_ROOT).as_posix(),
                     require_source_files=True,
                 )
-    except (OSError, RuntimeError, ValueError, HoldoutContractError, RecordedGenerationError) as exc:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        HoldoutContractError,
+        RecordedGenerationError,
+        RecordingGainLinearityError,
+        RecordingSourceGainError,
+    ) as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1
     mode = "verified" if args.verify_existing else ("written" if args.write else "checked")
@@ -404,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
         f"source plan {mode}: {destination}\n"
         f"rows: {len(rows)}\nsha256: {raw_sha}\nlineage evidence: {lineage_sha}"
         f"\nselection evidence: {selection_sha}"
+        f"\nphysical cap amplitude millionths: {measured_cap}"
+        f"\n19/19 cap audit: {cap_audit['evidence_sha256']}"
     )
     return 0
 

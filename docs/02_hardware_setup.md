@@ -168,9 +168,13 @@ dry-run은 출력·입력 장치를 열지 않고 디렉터리나 progress 파�
     --confirm-user-present --confirm-volume-minimum --confirm-routing-and-geometry
 ```
 
-file playback 기본 amplitude는 기존 82세션과 같은 **0.06**이다. canonical additions는
-이 값을 exact로 강제하여 실측 브랜치의 단일 레벨 계약을 보존한다. 일반 diagnostic batch만
-명시적으로 다른 값을 줄 수 있으며 공용 peak 안전 상한 0.15는 그대로 적용된다.
+file playback의 legacy/diagnostic 기본 amplitude는 기존 82세션과 같은 **0.06**이다.
+그러나 2026-08-31 strict-P 무출력 재계산에서 현재 19 source의 예측 peak 범위가 약
+22.82 dB로 달라, 이 숫자를 canonical additions 전체에 적용하는 live authority는 철회했다.
+canonical live는 exact source-list와 strict-P에 결속한 source별 gain plan, REF 상한,
+다중레벨 선형성 receipt가 모두 있어야 한다. 현 schema-v1 gain plan은 ERR 예측만 제공하므로
+정상적으로 live를 차단한다. 일반 diagnostic batch의 공용 peak 안전 상한 0.15는 그대로
+적용되지만, 안전 상한은 canonical 레벨이나 물리 SPL 근거가 아니다.
 기본값은 **재시도 없음**이다. 동일 소스를 다시 울려야 할 근거를 확인한 경우에만
 `--retry-once`를 명시한다. 각 자식 세션은 `seconds + settle +
 --session-timeout-overhead-seconds` hard timeout을 가지며 stdout/stderr가 터미널과

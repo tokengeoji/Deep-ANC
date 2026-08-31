@@ -1039,6 +1039,32 @@ def test_canonical_smoke_stop_budget_keeps_the_long_run_contract():
         validate_resume_experiment({"cfg": saved}, current)
 
 
+def test_secondary_prerequisite_provisional_cfg_resolves_with_real_loader():
+    """issuer는 prerequisite 발행 전 exists=false artifact로 prospective SHA를 만든다."""
+
+    neutral = "a" * 64
+    path = (
+        "results/training_prerequisites/second_seed/"
+        f"{neutral}/seed_20260903.json"
+    )
+    cfg = _load_bound_canonical(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        [
+            "seed=20260903",
+            f"second_seed_prerequisite={path}",
+            f"second_seed_prerequisite_sha256=\"{'0' * 64}\"",
+        ],
+    )
+
+    assert cfg["seed"] == 20260903
+    assert cfg["second_seed_prerequisite"] == path
+    assert cfg["second_seed_prerequisite_sha256"] == "0" * 64
+    artifact = cfg["experiment_contract"]["artifacts"][
+        "second_seed_prerequisite"
+    ]
+    assert artifact["exists"] is False
+
+
 def test_a100_pretrain_smoke_has_same_target_but_never_uses_canonical_runs():
     canonical = _load_bound_canonical(REPO_ROOT / "configs/train_pretrain_tiny.yaml")
     common = [

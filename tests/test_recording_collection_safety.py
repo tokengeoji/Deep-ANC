@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import contextlib
 import csv
 import hashlib
 import importlib.util
@@ -272,6 +273,77 @@ def test_record_duct_canonical_live_refuses_missing_campaign_before_audio(
     assert excinfo.value.code == 2
 
 
+def test_record_duct_direct_canonical_path_cannot_omit_v2_source_gain(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(RECORD, "REPO_ROOT", tmp_path)
+    source, ordinary_plan = _source_plan(tmp_path)
+    canonical_plan = (
+        tmp_path / RECORD.SOURCE_PLAN_ROOT / "direct-bypass-fixture.csv"
+    )
+    canonical_plan.parent.mkdir(parents=True)
+    canonical_plan.write_bytes(ordinary_plan.read_bytes())
+    digest = hashlib.sha256(canonical_plan.read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        RECORD,
+        "load_yaml",
+        lambda _path: {"audio": {"sample_rate": 48_000, "block_size": 256}},
+    )
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "sounddevice":
+            raise AssertionError("v2 authority 거절 전에 sounddevice를 import했습니다")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    with pytest.raises(SystemExit) as excinfo:
+        RECORD.main(
+            [
+                "--program", "file", "--file", str(source), "--seconds", "15",
+                "--amplitude", "0.06", "--source-family", "speech",
+                "--group-id", "speaker-book-001", "--source-list", str(canonical_plan),
+                "--source-list-sha256", digest, "--source-row-number", "2",
+                "--lineage-key", "speaker-book-001", "--preassigned-split", "train",
+                "--out-root", str(tmp_path / RECORD.ADDITIONS_ROOT / "direct-bypass-fixture"),
+                "--confirm-user-present", "--confirm-volume-minimum",
+                "--confirm-routing-and-geometry",
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_stream_constructor_mutation_is_caught_before_callback_start(tmp_path):
+    authority = tmp_path / "authority.json"
+    authority.write_text('{"version":1}\n', encoding="utf-8")
+    state = {"closed": False, "started": False}
+
+    class FakeStream:
+        def __init__(self, **_kwargs):
+            authority.write_text('{"version":2}\n', encoding="utf-8")
+
+        def close(self):
+            state["closed"] = True
+
+        def start(self):
+            state["started"] = True
+
+    class FakeSoundDevice:
+        Stream = FakeStream
+
+    with contextlib.ExitStack() as stack:
+        guard = stack.enter_context(
+            RECORD.RepositoryFileGuard(tmp_path, "authority.json", label="fixture authority")
+        )
+        with pytest.raises(RuntimeError, match="변경"):
+            RECORD._construct_stream_after_authority_check(
+                FakeSoundDevice,
+                pre_open_check=guard.verify,
+                stream_kwargs={},
+            )
+    assert state == {"closed": True, "started": False}
+
+
 def test_collection_plan_rejects_wrong_sha(tmp_path):
     source, plan = _source_plan(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
@@ -497,6 +569,21 @@ def test_canonical_batch_qa_failure_is_quarantined_and_exits_nonzero(
             "e" * 64,
             {"evidence_sha256": "s" * 64},
         ),
+    )
+    # 이 테스트의 책임은 이미 열린 live child가 QA 실패했을 때 raw를 격리하는
+    # downstream 동작이다. source-gain v1 자체가 canonical live를 차단하는지는
+    # test_recording_source_gain.py에서 별도로 실검증한다.
+    monkeypatch.setattr(
+        BATCH,
+        "_validate_batch_source_gain_plan",
+        lambda *_args, **_kwargs: {"plan_sha256": "g" * 64},
+    )
+    monkeypatch.setattr(
+        BATCH,
+        "_canonical_source_gain_by_row",
+        lambda _summary, current_entries: {
+            int(entry["source_row_number"]): 0.012 for entry in current_entries
+        },
     )
 
     def fake_child(command, *, timeout_seconds, log_path):
@@ -858,12 +945,13 @@ def test_batch_progress_migrates_existing_narrow_failure_rows_without_loss(
         reason = "coh²(source_aligned→ERR,600-1600Hz) 0.590000 < 0.600000"
         receipt.write_text(
             json.dumps(
-                {
-                    "schema_version": 1,
-                    "status": "failed_capture",
-                    "failure_stage": "timeline_gate",
-                    "failure_reason": reason,
-                }
+                    {
+                        "schema_version": 1,
+                        "status": "failed_capture",
+                        "failure_stage": "timeline_gate",
+                        "failure_reason": reason,
+                        "raw_available": False,
+                    }
             ),
             encoding="utf-8",
         )
@@ -909,7 +997,8 @@ def test_batch_progress_migrates_existing_narrow_failure_rows_without_loss(
     assert progress[1]["failure_stage"] == "timeline_gate"
     assert len(progress[1]["failure_receipt_sha256"]) == 64
     assert fields[: len(legacy_row)] == tuple(legacy_row)
-    assert fields[-4:] == (
+    assert fields[-5:] == (
+        "raw_available",
         "failure_stage",
         "failure_artifact",
         "failure_receipt",

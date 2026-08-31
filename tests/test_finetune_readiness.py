@@ -1853,11 +1853,59 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
             recorded_transfer_aggregate_sha256="c" * 64,
         ),
     )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+        capture_output=True, text=True,
+    ).stdout
+
+    def _completed_canonical_run(run: Path, run_cfg: dict, *, total_steps: int) -> Path:
+        best_checkpoint = run / "ckpt" / "best.pt"
+        _checkpoint(best_checkpoint, cfg=run_cfg, step=1_000)
+        _checkpoint(
+            best_checkpoint.parent / "last.pt", cfg=run_cfg, step=total_steps
+        )
+        (run / "config_snapshot.yaml").write_text(
+            yaml.safe_dump(run_cfg, allow_unicode=True, sort_keys=False)
+        )
+        (run / "git_rev.txt").write_text(commit)
+        (run / "pip_freeze.txt").write_text("fixture==1\n")
+        (run / "environment.json").write_text(
+            json.dumps(
+                {
+                    "python": "fixture",
+                    "torch": "fixture",
+                    "cuda_available": False,
+                    "device_count": 0,
+                    "devices": [],
+                    "deterministic_algorithms": True,
+                    "cudnn_benchmark": False,
+                    "cudnn_deterministic": True,
+                    "cublas_workspace_config": None,
+                }
+            )
+            + "\n"
+        )
+        write_completion_receipt(best_checkpoint.parent, repo_root=source_root)
+        return best_checkpoint
+
+    pretrain_cfg = load_train_config(
+        REPO_ROOT / "configs/train_pretrain_tiny.yaml",
+        [
+            f"data.bootstrap_receipt_sha256={'a' * 64}",
+            f"campaign_prerequisite_sha256={'d' * 64}",
+        ],
+    )
+    pretrain_best = _completed_canonical_run(
+        source_root / "results" / "runs" / "pretrain",
+        pretrain_cfg,
+        total_steps=100_000,
+    )
     cfg = load_train_config(
         REPO_ROOT / "configs/train_finetune.yaml",
         [
             "data.digital_primary_path_mode=measured",
             f"data.bootstrap_receipt_sha256={'a' * 64}",
+            f"init_ckpt={json.dumps(str(pretrain_best))}",
         ],
     )
     timing = TrainingTimingContract.from_data_config(cfg["data"])
@@ -1877,37 +1925,19 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
             + "\n",
             encoding="utf-8",
         )
-    run = tmp_path / "canonical"
-    best = run / "ckpt" / "best.pt"
-    last = best.parent / "last.pt"
-    _checkpoint(best, cfg=cfg, step=1_000)
-    _checkpoint(last, cfg=cfg, step=50_000)
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
-        capture_output=True, text=True,
-    ).stdout
-    (run / "config_snapshot.yaml").write_text(
-        yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+    run = source_root / "results" / "runs" / "canonical"
+    best = _completed_canonical_run(run, cfg, total_steps=50_000)
+
+    import deep_anc.train.campaign_prerequisite as campaign_module
+
+    prerequisite_validations: list[int] = []
+    monkeypatch.setattr(
+        campaign_module,
+        "validate_canonical_pretrain_prerequisites",
+        lambda init_cfg, *, repo_root: prerequisite_validations.append(
+            int(init_cfg["seed"])
+        ),
     )
-    (run / "git_rev.txt").write_text(commit)
-    (run / "pip_freeze.txt").write_text("fixture==1\n")
-    (run / "environment.json").write_text(
-        json.dumps(
-            {
-                "python": "fixture",
-                "torch": "fixture",
-                "cuda_available": False,
-                "device_count": 0,
-                "devices": [],
-                "deterministic_algorithms": True,
-                "cudnn_benchmark": False,
-                "cudnn_deterministic": True,
-                "cublas_workspace_config": None,
-            }
-        )
-        + "\n"
-    )
-    write_completion_receipt(best.parent)
 
     val_metrics = run / "eval_recorded_val" / "metrics.npz"
     contract_sha = cfg["experiment_contract_sha256"]
@@ -1927,7 +1957,7 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
         manifest_path=manifest,
         checkpoint_cfg=cfg,
     )
-    selection_path = tmp_path / "selection.json"
+    selection_path = source_root / "results" / "selection.json"
     campaign_sha = seed_neutral_campaign_sha256(cfg)
     selection = {
         "schema_version": 1,
@@ -1958,6 +1988,7 @@ def test_canonical_completion_verifies_selection_capability_marker_metrics_chain
         capability_path=capability_path,
         repo_root=source_root,
     )
+    assert prerequisite_validations == [20260803]
     _, _, consumed = consume_test_capability(
         selection_path=selection_path,
         capability_path=capability_path,

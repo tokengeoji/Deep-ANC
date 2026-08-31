@@ -186,7 +186,10 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
         '"$VENV_PYTHON" scripts/data/audit_recorded_subband_coverage.py'
     )
     assert "export PYTHONDONTWRITEBYTECODE=1" in text
-    pytest_call = text.index('"$VENV_PYTHON" -B -m pytest -q')
+    final_pytest_stage = text.index('echo "=== [5/6] 검증 (pytest) ==="')
+    pytest_call = text.index(
+        '"$VENV_PYTHON" -B -m pytest -q', final_pytest_stage
+    )
     assert recorded_qa_call < coverage_call < pytest_call
     assert '--canonical-out-dir "$RECORDED_SUBBAND_COVERAGE_REPORT_DIR"' in text
     assert 'if [ "$coverage_status" -gt 1 ]' in text
@@ -236,6 +239,12 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
     environment_stage = text.index('echo "=== [1/6] 환경 (venv + torch cu121 + 패키지) ==="')
     freeze_refresh = text.index("if environment_probe; then", environment_stage)
     full_transfer_gate = text.index('! verify_transfer_bundle "$VENV_PYTHON"; then')
+    early_collect_gate = text.index(
+        '"$VENV_PYTHON" -B -m pytest -qq -p no:cacheprovider --collect-only'
+    )
+    early_focused_gate = text.index(
+        "tests/test_elice_scripts.py", early_collect_gate
+    )
     download_stage = text.index('echo "=== [2/6] 데이터 다운로드 (병렬) ==="')
     assert (
         exact_checkout_gate
@@ -246,8 +255,18 @@ def test_bootstrap_has_explicit_completeness_and_empty_array_guards():
         < environment_stage
         < freeze_refresh
         < full_transfer_gate
+        < early_collect_gate
+        < early_focused_gate
         < download_stage
     )
+    for node in (
+        "tests/test_realtime_start.py::test_runtime_artifact_cohort_ignores_training_only_runs_directory",
+        "tests/test_realtime_start.py::test_engine_preflight_accepts_the_shipped_runtime_configs",
+        "tests/test_public_decode_audit.py::test_reuse_cli_requires_external_file_and_semantic_sha_then_rehashes_raw",
+        "tests/test_prepare_noise_pool.py::test_decoder_audit_path_index_is_cached_once_per_raw_root_context",
+        "tests/test_prepare_noise_pool.py::test_failed_raw_inventory_verification_does_not_leave_a_path_index",
+    ):
+        assert node in text
     assert "verify_transfer_manifest_anchor()" in text
     assert "full transfer validator에는 완성된 venv Python이 필요합니다" in text
     assert "GIT_NO_REPLACE_OBJECTS=1" in text
@@ -310,6 +329,118 @@ def test_bootstrap_uses_transfer_validated_recorded_manifest_for_all_evidence():
     assert "validated_recorded_relative != selected_recorded_manifest" in receipt
     assert "coverage_manifest = validated_recorded_manifest" in receipt
     assert 'root / "data/manifests/recorded_regrouped.jsonl"' not in receipt
+
+
+def test_cache_preflight_verifies_existing_cache_and_exits_before_generation():
+    """cache 점검은 download/canonical generation/full suite/receipt를 열지 않는다."""
+
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    environment_branch_start = text.index(
+        'if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ]; then\n'
+        '  if ! environment_complete; then'
+    )
+    environment_else = text.index("\nelse\n", environment_branch_start)
+    environment_cache_branch = text[environment_branch_start:environment_else]
+    assert "environment_complete" in environment_cache_branch
+    for forbidden in (
+        "write_environment_receipt",
+        "bash scripts/elice/setup_env.sh",
+        'touch "$SETUP_MARKER"',
+    ):
+        assert forbidden not in environment_cache_branch
+
+    full_transfer_gate = text.index('! verify_transfer_bundle "$VENV_PYTHON"; then')
+    early_gate = text.index(
+        '"$VENV_PYTHON" -B -m pytest -qq -p no:cacheprovider --collect-only'
+    )
+    branch_start = text.index(
+        'if [ "$CACHE_PREFLIGHT_ONLY" -eq 1 ]; then\n'
+        '  begin_status_stage cache_verification\n'
+        '  echo "=== [cache preflight] existing public raw + decoder audit reuse ==="'
+    )
+    download_stage = text.index(
+        'echo "=== [2/6] 데이터 다운로드 (병렬) ==="', branch_start
+    )
+    branch = text[branch_start:download_stage]
+
+    assert full_transfer_gate < early_gate < branch_start < download_stage
+    assert "verify_public_raw_cache" in branch
+    assert "verify_decoder_audit_reuse.py" in branch
+    assert '--expected-audit-sha256 "$EXPECTED_DECODER_AUDIT_SHA256"' in branch
+    assert (
+        '--expected-file-sha256 "$EXPECTED_DECODER_AUDIT_FILE_SHA256"'
+        in branch
+    )
+    assert '--hash-workers "$RAW_HASH_WORKERS"' in branch
+    assert "verify_exact_checkout" in branch
+    assert "verify_canonical_bundle" in branch
+    assert "exit 0" in branch
+    for forbidden in (
+        "mkdir -p data/raw/noise",
+        "prepare_noise_pool.py",
+        "validate_noise_pool.py",
+        "validate_recorded_sessions.py",
+        'echo "=== [5/6] 검증 (pytest) ==="',
+        "BOOTSTRAP_RECEIPT=",
+    ):
+        assert forbidden not in branch
+
+    raw_cache = text[
+        text.index("verify_public_raw_cache() {") : text.index(
+            "zip_valid() {", text.index("verify_public_raw_cache() {")
+        )
+    ]
+    for expected in (
+        'dns_fullband" 16000',
+        'noise/speech" 8065',
+        'ESC-50-master/audio" 2000',
+        'noise/machine" 3600',
+        'fma_small" 8000',
+        '"${DEMAND_ENVIRONMENTS[@]}"',
+        "fma_metadata_complete",
+        "fma_audio_metadata_match",
+    ):
+        assert expected in raw_cache
+
+
+def test_early_pytest_gate_stops_when_collection_fails(tmp_path: Path):
+    """함수가 ``if !`` 안에서 호출돼도 collect 실패를 focused PASS가 숨기지 못한다."""
+
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    function_start = text.index("run_early_pytest_gate() {")
+    function_end = text.index("\n}\n", function_start) + 2
+    function = text[function_start:function_end]
+    fake_python = tmp_path / "python"
+    call_log = tmp_path / "calls.log"
+    fake_python.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$*" >> "$EARLY_GATE_CALL_LOG"\n'
+        'if [[ " $* " == *" --collect-only "* ]]; then exit 42; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    environment = os.environ.copy()
+    environment["EARLY_GATE_CALL_LOG"] = str(call_log)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -euo pipefail\nVENV_PYTHON="$1"\n{function}\nrun_early_pytest_gate',
+            "bootstrap-early-gate",
+            str(fake_python),
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1
+    assert "--collect-only" in calls[0]
 
 
 @pytest.mark.parametrize(
@@ -645,18 +776,105 @@ def _make_bootstrap_git_repo(tmp_path: Path) -> tuple[Path, str]:
     return root, commit
 
 
-def _run_bootstrap_gate(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run_bootstrap_gate(
+    root: Path,
+    *args: str,
+    extra_env: dict[str, str] | None = None,
+    timeout_seconds: int = 10,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["DEEP_ANC_BOOTSTRAP_REPO"] = str(root)
+    env.update(extra_env or {})
     return subprocess.run(
         ["bash", str(ELICE_SCRIPTS[0]), *args],
         cwd=root.parent,
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout_seconds,
         check=False,
     )
+
+
+def _make_cache_preflight_runtime(
+    root: Path, commit: str
+) -> tuple[dict[str, str], str, Path, Path, Path]:
+    """실제 GPU/37k raw 없이 cache-only shell 경계를 끝까지 실행하는 fixture."""
+
+    fake_bin = root.parent / "cache-preflight-fake-bin"
+    fake_bin.mkdir()
+    call_log = root.parent / "cache-preflight-calls.log"
+    transfer = root / "data/manifests/elice_transfer_manifest.json"
+    transfer.parent.mkdir(parents=True, exist_ok=True)
+    transfer.write_bytes(b'{"schema_version":1,"files":[]}\n')
+    transfer_sha = _sha256(transfer)
+    audit = root / "results/provenance/decoder_audit.json"
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    audit.write_text("{}\n", encoding="utf-8")
+
+    venv_python = root / ".venv/bin/python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text(
+        "#!/bin/bash\n"
+        "set -u\n"
+        'printf "%s\\n" "$*" >> "$FAKE_CALL_LOG"\n'
+        'if [[ " $* " == *" -m pytest "* ]]; then\n'
+        '  if [[ " $* " == *" --collect-only "* ]]; then\n'
+        '    exit "${FAKE_COLLECT_EXIT:-0}"\n'
+        "  fi\n"
+        '  exit "${FAKE_FOCUSED_EXIT:-0}"\n'
+        "fi\n"
+        'if [[ " $* " == *" -m pip freeze "* ]]; then exit 91; fi\n'
+        'if [[ " $* " == *" scripts/data/verify_decoder_audit_reuse.py "* ]]; then\n'
+        '  exit "${FAKE_AUDIT_EXIT:-0}"\n'
+        "fi\n"
+        'if [[ "${1:-}" == "-B" && "${2:-}" == "-" && "${3:-}" == *"elice_transfer_manifest.json" ]]; then\n'
+        '  printf "1\\tdata/manifests/recorded_regrouped.jsonl\\t%s\\t82\\t%s\\t1\\t-\\t-\\n" '
+        '"$FAKE_RECORDED_MANIFEST_SHA" "$FAKE_TRANSFER_SHA"\n'
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    venv_python.chmod(0o755)
+    marker = root / ".venv/.setup-complete"
+    marker.write_text("complete\n", encoding="utf-8")
+    freeze = root / ".venv/environment-freeze.txt"
+    freeze.write_bytes(_freeze_with_source(commit))
+
+    command_stubs = {
+        "pgrep": "#!/bin/bash\nexit 1\n",
+        "nvidia-smi": (
+            "#!/bin/bash\n"
+            'printf "NVIDIA A100 80GB PCIe, 81920\\n"\n'
+        ),
+        "df": (
+            "#!/bin/bash\n"
+            'printf "Size Avail\\n137438953472 103079215104\\n"\n'
+        ),
+        "stat": (
+            "#!/bin/bash\n"
+            'if [[ " $* " == *"tracks.csv "* ]]; then printf "260414445\\n"; '
+            "else exec /usr/bin/stat \"$@\"; fi\n"
+        ),
+        "sha256sum": (
+            "#!/bin/bash\n"
+            'if [[ " $* " == *"tracks.csv "* ]]; then '
+            'printf "f73260fd112b8cd42bcd4f7c8918fc66b19d9d4c7b97f4faedce524b59e95d6b  %s\\n" "${@: -1}"; '
+            "else exec /usr/bin/sha256sum \"$@\"; fi\n"
+        ),
+    }
+    for name, payload in command_stubs.items():
+        path = fake_bin / name
+        path.write_text(payload, encoding="utf-8")
+        path.chmod(0o755)
+
+    environment = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_CALL_LOG": str(call_log),
+        "FAKE_TRANSFER_SHA": transfer_sha,
+        "FAKE_RECORDED_MANIFEST_SHA": "b" * 64,
+    }
+    return environment, transfer_sha, call_log, freeze, marker
 
 
 def test_bootstrap_derives_default_repo_from_its_own_path(tmp_path: Path):
@@ -1243,6 +1461,255 @@ def test_bootstrap_reuse_decoder_audit_requires_both_external_sha_anchors_before
     assert "--reuse-decoder-audit" in orphan.stderr
     assert not (root / "data").exists()
     assert not (root / ".venv").exists()
+
+
+def test_cache_preflight_requires_reuse_anchors_and_rejects_other_modes_before_setup(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    common = (
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        "a" * 64,
+    )
+    reuse = (
+        "--reuse-decoder-audit",
+        "--expected-decoder-audit-sha256",
+        "b" * 64,
+        "--expected-decoder-audit-file-sha256",
+        "c" * 64,
+    )
+
+    missing_reuse = _run_bootstrap_gate(
+        root, *common, "--cache-preflight-only", "--no-update"
+    )
+    preflight_conflict = _run_bootstrap_gate(
+        root,
+        *common,
+        *reuse,
+        "--cache-preflight-only",
+        "--preflight-only",
+        "--no-update",
+    )
+    full_octave_conflict = _run_bootstrap_gate(
+        root,
+        *common,
+        *reuse,
+        "--cache-preflight-only",
+        "--full-octave",
+        "--no-update",
+    )
+    duplicate = _run_bootstrap_gate(
+        root,
+        *common,
+        *reuse,
+        "--cache-preflight-only",
+        "--cache-preflight-only",
+        "--no-update",
+    )
+
+    assert missing_reuse.returncode == 2
+    assert preflight_conflict.returncode == 2
+    assert full_octave_conflict.returncode == 2
+    assert duplicate.returncode == 2
+    assert "--reuse-decoder-audit" in missing_reuse.stderr
+    assert "--preflight-only" in preflight_conflict.stderr
+    assert "--full-octave" in full_octave_conflict.stderr
+    assert "한 번만 지정" in duplicate.stderr
+    assert not (root / "data").exists()
+    assert not (root / ".venv").exists()
+
+
+def test_cache_preflight_runs_full_read_only_cache_verification_in_order(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    environment, transfer_sha, call_log, freeze, marker = (
+        _make_cache_preflight_runtime(root, commit)
+    )
+    freeze_before = freeze.read_bytes()
+    freeze_mtime_before = freeze.stat().st_mtime_ns
+    marker_inode_before = marker.stat().st_ino
+    marker_mtime_before = marker.stat().st_mtime_ns
+    status_root = tmp_path / "bootstrap-status"
+    status_root.mkdir()
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--expected-transfer-manifest-sha256",
+        transfer_sha,
+        "--reuse-decoder-audit",
+        "--expected-decoder-audit-sha256",
+        "d" * 64,
+        "--expected-decoder-audit-file-sha256",
+        "e" * 64,
+        "--raw-hash-workers",
+        "8",
+        "--cache-preflight-only",
+        "--status-root",
+        str(status_root),
+        "--no-update",
+        extra_env=environment,
+        timeout_seconds=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "[cache preflight] PASS" in result.stdout
+    assert "=== [2/6]" not in result.stdout
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    transfer_calls = [
+        index
+        for index, call in enumerate(calls)
+        if "elice_transfer_manifest.json" in call
+    ]
+    collect = next(
+        index for index, call in enumerate(calls) if "--collect-only" in call
+    )
+    focused = next(
+        index
+        for index, call in enumerate(calls)
+        if " -m pytest " in f" {call} " and "--collect-only" not in call
+    )
+    first_raw = next(
+        index
+        for index, call in enumerate(calls)
+        if "data/raw/noise/dns_fullband 16000" in call
+    )
+    audit = next(
+        index
+        for index, call in enumerate(calls)
+        if "verify_decoder_audit_reuse.py" in call
+    )
+    assert len(transfer_calls) == 2
+    assert transfer_calls[0] < collect < focused < first_raw < audit < transfer_calls[1]
+    assert not any("-m pip freeze" in call for call in calls)
+    assert freeze.read_bytes() == freeze_before
+    assert freeze.stat().st_mtime_ns == freeze_mtime_before
+    assert marker.stat().st_ino == marker_inode_before
+    assert marker.stat().st_mtime_ns == marker_mtime_before
+    status_payloads = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(status_root.glob("*.json"))
+    ]
+    assert {payload["stage"] for payload in status_payloads} == {
+        "source_preflight",
+        "environment",
+        "early_pytest",
+        "cache_verification",
+    }
+    for payload in status_payloads:
+        assert payload["state"] == "complete"
+        assert payload["exit_code"] == 0
+        assert payload["ended_at_epoch"] >= payload["started_at_epoch"]
+        assert payload["elapsed_seconds"] >= 0
+        assert payload["expected_commit"] == commit
+    for forbidden in (
+        root / "data/manifests/canonical_v4",
+        root / "data/manifests/recorded_qa.json",
+        root / "data/manifests/elice_bootstrap_receipt.json",
+    ):
+        assert not forbidden.exists()
+    assert not list(root.rglob("*.part"))
+
+
+def test_cache_preflight_missing_existing_venv_never_runs_setup_or_creates_it(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    environment, transfer_sha, call_log, _freeze, _marker = (
+        _make_cache_preflight_runtime(root, commit)
+    )
+    shutil.rmtree(root / ".venv")
+    status_root = tmp_path / "bootstrap-status"
+    status_root.mkdir()
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--expected-transfer-manifest-sha256",
+        transfer_sha,
+        "--reuse-decoder-audit",
+        "--expected-decoder-audit-sha256",
+        "d" * 64,
+        "--expected-decoder-audit-file-sha256",
+        "e" * 64,
+        "--cache-preflight-only",
+        "--status-root",
+        str(status_root),
+        "--no-update",
+        extra_env=environment,
+        timeout_seconds=30,
+    )
+
+    assert result.returncode == 1
+    assert "이미 완성된 exact venv" in result.stderr
+    assert not (root / ".venv").exists()
+    assert not call_log.exists()
+    assert "=== [early gate]" not in result.stdout
+    assert "=== [2/6]" not in result.stdout
+    states = {
+        payload["stage"]: payload
+        for payload in (
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in status_root.glob("*.json")
+        )
+    }
+    assert states["source_preflight"]["state"] == "complete"
+    assert states["environment"]["state"] == "failed"
+    assert states["environment"]["exit_code"] == 1
+
+
+def test_early_focused_failure_stops_before_raw_and_decoder_audit(
+    tmp_path: Path,
+):
+    root, commit = _make_bootstrap_git_repo(tmp_path)
+    _holdout, holdout_sha = _write_canonical_holdout_bundle(root)
+    environment, transfer_sha, call_log, _freeze, _marker = (
+        _make_cache_preflight_runtime(root, commit)
+    )
+    environment["FAKE_FOCUSED_EXIT"] = "43"
+
+    result = _run_bootstrap_gate(
+        root,
+        "--expected-commit",
+        commit,
+        "--expected-holdout-sha256",
+        holdout_sha,
+        "--expected-transfer-manifest-sha256",
+        transfer_sha,
+        "--reuse-decoder-audit",
+        "--expected-decoder-audit-sha256",
+        "d" * 64,
+        "--expected-decoder-audit-file-sha256",
+        "e" * 64,
+        "--cache-preflight-only",
+        "--no-update",
+        extra_env=environment,
+        timeout_seconds=30,
+    )
+
+    assert result.returncode == 1
+    assert "조기 pytest collection/Elice 핵심 회귀 실패" in result.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert any("--collect-only" in call for call in calls)
+    assert any(
+        " -m pytest " in f" {call} " and "--collect-only" not in call
+        for call in calls
+    )
+    assert not any("data/raw/noise/dns_fullband" in call for call in calls)
+    assert not any("verify_decoder_audit_reuse.py" in call for call in calls)
+    assert "=== [2/6]" not in result.stdout
+    assert not (root / "data/manifests/canonical_v4").exists()
 
 
 def test_bootstrap_requires_nonempty_holdout_before_setup(tmp_path: Path):

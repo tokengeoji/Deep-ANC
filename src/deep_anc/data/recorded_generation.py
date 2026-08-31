@@ -39,10 +39,21 @@ from deep_anc.data.recorded_qa import (
     evaluate_recorded_capture_gate,
 )
 from deep_anc.data.recording_level_campaign import (
+    RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA,
     RecordingLevelCampaignError,
     rendered_source_level_evidence,
+    rendered_source_level_evidence_v2,
     validate_recording_level_campaign,
     validate_recording_level_session_binding,
+    validate_recording_level_source_gain_session_binding,
+)
+from deep_anc.data.recording_source_gain import (
+    RecordingSourceGainError,
+    validate_recording_source_gain_plan,
+)
+from deep_anc.data.recording_gain_linearity import (
+    RecordingGainLinearityError,
+    validate_gain_linearity_receipt,
 )
 from deep_anc.data.recording_source_preflight import (
     RecordingSourcePreflightError,
@@ -162,12 +173,12 @@ CANONICAL_SOURCE_POOL_ADDITIONS = {
     ),
     "data/source_pool_v2/environment/environment_014.wav": (
         "environment",
-        20.5,
+        30.0,
         "val",
     ),
     "data/source_pool/environment/environment_003.wav": (
         "environment",
-        24.5,
+        44.5,
         "test",
     ),
     "data/source_pool/environment/environment_008.wav": (
@@ -176,7 +187,7 @@ CANONICAL_SOURCE_POOL_ADDITIONS = {
         "test",
     ),
     "data/source_pool/music/music_007.wav": ("music", 54.8, "test"),
-    "data/source_pool_v2/music/music_007.wav": ("music", 12.8, "test"),
+    "data/source_pool_v2/music/music_007.wav": ("music", 43.0, "test"),
     "data/source_pool_v2/music/music_012.wav": ("music", 17.1, "val"),
     "data/source_pool_v2/music/music_017.wav": ("music", 20.1, "val"),
     "data/source_pool_v2/music/music_008.wav": ("music", 31.5, "train"),
@@ -991,7 +1002,7 @@ def _canonical_source_selection_evidence(
 
     payload = {
         "schema": SOURCE_SELECTION_CONTRACT_SCHEMA,
-        "generation_id": "stage1-coverage-v2",
+        "generation_id": "stage1-coverage-v3-gain012",
         "strict_primary": _file_ref(primary, repo_root=repo_root),
         "algorithm": {
             "source_population": "full_source_pool_160_authority_DSU",
@@ -1936,6 +1947,11 @@ def _validate_recording_level_binding(
         )
     # generation은 며칠 뒤에도 검증되어야 한다. 현재 wall-clock freshness가 아니라
     # stored meter→duplex-stream age를 binding validator가 다시 계산한다.
+    source_gain_summary = None
+    source_gain_plan_ref = None
+    gain_linearity_receipt_ref = None
+    gain_linearity_plan_ref = None
+    gain_linearity_raw_ref = None
     try:
         campaign = validate_recording_level_campaign(
             repo_root=repo_root,
@@ -1944,13 +1960,65 @@ def _validate_recording_level_binding(
             now_utc=binding.get("session_started_at_utc"),
             require_fresh=False,
         )
-        validated_binding = validate_recording_level_session_binding(
-            campaign, binding
-        )
-        actual_rendered = rendered_source_level_evidence(
-            rendered_source
-        )
-    except (OSError, RecordingLevelCampaignError, ValueError) as exc:
+        if binding.get("schema") == RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA:
+            embedded_gain = binding.get("source_gain")
+            if metadata.get("source_gain_binding") != embedded_gain:
+                raise RecordingSourceGainError(
+                    "top-level source_gain_binding이 recording-level v2 binding과 다릅니다"
+                )
+            source_gain_plan_ref = (
+                embedded_gain.get("source_gain_plan")
+                if isinstance(embedded_gain, dict)
+                else None
+            )
+            if (
+                not isinstance(source_gain_plan_ref, dict)
+                or set(source_gain_plan_ref) != {"path", "size", "sha256"}
+            ):
+                raise RecordingSourceGainError(
+                    "v2 session source-gain plan ref가 불완전합니다"
+                )
+            source_gain_summary = validate_recording_source_gain_plan(
+                repo_root=repo_root,
+                plan_path=str(source_gain_plan_ref["path"]),
+                expected_sha256=str(source_gain_plan_ref["sha256"]),
+            )
+            validated_binding = validate_recording_level_source_gain_session_binding(
+                campaign, source_gain_summary, binding
+            )
+            gain_linearity_receipt_ref = embedded_gain.get(
+                "gain_linearity_receipt"
+            )
+            if not isinstance(gain_linearity_receipt_ref, dict):
+                raise RecordingGainLinearityError(
+                    "v2 session gain-linearity receipt ref가 없습니다"
+                )
+            gain_summary = validate_gain_linearity_receipt(
+                repo_root=repo_root,
+                receipt_path=str(gain_linearity_receipt_ref["path"]),
+                expected_sha256=str(gain_linearity_receipt_ref["sha256"]),
+            )
+            gain_payload = gain_summary["payload"]
+            gain_linearity_plan_ref = gain_payload.get("plan")
+            gain_linearity_raw_ref = gain_payload.get("raw")
+            actual_rendered = rendered_source_level_evidence_v2(
+                rendered_source,
+                amplitude_millionths=int(
+                    embedded_gain["amplitude_millionths"]
+                ),
+            )
+        else:
+            validated_binding = validate_recording_level_session_binding(
+                campaign, binding
+            )
+            actual_rendered = rendered_source_level_evidence(rendered_source)
+    except (
+        OSError,
+        RecordingLevelCampaignError,
+        RecordingGainLinearityError,
+        RecordingSourceGainError,
+        ValueError,
+    ) as exc:
         raise RecordedGenerationError(
             f"추가 session recording-level campaign/source 검증 실패: {session_dir}: {exc}"
         ) from exc
@@ -2006,13 +2074,36 @@ def _validate_recording_level_binding(
         raise RecordedGenerationError(
             f"추가 session campaign transfer refs가 불완전합니다: {session_dir}"
         )
-    return {
+    result = {
         "campaign_id": campaign["campaign_id"],
         "campaign": campaign_ref,
         "meter_raw": dict(meter_raw),
         "meter_receipt": dict(meter_receipt),
         "hardware_config": dict(hardware_config),
     }
+    if source_gain_summary is not None:
+        if (
+            not isinstance(source_gain_plan_ref, dict)
+            or not isinstance(gain_linearity_receipt_ref, dict)
+            or set(gain_linearity_receipt_ref) != {"path", "size", "sha256"}
+        ):
+            raise RecordedGenerationError(
+                f"추가 session v2 gain transfer refs가 불완전합니다: {session_dir}"
+            )
+        result["source_gain_plan"] = dict(source_gain_plan_ref)
+        result["gain_linearity_receipt"] = dict(gain_linearity_receipt_ref)
+        if (
+            not isinstance(gain_linearity_plan_ref, dict)
+            or set(gain_linearity_plan_ref) != {"path", "size", "sha256"}
+            or not isinstance(gain_linearity_raw_ref, dict)
+            or set(gain_linearity_raw_ref) != {"path", "size", "sha256"}
+        ):
+            raise RecordedGenerationError(
+                f"추가 session v2 gain plan/raw refs가 불완전합니다: {session_dir}"
+            )
+        result["gain_linearity_plan"] = dict(gain_linearity_plan_ref)
+        result["gain_linearity_raw"] = dict(gain_linearity_raw_ref)
+    return result
 
 
 def _validate_session_artifacts(
@@ -2030,15 +2121,18 @@ def _validate_session_artifacts(
 
     program = metadata.get("program")
     amplitude = program.get("amplitude") if isinstance(program, dict) else None
+    expected_amplitude = _expected_recording_amplitude(
+        metadata, session_dir=session_dir
+    )
     if (
         isinstance(amplitude, bool)
         or not isinstance(amplitude, (int, float))
         or not math.isfinite(float(amplitude))
-        or float(amplitude) != CANONICAL_RECORDING_AMPLITUDE
+        or float(amplitude) != expected_amplitude
     ):
         raise RecordedGenerationError(
             "추가 session digital amplitude가 exact "
-            f"{CANONICAL_RECORDING_AMPLITUDE:.2f}가 아닙니다: {session_dir}"
+            f"{expected_amplitude:.6f}가 아닙니다: {session_dir}"
         )
     _validate_canonical_capture_timeline(metadata, session_dir=session_dir)
 
@@ -2338,6 +2432,9 @@ def _validate_additions(
             "file_start_seconds",
         }
         amplitude = program.get("amplitude") if isinstance(program, dict) else None
+        expected_program_amplitude = _expected_recording_amplitude(
+            metadata, session_dir=session_dir
+        )
         file_start = (
             program.get("file_start_seconds") if isinstance(program, dict) else None
         )
@@ -2351,7 +2448,7 @@ def _validate_additions(
             or isinstance(amplitude, bool)
             or not isinstance(amplitude, (int, float))
             or not math.isfinite(float(amplitude))
-            or float(amplitude) != CANONICAL_RECORDING_AMPLITUDE
+            or float(amplitude) != expected_program_amplitude
             or isinstance(file_start, bool)
             or not isinstance(file_start, (int, float))
             or not math.isclose(
@@ -2793,3 +2890,35 @@ def validate_recorded_generation(
         "combined": derived["combined"],
         "_validated_generation_snapshot": snapshot,
     }
+def _expected_recording_amplitude(
+    metadata: dict[str, Any], *, session_dir: Path
+) -> float:
+    """Legacy .06 또는 v2 session binding의 exact measured-domain gain을 반환한다."""
+
+    level_binding = metadata.get("recording_level_binding")
+    if (
+        isinstance(level_binding, dict)
+        and level_binding.get("schema")
+        == RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA
+    ):
+        embedded_gain = level_binding.get("source_gain")
+        millionths = (
+            embedded_gain.get("amplitude_millionths")
+            if isinstance(embedded_gain, dict)
+            else None
+        )
+        if (
+            isinstance(millionths, bool)
+            or not isinstance(millionths, int)
+            or not 1 <= millionths <= 12_000
+        ):
+            raise RecordedGenerationError(
+                f"추가 session v2 amplitude_millionths가 유효하지 않습니다: {session_dir}"
+            )
+        return millionths / 1_000_000.0
+    if metadata.get("plant_domain") == "current_strict":
+        raise RecordedGenerationError(
+            "current_strict addition에는 v2 recording_level_binding/source-gain "
+            f"authority가 필수입니다: {session_dir}"
+        )
+    return CANONICAL_RECORDING_AMPLITUDE

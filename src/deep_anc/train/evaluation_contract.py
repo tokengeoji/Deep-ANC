@@ -70,6 +70,10 @@ _CAMPAIGN_OPERATIONAL_KEYS = {
     "resolved_contract_run_dir",
     "experiment_contract",
     "experiment_contract_sha256",
+    # seed=20260903 admission proof이다. 일반 experiment contract에는 그대로
+    # 결속하지만 두 공식 seed의 학습 의미를 비교하는 projection에서만 제외한다.
+    "second_seed_prerequisite",
+    "second_seed_prerequisite_sha256",
 }
 _STRICT_SUBBAND_UNVERIFIED_MARGIN_DB = -1_000_000.0
 """실측 dB가 아니라 fail-closed selection ordering sentinel.
@@ -1327,7 +1331,8 @@ def seed_neutral_campaign_sha256(
             if key in entry
         }
         for name, entry in sorted((contract.get("artifacts") or {}).items())
-        if name != "init_checkpoint" and isinstance(entry, dict)
+        if name not in {"init_checkpoint", "second_seed_prerequisite"}
+        and isinstance(entry, dict)
     }
     payload = {
         "schema_version": 1,
@@ -1585,7 +1590,151 @@ def classify_recorded_val_metrics(
     }
 
 
-def _validate_selection_candidate(payload: dict[str, Any]) -> dict[str, Any]:
+def _path_inside_repository(
+    root: Path, value: object, *, label: str
+) -> Path:
+    """canonical authority가 가리키는 실제 regular-file 경로를 저장소에 가둔다."""
+
+    candidate = Path(str(value or "")).expanduser()
+    target = Path(os.path.abspath(candidate if candidate.is_absolute() else root / candidate))
+    try:
+        relative = target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label}는 저장소 내부여야 합니다: {target}") from exc
+    if root.is_symlink():
+        raise ValueError(f"{label} 저장소 root는 심볼릭 링크일 수 없습니다: {root}")
+    cursor = root
+    for component in relative.parts:
+        cursor /= component
+        if cursor.is_symlink():
+            raise ValueError(f"{label} 경로에 심볼릭 링크가 있습니다: {cursor}")
+    try:
+        target.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label}가 없습니다: {target}") from exc
+    except ValueError as exc:
+        raise ValueError(f"{label} resolved path가 저장소 밖입니다: {target}") from exc
+    return target
+
+
+def validate_canonical_finetune_checkpoint_chain(
+    saved_cfg: dict[str, Any],
+    checkpoint: FileSnapshot,
+    *,
+    repo_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """선택 후보가 완료된 50k→동일-seed 100k canonical chain인지 검증한다.
+
+    seed-neutral digest는 두 공식 seed의 학습 의미를 비교하기 위한 projection일 뿐
+    init seed/secondary admission 권위가 아니다. 따라서 recorded-test capability와
+    cross-seed direct CLI 모두 이 validator를 통과해야 한다.
+    """
+
+    from ..config import validate_canonical_training_policy
+    from .campaign_prerequisite import validate_canonical_pretrain_prerequisites
+    from .completion_receipt import validate_completion_receipt
+
+    if repo_root is None:
+        from ..config import REPO_ROOT
+
+        root = Path(REPO_ROOT)
+    else:
+        root = Path(repo_root)
+    root = Path(os.path.abspath(root))
+    selected_path = _path_inside_repository(
+        root, checkpoint.path, label="canonical fine-tune selection checkpoint"
+    )
+    if selected_path != checkpoint.path or selected_path.name != "best.pt":
+        raise ValueError("selection checkpoint는 canonical fine-tune best.pt여야 합니다")
+
+    validate_canonical_training_policy(saved_cfg)
+    seed = saved_cfg.get("seed")
+    if (
+        saved_cfg.get("experiment_role") != "canonical_finetune"
+        or saved_cfg.get("init_eligible") is not False
+        or seed not in OFFICIAL_FINETUNE_SEEDS
+    ):
+        raise ValueError(
+            "selection checkpoint는 공식 seed의 canonical_finetune이어야 합니다"
+        )
+    fine_contract = validate_embedded_experiment_contract(saved_cfg)
+    fine_completion = validate_completion_receipt(
+        selected_path.parent,
+        expected_role="canonical_finetune",
+        expected_init_eligible=False,
+        repo_root=root,
+    )
+    if (
+        fine_completion.get("experiment_contract_sha256")
+        != fine_contract.get("sha256")
+        or fine_completion.get("best_checkpoint_sha256") != checkpoint.sha256
+        or fine_completion.get("schedule_total_steps") != 50_000
+        or fine_completion.get("completed_step") != 50_000
+    ):
+        raise ValueError(
+            "selection checkpoint의 exact canonical 50k completion/contract가 다릅니다"
+        )
+
+    init_value = saved_cfg.get("init_ckpt")
+    if not isinstance(init_value, str) or not init_value.strip():
+        raise ValueError("canonical fine-tune selection에 init_ckpt가 없습니다")
+    init_path = _path_inside_repository(
+        root, init_value, label="canonical pretrain init checkpoint"
+    )
+    if init_path.name != "best.pt":
+        raise ValueError("canonical fine-tune init_ckpt는 canonical pretrain best.pt여야 합니다")
+    init_snapshot = snapshot_regular_file(init_path)
+    try:
+        init_state = torch.load(
+            io.BytesIO(init_snapshot.content), map_location="cpu", weights_only=False
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("canonical pretrain init checkpoint를 읽을 수 없습니다") from exc
+    if not isinstance(init_state, dict) or not isinstance(init_state.get("cfg"), dict):
+        raise ValueError("canonical pretrain init checkpoint에 resolved cfg가 없습니다")
+    init_cfg = init_state["cfg"]
+    validate_canonical_training_policy(init_cfg)
+    if (
+        init_cfg.get("experiment_role") != "canonical_pretrain"
+        or init_cfg.get("init_eligible") is not True
+        or init_cfg.get("seed") != seed
+    ):
+        raise ValueError(
+            "canonical fine-tune init은 동일 seed의 init-eligible canonical_pretrain이어야 합니다"
+        )
+    init_contract = validate_embedded_experiment_contract(init_cfg)
+    init_completion = validate_completion_receipt(
+        init_path.parent,
+        expected_role="canonical_pretrain",
+        expected_init_eligible=True,
+        repo_root=root,
+    )
+    if (
+        init_completion.get("experiment_contract_sha256")
+        != init_contract.get("sha256")
+        or init_completion.get("best_checkpoint_sha256") != init_snapshot.sha256
+        or init_completion.get("schedule_total_steps") != 100_000
+        or init_completion.get("completed_step") != 100_000
+    ):
+        raise ValueError(
+            "fine-tune init의 exact canonical 100k completion/contract가 다릅니다"
+        )
+
+    # primary는 raw v7 campaign ledger를, secondary는 그 validator가 dispatch하는
+    # 별도 fixed-path prerequisite와 primary sealed selection을 전부 다시 연다.
+    validate_canonical_pretrain_prerequisites(init_cfg, repo_root=root)
+    return {
+        "seed": seed,
+        "fine_completion": fine_completion,
+        "pretrain_checkpoint": init_snapshot,
+        "pretrain_cfg": init_cfg,
+        "pretrain_completion": init_completion,
+    }
+
+
+def _validate_selection_candidate(
+    payload: dict[str, Any], *, repo_root: str | Path | None = None
+) -> dict[str, Any]:
     selected = payload.get("selected")
     if payload.get("selection_split") != "val" or not isinstance(selected, dict):
         raise ValueError("recorded-val selection이 고정되지 않았습니다")
@@ -1628,6 +1777,9 @@ def _validate_selection_candidate(payload: dict[str, Any]) -> dict[str, Any]:
         "seed_neutral_campaign_sha256"
     ) != declared_campaign:
         raise ValueError("selection seed-neutral campaign digest가 checkpoint와 다릅니다")
+    validate_canonical_finetune_checkpoint_chain(
+        saved_cfg, checkpoint, repo_root=repo_root
+    )
     with np.load(io.BytesIO(metrics.content), allow_pickle=False) as data:
         provenance = {
             "split": str(_npz_scalar(data, "split")),
@@ -1655,7 +1807,22 @@ def _validate_selection_candidate(payload: dict[str, Any]) -> dict[str, Any]:
     return decision
 
 
-def validate_test_open_selection(payload: dict[str, Any]) -> None:
+def validate_recorded_val_selection(
+    payload: dict[str, Any], *, repo_root: str | Path | None = None
+) -> dict[str, Any]:
+    """immutable recorded-val bundle을 raw bytes에서 다시 검증한다.
+
+    single-seed terminal, second-seed admission, cross-seed finalizer가 같은
+    validator를 공유하도록 공개한 좁은 API다. 반환값은 저장 claim이 아니라 현재
+    checkpoint/manifest/metrics bytes에서 다시 계산한 decision이다.
+    """
+
+    return _validate_selection_candidate(payload, repo_root=repo_root)
+
+
+def validate_test_open_selection(
+    payload: dict[str, Any], *, repo_root: str | Path | None = None
+) -> None:
     """single clear-pass 또는 검증된 2-seed final만 test 개봉을 허용한다."""
 
     campaign = _sha256_identity(
@@ -1665,7 +1832,7 @@ def validate_test_open_selection(payload: dict[str, Any]) -> None:
     if not isinstance(decision, dict):
         raise ValueError("selection decision이 없습니다")
     if decision.get("status") != "cross_seed_final":
-        current = _validate_selection_candidate(payload)
+        current = _validate_selection_candidate(payload, repo_root=repo_root)
         if payload.get("seed") != 20260803 or current.get("status") != "clear_pass":
             raise ValueError("single-seed test는 seed 20260803 val clear-pass만 허용합니다")
         if decision != current:
@@ -1689,7 +1856,7 @@ def validate_test_open_selection(payload: dict[str, Any]) -> None:
             raise ValueError("cross-seed bundle campaign digest가 다릅니다")
         if bundle.get("manifest_sha256") != payload.get("manifest_sha256"):
             raise ValueError("cross-seed bundle recorded manifest가 다릅니다")
-        current = _validate_selection_candidate(bundle)
+        current = _validate_selection_candidate(bundle, repo_root=repo_root)
         if bundle.get("decision") != current:
             raise ValueError("cross-seed bundle top-level decision이 metrics와 다릅니다")
         bundles.append((int(seed), bundle, current))
@@ -1896,7 +2063,7 @@ def issue_test_capability(
     selected = selection.get("selected")
     if selection.get("selection_split") != "val" or not isinstance(selected, dict):
         raise ValueError("recorded-val selection이 고정되지 않았습니다")
-    validate_test_open_selection(selection)
+    validate_test_open_selection(selection, repo_root=repo_root)
     expected_capability, expected_consumed = canonical_test_ledger_paths_from_payload(
         selection, repo_root=repo_root
     )
@@ -1949,7 +2116,7 @@ def consume_test_capability(
     if not token:
         raise ValueError(f"test capability token이 없습니다 ({CAPABILITY_ENV})")
     selection, selection_snapshot = read_json_snapshot(selection_path)
-    validate_test_open_selection(selection)
+    validate_test_open_selection(selection, repo_root=repo_root)
     expected_capability, expected_consumed = canonical_test_ledger_paths_from_payload(
         selection, repo_root=repo_root
     )
@@ -2016,7 +2183,7 @@ def _active_test_ledger(
     repo_root: str | Path | None,
 ) -> tuple[dict[str, Any], FileSnapshot, FileSnapshot, dict[str, Path]]:
     selection, selection_snapshot = read_json_snapshot(selection_path)
-    validate_test_open_selection(selection)
+    validate_test_open_selection(selection, repo_root=repo_root)
     selected = selection.get("selected")
     if not isinstance(selected, dict):
         raise ValueError("test ledger selection.selected가 없습니다")
@@ -2234,8 +2401,10 @@ __all__ = [
     "read_json_snapshot",
     "seed_neutral_campaign_sha256",
     "snapshot_regular_file",
+    "validate_canonical_finetune_checkpoint_chain",
     "validate_checkpoint_recorded_manifest",
     "validate_persisted_g4_metrics",
+    "validate_recorded_val_selection",
     "validate_test_open_selection",
     "write_json_exclusive",
 ]

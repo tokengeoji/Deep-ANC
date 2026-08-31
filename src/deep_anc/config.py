@@ -29,6 +29,8 @@ DEFAULT_HANDOFF_SAMPLES = 256
 CANONICAL_FINETUNE_POLICY_VERSION = "canonical_finetune_v1"
 CANONICAL_PRETRAIN_POLICY_VERSION = "canonical_pretrain_v1"
 A100_PRETRAIN_SMOKE_POLICY_VERSION = "a100_pretrain_smoke_v1"
+CANONICAL_PRIMARY_SEED = 20260803
+CANONICAL_SECONDARY_SEED = 20260903
 PRETRAIN_DERIVATIVE_STRICT_ROLES = frozenset({"loss_pilot", "measured_probe"})
 """canonical 선택 증거를 만드는 단일-GPU·결정론 derivative 역할."""
 # 이 두 값은 campaign ledger가 다시 검증하는 선택 증거의 길이이면서, GPU를
@@ -633,6 +635,34 @@ def _enforce_canonical_pretrain_policy(cfg: dict) -> None:
         if cfg.get(key) != required:
             mismatches.append(f"{key}={cfg.get(key)!r} (required {required!r})")
     _collect_canonical_pretrain_semantic_mismatches(cfg, mismatches)
+    seed = cfg.get("seed")
+    prerequisite = cfg.get("second_seed_prerequisite")
+    prerequisite_sha = cfg.get("second_seed_prerequisite_sha256")
+    if seed == CANONICAL_PRIMARY_SEED:
+        if prerequisite not in (None, "") or prerequisite_sha not in (None, ""):
+            mismatches.append(
+                "seed=20260803 second_seed_prerequisite/path SHA must both be null"
+            )
+    elif seed == CANONICAL_SECONDARY_SEED:
+        prefix = "results/training_prerequisites/second_seed/"
+        suffix = "/seed_20260903.json"
+        if (
+            not isinstance(prerequisite, str)
+            or not prerequisite.startswith(prefix)
+            or not prerequisite.endswith(suffix)
+            or prerequisite.count("/") != 4
+        ):
+            mismatches.append(
+                "seed=20260903 second_seed_prerequisite must be the fixed "
+                "results/training_prerequisites/second_seed/<digest>/seed_20260903.json path"
+            )
+        if (
+            not isinstance(prerequisite_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", prerequisite_sha) is None
+        ):
+            mismatches.append(
+                "seed=20260903 second_seed_prerequisite_sha256 must be lowercase SHA-256"
+            )
     if mismatches:
         raise ValueError(
             "canonical_pretrain trust policy는 override로 약화할 수 없습니다: "
@@ -702,6 +732,10 @@ def _enforce_a100_pretrain_smoke_policy(cfg: dict) -> None:
         "campaign_prerequisite_sha256"
     ) not in (None, ""):
         mismatches.append("campaign prerequisite must be null for smoke")
+    if cfg.get("second_seed_prerequisite") not in (None, "") or cfg.get(
+        "second_seed_prerequisite_sha256"
+    ) not in (None, ""):
+        mismatches.append("second-seed prerequisite must be null for smoke")
     if cfg.get("init_ckpt") not in (None, ""):
         mismatches.append("init_ckpt must be null for smoke")
     label = str(cfg.get("a100_smoke_run_label", ""))
@@ -749,6 +783,16 @@ def _enforce_pretrain_derivative_policy(cfg: dict) -> None:
         )
     if role in PRETRAIN_DERIVATIVE_STRICT_ROLES:
         mismatches: list[str] = []
+        if cfg.get("seed") != CANONICAL_PRIMARY_SEED:
+            mismatches.append(
+                "loss-selection derivative seed must be exact 20260803"
+            )
+        if cfg.get("second_seed_prerequisite") not in (None, "") or cfg.get(
+            "second_seed_prerequisite_sha256"
+        ) not in (None, ""):
+            mismatches.append(
+                "loss-selection derivative cannot consume a second-seed prerequisite"
+            )
         # derivative는 길이/role/primary/recorded stream만 다르고 optimizer,
         # schedule, batch, AMP, logging cadence 등 학습 의미는 canonical pretrain과
         # 정확히 같아야 한다. campaign validator가 checkpoint에서 이 정책을 다시

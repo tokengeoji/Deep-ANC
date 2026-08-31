@@ -33,6 +33,7 @@ UAC1 ADAPTIVE(full speed, 피드백 엔드포인트 없음)라 장치 PLL 이 �
 """
 
 import argparse
+import contextlib
 import csv
 import ctypes
 import datetime
@@ -40,8 +41,10 @@ import errno
 import hashlib
 import io
 import json
+import math
 import os
 import secrets
+import signal
 import sys
 import time
 from pathlib import Path
@@ -80,12 +83,29 @@ from deep_anc.data.recording_level_campaign import (        # noqa: E402
     RECORDING_LEVEL_SESSION_FRAMES,
     RecordingLevelCampaignError,
     build_recording_level_session_binding,
+    build_recording_level_source_gain_session_binding,
     rendered_source_level_evidence,
+    rendered_source_level_evidence_v2,
     validate_recording_level_campaign,
     validate_recording_level_session_binding,
+    validate_recording_level_source_gain_session_binding,
+)
+from deep_anc.data.recording_source_gain import (            # noqa: E402
+    RecordingSourceGainError,
+    build_recording_source_gain_session_binding,
+    validate_recording_source_gain_plan,
+    validate_recording_source_gain_session_binding,
+)
+from deep_anc.data.recorded_generation import (               # noqa: E402
+    ADDITIONS_ROOT,
+    SOURCE_PLAN_ROOT,
 )
 from deep_anc.data.holdout_contract import (                 # noqa: E402
     read_regular_file_snapshot,
+)
+from deep_anc.data.repository_fd import (                     # noqa: E402
+    RepositoryFileGuard,
+    repository_execution_identity,
 )
 from deep_anc.data.timeline import (                         # noqa: E402
     TimelineSettings,
@@ -97,6 +117,7 @@ from deep_anc.audio_io import (                             # noqa: E402
 )
 from deep_anc.dsp.measurement_level import (                 # noqa: E402
     assert_live_pcm_clock_preconditions,
+    collect_alsa_physical_fingerprint,
 )
 from deep_anc.realtime.noise_gen import (                    # noqa: E402
     NoiseProgram,
@@ -118,6 +139,7 @@ PROGRAM_PEAK_FACTORS = {
 # durable ``failure.json``이 발행된 **뒤에만** 이 한 줄짜리 기계 판독 포인터를 stderr로
 # 내보낸다. 기존 한국어 안내 줄은 현장 운용/로그 하위 호환성을 위해 그대로 유지한다.
 FAILURE_RECEIPT_MARKER = "DEEP_ANC_RECORD_DUCT_FAILURE_JSON="
+SCRIPT_RELATIVE_PATH = "scripts/data/record_duct.py"
 
 
 def _prepare_file_source_timeline(
@@ -158,6 +180,7 @@ def _validate_recording_level_authority(
     *,
     sample_rate: int,
     now_utc: datetime.datetime,
+    source_gain_binding: dict | None = None,
 ) -> dict | None:
     """Canonical additions의 fresh meter campaign을 audio open 전에 검증한다."""
 
@@ -199,15 +222,19 @@ def _validate_recording_level_authority(
             rtol=0.0,
             atol=1e-9,
         )
-        or not np.isclose(
-            float(args.amplitude),
-            RECORDING_LEVEL_PLAYBACK_AMPLITUDE,
-            rtol=0.0,
-            atol=1e-12,
+        or (
+            source_gain_binding is None
+            and not np.isclose(
+                float(args.amplitude),
+                RECORDING_LEVEL_PLAYBACK_AMPLITUDE,
+                rtol=0.0,
+                atol=1e-12,
+            )
         )
     ):
         raise RecordingLevelCampaignError(
-            "recording level campaign session은 exact 48kHz/15초/amplitude 0.06이어야 합니다"
+            "recording level campaign session은 exact 48kHz/15초이며, legacy는 amplitude "
+            "0.06, v2는 verified source-gain row amplitude여야 합니다"
         )
     summary = validate_recording_level_campaign(
         repo_root=REPO_ROOT,
@@ -228,7 +255,216 @@ def _validate_recording_level_authority(
         raise RecordingLevelCampaignError(
             "record_duct --hardware가 fresh campaign에 결속된 hardware config와 다릅니다"
         )
+    if source_gain_binding is not None:
+        gain_hardware = source_gain_binding.get("gain_linearity_hardware")
+        campaign_hardware = payload.get("hardware") if isinstance(payload, dict) else None
+        if (
+            not isinstance(gain_hardware, dict)
+            or not isinstance(campaign_hardware, dict)
+            or config_ref.get("sha256") != gain_hardware.get("sha256")
+            or config_ref.get("path") != gain_hardware.get("path")
+            or campaign_hardware.get("physical_fingerprint_sha256")
+            != gain_hardware.get("physical_fingerprint_sha256")
+        ):
+            raise RecordingLevelCampaignError(
+                "fresh meter campaign hardware가 gain-linearity receipt hardware와 다릅니다"
+            )
     return summary
+
+
+def _validate_source_gain_authority(
+    args: argparse.Namespace,
+    *,
+    collection_plan: dict,
+    require_clean_execution: bool,
+    authority_required: bool = False,
+) -> dict | None:
+    """v2 source-gain plan/row/amplitude/commit을 audio open 전에 결속한다."""
+
+    plan_path = args.source_gain_plan
+    expected_sha = args.source_gain_plan_sha256
+    required = bool(
+        (args.require_source_gain_plan or authority_required) and not args.dry_run
+    )
+    if plan_path is None and expected_sha is None:
+        if required:
+            raise RecordingSourceGainError(
+                "canonical v2 live에는 --source-gain-plan과 외부 SHA가 필요합니다"
+            )
+        return None
+    if plan_path is None or expected_sha is None:
+        raise RecordingSourceGainError(
+            "--source-gain-plan과 --source-gain-plan-sha256은 함께 필요합니다"
+        )
+    if collection_plan.get("status") != "exact":
+        raise RecordingSourceGainError("source-gain plan은 exact collection row에만 쓸 수 있습니다")
+    source_list_path = _repo_path(str(collection_plan.get("source_list", "")))
+    source_file_path = _repo_path(str(args.file or ""))
+    if (
+        _sha256(source_list_path) != collection_plan.get("source_list_sha256")
+        or _sha256(source_file_path) != collection_plan.get("source_file_sha256")
+    ):
+        raise RecordingSourceGainError(
+            "current source-list/source file bytes가 initial collection snapshot과 다릅니다"
+        )
+    summary = validate_recording_source_gain_plan(
+        repo_root=REPO_ROOT,
+        plan_path=str(plan_path),
+        expected_sha256=str(expected_sha).lower(),
+    )
+    payload = summary.get("payload")
+    source_ref = payload.get("source_plan") if isinstance(payload, dict) else None
+    if (
+        summary.get("canonical_live_eligible") is not True
+        or not isinstance(source_ref, dict)
+        or source_ref.get("sha256") != collection_plan.get("source_list_sha256")
+    ):
+        raise RecordingSourceGainError(
+            "source-gain v2 live eligibility/source-list SHA 결속 실패"
+        )
+    if require_clean_execution:
+        execution = repository_execution_identity(REPO_ROOT, SCRIPT_RELATIVE_PATH)
+        expected_commit = str(execution["repository_commit"])
+    else:
+        contract = payload.get("contract") if isinstance(payload, dict) else None
+        expected_commit = (
+            str(contract.get("gain_linearity_source_commit", ""))
+            if isinstance(contract, dict)
+            else ""
+        )
+        execution = None
+    binding = build_recording_source_gain_session_binding(
+        summary,
+        source_row_number=int(collection_plan["source_row_number"]),
+        expected_source_commit=expected_commit,
+    )
+    gain_hardware = binding.get("gain_linearity_hardware")
+    if not isinstance(gain_hardware, dict):
+        raise RecordingSourceGainError("source-gain binding에 gain-linearity hardware가 없습니다")
+    current_hardware_path = _repo_path(args.hardware)
+    expected_hardware_path = _repo_path(str(gain_hardware.get("path", "")))
+    current_config = load_yaml(current_hardware_path)
+    current_fingerprint = collect_alsa_physical_fingerprint(current_config)
+    if (
+        Path(os.path.abspath(current_hardware_path))
+        != Path(os.path.abspath(expected_hardware_path))
+        or _sha256(current_hardware_path) != gain_hardware.get("sha256")
+        or current_fingerprint != gain_hardware.get("physical_fingerprint")
+    ):
+        raise RecordingSourceGainError(
+            "current hardware YAML/physical fingerprint가 gain-linearity receipt와 다릅니다"
+        )
+    if binding["source_file"].get("sha256") != collection_plan.get(
+        "source_file_sha256"
+    ):
+        raise RecordingSourceGainError("source-gain row source bytes가 collection과 다릅니다")
+    millionths_float = float(args.amplitude) * 1_000_000.0
+    millionths = int(round(millionths_float))
+    if (
+        not math.isclose(millionths_float, float(millionths), rel_tol=0.0, abs_tol=1e-9)
+        or millionths != binding["amplitude_millionths"]
+        or not math.isclose(
+            float(args.amplitude), float(binding["amplitude"]), rel_tol=0.0, abs_tol=1e-15
+        )
+    ):
+        raise RecordingSourceGainError(
+            "CLI amplitude가 source-gain integer-millionths selected row와 다릅니다"
+        )
+    return {"summary": summary, "binding": binding, "execution": execution}
+
+
+def _is_within_repo_subtree(value: str | Path, relative_root: str) -> bool:
+    candidate = Path(os.path.abspath(_repo_path(value)))
+    root = Path(os.path.abspath(_repo_path(relative_root)))
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _requires_v2_source_gain_authority(
+    args: argparse.Namespace, collection_plan: dict
+) -> bool:
+    """Canonical additions/authority 경로는 hidden CLI flag가 없어도 v2를 요구한다."""
+
+    source_list = collection_plan.get("source_list")
+    return bool(
+        args.require_source_gain_plan
+        or args.require_recording_level_campaign
+        or (
+            collection_plan.get("status") == "exact"
+            and isinstance(source_list, str)
+            and _is_within_repo_subtree(source_list, SOURCE_PLAN_ROOT)
+        )
+        or _is_within_repo_subtree(args.out_root, ADDITIONS_ROOT)
+    )
+
+
+def _guard_relative_path(value: str | Path, *, label: str) -> str:
+    absolute = Path(os.path.abspath(_repo_path(value)))
+    root = Path(os.path.abspath(REPO_ROOT))
+    try:
+        relative = absolute.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise RecordingSourceGainError(
+            f"{label}는 canonical live에서 저장소 내부 regular file이어야 합니다"
+        ) from exc
+    return relative
+
+
+def _open_live_authority_guards(
+    stack: contextlib.ExitStack,
+    *,
+    args: argparse.Namespace,
+    collection_plan: dict,
+    source_gain_binding: dict,
+) -> list[RepositoryFileGuard]:
+    """Stream 시작 전부터 종료까지 모든 v2 authority inode/bytes를 고정한다."""
+
+    receipt = source_gain_binding.get("gain_linearity_receipt")
+    paths: list[tuple[str | Path, str]] = [
+        (args.hardware, "hardware config"),
+        (args.file, "rendered source file"),
+        (collection_plan["source_list"], "source list"),
+        (args.source_gain_plan, "source gain plan"),
+        (args.recording_level_campaign, "recording level campaign"),
+    ]
+    if isinstance(receipt, dict) and isinstance(receipt.get("path"), str):
+        paths.append((receipt["path"], "gain-linearity receipt"))
+    guards: list[RepositoryFileGuard] = []
+    seen: set[str] = set()
+    for value, label in paths:
+        relative = _guard_relative_path(value, label=label)
+        if relative in seen:
+            continue
+        seen.add(relative)
+        guards.append(
+            stack.enter_context(RepositoryFileGuard(REPO_ROOT, relative, label=label))
+        )
+    return guards
+
+
+def _construct_stream_after_authority_check(
+    sd,
+    *,
+    pre_open_check,
+    stream_kwargs: dict,
+):
+    """Pa_OpenStream 직전과 constructor 직후(아직 start 전)에 authority를 검사한다."""
+
+    pre_open_check()
+    stream = sd.Stream(**stream_kwargs)
+    try:
+        # sounddevice constructor가 PortAudio stream을 열 수 있지만 context enter 전이라
+        # callback/start는 아직 아니다. constructor 사이 mutation은 여기서 잡고 닫는다.
+        pre_open_check()
+    except BaseException:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+        raise
+    return stream
 
 
 def _sha256(path: Path) -> str:
@@ -767,6 +1003,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--source-gain-plan",
+        default=None,
+        help="v2 source별 physical gain plan 저장소 상대경로",
+    )
+    parser.add_argument(
+        "--source-gain-plan-sha256",
+        default=None,
+        help="v2 source별 gain plan의 외부 SHA-256 anchor",
+    )
+    parser.add_argument(
+        "--require-source-gain-plan",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -828,6 +1079,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     collection_plan = _validate_collection_plan(args, parser)
+    v2_authority_required = _requires_v2_source_gain_authority(
+        args, collection_plan
+    )
     hw = load_yaml(_repo_path(args.hardware))["audio"]
     fs = int(hw["sample_rate"])
     block = int(hw["block_size"])
@@ -849,10 +1103,25 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     try:
+        source_gain_authority = _validate_source_gain_authority(
+            args,
+            collection_plan=collection_plan,
+            require_clean_execution=not args.dry_run,
+            authority_required=v2_authority_required,
+        )
+    except (OSError, RecordingSourceGainError, RuntimeError, ValueError) as exc:
+        parser.error(f"recording source gain 검증 실패: {exc}")
+    source_gain_binding = (
+        source_gain_authority["binding"]
+        if source_gain_authority is not None
+        else None
+    )
+    try:
         recording_level_campaign = _validate_recording_level_authority(
             args,
             sample_rate=fs,
             now_utc=datetime.datetime.now(datetime.timezone.utc),
+            source_gain_binding=source_gain_binding,
         )
     except (OSError, RecordingLevelCampaignError, ValueError) as exc:
         parser.error(f"recording level campaign 검증 실패: {exc}")
@@ -869,6 +1138,11 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "[DRY-RUN 안내] live canonical 실행에는 fresh recording-level "
                 "campaign path/SHA와 same-amplifier 확인이 필수입니다"
+            )
+        if v2_authority_required and source_gain_authority is None:
+            print(
+                "[DRY-RUN 안내] live canonical 실행에는 PASS v2 source-gain plan path/SHA가 "
+                "필수입니다"
             )
         print("[DRY-RUN PASS] 파일 생성/수정 및 오디오 장치 open 없음")
         return 0
@@ -899,6 +1173,12 @@ def main(argv: list[str] | None = None) -> int:
                 "receipt_sha256": recording_level_campaign["receipt_sha256"],
             }
             if recording_level_campaign is not None
+            else None
+        ),
+        "source_gain_binding": source_gain_binding,
+        "source_gain_execution": (
+            source_gain_authority.get("execution")
+            if source_gain_authority is not None
             else None
         ),
     }
@@ -1095,8 +1375,15 @@ def main(argv: list[str] | None = None) -> int:
     max_callbacks = total // max(1, block) + 64
     stamps = np.zeros((max_callbacks, 3), dtype=np.float64)
     stamp_count = {"n": 0}
+    graceful_stop = {"signal": None}
 
     def callback(indata, outdata, frames, time_info, status):
+        if graceful_stop["signal"] is not None:
+            # Parent hard-timeout의 첫 단계는 SIGTERM이다. 다음 callback에서 두 DAC
+            # 채널을 exact zero로 제출하고 stream을 정상 close시킨 뒤 partial raw를
+            # durable failure receipt로 발행한다.
+            outdata[:] = 0
+            raise sd.CallbackStop
         if status:
             # 콜백 안에서 print 하면 그 자체가 다음 xrun 을 만든다. 세어만 두고 밖에서 판정한다.
             # xrun 은 source 와 mics 사이에 **영구 오프셋**을 남긴다 — 커서는 frames 만큼
@@ -1143,28 +1430,74 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # input probe 뒤 다른 프로세스가 PCM을 잡았거나 CPU 부하가 생긴 race를 닫는다.
+        current_source_gain = _validate_source_gain_authority(
+            args,
+            collection_plan=collection_plan,
+            require_clean_execution=source_gain_authority is not None,
+            authority_required=v2_authority_required,
+        )
+        if (
+            (current_source_gain is None) != (source_gain_authority is None)
+            or (
+                current_source_gain is not None
+                and current_source_gain["binding"] != source_gain_binding
+            )
+        ):
+            raise RecordingSourceGainError(
+                "input probe 뒤 source-gain plan/row/commit binding이 변경됐습니다"
+            )
         current_level_campaign = _validate_recording_level_authority(
             args,
             sample_rate=fs,
             now_utc=datetime.datetime.now(datetime.timezone.utc),
+            source_gain_binding=source_gain_binding,
         )
         recording_level_binding = None
         rendered_level = None
         if current_level_campaign is not None:
-            rendered_level = rendered_source_level_evidence(source[settle : settle + keep])
+            if source_gain_binding is None:
+                rendered_level = rendered_source_level_evidence(
+                    source[settle : settle + keep]
+                )
+            else:
+                rendered_level = rendered_source_level_evidence_v2(
+                    source[settle : settle + keep],
+                    amplitude_millionths=source_gain_binding[
+                        "amplitude_millionths"
+                    ],
+                )
         assert_live_pcm_clock_preconditions(hw)
         # 이 timestamp는 CLI 시작이나 input probe 시작이 아니라, 마지막 live gate가
         # 끝난 뒤 duplex stream을 여는 바로 직전의 시각이다.
         session_started_at_utc = datetime.datetime.now(datetime.timezone.utc)
         if current_level_campaign is not None:
             assert rendered_level is not None
-            recording_level_binding = build_recording_level_session_binding(
-                current_level_campaign,
-                session_started_at_utc=session_started_at_utc,
-                same_amplifier_setting=args.confirm_same_amplifier_setting,
-                rendered_source=rendered_level,
-            )
-    except (OSError, RuntimeError, RecordingLevelCampaignError, ValueError) as exc:
+            if source_gain_binding is None:
+                recording_level_binding = build_recording_level_session_binding(
+                    current_level_campaign,
+                    session_started_at_utc=session_started_at_utc,
+                    same_amplifier_setting=args.confirm_same_amplifier_setting,
+                    rendered_source=rendered_level,
+                )
+            else:
+                assert current_source_gain is not None
+                recording_level_binding = (
+                    build_recording_level_source_gain_session_binding(
+                        current_level_campaign,
+                        current_source_gain["summary"],
+                        session_started_at_utc=session_started_at_utc,
+                        same_amplifier_setting=args.confirm_same_amplifier_setting,
+                        source_gain_binding=source_gain_binding,
+                        rendered_source=rendered_level,
+                    )
+                )
+    except (
+        OSError,
+        RuntimeError,
+        RecordingLevelCampaignError,
+        RecordingSourceGainError,
+        ValueError,
+    ) as exc:
         _preserve_failed_capture(
             failed_root=_repo_path(args.failed_root),
             stage="immediate_live_gate",
@@ -1177,24 +1510,109 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"녹음 시작: {args.program}, {args.seconds:.0f}초 (ANC 없음, ch1 무음)")
     stream_error: Exception | None = None
-    try:
-        with sd.Stream(
-            samplerate=fs,
-            blocksize=block,
-            device=(in_dev, out_dev),
-            channels=(2, 2),
-            dtype=("int32", "int16"),
-            latency=("low", "low"),
-            callback=callback,
-            prime_output_buffers_using_stream_callback=True,
+    previous_handlers: dict[int, object] = {}
+
+    def _request_graceful_stop(signum, _frame):
+        graceful_stop["signal"] = signal.Signals(signum).name
+
+    authority_guards: list[RepositoryFileGuard] = []
+
+    def _immediate_pre_open_authority_check() -> None:
+        for guard in authority_guards:
+            guard.verify()
+        immediate_source_gain = _validate_source_gain_authority(
+            args,
+            collection_plan=collection_plan,
+            require_clean_execution=True,
+            authority_required=v2_authority_required,
+        )
+        if (
+            immediate_source_gain is None
+            or immediate_source_gain["binding"] != source_gain_binding
         ):
-            while cursor["in"] < total:
-                time.sleep(0.1)
+            raise RecordingSourceGainError(
+                "audio start 직전 source-gain plan/row/commit binding이 변경됐습니다"
+            )
+        immediate_campaign = _validate_recording_level_authority(
+            args,
+            sample_rate=fs,
+            now_utc=datetime.datetime.now(datetime.timezone.utc),
+            source_gain_binding=source_gain_binding,
+        )
+        if (
+            immediate_campaign is None
+            or recording_level_campaign is None
+            or immediate_campaign.get("campaign_id")
+            != recording_level_campaign.get("campaign_id")
+            or immediate_campaign.get("receipt_sha256")
+            != recording_level_campaign.get("receipt_sha256")
+        ):
+            raise RecordingLevelCampaignError(
+                "audio start 직전 recording-level campaign binding이 변경됐습니다"
+            )
+        assert_live_pcm_clock_preconditions(hw)
+        for guard in authority_guards:
+            guard.verify()
+
+    try:
+        for stop_signal in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[int(stop_signal)] = signal.getsignal(stop_signal)
+            signal.signal(stop_signal, _request_graceful_stop)
+        stream_kwargs = {
+            "samplerate": fs,
+            "blocksize": block,
+            "device": (in_dev, out_dev),
+            "channels": (2, 2),
+            "dtype": ("int32", "int16"),
+            "latency": ("low", "low"),
+            "callback": callback,
+            "prime_output_buffers_using_stream_callback": True,
+        }
+        with contextlib.ExitStack() as authority_stack:
+            if source_gain_binding is not None:
+                authority_guards = _open_live_authority_guards(
+                    authority_stack,
+                    args=args,
+                    collection_plan=collection_plan,
+                    source_gain_binding=source_gain_binding,
+                )
+                stream = _construct_stream_after_authority_check(
+                    sd,
+                    pre_open_check=_immediate_pre_open_authority_check,
+                    stream_kwargs=stream_kwargs,
+                )
+            else:
+                # legacy gain은 diagnostic-only이며 canonical authority 경로에서는 위에서
+                # 이미 거절된다. 일반 진단 수집의 기존 동작만 보존한다.
+                stream = sd.Stream(**stream_kwargs)
+            try:
+                if source_gain_binding is not None:
+                    # sounddevice Stream constructor는 Pa_OpenStream만 수행하고 start하지
+                    # 않는다. context manager의 암시적 start 대신 authority를 한 번 더
+                    # 확인한 뒤 explicit start한다.
+                    _immediate_pre_open_authority_check()
+                stream.start()
+                while cursor["in"] < total and graceful_stop["signal"] is None:
+                    time.sleep(0.1)
+            finally:
+                try:
+                    stream.stop()
+                finally:
+                    stream.close()
     except Exception as exc:  # PortAudio/callback 오류도 메모리에 남은 partial raw를 보존한다.
         stream_error = exc
     finally:
+        for stop_signal in (signal.SIGTERM, signal.SIGINT):
+            previous = previous_handlers.get(int(stop_signal))
+            if previous is not None:
+                signal.signal(stop_signal, previous)
         # 정렬/저장보다 먼저 알려야 스피커가 분석 시간 동안 연결된 채 방치되지 않는다.
         print("출력 종료 — 지금 스피커를 분리하세요.", flush=True)
+
+    if graceful_stop["signal"] is not None and stream_error is None:
+        stream_error = RuntimeError(
+            f"graceful_parent_stop:{graceful_stop['signal']}"
+        )
 
     captured = min(int(cursor["in"]), int(cursor["out"]), total)
     raw_mics = recorded[:captured]
@@ -1223,6 +1641,22 @@ def main(argv: list[str] | None = None) -> int:
     # receipt SHA에서 재유도한다. 출력 중 receipt/raw가 바뀐 경우 active tree에 발행하지 않는다.
     if recording_level_binding is not None:
         try:
+            post_source_gain = _validate_source_gain_authority(
+                args,
+                collection_plan=collection_plan,
+                require_clean_execution=source_gain_authority is not None,
+                authority_required=v2_authority_required,
+            )
+            if (
+                (post_source_gain is None) != (source_gain_authority is None)
+                or (
+                    post_source_gain is not None
+                    and post_source_gain["binding"] != source_gain_binding
+                )
+            ):
+                raise RecordingSourceGainError(
+                    "stream close 뒤 source-gain plan/row/commit binding이 변경됐습니다"
+                )
             post_campaign = validate_recording_level_campaign(
                 repo_root=REPO_ROOT,
                 campaign_receipt=str(args.recording_level_campaign),
@@ -1230,17 +1664,40 @@ def main(argv: list[str] | None = None) -> int:
                 now_utc=session_started_at_utc,
                 require_fresh=True,
             )
-            validate_recording_level_session_binding(
-                post_campaign, recording_level_binding
-            )
-            post_rendered = rendered_source_level_evidence(
-                source[settle : settle + keep]
-            )
+            if source_gain_binding is None:
+                validate_recording_level_session_binding(
+                    post_campaign, recording_level_binding
+                )
+                post_rendered = rendered_source_level_evidence(
+                    source[settle : settle + keep]
+                )
+            else:
+                assert post_source_gain is not None
+                validate_recording_source_gain_session_binding(
+                    post_source_gain["summary"], source_gain_binding
+                )
+                validate_recording_level_source_gain_session_binding(
+                    post_campaign,
+                    post_source_gain["summary"],
+                    recording_level_binding,
+                )
+                post_rendered = rendered_source_level_evidence_v2(
+                    source[settle : settle + keep],
+                    amplitude_millionths=source_gain_binding[
+                        "amplitude_millionths"
+                    ],
+                )
             if post_rendered != recording_level_binding.get("rendered_source"):
                 raise RecordingLevelCampaignError(
                     "stream close 뒤 rendered source binding이 pre-live bytes와 다릅니다"
                 )
-        except (OSError, RecordingLevelCampaignError, ValueError) as exc:
+        except (
+            OSError,
+            RecordingLevelCampaignError,
+            RecordingSourceGainError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
             _preserve_failed_capture(
                 failed_root=_repo_path(args.failed_root),
                 stage="recording_level_binding",
@@ -1418,8 +1875,15 @@ def main(argv: list[str] | None = None) -> int:
         },
         "timeline": timeline_meta,
         "recording_level_binding": recording_level_binding,
+        "source_gain_binding": source_gain_binding,
         "plant_domain": (
-            "current_strict" if recording_level_binding is not None else None
+            "current_strict"
+            if source_gain_binding is not None and recording_level_binding is not None
+            else (
+                "diagnostic_legacy_gain"
+                if recording_level_binding is not None
+                else None
+            )
         ),
         "io_timestamps": _summarise_io_timestamps(stamps[: stamp_count["n"]], fs),
     }

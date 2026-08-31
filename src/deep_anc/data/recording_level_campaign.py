@@ -41,11 +41,20 @@ from .holdout_contract import (
     read_regular_file_snapshot,
     reject_symlink_components,
 )
+from .recording_source_gain import (
+    PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS,
+    RECORDING_SOURCE_GAIN_SESSION_BINDING_SCHEMA,
+    validate_recording_source_gain_session_binding,
+)
 
 
 RECORDING_LEVEL_CAMPAIGN_SCHEMA = "recording_level_campaign_v1"
 RECORDING_LEVEL_SESSION_BINDING_SCHEMA = "recording_level_session_binding_v1"
 RECORDING_LEVEL_RENDERED_SOURCE_SCHEMA = "recording_rendered_source_level_v1"
+RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA = (
+    "recording_level_source_gain_session_binding/v2"
+)
+RECORDING_LEVEL_RENDERED_SOURCE_V2_SCHEMA = "recording_rendered_source_level/v2"
 RECORDING_LEVEL_CAMPAIGN_ROOT = "results/recording_level_campaigns"
 RECORDING_LEVEL_CAMPAIGN_FILENAME = "campaign.json"
 RECORDING_LEVEL_MAX_AGE_SECONDS = BOOTSTRAP_METER_MAX_AGE_SECONDS
@@ -951,6 +960,208 @@ def validate_recording_level_session_binding(
     return json.loads(_canonical_json_bytes(dict(binding)))
 
 
+def rendered_source_level_evidence_v2(
+    samples: np.ndarray, *, amplitude_millionths: int
+) -> dict[str, Any]:
+    """Source-gain v2가 선택한 integer amplitude의 exact rendered bytes를 봉인한다."""
+
+    if (
+        isinstance(amplitude_millionths, bool)
+        or not isinstance(amplitude_millionths, int)
+        or not 1
+        <= amplitude_millionths
+        <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
+    ):
+        raise RecordingLevelCampaignError("v2 amplitude_millionths 범위 위반")
+    values = np.asarray(samples)
+    if values.ndim != 1 or values.shape != (RECORDING_LEVEL_SESSION_FRAMES,):
+        raise RecordingLevelCampaignError(
+            f"v2 rendered source는 mono exact {RECORDING_LEVEL_SESSION_FRAMES} frames여야 합니다"
+        )
+    canonical = np.ascontiguousarray(values, dtype="<f4")
+    numeric = np.asarray(canonical, dtype=np.float64)
+    if not bool(np.isfinite(numeric).all()):
+        raise RecordingLevelCampaignError("v2 rendered source에 non-finite sample이 있습니다")
+    peak = float(np.max(np.abs(numeric)))
+    amplitude = amplitude_millionths / 1_000_000.0
+    if peak <= 0.0 or peak > amplitude + 1.0e-6:
+        raise RecordingLevelCampaignError("v2 rendered source peak/amplitude 계약 위반")
+    floor = np.finfo(np.float64).tiny
+    evidence = {
+        "schema": RECORDING_LEVEL_RENDERED_SOURCE_V2_SCHEMA,
+        "metric_definition": "measurement_level.band_rms_dbfs_hann_v1",
+        "sample_rate": RECORDING_LEVEL_SAMPLE_RATE,
+        "frames": RECORDING_LEVEL_SESSION_FRAMES,
+        "sample_encoding": "float32_le",
+        "sample_sha256": hashlib.sha256(canonical.tobytes()).hexdigest(),
+        "playback_amplitude_millionths": amplitude_millionths,
+        "playback_amplitude": amplitude,
+        "peak_linear": peak,
+        "peak_dbfs": float(20.0 * math.log10(max(peak, floor))),
+        "rms_dbfs": float(
+            20.0
+            * math.log10(
+                math.sqrt(float(np.mean(np.square(numeric)))) + floor
+            )
+        ),
+        "trusted_band_hz": list(OFFICIAL_MEASUREMENT_LEVEL.meter_band_hz),
+        "trusted_band_rms_dbfs": float(band_rms_dbfs(numeric)),
+    }
+    return validate_rendered_source_level_v2(evidence)
+
+
+def validate_rendered_source_level_v2(value: Any) -> dict[str, Any]:
+    required = {
+        "schema",
+        "metric_definition",
+        "sample_rate",
+        "frames",
+        "sample_encoding",
+        "sample_sha256",
+        "playback_amplitude_millionths",
+        "playback_amplitude",
+        "peak_linear",
+        "peak_dbfs",
+        "rms_dbfs",
+        "trusted_band_hz",
+        "trusted_band_rms_dbfs",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise RecordingLevelCampaignError("v2 rendered source field 집합 불일치")
+    millionths = value.get("playback_amplitude_millionths")
+    if (
+        isinstance(millionths, bool)
+        or not isinstance(millionths, int)
+        or not 1 <= millionths <= PHYSICAL_SELECTOR_MAX_AMPLITUDE_MILLIONTHS
+    ):
+        raise RecordingLevelCampaignError("v2 rendered source amplitude integer 위반")
+    amplitude = _finite_number(value.get("playback_amplitude"), label="v2 amplitude")
+    peak = _finite_number(value.get("peak_linear"), label="v2 peak")
+    peak_dbfs = _finite_number(value.get("peak_dbfs"), label="v2 peak dBFS")
+    rms_dbfs = _finite_number(value.get("rms_dbfs"), label="v2 RMS dBFS")
+    _finite_number(value.get("trusted_band_rms_dbfs"), label="v2 trusted RMS")
+    sample_sha = value.get("sample_sha256")
+    if (
+        value.get("schema") != RECORDING_LEVEL_RENDERED_SOURCE_V2_SCHEMA
+        or value.get("metric_definition")
+        != "measurement_level.band_rms_dbfs_hann_v1"
+        or value.get("sample_rate") != RECORDING_LEVEL_SAMPLE_RATE
+        or value.get("frames") != RECORDING_LEVEL_SESSION_FRAMES
+        or value.get("sample_encoding") != "float32_le"
+        or not isinstance(sample_sha, str)
+        or _SHA256_RE.fullmatch(sample_sha) is None
+        or value.get("trusted_band_hz")
+        != list(OFFICIAL_MEASUREMENT_LEVEL.meter_band_hz)
+        or not math.isclose(
+            amplitude, millionths / 1_000_000.0, rel_tol=0.0, abs_tol=1e-15
+        )
+        or peak <= 0.0
+        or peak > amplitude + 1.0e-6
+        or not math.isclose(
+            peak_dbfs, 20.0 * math.log10(peak), rel_tol=1e-12, abs_tol=1e-12
+        )
+        or rms_dbfs > peak_dbfs + 1.0e-9
+    ):
+        raise RecordingLevelCampaignError("v2 rendered source scalar/peak 계약 위반")
+    return json.loads(_canonical_json_bytes(dict(value)))
+
+
+def build_recording_level_source_gain_session_binding(
+    campaign: Mapping[str, Any],
+    source_gain_summary: Mapping[str, Any],
+    *,
+    session_started_at_utc: str | dt.datetime,
+    same_amplifier_setting: bool,
+    source_gain_binding: Mapping[str, Any],
+    rendered_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fresh meter knob authority와 v2 per-row gain authority를 합성한다."""
+
+    if not isinstance(campaign, Mapping) or not isinstance(campaign.get("payload"), Mapping):
+        raise RecordingLevelCampaignError("validated level campaign summary가 필요합니다")
+    payload = campaign["payload"]
+    if campaign.get("campaign_id") != payload.get("campaign_id"):
+        raise RecordingLevelCampaignError("campaign summary/payload ID 불일치")
+    try:
+        gain_binding = validate_recording_source_gain_session_binding(
+            source_gain_summary, source_gain_binding
+        )
+    except ValueError as exc:
+        raise RecordingLevelCampaignError(f"source gain binding 검증 실패: {exc}") from exc
+    rendered = validate_rendered_source_level_v2(rendered_source)
+    if (
+        rendered["playback_amplitude_millionths"]
+        != gain_binding["amplitude_millionths"]
+        or rendered["sample_sha256"] != gain_binding["render_sample_sha256"]
+    ):
+        raise RecordingLevelCampaignError(
+            "rendered source가 source-gain row amplitude/sample SHA와 다릅니다"
+        )
+    started = _parse_utc(session_started_at_utc, label="session_started_at_utc")
+    completed = _parse_utc(
+        payload["meter"].get("completed_at_utc"), label="meter completed_at_utc"
+    )
+    issued = _parse_utc(payload.get("issued_at_utc"), label="campaign issued_at_utc")
+    age = float((started - completed).total_seconds())
+    if age < 0.0 or age > RECORDING_LEVEL_MAX_AGE_SECONDS:
+        raise RecordingLevelCampaignError(
+            f"v2 session meter age가 0..{RECORDING_LEVEL_MAX_AGE_SECONDS}초가 아닙니다: {age:.6f}"
+        )
+    if started < issued:
+        raise RecordingLevelCampaignError("v2 session 시작이 campaign 발행보다 빠릅니다")
+    if same_amplifier_setting is not True:
+        raise RecordingLevelCampaignError("same_amplifier_setting은 exact true여야 합니다")
+    receipt_ref = {
+        "path": campaign.get("receipt_path"),
+        "size": campaign.get("receipt_size"),
+        "sha256": campaign.get("receipt_sha256"),
+    }
+    binding: dict[str, Any] = {
+        "schema": RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA,
+        "campaign_id": payload["campaign_id"],
+        "campaign_receipt": receipt_ref,
+        "meter_capture_id": payload["meter"]["capture_id"],
+        "meter_completed_at_utc": completed.isoformat(),
+        "session_started_at_utc": started.isoformat(),
+        "meter_age_seconds_at_session_start": age,
+        "same_amplifier_setting": True,
+        "source_gain": gain_binding,
+        "rendered_source": rendered,
+    }
+    binding["binding_sha256"] = _canonical_sha256(binding)
+    return binding
+
+
+def validate_recording_level_source_gain_session_binding(
+    campaign: Mapping[str, Any],
+    source_gain_summary: Mapping[str, Any],
+    binding: Any,
+) -> dict[str, Any]:
+    if not isinstance(binding, Mapping):
+        raise RecordingLevelCampaignError("v2 level/source-gain binding이 mapping이 아닙니다")
+    seal = binding.get("binding_sha256")
+    unsealed = dict(binding)
+    unsealed.pop("binding_sha256", None)
+    if (
+        binding.get("schema") != RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA
+        or not isinstance(seal, str)
+        or _SHA256_RE.fullmatch(seal) is None
+        or seal != _canonical_sha256(unsealed)
+    ):
+        raise RecordingLevelCampaignError("v2 level/source-gain binding seal/schema 불일치")
+    rebuilt = build_recording_level_source_gain_session_binding(
+        campaign,
+        source_gain_summary,
+        session_started_at_utc=binding.get("session_started_at_utc"),
+        same_amplifier_setting=binding.get("same_amplifier_setting") is True,
+        source_gain_binding=binding.get("source_gain"),
+        rendered_source=binding.get("rendered_source"),
+    )
+    if dict(binding) != rebuilt:
+        raise RecordingLevelCampaignError("v2 level/source-gain binding 독립 재유도 불일치")
+    return json.loads(_canonical_json_bytes(dict(binding)))
+
+
 __all__ = [
     "RECORDING_LEVEL_CAMPAIGN_FILENAME",
     "RECORDING_LEVEL_CAMPAIGN_ROOT",
@@ -958,14 +1169,20 @@ __all__ = [
     "RECORDING_LEVEL_MAX_AGE_SECONDS",
     "RECORDING_LEVEL_PLAYBACK_AMPLITUDE",
     "RECORDING_LEVEL_RENDERED_SOURCE_SCHEMA",
+    "RECORDING_LEVEL_RENDERED_SOURCE_V2_SCHEMA",
     "RECORDING_LEVEL_SESSION_BINDING_SCHEMA",
+    "RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA",
     "RecordingLevelCampaignError",
     "build_recording_level_campaign_payload",
     "build_recording_level_session_binding",
+    "build_recording_level_source_gain_session_binding",
     "campaign_receipt_relative_path",
     "issue_recording_level_campaign",
     "rendered_source_level_evidence",
+    "rendered_source_level_evidence_v2",
     "validate_recording_level_campaign",
     "validate_recording_level_session_binding",
+    "validate_recording_level_source_gain_session_binding",
     "validate_rendered_source_level",
+    "validate_rendered_source_level_v2",
 ]

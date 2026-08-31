@@ -95,6 +95,14 @@ def validate_canonical_pretrain_ledger_payload(
     if str(cfg.get("experiment_role", "")) != "canonical_pretrain":
         return {}
     root = Path(os.path.abspath(Path(repo_root)))
+    if cfg.get("seed") == 20260903:
+        # secondary는 primary v7 ledger를 자기 seed cfg로 직접 검증하지 않는다.
+        # 별도 no-replace prerequisite가 primary raw chain과 fresh seed-specific
+        # smoke를 먼저 검증한 뒤, 그 안에서 실제 primary checkpoint cfg로 v7
+        # validator를 재사용한다.
+        from .second_seed_prerequisite import validate_second_seed_prerequisites
+
+        return validate_second_seed_prerequisites(cfg, repo_root=root)
     ledger = _exact_keys(
         ledger_payload,
         {

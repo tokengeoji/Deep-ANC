@@ -56,14 +56,14 @@ from .source_trust import (
 
 DNS_SELECTION_SCHEMA_VERSION = 3
 DNS_SELECTION_KIND = "recorded_dns_speech_selection"
-DNS_SELECTION_GENERATION_ID = "stage1-coverage-v2"
+DNS_SELECTION_GENERATION_ID = "stage1-coverage-v3-gain012"
 DNS_SELECTION_RECEIPT = (
     "data/source_plans/recorded_additions/dns_speech_selections/"
-    "stage1-coverage-v2/selection_receipt.json"
+    "stage1-coverage-v3-gain012/selection_receipt.json"
 )
 DNS_SELECTION_BUNDLE_ROOT = (
     "data/source_plans/recorded_additions/dns_speech_selections/"
-    "stage1-coverage-v2"
+    "stage1-coverage-v3-gain012"
 )
 DNS_SOURCE_KIND = "external_dns_speech_composite"
 DNS_RAW_SAMPLE_RATE = 48_000

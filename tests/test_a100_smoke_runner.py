@@ -71,6 +71,26 @@ def test_runner_only_admits_the_approved_loss_alpha_grid():
     assert tuple(action.choices) == (0.7, 0.85, 1.0)
 
 
+def test_secondary_seed_smoke_is_fresh_and_never_consumes_its_own_prerequisite():
+    runner = _load_runner()
+    overrides = runner._overrides(
+        bootstrap_sha256="a" * 64,
+        label="uninterrupted",
+        run_until_step=500,
+        loss_alpha=0.7,
+        loss_lambda_dnh=0.00075,
+        seed=20260903,
+    )
+    seed_action = next(
+        item for item in runner.build_parser()._actions if item.dest == "seed"
+    )
+
+    assert tuple(seed_action.choices) == (20260803, 20260903)
+    assert "seed=20260903" in overrides
+    assert "second_seed_prerequisite=null" in overrides
+    assert "second_seed_prerequisite_sha256=null" in overrides
+
+
 def test_runner_uses_the_same_nominal_a100_usable_memory_floor_as_receipt_validator():
     runner = _load_runner()
     assert runner.A100_MIN_USABLE_MEMORY_BYTES == A100_MIN_USABLE_MEMORY_BYTES

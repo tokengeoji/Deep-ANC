@@ -97,7 +97,9 @@ _TARGET_TRAINING_KEYS = (
     "nmse_cvar_scope",
     "determinism_policy",
 )
-_TARGET_EXCLUDED_ARTIFACTS = frozenset({"campaign_prerequisite", "init_checkpoint"})
+_TARGET_EXCLUDED_ARTIFACTS = frozenset(
+    {"campaign_prerequisite", "second_seed_prerequisite", "init_checkpoint"}
+)
 
 
 def _root(value: str | Path) -> Path:

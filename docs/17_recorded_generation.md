@@ -8,7 +8,10 @@
 > [docs/18](18_broadband_anc_guardrails.md)과
 > `src/deep_anc/data/broadband_coverage_receipt.py`를 따른다.
 >
-> 현행 수집 세대는 `stage1-coverage-v2`다. v1 첫 environment 원본의 두 실제
+> `stage1-coverage-v2`는 fixed `0.06`과 environment_006 `25.75 s`를 사용했던
+> **immutable stale 세대**다. source별 physical cap 계약과 맞지 않으므로 기존
+> receipt/plan/raw는 진단 증거로만 보존하고 덮어쓰거나 현행 수집에 재사용하지 않는다.
+> 현행 수집 세대는 새 no-replace ID `stage1-coverage-v3-gain012`다. v1 첫 environment 원본의 두 실제
 > capture는 하드웨어/xrun/clip 문제가 없었지만 source→ERR 150--600 Hz coherence²가
 > `0.872375`, `0.836006`으로 canonical `0.90`에 미달했다. 임계값을 낮추거나 같은
 > church-bells 원본을 반복하지 않고, 안정적인 DEMAND DKITCHEN immutable 원본으로
@@ -22,7 +25,7 @@ root에 수집하고, 검증을 모두 통과한 뒤에만 parent 82 + additions
 generation manifest를 발행한다.
 
 현재 82세션만 존재하는 schema v1은 기존 bytes를 재검증하는 forensic/readiness 계약으로만
-유효하다. 현행 `stage1-coverage-v2` 신규 학습 입력으로는 사용할 수 없다. 19세션이 실제로
+유효하다. 현행 `stage1-coverage-v3-gain012` 신규 학습 입력으로는 사용할 수 없다. 19세션이 실제로
 녹음되기 전에는 101세션 generation을 만들었다고 간주하지 않으며 readiness도 기존
 82세션 증거를 사용한다.
 
@@ -51,20 +54,22 @@ speech 5, music 5, environment 5,
 machine 4로 고정한다. 모든 행은 녹음 전에 split을 지정하고, lineage component와 원본
 SHA가 서로 독립적이어야 한다.
 
-현행 generation-id는 `stage1-coverage-v2`다. canonical 구성은 environment/music
+현행 generation-id는 `stage1-coverage-v3-gain012`다. canonical 구성은 environment/music
 source-pool 9행, immutable DEMAND environment 1행, external DNS speech 5행, external
 ESC machine 4행이다. DNS와 DEMAND selection receipt가 없거나 두 외부 전달 receipt
-SHA 중 하나라도 없으면 source plan은 명시적으로 BLOCKED된다.
+SHA 중 하나라도 없으면 source plan은 명시적으로 BLOCKED된다. bounded physical
+gain-linearity PASS receipt와 외부 SHA도 필수이며, 그 receipt가 허용한 최대값(현재
+`0.012` 이하)에서 exact 19행 모두가 feasible일 때만 plan을 발행한다.
 
 | family | path | start | split |
 |---|---|---:|---|
-| environment | `data/source_pool/environment/environment_006.wav` | 25.75 | train |
-| environment | `data/source_pool_v2/environment/environment_012.wav` | 3.0 | test |
-| environment | `data/source_pool_v2/environment/environment_004.wav` | 5.9 | test |
-| environment | `data/source_pool_v2/environment/environment_017.wav` | 26.2 | val |
+| environment | `data/source_pool/environment/environment_006.wav` | 42.0 | train |
+| environment | `data/source_pool_v2/environment/environment_014.wav` | 30.0 | val |
+| environment | `data/source_pool/environment/environment_003.wav` | 44.5 | test |
+| environment | `data/source_pool/environment/environment_008.wav` | 53.25 | test |
 | environment | immutable origin `.../origin-environment-demand-dkitchen-ch01-f7e2a2868219.wav` 185.6--200.6 s → exact peak-normalized composite `.../environment-demand-dkitchen-ch01-f7e2a2868219-185600ms-peaknorm.wav` | composite 0.0 | test |
 | music | `data/source_pool/music/music_007.wav` | 54.8 | test |
-| music | `data/source_pool_v2/music/music_007.wav` | 12.8 | test |
+| music | `data/source_pool_v2/music/music_007.wav` | 43.0 | test |
 | music | `data/source_pool_v2/music/music_012.wav` | 17.1 | val |
 | music | `data/source_pool_v2/music/music_017.wav` | 20.1 | val |
 | music | `data/source_pool_v2/music/music_008.wav` | 31.5 | train |
@@ -206,7 +211,7 @@ for spec in \
   '5-222524-A-41.wav machine-222524-repeat3.wav'; do
   set -- $spec
   .venv/bin/python scripts/data/build_recorded_external_composite.py \
-    --generation-id stage1-coverage-v2 \
+    --generation-id stage1-coverage-v3-gain012 \
     --raw-member "data/raw/noise/esc50/ESC-50-master/audio/$1" \
     --family machine --out-name "$2" || exit 1
 done
@@ -289,9 +294,11 @@ canonical 경로는 비워져 원인 수정 후 새 no-replace 실행이 가능�
 
 ```bash
 .venv/bin/python scripts/data/build_recorded_additions_plan.py \
-  --generation-id stage1-coverage-v2 \
+  --generation-id stage1-coverage-v3-gain012 \
   --dns-selection-receipt-sha256 <Elice_selection_receipt_SHA256> \
   --demand-selection-receipt-sha256 <Elice_DEMAND_receipt_SHA256> \
+  --gain-linearity-receipt results/recording_gain_linearity/<capture>/receipt.json \
+  --gain-linearity-receipt-sha256 <Jetson_gain_linearity_receipt_SHA256> \
   --check-only
 ```
 
@@ -302,12 +309,17 @@ source plan은 다음 무음 dry-run으로 검사한다. 이 명령은 파일을
 
 ```bash
 .venv/bin/python scripts/data/record_session_batch.py \
-  --sources data/source_plans/recorded_additions/stage1-coverage-v2.csv \
-  --out-root data/recorded_additions/stage1-coverage-v2 \
-  --canonical-additions-generation stage1-coverage-v2 \
+  --sources data/source_plans/recorded_additions/stage1-coverage-v3-gain012.csv \
+  --out-root data/recorded_additions/stage1-coverage-v3-gain012 \
+  --canonical-additions-generation stage1-coverage-v3-gain012 \
   --amplitude 0.06 \
   --dry-run
 ```
+
+위 `--amplitude 0.06`은 v1 CLI 호환을 위한 **unused legacy sentinel**이다. canonical
+v2 child 명령의 실제 출력은 PASS source-gain plan의 행별 값만 사용하고 모두
+`0.012` 이하임을 parent와 child가 다시 검사한다. sentinel을 실제 출력 레벨로
+해석하거나 plan 없이 직접 canonical root에 녹음할 수 없다.
 
 이 pre-campaign dry-run은 source/lineage/plan/기존 session을 전부 읽되 오디오 장치와 fresh
 campaign만 열지 않는다. 실제 실행은 아래처럼 방금 발행한 campaign의 외부 SHA를 반드시 함께
@@ -332,9 +344,14 @@ campaign만 열지 않는다. 실제 실행은 아래처럼 방금 발행한 cam
 출력한 input-only preflight·settle 포함 상한을 따른다. 실제 실행은 사용자 입회,
 볼륨 최소, 배선/덕트 geometry 확인, 오디오 장치 무점유 확인 뒤 별도 승인된 연결
 창에서만 한다. 실패 세션은 자동 재시도하지 않고 failure evidence를 먼저 분석한다.
-canonical additions의 file playback **digital amplitude**는 **exact 0.06**이며, CLI
-기본값뿐 아니라 최종 generation validator도 이 값을 강제한다.
-이 숫자는 같은 physical SPL이나 과거 82세션과 같은 amplifier gain을 증명하지 않는다.
+`0.06`은 과거 82세션과 legacy additions 계획의 file playback 기준값이지, 현재
+canonical additions의 source-independent live authority가 아니다. 2026-08-31 strict-P
+재계산에서 source별 예측 peak가 약 22.82 dB 범위로 달라 fixed `0.06` batch를 차단했다.
+canonical live는 source별 gain plan과 REF 상한 및 다중레벨 선형성 receipt를 결속해야 한다.
+schema-v1 plan은 ERR-only 무출력 계산이므로 `canonical_live_eligible=false`이며,
+아래 실행은 PASS v2 physical authority가 없으면 audio open 전에 실패해야 한다.
+어떤 digital amplitude도 같은 physical SPL이나 과거 82세션과 같은 amplifier gain을
+자동으로 증명하지 않는다.
 canonical batch/session/generation은 fresh meter raw·receipt를 recording-level campaign
 path/SHA로 결속한다. 각 session 시작 시 meter 완료 후 최대 600초 이내인지, 같은 hardware
 config/fingerprint와 amplifier setting 확인이 유지되는지 다시 검사한다. 시간이 만료되면 임계값을
@@ -357,16 +374,19 @@ config/fingerprint와 amplifier setting 확인이 유지되는지 다시 검사�
 발행되지 않는다. batch resume과 최종 101세션 generation도 저장된 `TimelineReport`에서
 같은 공용 계약을 다시 계산하여, 수집 시점과 최종 승격 시점의 판정식이 갈라지지 않게 한다.
 
-승인된 연결 창의 실제 실행도 dry-run과 같은 amplitude를 명시한다.
+아래 명령은 과거 fixed-gain 형식을 보존한 예시다. 현 canonical 실행에는 추가로
+`--source-gain-plan`과 외부 SHA가 필요하며, schema-v1 plan을 주어도 live는 열리지 않는다.
 
 ```bash
 .venv/bin/python scripts/data/record_session_batch.py \
-  --sources data/source_plans/recorded_additions/stage1-coverage-v2.csv \
-  --out-root data/recorded_additions/stage1-coverage-v2 \
-  --canonical-additions-generation stage1-coverage-v2 \
+  --sources data/source_plans/recorded_additions/stage1-coverage-v3-gain012.csv \
+  --out-root data/recorded_additions/stage1-coverage-v3-gain012 \
+  --canonical-additions-generation stage1-coverage-v3-gain012 \
   --amplitude 0.06 \
   --recording-level-campaign results/recording_level_campaigns/<campaign-id>/campaign.json \
   --recording-level-campaign-sha256 <외부_SHA256> \
+  --source-gain-plan results/recording_source_gains/<plan-id>.json \
+  --source-gain-plan-sha256 <외부_SHA256> \
   --confirm-same-amplifier-setting \
   --confirm-user-present \
   --confirm-volume-minimum \
@@ -400,7 +420,7 @@ root에 남은 경우 자동 삭제하지 않고 명시적으로 quarantine하�
 
 ```bash
 .venv/bin/python scripts/data/build_recorded_generation.py \
-  --generation-id stage1-coverage-v2 \
+  --generation-id stage1-coverage-v3-gain012 \
   --expected-holdout-sha256 <recorded_holdout_sha256>
 ```
 
@@ -430,7 +450,7 @@ generation의 exclusion으로 바꾸면 학습 전에 실패한다.
 검증된 기존 SHA를 명시하여 content-addressed history를 먼저 만들고, 완성된 101세션
 schema v2만 원자 교체한다. 전체 인자는 `docs/05_training_elice.md`의 canonical 명령을
 byte 그대로 사용한다. 그 완전한 명령에서 `--recorded-generation`은
-`data/manifests/recorded_generations/stage1-coverage-v2/generation.json`,
+`data/manifests/recorded_generations/stage1-coverage-v3-gain012/generation.json`,
 `--rotate-existing-transfer-sha256`은 검증 직전 canonical schema v1의 실제 SHA-256이어야 한다.
 설명용 placeholder를 bash에 복사해 실행하지 않는다.
 

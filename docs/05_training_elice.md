@@ -42,23 +42,187 @@ transfer 검증·public download·최종 bootstrap receipt 발행으로 진행�
 새로 봉인하는 것만으로 과거 source SHA를 현재 commit으로 승격할 수 없다.
 200–500 step smoke에서 VRAM, 처리량과 ETA를 기록하기 전에는 장기 인스턴스를 방치하지 않는다.
 
+### 0.1 bootstrap부터 학습까지의 one-step campaign 상태기계
+
+사람이 단계 이름·run directory·winner를 다시 입력하지 않는다. 외부 regular file에 둔
+SHA-256 봉인 contract와 `scripts/train/run_canonical_campaign.py`가 아래 순서를 매번 fresh
+artifact validator로 다시 유도한다. `status.json`은 관측값일 뿐 완료 authority가 아니다.
+
+`schema_version=2` primary contract의 exact 형태는 다음과 같다. contract와 state JSON은
+clean checkout을 오염시키지 않도록 반드시 저장소 밖에 둔다.
+
+```json
+{
+  "schema_version": 2,
+  "expected_commit": "<40-lowercase-hex>",
+  "expected_holdout_sha256": "<64-lowercase-hex>",
+  "expected_transfer_manifest_sha256": "<64-lowercase-hex>",
+  "campaign": {"seed": 20260803, "second_seed": null},
+  "bootstrap": {
+    "raw_hash_workers": 8,
+    "cublas_workspace_config": ":4096:8",
+    "decoder_audit": {
+      "expected_audit_sha256": "<64-lowercase-hex>",
+      "expected_file_sha256": "<64-lowercase-hex>"
+    }
+  },
+  "candidates": [
+    {"alpha": "0.7", "lambda_dnh": "0.00075"},
+    {"alpha": "1.0", "lambda_dnh": "0.00075"}
+  ]
+}
+```
+
+`decoder_audit`은 fresh decode가 필요한 contract에서만 `null`이다. 후보 값은 JSON number가
+아니라 canonical decimal string이다. alpha 0.85가 raw probe 규칙상 필요해지면 기존
+contract를 수정하지 않고 `[0.7, 0.85, 1.0]` 순서의 새 외부 contract를 봉인한다.
+
+```bash
+CONTRACT=/tmp/deep-anc/campaign-primary.json
+CONTRACT_SHA=<위_파일의_SHA256>
+STATE=/tmp/deep-anc/campaign-state.json
+
+# bootstrap 전에는 system Python으로 read-only inspection/한 단계 실행이 가능하다.
+python3 -I -B scripts/train/run_canonical_campaign.py \
+  --contract "$CONTRACT" --expected-contract-sha256 "$CONTRACT_SHA" \
+  --state-out "$STATE"
+python3 -I -B scripts/train/run_canonical_campaign.py \
+  --contract "$CONTRACT" --expected-contract-sha256 "$CONTRACT_SHA" \
+  --state-out "$STATE" --execute-next
+
+# bootstrap 성공 상태가 REINVOKE_WITH_EXACT_VENV_REQUIRED이면 이후 호출은 항상 이 interpreter다.
+.venv/bin/python scripts/train/run_canonical_campaign.py \
+  --contract "$CONTRACT" --expected-contract-sha256 "$CONTRACT_SHA" \
+  --state-out "$STATE" --execute-next
+```
+
+`--execute-next`는 dry-run state JSON을 먼저 원자 저장한 뒤 exact child 하나만 실행한다.
+child 직전에는 clean exact commit, external contract SHA, campaign entrypoint와 command-target
+bytes/argv를 다시 검사하므로 state 기록 사이에 source가 바뀌면 GPU child를 열지 않는다.
+partial 20k/5k/100k/50k는 state가 요구한 exact `last.pt`와 별도 외부 checkpoint SHA를 둘 다
+준 호출에서만 재개된다.
+
+| 상태기계 순서 | 실행 authority |
+|---|---|
+| bootstrap → pre-G0 16/17 | exact commit/holdout/transfer/bootstrap receipt |
+| 모든 G0 → 모든 pre-pilot gradient | 후보별 fixed batch와 raw receipt |
+| 각 20k → 각 best.pt recorded val | completion/checkpoint/manifest/metrics raw bytes |
+| 각 5k measured probe → 각 recorded val | same-alpha 20k init과 raw score |
+| raw winner → selected-20k gradient → 500-step resume smoke | 현행 campaign validator와 seed-specific smoke target |
+| primary v7 ledger → 100k → readiness 17/17 → 50k | exact ledger/config/contract/completion receipt |
+| val selection → test 1회 또는 second seed | raw selection 분류와 single-use test ledger |
+
+primary raw val이 `borderline`일 때만 state가 secondary contract에 넣을 exact primary contract
+path/SHA, primary selection SHA와 seed-neutral campaign SHA를 출력한다. `inconclusive_data`는
+second seed가 아니라 지정 family/subband의 추가 수집 대상이다. secondary contract는 다음
+link 형태이며 나머지 bootstrap/candidate 필드는 primary와 byte-semantic하게 같아야 한다.
+
+```json
+"campaign": {
+  "seed": 20260903,
+  "second_seed": {
+    "primary_contract_path": "/tmp/deep-anc/campaign-primary.json",
+    "primary_contract_sha256": "<primary-contract-sha256>",
+    "primary_selection_sha256": "<primary-recorded-val-selection-sha256>",
+    "seed_neutral_campaign_sha256": "<raw-selection-seed-neutral-sha256>"
+  }
+}
+```
+
+secondary는 G0/pilot/probe와 fixed primary v7 ledger를 재발행하지 않는다. primary raw chain과
+test-ledger 미개봉을 다시 검증하고, **seed 20260903 전용 fresh A100 resume smoke**를 실행한 뒤
+`results/training_prerequisites/second_seed/<seed-neutral-sha>/seed_20260903.json`에 별도
+no-replace prerequisite를 발행한다. 그 exact path/SHA가 config에 결속돼야 fresh 20260903
+100k가 열리고, 그 run의 `best.pt`만 20260903 50k init이 된다. 두 val bundle이 준비되면 같은
+상태기계가 cross-seed finalizer를 호출한다. finalizer는 winner checkpoint embedded cfg에서
+seed/init/bootstrap/loss를 다시 구성하고 exact contract가 일치할 때만 campaign 전체 test를
+정확히 한 번 연다. cross-seed 호출에 수기 `--set seed=...` 또는 `init_ckpt=...`를 주지 않는다.
+
 ## 2. Jetson에서 먼저 고정할 입력
 
-Elice로 가기 전에 Jetson에서 다음을 완료한다.
+Elice로 가기 전에 Jetson에서 다음을 완료한다. 여기서 82세션 schema v1은 **selector를
+만들기 위한 1차 입력**이고 101세션 schema v2는 **학습을 여는 2차 입력**이다. 두 단계를
+같은 transfer나 같은 bootstrap receipt로 뭉개지 않는다.
 
 1. 전체 pytest와 무음 측정 dry-run
 2. historical source CSV 복구와 160 WAV 불변성 검증
 3. parent 82세션 holdout과 lineage-component regrouped split 보존
 4. 사용자 입회 strict P/S 측정과 raw/analysis/NPZ 보존
 5. 모든 tracked 코드·config·문서 변경을 review/commit/push하고 clean exact commit 고정
-6. 그 exact commit에서 DNS/DEMAND selector와 source plan을 새로 발행하고 추가 19세션 QA PASS,
-   combined 101세션 generation/manifest no-replace 발행
-7. old82 train-only strict-P level calibration receipt를 발행하고 같은 commit/generation으로
-   transfer schema v2 발행
+   DNS/DEMAND selector와 source plan은 이 commit에서 아래 6~7번 순서로 각각 발행한다.
+6. parent 82세션 schema v1 transfer를 같은 exact commit의 Elice에 보내 full bootstrap을
+   끝내고, 그 receipt와 pre-exclusion public generation에서 DNS/DEMAND selector를 발행
+7. selector bundle을 Jetson으로 되받아 외부 SHA로 검증한 뒤 source plan을 발행하고 추가
+   19세션 QA PASS, combined 101세션 generation/manifest no-replace 발행
+8. old82 train-only strict-P level calibration receipt를 발행하고 같은 commit/generation으로
+   transfer schema v2 발행·전송한 뒤, 같은 Elice raw cache에서 full bootstrap을 다시 실행
 
 5번 뒤에는 tracked 파일을 한 byte도 바꾸지 않는다. commit이 달라지면 이전 DNS/DEMAND selector,
 source plan, recorded generation과 transfer manifest는 새 commit의 증거가 될 수 없으므로 selector부터
 다시 발행한다. data artifact의 SHA를 새 commit 문자열로 바꾸는 재봉인은 금지한다.
+
+### 2.1 두 단계 exact lifecycle과 순환 차단
+
+selector는 canonical public manifest를 필요로 하고, schema v2 public manifest exclusion은
+그 selector로 만든 19세션 generation을 필요로 한다. 이를 순환 의존성으로 만들지 않기 위해
+다음 두 bootstrap을 **같은 40자리 commit**에서 순서대로 실행한다.
+
+1. **v1 selector bootstrap:** 82세션 schema v1 transfer를 full 검증하고 pre-exclusion
+   `canonical_v4`와 첫 `data/manifests/elice_bootstrap_receipt.json`을 발행한다. 이 receipt는
+   DNS/DEMAND selector를 만드는 권한일 뿐 G0·pilot·100k·50k 학습 권한이 아니다.
+2. DNS/DEMAND selector는 첫 receipt, environment freeze, pre-exclusion manifest를 각
+   selection bundle의 `inputs/` 아래에 **byte copy**로 봉인한다. bundle을 Jetson으로
+   되받아 immutable verifier와 외부 receipt SHA를 통과시킨다.
+3. Jetson에서 19세션을 수집하고 combined 101세션 generation, old82 calibration과 schema v2
+   transfer를 발행한다. schema v2에는 위 selection bundle 복사본까지 모두 열거된다.
+4. **v2 training bootstrap:** 같은 Elice cache에 v2 bundle을 전송하고 full bootstrap을 다시
+   실행한다. 이때 canonical bootstrap receipt는 v2 transfer/101세션 aggregate를 가리키는
+   새 bytes로 원자 교체된다. 첫 receipt의 권위 bytes는 selection bundle 안에 남으므로
+   계보가 사라지지 않는다. 반대로 첫 receipt SHA를 v2 학습 config에 재사용해서는 안 된다.
+
+bootstrap 사이에 tracked 코드 한 byte라도 바뀌면 이 lifecycle을 이어 붙이지 않는다. 새 commit의
+v1 bootstrap과 selector부터 다시 시작한다. v1 receipt를 새 commit이나 v2 transfer로 재봉인하거나,
+v2 receipt를 만들기 전에 100k/50k 학습을 시작하는 경로는 없다.
+
+### 2.2 manifest 열거 파일의 Jetson→Elice 전송
+
+canonical manifest와 `files[]` 전체는 다음 전용 도구로 전송한다. 이 도구는 로컬 clean exact
+HEAD와 full semantic validator를 먼저 통과시키고, 원격 tracked checkout을 blob 단위로
+검증한 뒤 `rsync -aR --partial --from0 --files-from=-`를 사용한다. manifest 자체도 file list에
+추가하며 `--delete`를 사용하지 않는다. 전송 뒤 원격의 모든 size/SHA를 다시 계산한다. 중단되면
+원격 partial을 삭제하지 말고 같은 명령을 재실행한다.
+
+```bash
+EXACT_COMMIT=$(git rev-parse HEAD)
+EXPECTED_TRANSFER_MANIFEST_SHA256=$(sha256sum \
+  data/manifests/elice_transfer_manifest.json | awk '{print $1}')
+
+# network 0: private-key 형식/권한과 로컬 full bundle까지만 검사
+.venv/bin/python scripts/elice/push_transfer_bundle.py \
+  --host <현재_host> \
+  --port <현재_포트> --user elicer \
+  --identity /absolute/path/to/elice.pem \
+  --remote-repo /home/elicer/Deep_ANC \
+  --expected-commit "$EXACT_COMMIT" \
+  --expected-manifest-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
+  --dry-run
+
+# 위 dry-run PASS 뒤 같은 인자에서 --dry-run만 제거
+.venv/bin/python scripts/elice/push_transfer_bundle.py \
+  --host <현재_host> \
+  --port <현재_포트> --user elicer \
+  --identity /absolute/path/to/elice.pem \
+  --remote-repo /home/elicer/Deep_ANC \
+  --expected-commit "$EXACT_COMMIT" \
+  --expected-manifest-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256"
+```
+
+host/user/remote path는 shell 문법을 허용하지 않고 identity는 현재 사용자 소유 regular private
+key, group/other 권한 0이어야 한다. 저장소 안 key를 쓰는 경우 Git tracked이면 즉시 실패하고
+`.gitignore`에 명시된 파일만 허용한다. key bytes와 경로는 status 출력이나 원격 payload에
+넣지 않는다. 이 도구는 Elice public raw나 selector bundle을 Jetson으로 되받는 도구가 아니다.
+selector back-transfer는 `docs/17_recorded_generation.md`의 immutable bundle 경로만 별도
+staging에 받아 외부 receipt SHA로 검증한다.
 
 strict P/S가 없거나 legacy P/S만 있으면 transfer manifest를 만들지 않는다. parent 82만 담은
 schema v1도 새 학습의 입력이 아니다. 추가 19세션을 봉인한 generation을 먼저 검증한 뒤 다음처럼
@@ -168,6 +332,35 @@ bash scripts/elice/bootstrap_all.sh \
   --no-update
 ```
 
+완료 decoder audit JSON을 Drive/별도 채널에서 복원했지만 새 인스턴스에 public raw가 아직
+없는 경우에도 `--cache-preflight-only`를 쓰지 않는다. audit의 semantic/file SHA 두 개를
+붙인 **full bootstrap**을 실행한다. full bootstrap은 official source에서 빠진 raw를 먼저
+재개 다운로드한 뒤, 복원한 audit fingerprint와 37,761개 raw의 size/SHA를 전수 대조하고
+manifest·QA·pytest·receipt까지 계속한다.
+
+```bash
+bash scripts/elice/bootstrap_all.sh \
+  --expected-commit "$EXPECTED_COMMIT" \
+  --expected-holdout-sha256 "$EXPECTED_HOLDOUT_SHA256" \
+  --expected-transfer-manifest-sha256 "$EXPECTED_TRANSFER_MANIFEST_SHA256" \
+  --reuse-decoder-audit \
+  --expected-decoder-audit-sha256 "$EXPECTED_DECODER_AUDIT_SHA256" \
+  --expected-decoder-audit-file-sha256 "$EXPECTED_DECODER_AUDIT_FILE_SHA256" \
+  --raw-hash-workers 8 \
+  --no-update
+```
+
+반대로 audit JSON 자체가 없으면 `--reuse-decoder-audit`과 두 audit SHA를 모두 빼고 full
+bootstrap이 새 audit을 발행하게 한다. public raw·exact venv·audit가 이미 모두 존재하는
+재개 인스턴스에서는 `--cache-preflight-only`를 선택적 read-only 진단으로 먼저 쓸 수 있지만,
+그 모드는 download/manifest/QA/full pytest/bootstrap receipt를 **0개** 발행한다. 따라서
+cache-preflight PASS 뒤에도 위 full bootstrap 중 하나를 반드시 실행한다.
+
+v1 selector bootstrap과 v2 training bootstrap 모두 이 규칙을 따른다. v2에서는 같은 public
+raw와 완료 audit을 재사용하므로 full bootstrap에 `--reuse-decoder-audit`과 동일한 두 외부
+SHA를 다시 주고, transfer SHA만 새 schema v2 SHA로 바꾼다. v1 bootstrap receipt SHA를 v2
+명령의 transfer/bootstrap anchor로 대신하지 않는다.
+
 `--no-update`는 필수다. bootstrap은 pull하지 않는다. 다음은 모두 즉시 실패한다.
 
 - HEAD/expected commit 불일치 또는 dirty tree
@@ -181,7 +374,28 @@ bash scripts/elice/bootstrap_all.sh \
 검증하지 않는다. 반드시 같은 네 anchor로 full bootstrap을 끝내고
 `data/manifests/elice_bootstrap_receipt.json`을 얻어야 다음 단계로 갈 수 있다.
 
-### 3.0.1 Elice 실패 복구와 재발 방지
+### 3.0.1 실제 cold-download/스토리지 재개 경계
+
+완전 raw가 없는 첫 실행은 filesystem total 127.875 GiB 이상과 available 96 GiB 이상을
+요구한다. 완전 raw 37,761개와 FMA metadata가 이미 materialize된 재개 실행만 초기 archive/
+staging 96 GiB 가용 조건을 건너뛸 수 있으며, filesystem total 계약과 뒤의 audit/manifest
+전수 검증은 그대로 유지된다. 파일 수만 맞춘 가짜 cache는 decoder audit 외부 SHA와 raw
+inventory 전수 hash에서 실패한다.
+
+2026-08-31 Jetson read-only HEAD/1-byte Range 확인에서 현재 official 대용량 endpoint는 다음
+응답을 보였다. 이는 접근성·resume 가능 증거이며 다운로드 시간 SLA는 아니다.
+
+| archive 집합 | 확인 byte | Range/validator |
+|---|---:|---|
+| DNS noise 2 + speech 1 | 5,364,611,964 / 5,357,916,291 / 4,664,045,287 | strong ETag + HTTP 206 |
+| FMA small + metadata | 7,679,594,875 / 358,412,441 | strong ETag + HTTP 206 |
+| MIMII fan | 928,511,244 | HTTP 206 |
+
+downloader는 고정 block 완료 상태와 strong validator가 맞는 경우만 재개한다. SSH/instance가
+끊겨도 검증된 raw·archive·`.part`를 삭제하지 않는다. ETag가 바뀌거나 완성 파일 SHA/ZIP·bzip2
+검사가 실패하면 다른 세대 bytes를 이어 붙이지 않고 fail-closed한다.
+
+### 3.0.2 Elice 실패 복구와 재발 방지
 
 Elice working tree만 고치는 hotfix는 금지한다. 원격에서 발견한 결함은 Jetson의 이
 저장소에서 코드·negative regression fixture·문서를 함께 수정하고 GitHub에 push한 뒤,
@@ -488,10 +702,11 @@ LAMBDA_DNH=<같은 winner의 approved 값>
 checkpoint 선택은 recorded val만 사용한다. 선택을 원자 고정한 뒤 capability ledger가 허용한
 test를 캠페인 전체에서 정확히 한 번 연다.
 
-첫 seed의 val 지표가 경계 0.3 dB 이내이거나 INCONCLUSIVE이면 seed `20260903`으로 선택 계약의
-100k+50k를 한 번 더 실행한다. clear PASS는 1시드로 종료하고 clear FAIL은 두 번째 seed를
-소모하지 않고 원인을 수정한다. 2시드가 필요하면 val G4를 통과하면서 모든 gate까지의 최소
-여유가 큰 모델만 최종 선택할 수 있다.
+첫 seed의 raw val 분류가 numeric/CI `borderline`일 때만 seed `20260903`으로 선택 계약의
+fresh 100k+50k를 한 번 더 실행한다. `inconclusive_data`는 같은 데이터의 second seed가 아니라
+판정이 지목한 family/subband 추가 수집 대상이다. clear PASS는 1시드로 종료하고 clear FAIL은
+두 번째 seed를 소모하지 않고 원인을 수정한다. 2시드가 필요하면 val G4를 통과하면서 모든
+gate까지의 최소 여유가 큰 모델만 최종 선택할 수 있다.
 
 G4 PASS와 별도 natural-crest challenge 전에는 closed-loop, ONNX export, 실제 ANC ON 평가로
 진행하지 않는다.

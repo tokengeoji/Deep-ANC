@@ -434,6 +434,49 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
         "receipt_sha256": campaign_ref("campaign")["sha256"],
     }
 
+    # schema-v2 canonical additions는 더 이상 legacy fixed 0.06 campaign을
+    # transfer authority로 승격하지 않는다. fixture도 physical probe cap 아래의
+    # exact source-gain/linearity 4종 ref를 끝까지 운반한다.
+    gain_files = {
+        "source_gain_plan": root / "results/recording_source_gains/fixture.json",
+        "gain_linearity_receipt": (
+            root / "results/recording_gain_linearity/fixture/receipt.json"
+        ),
+        "gain_linearity_plan": (
+            root / "results/recording_gain_linearity/fixture/plan.json"
+        ),
+        "gain_linearity_raw": (
+            root / "results/recording_gain_linearity/fixture/raw.npz"
+        ),
+    }
+    for name, path in gain_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"fixture-{name}\n".encode())
+
+    def gain_ref(name: str) -> dict[str, object]:
+        path = gain_files[name]
+        return {
+            "path": path.relative_to(root).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": _sha(path.read_bytes()),
+        }
+
+    source_gain_summary = {
+        "canonical_live_eligible": True,
+        "payload": {
+            "gain_linearity_receipt": gain_ref("gain_linearity_receipt"),
+            "gain_linearity_hardware": campaign_ref("hardware_config"),
+        },
+    }
+    gain_linearity_summary = {
+        "passed": True,
+        "payload": {
+            "plan": gain_ref("gain_linearity_plan"),
+            "raw": gain_ref("gain_linearity_raw"),
+            "hardware": campaign_ref("hardware_config"),
+        },
+    }
+
     def validate_level_campaign(
         *, repo_root, campaign_receipt, expected_sha256=None, **_kwargs
     ):
@@ -472,8 +515,41 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
     monkeypatch.setattr(generation, "rendered_source_level_evidence", rendered_level)
     monkeypatch.setattr(
         generation,
+        "rendered_source_level_evidence_v2",
+        lambda samples, *, amplitude_millionths: rendered_level(samples),
+    )
+    monkeypatch.setattr(
+        generation,
         "validate_recording_level_session_binding",
         validate_level_binding,
+    )
+    monkeypatch.setattr(
+        generation,
+        "validate_recording_level_source_gain_session_binding",
+        lambda campaign, source_gain, binding: json.loads(json.dumps(binding)),
+    )
+    monkeypatch.setattr(
+        generation,
+        "validate_recording_source_gain_plan",
+        lambda **_kwargs: json.loads(json.dumps(source_gain_summary)),
+    )
+    monkeypatch.setattr(
+        generation,
+        "validate_gain_linearity_receipt",
+        lambda **_kwargs: json.loads(json.dumps(gain_linearity_summary)),
+    )
+    import deep_anc.data.recording_gain_linearity as gain_linearity_module
+    import deep_anc.data.recording_source_gain as source_gain_module
+
+    monkeypatch.setattr(
+        source_gain_module,
+        "validate_recording_source_gain_plan",
+        lambda **_kwargs: json.loads(json.dumps(source_gain_summary)),
+    )
+    monkeypatch.setattr(
+        gain_linearity_module,
+        "validate_gain_linearity_receipt",
+        lambda **_kwargs: json.loads(json.dumps(gain_linearity_summary)),
     )
 
     plan_path = root / generation.SOURCE_PLAN_ROOT / f"{GENERATION_ID}.csv"
@@ -587,7 +663,7 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
             "program": {
                 "type": "file",
                 "frequency": 300.0,
-                "amplitude": generation.CANONICAL_RECORDING_AMPLITUDE,
+                "amplitude": 0.012,
                 "band": [80.0, 1000.0],
                 "file": row["path"],
                 "file_start_seconds": float(row["start_seconds"]),
@@ -634,11 +710,18 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
         )
         assert source_sample_rate == 48_000
         rendered = rendered_level(source_samples)
+        embedded_gain = {
+            "source_gain_plan": gain_ref("source_gain_plan"),
+            "gain_linearity_receipt": gain_ref("gain_linearity_receipt"),
+            "amplitude_millionths": 12_000,
+        }
         binding_without_seal = {
+            "schema": generation.RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA,
             "campaign_id": campaign_id,
             "campaign_receipt": campaign_ref("campaign"),
             "session_started_at_utc": "2026-08-30T00:00:01+00:00",
             "rendered_source": rendered,
+            "source_gain": embedded_gain,
         }
         metadata["recording_level_binding"] = {
             **binding_without_seal,
@@ -650,6 +733,7 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
                 ).encode()
             ),
         }
+        metadata["source_gain_binding"] = embedded_gain
         _write_json(session / "session.json", metadata)
         progress_rows.append(
             {
@@ -1192,12 +1276,12 @@ def test_exact_highband_addition_inventory_and_split_matrix_are_frozen():
         ),
         "data/source_pool_v2/environment/environment_014.wav": (
             "environment",
-            20.5,
+            30.0,
             "val",
         ),
         "data/source_pool/environment/environment_003.wav": (
             "environment",
-            24.5,
+            44.5,
             "test",
         ),
         "data/source_pool/environment/environment_008.wav": (
@@ -1206,7 +1290,7 @@ def test_exact_highband_addition_inventory_and_split_matrix_are_frozen():
             "test",
         ),
         "data/source_pool/music/music_007.wav": ("music", 54.8, "test"),
-        "data/source_pool_v2/music/music_007.wav": ("music", 12.8, "test"),
+        "data/source_pool_v2/music/music_007.wav": ("music", 43.0, "test"),
         "data/source_pool_v2/music/music_012.wav": ("music", 17.1, "val"),
         "data/source_pool_v2/music/music_017.wav": ("music", 20.1, "val"),
         "data/source_pool_v2/music/music_008.wav": ("music", 31.5, "train"),
@@ -1466,6 +1550,24 @@ def test_transfer_schema_v2_requires_generation_and_loads_exact101(tmp_path, mon
     with pytest.raises(
         transfer_contract.TransferContractError,
         match="campaign/raw/receipt role",
+    ):
+        transfer_contract.validate_transfer_manifest(
+            transfer,
+            repo_root=tmp_path,
+            expected_sha256=_sha(transfer.read_bytes()),
+        )
+    _write_json(transfer, original_transfer_payload)
+
+    missing_gain_payload = json.loads(json.dumps(original_transfer_payload))
+    missing_gain_payload["files"] = [
+        entry
+        for entry in missing_gain_payload["files"]
+        if entry["role"] != "recording_gain_linearity_raw"
+    ]
+    _write_json(transfer, missing_gain_payload)
+    with pytest.raises(
+        transfer_contract.TransferContractError,
+        match="authority 4개 role",
     ):
         transfer_contract.validate_transfer_manifest(
             transfer,
@@ -2165,3 +2267,32 @@ def test_external_librispeech_rederives_transitive_component_and_window(
     source_lineage["librispeech_chapters_sha256"] = "d" * 64
     with pytest.raises(generation.RecordedGenerationError, match="CHAPTERS SHA"):
         generation.validate_recorded_generation(report, repo_root=tmp_path)
+
+
+def test_generation_amplitude_contract_preserves_legacy_and_accepts_only_v2_probe_cap():
+    session = Path("data/recorded_additions/fixture")
+    assert generation._expected_recording_amplitude(
+        {"recording_level_binding": {"schema": "legacy"}}, session_dir=session
+    ) == 0.06
+    with pytest.raises(generation.RecordedGenerationError, match="v2 recording_level_binding"):
+        generation._expected_recording_amplitude(
+            {
+                "plant_domain": "current_strict",
+                "recording_level_binding": {"schema": "legacy"},
+            },
+            session_dir=session,
+        )
+    metadata = {
+        "recording_level_binding": {
+            "schema": generation.RECORDING_LEVEL_SOURCE_GAIN_SESSION_BINDING_SCHEMA,
+            "source_gain": {"amplitude_millionths": 9_001},
+        }
+    }
+    assert generation._expected_recording_amplitude(
+        metadata, session_dir=session
+    ) == 0.009001
+    metadata["recording_level_binding"]["source_gain"][
+        "amplitude_millionths"
+    ] = 12_001
+    with pytest.raises(generation.RecordedGenerationError, match="amplitude_millionths"):
+        generation._expected_recording_amplitude(metadata, session_dir=session)
