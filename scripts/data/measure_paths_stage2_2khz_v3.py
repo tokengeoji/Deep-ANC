@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Stage-2 output-master P/S v3 raw-first production adapter.
+"""Retired Stage-2 output-master P/S v3 forensic adapter.
 
-기본 실행은 무음 dry-run이다. Live는 clean exact ``origin/dev``, durable
-diagnostic clock+linearity, 같은 hardware/route/fresh meter를 재검증한 뒤 12.395초
-P/S output을 딱 한 번 열고 raw를 analysis 전 no-replace로 발행한다.
+USB AB13X output과 APE input의 actual split-clock failure 뒤 이 경로는 더 이상
+physical P/S를 재측정하지 않는다. 기본 실행의 무음 dry-run과 기존 raw의 offline
+forensic 검증만 보존한다. ``--execute-live``는 backend import 전에 영구 차단한다.
+현행 physical 후보는 RT5640/J511 same-card S32 actual-P/S read-only preflight다.
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ from scripts.data.measure_paths_stage2_2khz import (  # noqa: E402
 
 
 ADAPTER_PATH = "scripts/data/measure_paths_stage2_2khz_v3.py"
+OUTPUT_MASTER_SPLIT_CLOCK_RETIRED = True
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -170,7 +172,7 @@ def _dry_run(arguments: argparse.Namespace) -> int:
     except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         print(f"[BLOCKED] diagnostic artifact 검증 실패: {error}", file=sys.stderr)
         return 2
-    print("Stage-2 output-master P/S v3 무음 dry-run")
+    print("Retired output-master P/S v3 forensic 무음 dry-run")
     print(
         f"ps_output={v3_plan['ps_output_seconds']:.6f}s "
         f"frames={v3_plan['ps_output_frames']}"
@@ -188,6 +190,14 @@ def _dry_run(arguments: argparse.Namespace) -> int:
 
 
 def _execute_live(arguments: argparse.Namespace) -> int:
+    if OUTPUT_MASTER_SPLIT_CLOCK_RETIRED:
+        print(
+            "[BLOCKED_RETIRED_OUTPUT_MASTER_SPLIT_CLOCK] USB AB13X output-master "
+            "경로는 실제 global clock failure raw 뒤 forensic-only입니다. "
+            "sounddevice import/open=0; P/S output=0; raw write=0",
+            file=sys.stderr,
+        )
+        return 2
     try:
         confirmations = _confirmations(arguments)
         if not arguments.meter_raw or not arguments.expected_meter_raw_sha256:

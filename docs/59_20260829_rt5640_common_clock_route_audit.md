@@ -72,7 +72,7 @@ witness로 바로 사용할 수 없다는 반대 증거다.
 | RT5640/J511 output route가 Jetson에 노출됨 | Confirmed |
 | APE 내부 common-PLL topology 후보 | Likely |
 | USB DAC보다 timing 구조상 유리한 후보 | Likely |
-| J511 plug/cable을 현재 software가 감지 | Contradicted (`None`) |
+| J511 HDA front-panel breakout의 headphone/mic sense를 현재 software가 감지 | Contradicted (`None`) |
 | 실제 앰프까지의 아날로그 출력 | Inconclusive |
 | ADC↔DAC absolute hardware-frame identity | Inconclusive |
 | high-band P/S·학습·ANC authority | BLOCKED |
@@ -80,9 +80,12 @@ witness로 바로 사용할 수 없다는 반대 증거다.
 
 ## [다음 행동]
 
-1. J511에서 앰프 input으로 가는 line cable이 물리적으로 연결됐을 때만, 위 read-only
-   gate가 세 번 연속 `HP` 또는 `HS`가 되는지 먼저 확인한다. `None`이면 TRS/TRRS
-   adapter·cable·jack detection을 해결하기 전 mixer/pinmux를 추측으로 바꾸지 않는다.
+1. J511 자체는 10-pin HD Audio header이므로, keyed Intel HD Audio front-panel breakout을
+   먼저 결합하고 그 breakout의 headphone 3.5 mm jack에서 앰프 line input으로 stereo TRS
+   cable을 연결한다. 그때만 위 read-only gate가 세 번 연속 `HP` 또는 `HS`가 되는지 먼저
+   확인한다. `HS`는 headphone과 mic/presence sense가 함께 active인 상태이며 TRRS plug나
+   앰프 반대편 연결을 단독으로 증명하지 않는다. `None`이면 HDA harness·headphone-jack
+   detect를 해결하기 전 mixer/pinmux를 추측으로 바꾸지 않는다.
 2. plug gate가 통과한 뒤에도 실제 sound를 내기 전에 disarmed S32 device-open/transport
    admission을 통과시킨다. zero-duplex PASS는 physical output, common frame 또는 P/S
    authority가 아니다.

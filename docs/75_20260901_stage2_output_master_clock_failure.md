@@ -58,9 +58,13 @@ P/S·plant binding·학습·성능 근거로 승격할 수 없다.
 
 1. 이 raw와 meter raw를 그대로 보존·백업한다. 자동 재측정은 금지한다.
 2. USB DAC 출력 경로를 사용하지 않고, Jetson의 common-clock 후보
-   `ADMAIF1 ↔ I2S1 ↔ RT5640/J511`로 앰프 line input을 물리 연결한다.
-   현재 read-only 상태에서 `I2S1 Mux=ADMAIF1`, `ADMAIF1 Mux=I2S1`이지만
-   `CVB-RT Jack-state=None`이므로 실제 cable/route가 아직 증명된 것은 아니다.
+   `ADMAIF1 ↔ I2S1 ↔ RT5640/J511`를 사용한다. J511 자체는 10-pin HD Audio header이므로
+   keyed Intel HD Audio front-panel breakout을 결합하고, 그 breakout의 headphone 3.5 mm
+   jack에서 앰프 line input으로 stereo TRS cable을 연결한다. 현재 read-only 상태에서
+   `I2S1 Mux=ADMAIF1`, `ADMAIF1 Mux=I2S1`이지만 `CVB-RT Jack-state=None`이므로 실제
+   HDA jack sense/cable route가 아직 증명된 것은 아니다. `HP` 또는 `HS`가 세 번 연속
+   관측되기 전에는 실기 출력을 시작하지 않는다. `HS`는 headphone과 mic/presence sense가
+   함께 active인 Linux state일 뿐, TRRS 또는 앰프 연결의 단독 증거는 아니다.
 3. 연결 후에는 **무음** device/route preflight부터 하고, 새 meter 20초와
    diagnostic 11.605초를 한 번만 실행한다. global-affine clock PASS 전에는 P/S
    12.395초를 열지 않는다.

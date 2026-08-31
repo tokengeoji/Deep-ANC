@@ -351,6 +351,44 @@ def validate_generation_id(value: object) -> str:
     return _canonical_generation_id(value)
 
 
+def validate_stage2_2khz_generation_id(value: object) -> str:
+    """Stage-1 19-row generation과 분리된 Stage-2 47-slot ID를 검증한다.
+
+    기존 :func:`validate_generation_id`의 의미를 넓히지 않는다. 따라서 legacy
+    Stage-1 builder가 Stage-2 plan을 우연히 19-row generation으로 해석하거나,
+    반대로 Stage-1 generation을 Stage-2 recorder가 받는 경로는 없다.
+    """
+
+    from deep_anc.data.stage2_2khz_recorded_additions import (
+        validate_stage2_2khz_generation_id as _validate,
+    )
+
+    return _validate(value)
+
+
+def validate_stage2_2khz_recorded_additions_source_plan_bytes(
+    source_plan_bytes: bytes,
+    *,
+    generation_id: object,
+) -> dict[str, Any]:
+    """47-slot Stage-2 source-plan의 순수 구조 검증을 위임한다.
+
+    이 함수는 source WAV/physical P/S/gain authority를 검증하지 않으며, Stage-2
+    session 또는 combined generation을 발행하지 않는다. physical evidence가 없는
+    상태에서 old Stage-1 ``build_recorded_generation_payload``를 재사용하는 것을
+    막기 위한 별도 preflight API다.
+    """
+
+    from deep_anc.data.stage2_2khz_recorded_additions import (
+        validate_stage2_2khz_source_plan_bytes,
+    )
+
+    return validate_stage2_2khz_source_plan_bytes(
+        source_plan_bytes,
+        generation_id=generation_id,
+    )
+
+
 def _relative(value: object, *, field: str, prefix: str | None = None) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise RecordedGenerationError(f"{field}는 비어 있지 않은 문자열이어야 합니다")

@@ -1,4 +1,12 @@
-# Stage-2 output-master P/S v3 경계
+# [RETIRED / FORENSIC] Stage-2 output-master P/S v3 경계
+
+> [!WARNING]
+> USB AB13X output → APE input의 output-master 경로는 실제 global affine clock failure
+> (`docs/75`)로 **retired forensic-only**다. 이 문서의 `--execute-live` 명령은 재실행하면
+> 안 되며, CLI도 backend import 전에
+> `BLOCKED_RETIRED_OUTPUT_MASTER_SPLIT_CLOCK`으로 종료한다. 보존 raw의 무음 분석만
+> 허용한다. 현행 physical 후보는 RT5640/J511 10-pin HDA breakout 기반 same-card S32
+> actual-P/S이며 `scripts/jetson/preflight_stage2_2khz_rt5640_s32.py --dry-run`부터 시작한다.
 
 ## 현재 판정
 
@@ -31,61 +39,25 @@ xrun/clip 0이지만 slot clock이 약 `-0.73~+3.38 kppm`으로 바뀌었다. no
 - 저장소 bytes에 결속된 physical level evidence만 DPSS fit/holdout analyzer가 소비
 - legacy combined raw가 어떤 v3 blocker도 충족하지 못함
 
-소프트웨어 adapter와 synthetic 2×2 LTI/q=250 ppm end-to-end는 PASS했다.
-다만 실제 output-master diagnostic/P/S raw는 아직 없다. 실측 diagnostic
-clock/linearity가 PASS하기 전에는 `ps_stream_may_open=false`이며, 실측 P/S
-raw·DPSS holdout·3 dB feasibility가 PASS하기 전에는 training은 계속 차단된다.
+소프트웨어 adapter와 synthetic 2×2 LTI/q=250 ppm end-to-end는 당시 PASS했다. 이후 actual
+output-master diagnostic raw는 global clock gate에서 실패했다. 따라서 이 adapter의 synthetic
+PASS나 과거 계획을 RT5640 actual P/S·training authority로 해석할 수 없다.
 
-## 무음 검증 명령
+## 허용되는 forensic 무음 확인
 
 기본 실행은 sounddevice를 import하지 않고, 파일을 쓰지 않으며, 소리를 내지 않는다.
 
 ```bash
-.venv/bin/python scripts/data/measure_paths_stage2_2khz_v3.py
+.venv/bin/python scripts/data/measure_paths_stage2_2khz_v3.py --dry-run
 ```
 
-Diagnostic capture는 별도 diagnostic-only CLI로 실행한다. 아래 명령은
-스피커 출력 11.605333초이며 P/S를 자동 실행하지 않는다.
+`capture_stage2_output_master_diagnostic.py --execute-live`와
+`measure_paths_stage2_2khz_v3.py --execute-live`는 이제 sounddevice import, ALSA open,
+speaker output, raw write를 모두 `0`으로 남기고 block한다. 과거 raw의 no-audio analysis가
+필요하면 별도 결과 root로 read-only 재분석하되, 새 physical measurement나 plant binding을
+발행하지 않는다.
 
-```bash
-.venv/bin/python scripts/data/capture_stage2_output_master_diagnostic.py \
-  --execute-live --meter-raw <fresh-meter-raw.npz> \
-  --expected-meter-raw-sha256 <64SHA> \
-  --confirm-speaker --confirm-user-present --confirm-volume-fixed \
-  --confirm-routing-and-geometry --confirm-same-amplifier-setting
-```
-
-Clock PASS 후 corrected linearity receipt를 무음 offline으로 발행한다. 이 단계는
-speaker/backend을 열지 않는다.
-
-```bash
-.venv/bin/python scripts/data/measure_paths_stage2_2khz_v3.py \
-  --publish-diagnostic-linearity \
-  --diagnostic-session results/stage2_2khz_output_master_diagnostic/<session> \
-  --diagnostic-clock-sha256 <clock_receipt.json의-64자리-SHA256>
-```
-
-Linearity PASS receipt SHA를 받은 뒤에만 P/S 12.394667초 출력을 한 번 열다.
-
-```bash
-.venv/bin/python scripts/data/measure_paths_stage2_2khz_v3.py \
-  --execute-live \
-  --diagnostic-session results/stage2_2khz_output_master_diagnostic/<session> \
-  --diagnostic-clock-sha256 <clock-64SHA> \
-  --diagnostic-linearity-sha256 <linearity-64SHA> \
-  --meter-raw <같은-fresh-meter-raw.npz> \
-  --expected-meter-raw-sha256 <meter-64SHA> \
-  --confirm-speaker --confirm-user-present --confirm-volume-fixed \
-  --confirm-routing-and-geometry --confirm-same-amplifier-setting
-```
-
-세 live boundary 모두 clean attached `dev`, `HEAD == origin/dev`, tracked critical bytes를
-요구한다. clean해도 push되지 않은 HEAD와 다른 branch는 backend import 전 실패한다.
-Library의 exported `assess/run_stage2_output_master_ps_v3_if_admitted` 함수는
-항상 audio 0회로 차단된다. 실제 capture state machine은 위 tracked CLI의
-repository·ALSA·device·fresh-meter pre-open 검증을 통과한 경우에만 호출된다.
-
-## v3를 실제 P/S 측정으로 열기 위한 합격 조건
+## 역사적 v3 proposal이 요구했던 조건
 
 - diagnostic과 P/S를 각각 고유 no-replace session으로 raw-first 발행
 - partial/failure raw 보존 및 자동 재측정 금지
@@ -99,4 +71,5 @@ repository·ALSA·device·fresh-meter pre-open 검증을 통과한 경우에만 
 - physical operating level과 3 dB actuator feasibility를 actual raw SHA에 결속
 - 그 뒤에만 plant binding과 training admission을 별도 no-replace artifact로 발행
 
-이 조건 전에는 새 P/S 측정을 반복하거나 Stage-2 학습을 시작하지 않는다.
+이 조건은 split-clock 경로를 다시 여는 조건이 아니다. 현재 actual P/S와 Stage-2 학습은
+`HANDOFF.md` 최상단의 RT5640/J511 same-card 경계만 따른다.

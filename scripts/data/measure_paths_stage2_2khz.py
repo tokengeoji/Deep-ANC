@@ -3,8 +3,10 @@
 
 이 파일의 combined PortAudio callback frame index는 USB DAC와 APE ADC의 hardware
 frame identity가 아니다. 보존된 v2 raw는 진단 자료일 뿐 P/S/plant/training authority가
-아니다. dry-run만 유지하며 ``--execute-live``는 backend import 전에 닫힌다. 새 경로는
-``measure_paths_stage2_2khz_v3.py``의 output-master admission을 사용한다.
+아니다. dry-run만 유지하며 ``--execute-live``는 backend import 전에 닫힌다. USB
+output-master 경로도 실제 split-clock failure 뒤 retired forensic-only다. 현행 후보는
+RT5640/J511 same-card S32 actual-P/S의 read-only preflight이며, live adapter가 생기기
+전에는 그 경로도 출력을 열지 않는다.
 """
 
 from __future__ import annotations
@@ -404,7 +406,8 @@ def _execute_live(
     if LEGACY_COMBINED_LIVE_AUTHORITY_DISABLED:
         print(
             "[BLOCKED_LEGACY_COMBINED] USB DAC/APE cross-clock combined callback raw는 "
-            "P/S authority가 아닙니다. output-master v3 admission을 사용하세요. "
+            "P/S authority가 아닙니다. output-master 경로는 retired forensic-only입니다. "
+            "RT5640/J511 same-card S32 actual-P/S read-only preflight를 사용하세요. "
             "sounddevice import/open=0; output=0",
             file=sys.stderr,
         )

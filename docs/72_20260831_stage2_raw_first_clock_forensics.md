@@ -4,6 +4,12 @@
 > `8c217b1cc901c07589282f5f044d05e64fe7376c`에서 실제 Jetson AGX Orin,
 > AB13X USB DAC output + APE ERR/REF input으로 생성한 보존 raw만 분석한다.
 > 이 문서는 P/S, ANC 감쇠, 학습 적합성을 PASS로 승격하지 않는다.
+>
+> [!WARNING]
+> 후속 actual output-master global clock raw는 `docs/75`에서 실패 확정됐다. 이 문서의
+> 당시 “새 output-master/split transport 재측정” 제안은 **retired**이며, USB AB13X
+> `--execute-live` 재시도를 해서는 안 된다. 보존 raw의 offline forensic 분석만 허용한다.
+> 현행 측정 후보는 RT5640/J511 10-pin HDA breakout 기반 same-card S32 경로다.
 
 ## 1. fresh meter 경계 FAIL
 

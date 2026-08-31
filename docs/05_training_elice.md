@@ -5,6 +5,14 @@ canonical 데이터 계약과 환경만 준비하며 학습을 자동 시작하�
 실행과 `pretrain_*_corrected`는 150–600 Hz/legacy plant 진단 기록이라 init·resume·성능
 근거로 사용하지 않는다.
 
+> [!IMPORTANT]
+> 2026-09-01 현행 admission은 아직 열리지 않았다. USB AB13X output-master raw는 actual
+> split-clock failure로 forensic-only이며, 새 same-card RT5640/J511 S32 P/S raw/plant binding,
+> Stage-2 `stage2-2khz-47slot-v1` 47개 독립 component (`train/val/test=16/15/16`) source
+> plan·QA, transfer-v3 manifest가 생기기 전에는 Elice bootstrap/full download/GPU 학습을
+> 실행하지 않는다. 이 문서 아래의 Stage-1 19 additions/101-session historical 절차는 현행
+> 2 kHz 학습 authority가 아니다. 현재 상태는 `HANDOFF.md` 최상단과 `docs/75`를 우선한다.
+
 ## 0. 유일한 운영 진입점
 
 새 Elice 인스턴스의 **유일한 권위 진입점**은
@@ -344,7 +352,7 @@ plant binding 및 bootstrap receipt를 독립 재검증한다. 기본 worker 수
 `min(16, cpu_count)`이며 `--workers 1..16`으로 제한할 수 있다.
 
 ```bash
-PLANT=<새_output_master_v3_authority_PASS_plant_binding_상대경로>
+PLANT=<새_same_card_RT5640_J511_actual_P_S_authority_PASS_plant_binding_상대경로>
 PLANT_SHA=<외부_신뢰_채널에서_확인한_64자리_SHA256>
 
 .venv/bin/python -I -B scripts/data/issue_stage2_pretrain_data.py \
@@ -362,9 +370,11 @@ directory는 삭제·덮어쓰기하지 말고 새 attempt 경로를 사용한�
 `authority/stage2_2khz_public_data.json`에 결속해 새 clean commit으로 push해야 tracked
 pretrain admission이 열린다.
 
-여기서 `PLANT`는 새 output-master v3 측정과 human authority를 모두 통과한 strict
-binding만 허용한다. legacy/v1/v2/combined binding 또는 아직 physical authority가 없는
-candidate로 issuer를 먼저 실행할 수 없다.
+여기서 `PLANT`는 새 same-card `APE PCM1/PCM0 → RT5640/J511` actual P/S 측정과
+physical authority를 모두 통과한 strict binding만 허용한다. USB AB13X output-master
+diagnostic은 split-clock 실패 raw로 보존할 뿐 이 binding의 입력이 될 수 없다.
+legacy/v1/v2/combined binding 또는 아직 physical authority가 없는 candidate로 issuer를
+먼저 실행할 수 없다.
 
 외부 archive cache 세 anchor가 없으면 cache 인자를 넣지 않는다. plain full bootstrap은
 official provider에서 10개 archive 약 18.23 GB를 받아 계속 진행하며, 완성된 extracted

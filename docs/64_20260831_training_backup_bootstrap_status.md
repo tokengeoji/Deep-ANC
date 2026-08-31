@@ -3,6 +3,13 @@
 이 문서는 Elice 크레딧 종료 직후 실제 Jetson, GitHub remote, Google Drive를 다시 읽어
 확인한 상태다. 문서의 존재를 학습 완료나 성능 증거로 해석하지 않는다.
 
+> [!CAUTION]
+> 이 문서는 2026-08-31의 historical snapshot이다. 2026-09-01 actual USB output-master
+> split-clock failure 뒤에는 여기의 Stage-1 19 additions/101-session·schema-v1/v2 진행선을
+> 현행 학습·녹음 authority로 사용하지 않는다. 현행 순서는 same-card RT5640/J511 S32 actual
+> P/S → Stage-2 47개 독립 component source plan/QA → transfer-v3 → exact Elice bootstrap이며,
+> `HANDOFF.md` 최상단과 `docs/75`가 우선한다.
+
 ## 1. 학습 판정
 
 - canonical surrogate pretrain 100k: **미시작**

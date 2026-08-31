@@ -401,6 +401,19 @@ def _requires_v2_source_gain_authority(
     )
 
 
+def _uses_managed_recorded_additions_namespace(
+    args: argparse.Namespace, collection_plan: dict
+) -> bool:
+    """공식 additions path를 generic diagnostic으로 위장한 live 우회를 막는다."""
+
+    source_list = collection_plan.get("source_list")
+    return bool(
+        isinstance(source_list, str)
+        and _is_within_repo_subtree(source_list, SOURCE_PLAN_ROOT)
+        or _is_within_repo_subtree(args.out_root, ADDITIONS_ROOT)
+    )
+
+
 def _guard_relative_path(value: str | Path, *, label: str) -> str:
     absolute = Path(os.path.abspath(_repo_path(value)))
     root = Path(os.path.abspath(REPO_ROOT))
@@ -1079,6 +1092,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     collection_plan = _validate_collection_plan(args, parser)
+    if (
+        not args.dry_run
+        and _uses_managed_recorded_additions_namespace(args, collection_plan)
+    ):
+        parser.error(
+            "관리되는 recorded-additions source-plan/out-root를 record_duct로 직접 live 실행할 수 없습니다. "
+            "Stage-1 19-session은 retired이고, Stage-2 47-slot은 actual P/S·source-gain·"
+            "raw-first authority 전까지 audio open=0입니다."
+        )
     v2_authority_required = _requires_v2_source_gain_authority(
         args, collection_plan
     )

@@ -17,6 +17,13 @@
 > `0.872375`, `0.836006`으로 canonical `0.90`에 미달했다. 임계값을 낮추거나 같은
 > church-bells 원본을 반복하지 않고, 안정적인 DEMAND DKITCHEN immutable 원본으로
 > 교체한다. v1 raw와 progress는 diagnostic evidence로 보존하고 v2가 resume하지 않는다.
+>
+> **2026-09-01 상태 정정:** 이 문서의 Stage-1 82+19/101-session 경로는 역사적
+> forensic 계획이며 현행 Stage-2 2 kHz 녹음 authority가 아니다. 현행 최소 모집단은
+> `stage2-2khz-47slot-v1`의 47개 독립 component (`16/15/16`)이며, same-card
+> RT5640/J511 actual P/S, source-gain, parent-82 lineage closure와 raw-first ERR/coherence
+> QA가 PASS하기 전에는 어느 경로도 live collection을 열지 않는다. `HANDOFF.md` 최상단을
+> 우선한다.
 
 ## 1. 목적과 현재 상태
 

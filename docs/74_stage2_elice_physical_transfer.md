@@ -1,5 +1,13 @@
 # Stage-2 2 kHz Elice 물리 P/S 전송 계약
 
+> [!IMPORTANT]
+> 이 문서의 `combined-generation(101세션)` 표기는 Stage-1 historical transfer shape를
+> 설명하기 위한 것이다. 2026-09-01 현행 Stage-2 authority는 47개 독립 component
+> (`stage2-2khz-47slot-v1`, `train/val/test=16/15/16`)와 same-card RT5640/J511 actual
+> P/S raw/plant binding을 모두 요구한다. USB AB13X output-master 경로는 split-clock
+> failure로 retired forensic-only이며, 이 문서가 bootstrap 또는 학습을 여는 명령이 아니다.
+> 현재 gate는 `HANDOFF.md` 최상단과 `docs/75`를 우선한다.
+
 Stage-2 scratch pretrain은 일반 recorded 전송 manifest(v1)나 combined recorded
 generation 전송 manifest(v2)만으로 시작할 수 없다. 실제 덕트에서 strict P/S가
 PASS하고, 사람이 검토한 Git authority가 exact commit에 포함된 뒤에만

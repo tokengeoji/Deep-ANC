@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Stage-2 2 kHz output-master diagnostic-only A/B capture.
+"""Retired Stage-2 output-master diagnostic forensic adapter.
 
-기본 실행은 무음 dry-run이며 ``sounddevice``를 import하지 않는다. ``--execute-live``는
-fresh meter와 clean exact ``origin/dev``를 확인한 뒤 canonical diagnostic 11.605초만
-출력한다. raw를 고유 session에 no-replace로 저장·재로딩해 global clock을 분석하지만
-P/S stream을 자동으로 열거나 plant/training authority를 만들지 않는다.
+기본 실행은 무음 dry-run이며 ``sounddevice``를 import하지 않는다. USB AB13X output과
+APE input의 split-clock failure가 actual raw로 확인됐으므로 ``--execute-live``는
+backend import 전에 영구 차단한다. 기존 raw를 재분석하는 forensic 기능만 보존하며,
+현행 same-card RT5640/J511 actual-P/S authority를 만들지 않는다.
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ from scripts.data.measure_paths_stage2_2khz import (  # noqa: E402
 
 ADAPTER_PATH = "scripts/data/capture_stage2_output_master_diagnostic.py"
 LIVE_AUDIO_LOCK_PURPOSE = "stage2_2khz_output_master_diagnostic_only"
+OUTPUT_MASTER_SPLIT_CLOCK_RETIRED = True
 _EXTRA_CRITICAL_FILES = (
     ADAPTER_PATH,
     "scripts/data/measure_paths_stage2_2khz_v3.py",
@@ -141,6 +142,14 @@ def _authority_equal_except_meter_age(
 
 
 def _execute_live(arguments: argparse.Namespace) -> int:
+    if OUTPUT_MASTER_SPLIT_CLOCK_RETIRED:
+        print(
+            "[BLOCKED_RETIRED_OUTPUT_MASTER_SPLIT_CLOCK] USB AB13X output-master "
+            "경로는 실제 global clock failure raw 뒤 forensic-only입니다. "
+            "sounddevice import/open=0; diagnostic output=0; raw write=0",
+            file=sys.stderr,
+        )
+        return 2
     try:
         confirmations = _confirmations(arguments)
     except Stage2MeasurementV2Error as error:
@@ -329,7 +338,7 @@ def _dry_run() -> int:
     nonzero_frames = int(
         np.count_nonzero(np.any(submitted[:boundary] != 0, axis=1))
     )
-    print("Stage-2 output-master diagnostic-only 무음 dry-run PASS")
+    print("Retired output-master diagnostic forensic 무음 dry-run PASS")
     print(f"output_stream={boundary / 48_000.0:.6f}s frames={boundary}")
     print(
         f"nonzero_output={nonzero_frames / 48_000.0:.6f}s "

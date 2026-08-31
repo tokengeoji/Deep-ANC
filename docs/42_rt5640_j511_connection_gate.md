@@ -3,7 +3,9 @@
 ## [가설]
 
 Jetson 온보드 RT5640의 ALSA `CVB-RT Jack-state` control을 반복해서 읽으면, J511에
-3.5 mm plug가 감지됐는지 여부를 소리를 내지 않고 확인할 수 있다고 가정한다.
+결합된 Intel HD Audio front-panel breakout의 headphone/headset jack plug가 감지됐는지
+여부를 소리를 내지 않고 확인할 수 있다고 가정한다. J511 자체는 3.5 mm socket이 아니라
+10-pin HD Audio header다.
 
 ## [근거]
 
@@ -17,8 +19,13 @@ Item #2 'MIC'
 Item #3 'HS'
 ```
 
-v8 transport 실행 직전에는 이 control이 세 번 연속 `None`이었다. 따라서 J511에
-headphone/headset plug가 검출되지 않은 상태에서 exact-zero 동시 입출력 검증을 수행했다.
+v8 transport 실행 직전에는 이 control이 세 번 연속 `None`이었다. 따라서 J511 HDA
+header에 결합된 front-panel breakout의 headphone/headset plug가 검출되지 않은 상태에서
+exact-zero 동시 입출력 검증을 수행했다.
+
+`HP`는 headphone detect만, `HS`는 RT5640 HDA-header mode에서 headphone과
+mic/presence detect가 함께 active인 Linux jack state다. `HS` 자체는 TRRS plug나 앰프
+반대편 연결의 증거가 아니므로, 실제 P/S 전 gate는 안정적인 `HP` **또는** `HS`를 허용한다.
 
 ## [확인 방법]
 
@@ -30,16 +37,23 @@ PYTHONPATH=src .venv/bin/python scripts/jetson/check_rt5640_j511.py \
   --expect None --samples 3
 ```
 
-반대로 실제 J511→앰프 line cable을 연결한 뒤에는 먼저 관측값을 확인한다.
+반대로 J511에 keyed Intel HD Audio front-panel breakout을 결합하고, 그 breakout의
+headphone 3.5 mm jack에서 앰프 line input까지 stereo TRS line cable을 연결한 뒤에는 먼저
+관측값을 확인한다.
 
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/jetson/check_rt5640_j511.py \
   --expect HP --samples 3
 ```
 
-`HP`가 아닌 상태이면 그 관측값을 바탕으로 배선·TRRS adapter를 확인하고, 임의로 `HP`를
-가정하거나 실기 출력을 시작하지 않는다. 측정 전에는 이 gate 외에도 PCM 전역 무점유, 입력
-preflight, operator confirmation, 앰프 최소 볼륨 확인이 계속 필요하다.
+위 명령의 observed state가 `HS`라면, HDA sense wiring이 유효한 상태일 수 있으므로
+`--expect HS --samples 3`으로 다시 확인한다. 실제 Stage-2 gate는 두 상태를 모두 허용한다.
+
+`HP` 또는 `HS`가 아닌 상태이면 HDA breakout/harness의 keyed 결합과 headphone-jack
+detect 배선을 확인하고, 임의로 상태를 가정하거나 실기 출력을 시작하지 않는다. 단순
+TRS/TRRS 변환 젠더만으로는 J511 header의 dedicated detect pin을 대체할 수 없다. 측정
+전에는 이 gate 외에도 PCM 전역 무점유, 입력 preflight, operator confirmation, 앰프 최소
+볼륨 확인이 계속 필요하다.
 
 ## [결과]
 
@@ -70,8 +84,8 @@ clock evidence가 아니다.
 
 ## [판정]
 
-**Confirmed — J511의 software-visible plug state는 `None`이다.** 이는 Jetson 잭에서
-plug가 감지되지 않았다는 증거다.
+**Confirmed — J511 HDA header 경로의 software-visible plug state는 `None`이다.** 이는
+결합된 front-panel breakout의 headphone/mic sense가 RT5640에 감지되지 않았다는 증거다.
 
 다음은 이 control만으로는 판단할 수 없다.
 
@@ -86,7 +100,8 @@ J511 전기 witness 입력으로 쓰지 않는다.
 
 ## [다음 행동]
 
-실제 광대역 P/S 연결 창에서는 J511 cable의 감지 상태를 먼저 raw receipt에 결속한다. 독립
-electrical witness가 필요하면 J511 pre-amp tap을 안전한 감쇠/DC-block 회로를 거쳐 2채널
-동기 ADC 또는 검증된 RT5640 TRRS capture에 넣고, 그 입력 health부터 다시 PASS시켜야 한다.
-그 뒤 낮은 레벨의 channel/polarity 확인과 fullband clock/P/S gate를 순서대로 수행한다.
+실제 광대역 P/S 연결 창에서는 J511 HDA front-panel breakout의 headphone-jack 감지 상태를
+먼저 raw receipt에 결속한다. 독립 electrical witness가 필요하면 J511 pre-amp tap을 안전한
+감쇠/DC-block 회로를 거쳐 2채널 동기 ADC 또는 검증된 RT5640 capture에 넣고, 그 입력
+health부터 다시 PASS시켜야 한다. 그 뒤 낮은 레벨의 channel/polarity 확인과 fullband
+clock/P/S gate를 순서대로 수행한다.

@@ -846,7 +846,7 @@ def test_cli_subprocess_dry_run_resolves_tracked_repository_imports() -> None:
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    assert "Stage-2 output-master P/S v3 무음 dry-run" in completed.stdout
+    assert "Retired output-master P/S v3 forensic 무음 dry-run" in completed.stdout
     assert "sounddevice import/open=0; P/S output=0; raw write=0" in completed.stdout
 
 
@@ -879,7 +879,7 @@ def test_cli_execute_live_is_blocked_after_clean_identity_without_backend(
     )
     assert module.main(["--execute-live"]) == 2
     captured = capsys.readouterr()
-    assert "BLOCKED_BEFORE_AUDIO" in captured.err
+    assert "BLOCKED_RETIRED_OUTPUT_MASTER_SPLIT_CLOCK" in captured.err
     assert imports == []
 
 

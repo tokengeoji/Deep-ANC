@@ -487,8 +487,11 @@ def test_default_campaign_blocks_runner_before_cuda_or_run_directory(
         runner_module, "load_ready_stage2_pretrain_launch", unexpected_admission
     )
     before = tuple((root / "runs").glob("stage2_pretrain_*"))
+    # dirty checkout은 external-contract/corpus/CUDA보다 먼저 fail-closed하는
+    # 정상 경로다. 어느 조기 authority gate든 run directory나 CUDA에 닿지 않아야 한다.
     with pytest.raises(
-        ValueError, match="origin/dev exact HEAD|external contract/commit"
+        ValueError,
+        match="origin/dev exact HEAD|authority checkout이 clean하지 않습니다|external contract/commit",
     ):
         runner_module.Stage2ScratchPretrainRunner(
             repository_root=root,

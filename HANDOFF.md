@@ -3,7 +3,85 @@
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
 > 최종 갱신: 2026-09-01. 현행 통합 개발 브랜치: `dev`.
 
-## 긴급 현장 갱신 (2026-09-01, Stage-2 2 kHz)
+## 최우선 현행 상태 — physical P/S·pretrain 차단 원인 (2026-09-01)
+
+아래의 누적 기록은 forensic evidence로 보존한다. **현재 다음 행동과 학습 허용 판정은 이
+절만 기준으로 한다.** canonical surrogate pretrain 100k, measured fine-tune 50k,
+canonical checkpoint, G4 및 strict/canonical plant에 결속된 ANC OFF/ON raw는 아직 모두
+없다. 따라서 현재 감쇠 dB, 2 kHz 성능 또는 unseen-source 일반화를 숫자로 주장할 수 없다.
+
+### 실제 Jetson read-only 확인
+
+- `APE PCM1` ERR/REF 입력과 `APE PCM0` 출력의 mux는 모두 기대값이며, 모든 PCM
+  substream과 `/dev/snd/*` PCM owner는 비점유였다.
+- 새 same-card Stage-2 static preflight도 실제 장비에서 실행했다. audio backend import,
+  ALSA PCM open, speaker output, raw write, mixer/pinmux 변경은 모두 `0`이었다.
+- 그러나 `CVB-RT Jack-state`는 세 번 연속 `None`이었다. 이 결과는 RT5640/J511 output
+  route가 실제 앰프까지 감지·연결됐다는 증거가 없음을 뜻한다.
+
+**중요한 물리 정정:** J511은 3.5 mm socket이 아니라 10-pin keyed Intel HD Audio
+front-panel header다. USB DAC 또는 TRS cable을 J511에 직접 연결해서는 `HP`/`HS` 감지가
+생기지 않는다. 다음 실측 창 전에는 다음의 실제 배선이 필요하다.
+
+```text
+Jetson J511 10-pin HDA header
+  → keyed Intel HD Audio front-panel breakout/harness
+  → breakout headphone 3.5 mm jack
+  → stereo TRS (필요하면 TRS→2RCA) → amplifier LINE-IN
+```
+
+앰프의 speaker output을 J511에 연결해서는 안 된다. harness가 결합된 뒤에도 먼저 소리
+없이 아래를 실행해 `HP` 또는 `HS`가 3회 동일한지 확인한다. `None`이면 출력·meter·P/S를
+열지 않는다.
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/jetson/check_rt5640_j511.py \
+  --expect HP --samples 3
+```
+
+관측값이 `HS`이면 `--expect HS`로 동일하게 재검증한다. `HS`는 HDA sense 상태일 뿐,
+앰프 반대편 연결 또는 음향 출력의 단독 증거는 아니다.
+
+### 코드·데이터 준비 상태
+
+- same-card `S32_LE` 48 kHz/256-frame actual P/S의 full-PE **24초 plan**, no-audio
+  preflight, no-audio capture admission이 준비돼 있다. 현 capture adapter는 actual raw
+  publisher가 아직 없으므로 live backend 접근 전에 계속 fail-closed한다. 이는 실측을
+  건너뛰기 위한 우회가 아니라, 출력 전에 오류를 막는 경계다.
+- Stage-2 2 kHz recorded coverage는 기존 19-row Stage-1과 분리했다. 필요한 최소량은
+  **47 independent component/session** (`train=16`, `val=15`, `test=16`)이며, 모든 slot은
+  2 kHz objective와 1.6 kHz sentinel을 요구한다. 아직 실제 candidate WAV/source-plan,
+  parent-82 lineage closure, source-gain authority, fresh ERR/coherence raw가 없으므로
+  녹음은 의도적으로 audio-open 전 차단된다.
+- output-master USB AB13X diagnostic raw는 global clock coherence 실패 증거로 보존한다.
+  이 raw는 strict P/S, plant binding 또는 학습 입력으로 재사용하지 않는다.
+
+### Elice·백업 상태
+
+- Elice A100 80 GB 환경은 remote exact checkout, `torch 2.5.1+cu121`, CUDA 12.1,
+  environment freeze 및 약 247 GiB 가용 공간까지 확인됐다. 현재 GPU job은 없다.
+  새 physical P/S authority, Stage-2 source plan, transfer-v3 manifest가 생기기 전에는
+  bootstrap/download/pretrain을 시작하지 않는다. 비용만 발생하는 idle GPU를 학습 대기로
+  유지할 이유가 없다.
+- output-master diagnostic raw와 meter raw는 Drive `DeepANC/jetson_measurements_20260901/`
+  에 size readback으로 백업돼 있다. 이는 forensic backup이며 Stage-2 full corpus/transfer의
+  완전한 cold restore는 아니다. 로컬 원본은 external SHA 검증 전 삭제하지 않는다.
+
+### 다음 순서 (출력은 한 번의 짧은 창으로만)
+
+1. HDA breakout/harness를 실제 결합하고 no-audio `HP`/`HS` 3회 gate를 통과한다.
+2. actual raw publisher의 무음 dry-run과 post-start S32 route/hw_params receipt를
+   검증한다.
+3. 사용자 입회·최소 볼륨에서 fresh level meter 20초와 full-PE P/S 24초를 한 번의
+   출력 창(총 audible 약 44초)으로 실행한다. 종료 즉시 출력 종료·분리를 안내하고 raw를
+   먼저 immutable SHA로 고정한다.
+4. offline clock/fixed-LTI·P/S analysis PASS 뒤에만 plant binding, source candidate
+   closure, 47-session collection, transfer-v3, Elice bootstrap/pretrain 순으로 연다.
+
+이 순서의 어떤 gate도 통과하지 않은 상태에서 기존 legacy P/S/checkpoint나 19-row
+계획을 재사용해 학습을 시작하지 않는다.
+
+## Forensic 현장 기록 — output-master 실패 (2026-09-01, Stage-2 2 kHz)
 
 실제 output-master diagnostic을 exact clean `dev`
 `6034fe12227b82778793a6fe6e34450b5f6442ca`에서 한 번 실행했다. fresh meter는
@@ -71,16 +149,22 @@ DAC를 다시 시도하지 않고 `ADMAIF1 ↔ I2S1 ↔ RT5640/J511` common-cloc
 
 ### 다음 실제 측정 창의 단일 순서
 
-1. 앰프 입력을 AB13X USB DAC가 아니라 Jetson J511로 옮긴 뒤, 소리 없이 J511 상태가
-   `HP` 또는 `HS`인지 3회 확인한다. `None`이면 케이블/TRS-TRRS adapter/jack 접촉을
-   해결하며 mixer/pinmux를 추측으로 변경하지 않는다.
+1. 앰프 입력을 AB13X USB DAC가 아니라 **J511 10-pin HDA header → keyed front-panel
+   breakout → breakout headphone jack** 경로로 옮긴 뒤, 소리 없이 J511 상태가 `HP` 또는
+   `HS`인지 3회 확인한다. `None`이면 HDA harness/headphone-jack detect를 해결하며
+   mixer/pinmux를 추측으로 변경하지 않는다. 단순 TRS/TRRS adapter는 header의 detect
+   배선을 대체하지 않는다.
 2. PCM 전역 비점유와 새 S32 dry-run을 재확인한다. 그 뒤에만 actual P/S plan과
    same-card disarmed capture adapter를 별도 review/commit한다.
 3. 그 adapter의 무음 dry-run이 통과하면 한 번의 짧은 fresh meter→P/S 출력 창을
    설계한다. raw를 먼저 고정하고, 분석/plant binding/pretrain은 raw receipt가 PASS한
    뒤에만 수행한다.
 
-## 현재 권위 상태 (2026-08-31)
+## Historical snapshot — 2026-08-31 이전 권위 상태 (현행 실행 금지)
+
+> 이 절의 Stage-1 19-session/101-session 및 USB output 경로는 보존된 당시 상태다.
+> 2026-09-01 이후 current execution authority가 아니며, `HANDOFF.md` 최상단의
+> RT5640/J511 same-card Stage-2 47-slot 경계를 우선한다.
 
 **학습은 아직 시작하지 않았다.** canonical surrogate pretrain 100k, measured fine-tune
 50k, canonical checkpoint, G4, **현행 strict 계약에 결속된** 현장 ANC OFF/ON raw는 모두

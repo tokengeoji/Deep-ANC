@@ -286,7 +286,29 @@ def test_cli_dry_run_never_imports_sounddevice(monkeypatch, capsys) -> None:
     monkeypatch.setattr(module.importlib, "import_module", forbidden_import)
     assert module.main(["--dry-run"]) == 0
     stdout = capsys.readouterr().out
+    assert "Retired output-master diagnostic forensic 무음 dry-run PASS" in stdout
     assert "output_stream=11.605333s" in stdout
     assert "nonzero_output=5.537417s frames=265796 peak_pcm=98" in stdout
     assert "sounddevice import/open=0" in stdout
+    assert imports == []
+
+
+def test_cli_execute_live_is_retired_before_audio_backend_import(monkeypatch, capsys) -> None:
+    path = ROOT / "scripts/data/capture_stage2_output_master_diagnostic.py"
+    spec = importlib.util.spec_from_file_location(
+        "stage2_output_master_diagnostic_retired_cli_test", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    imports: list[str] = []
+    monkeypatch.setattr(
+        module.importlib,
+        "import_module",
+        lambda name: imports.append(name),
+    )
+    assert module.main(["--execute-live"]) == 2
+    assert "BLOCKED_RETIRED_OUTPUT_MASTER_SPLIT_CLOCK" in capsys.readouterr().err
     assert imports == []

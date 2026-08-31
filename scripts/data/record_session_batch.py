@@ -55,6 +55,11 @@ from deep_anc.data.recorded_generation import (  # noqa: E402
     _read_session_metadata,
     _validate_session_artifacts,
     validate_generation_id,
+    validate_stage2_2khz_generation_id,
+    validate_stage2_2khz_recorded_additions_source_plan_bytes,
+)
+from deep_anc.data.stage2_2khz_recorded_additions import (  # noqa: E402
+    Stage2TwoKhzRecordedAdditionsError,
 )
 from deep_anc.data.recording_level_campaign import (  # noqa: E402
     RecordingLevelCampaignError,
@@ -322,6 +327,18 @@ def _lexical_repo_path(value: str | Path) -> Path:
     candidate = Path(value).expanduser()
     candidate = candidate if candidate.is_absolute() else REPO_ROOT / candidate
     return Path(os.path.abspath(candidate))
+
+
+def _is_within_lexical_repo_subtree(value: str | Path, relative_root: str) -> bool:
+    """관리되는 additions namespace의 flag 생략 우회를 막는다."""
+
+    candidate = _lexical_repo_path(value)
+    root = _lexical_repo_path(relative_root)
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _reject_existing_symlink_components(path: Path) -> Path:
@@ -888,6 +905,15 @@ def build_parser() -> argparse.ArgumentParser:
             f"{CANONICAL_GENERATION_ID!r}와 source plan/out-root를 강제합니다"
         ),
     )
+    parser.add_argument(
+        "--stage2-2khz-canonical-generation",
+        default=None,
+        help=(
+            "Stage-2 2 kHz 47-slot source-plan의 무출력 preflight ID. "
+            "현재는 strict P/S·source-gain·actual ERR authority 전까지 live 녹음을 "
+            "의도적으로 허용하지 않습니다."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="파일/오디오를 변경하지 않고 계획만 검증")
     parser.add_argument("--confirm-speaker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--confirm-user-present", action="store_true")
@@ -922,6 +948,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.no_retry and args.retry_once:
         parser.error("--retry-once와 legacy --no-retry를 함께 쓸 수 없습니다")
+    if (
+        args.canonical_additions_generation is not None
+        and args.stage2_2khz_canonical_generation is not None
+    ):
+        parser.error(
+            "Stage-1 --canonical-additions-generation과 Stage-2 2 kHz canonical "
+            "preflight를 함께 지정할 수 없습니다"
+        )
+    if args.canonical_additions_generation is not None and not args.dry_run:
+        parser.error(
+            "Stage-1 19-session canonical additions는 historical forensic 경로입니다. "
+            "현재 Stage-2 2 kHz 학습 수집에는 사용할 수 없으며 live 녹음은 audio open 전에 "
+            "차단됩니다. 무출력 --dry-run만 허용합니다."
+        )
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit은 양수여야 합니다")
     for name in ("settle_seconds", "session_timeout_overhead_seconds"):
@@ -951,6 +991,55 @@ def main(argv: list[str] | None = None) -> int:
     if not sources_path.is_file():
         print(f"[중단] 소스 목록이 없습니다: {sources_path}", file=sys.stderr)
         return 2
+    out_root = _repo_path(args.out_root)
+    if (
+        not args.dry_run
+        and args.canonical_additions_generation is None
+        and args.stage2_2khz_canonical_generation is None
+        and (
+            _is_within_lexical_repo_subtree(sources_path, SOURCE_PLAN_ROOT)
+            or _is_within_lexical_repo_subtree(out_root, ADDITIONS_ROOT)
+        )
+    ):
+        parser.error(
+            "관리되는 recorded-additions source-plan/out-root를 generic batch로 실행할 수 없습니다. "
+            "Stage-1 19-session은 retired이고, Stage-2 47-slot은 actual P/S·source-gain·"
+            "raw-first authority 전까지 live 녹음이 차단됩니다. audio open=0"
+        )
+    stage2_preflight: dict | None = None
+    if args.stage2_2khz_canonical_generation is not None:
+        try:
+            generation_id = validate_stage2_2khz_generation_id(
+                args.stage2_2khz_canonical_generation
+            )
+            expected_sources = _lexical_repo_path(
+                f"{SOURCE_PLAN_ROOT}/{generation_id}.csv"
+            )
+            expected_out = _lexical_repo_path(f"{ADDITIONS_ROOT}/{generation_id}")
+            actual_sources = _lexical_repo_path(sources_path)
+            actual_out = _reject_existing_symlink_components(out_root)
+            if actual_sources != expected_sources or actual_out != expected_out:
+                raise Stage2TwoKhzRecordedAdditionsError(
+                    "Stage-2 2 kHz source plan/out-root 경로가 exact generation과 다릅니다: "
+                    f"expected={expected_sources}/{expected_out}, "
+                    f"actual={actual_sources}/{actual_out}"
+                )
+            if args.families is not None or args.preassigned_split is not None:
+                raise Stage2TwoKhzRecordedAdditionsError(
+                    "Stage-2 2 kHz canonical preflight는 전체 47-slot CSV의 "
+                    "family/split 배정을 override할 수 없습니다"
+                )
+            stage2_preflight = validate_stage2_2khz_recorded_additions_source_plan_bytes(
+                sources_path.read_bytes(), generation_id=generation_id
+            )
+        except (OSError, ValueError, Stage2TwoKhzRecordedAdditionsError) as exc:
+            parser.error(f"Stage-2 2 kHz source-plan preflight 실패: {exc}")
+        if not args.dry_run:
+            parser.error(
+                "Stage-2 2 kHz 47-slot path는 현재 무출력 source-plan preflight 전용입니다. "
+                "same-card strict P/S, physical source-gain authority, source-parent82 "
+                "lineage closure 및 actual ERR/coherence admission 전에는 live 녹음을 허용하지 않습니다"
+            )
     try:
         entries, source_list_sha256 = _load_plan(
             sources_path, families=args.families, default_split=args.preassigned_split
@@ -958,8 +1047,15 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"[중단] 수집 계획 오류: {exc}", file=sys.stderr)
         return 2
+    if stage2_preflight is not None:
+        print(
+            "[Stage-2 2 kHz preflight PASS] "
+            f"generation={stage2_preflight['generation_id']} · "
+            f"rows={stage2_preflight['source_plan_row_count']} · "
+            f"splits={stage2_preflight['split_counts']} · "
+            "all-slot 2k+1.6k sentinel required · live recording blocked"
+        )
 
-    out_root = _repo_path(args.out_root)
     canonical_rows: list[dict] | None = None
     if args.canonical_additions_generation is not None:
         try:

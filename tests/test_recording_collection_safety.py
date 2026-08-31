@@ -143,6 +143,35 @@ def test_batch_live_requires_all_three_confirmations_before_writes(tmp_path):
     assert not out_root.exists()
 
 
+def test_batch_managed_additions_namespace_cannot_bypass_live_gate_without_flag(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(BATCH, "REPO_ROOT", tmp_path)
+    plan = tmp_path / BATCH.SOURCE_PLAN_ROOT / "legacy-copy.csv"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("path,seconds\nunused.wav,15\n", encoding="utf-8")
+    child_calls: list[object] = []
+    monkeypatch.setattr(
+        BATCH.subprocess,
+        "Popen",
+        lambda *args, **kwargs: child_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        BATCH.main(
+            [
+                "--sources", str(plan),
+                "--out-root", str(tmp_path / BATCH.ADDITIONS_ROOT / "legacy-copy"),
+                "--confirm-user-present",
+                "--confirm-volume-minimum",
+                "--confirm-routing-and-geometry",
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert "generic batch" in capsys.readouterr().err
+    assert child_calls == []
+
+
 def test_child_stdout_stderr_are_streamed_and_logged(tmp_path, capsys):
     log = tmp_path / "child.log"
     result = BATCH.run_child_live(
@@ -274,7 +303,7 @@ def test_record_duct_canonical_live_refuses_missing_campaign_before_audio(
 
 
 def test_record_duct_direct_canonical_path_cannot_omit_v2_source_gain(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     monkeypatch.setattr(RECORD, "REPO_ROOT", tmp_path)
     source, ordinary_plan = _source_plan(tmp_path)
@@ -311,6 +340,7 @@ def test_record_duct_direct_canonical_path_cannot_omit_v2_source_gain(
             ]
         )
     assert excinfo.value.code == 2
+    assert "record_duct로 직접 live 실행할 수 없습니다" in capsys.readouterr().err
 
 
 def test_stream_constructor_mutation_is_caught_before_callback_start(tmp_path):
@@ -487,13 +517,15 @@ def test_canonical_additions_mode_requires_exact_generation_paths_and_header(
         "--dry-run",
     ]
     assert BATCH.main(common) == 0
+    # 두 dry-run만 historical plan을 읽는다. 중간 live invocation은 retired
+    # Stage-1 gate에서 source-plan/child audio open 전에 차단된다.
     assert authoritative_calls == [
         (
             tmp_path,
             f"{BATCH.SOURCE_PLAN_ROOT}/{generation_id}.csv",
             True,
         )
-    ] * 3
+    ] * 2
 
     with pytest.raises(SystemExit) as excinfo:
         BATCH.main([*common, "--amplitude", "0.15"])
@@ -541,8 +573,8 @@ def test_canonical_additions_mode_requires_exact_generation_paths_and_header(
     assert excinfo.value.code == 2
 
 
-def test_canonical_batch_qa_failure_is_quarantined_and_exits_nonzero(
-    tmp_path, monkeypatch
+def test_stage1_canonical_live_collection_is_retired_before_child_audio_open(
+    tmp_path, monkeypatch, capsys
 ):
     monkeypatch.setattr(BATCH, "REPO_ROOT", tmp_path)
     generation_id = BATCH.CANONICAL_GENERATION_ID
@@ -593,72 +625,32 @@ def test_canonical_batch_qa_failure_is_quarantined_and_exits_nonzero(
             {"evidence_sha256": "s" * 64},
         ),
     )
-    # 이 테스트의 책임은 이미 열린 live child가 QA 실패했을 때 raw를 격리하는
-    # downstream 동작이다. source-gain v1 자체가 canonical live를 차단하는지는
-    # test_recording_source_gain.py에서 별도로 실검증한다.
-    monkeypatch.setattr(
-        BATCH,
-        "_validate_batch_source_gain_plan",
-        lambda *_args, **_kwargs: {
-            "plan_sha256": "g" * 64,
-            "payload": {"contract": {"reference_amplitude_millionths": 6_000}},
-        },
-    )
-    monkeypatch.setattr(
-        BATCH,
-        "_canonical_source_gain_by_row",
-        lambda _summary, current_entries: {
-            int(entry["source_row_number"]): 0.006 for entry in current_entries
-        },
-    )
-
-    def fake_child(command, *, timeout_seconds, log_path):
-        del timeout_seconds, log_path
-        child_root = Path(command[command.index("--out-root") + 1])
-        session = child_root / "qa-failed-session"
-        session.mkdir()
-        (session / "session.json").write_text("{}\n", encoding="utf-8")
-        sf.write(
-            session / "mics.wav",
-            np.zeros((720_000, 2), dtype=np.float32),
-            48_000,
-            subtype="PCM_32",
-        )
-        return BATCH.ChildResult(0, "", "", False)
-
-    monkeypatch.setattr(BATCH, "run_child_live", fake_child)
+    child_calls: list[object] = []
+    monkeypatch.setattr(BATCH, "run_child_live", lambda *args, **kwargs: child_calls.append((args, kwargs)))
     out_root = tmp_path / BATCH.ADDITIONS_ROOT / generation_id
-    result = BATCH.main(
-        [
-            "--sources",
-            str(plan),
-            "--out-root",
-            str(out_root),
-            "--canonical-additions-generation",
-            generation_id,
-            "--limit",
-            "1",
-            "--settle-seconds",
-            "0",
-            "--confirm-user-present",
-            "--confirm-volume-minimum",
-            "--confirm-routing-and-geometry",
-            *_fake_campaign_args(BATCH, monkeypatch, root=tmp_path),
-        ]
-    )
-    assert result == 1
-    assert not list(out_root.glob("*/session.json"))
-    progress = list(
-        csv.DictReader((out_root / "batch_progress.csv").open(encoding="utf-8"))
-    )
-    assert progress[0]["verdict"] == "qa_failed"
-    assert progress[0]["seconds"] == "15.0"
-    failures = list(
-        (tmp_path / "results/recording_failures/record_duct/batch_qa").glob(
-            "**/qa-failed-session/session.json"
+    with pytest.raises(SystemExit) as excinfo:
+        BATCH.main(
+            [
+                "--sources",
+                str(plan),
+                "--out-root",
+                str(out_root),
+                "--canonical-additions-generation",
+                generation_id,
+                "--limit",
+                "1",
+                "--settle-seconds",
+                "0",
+                "--confirm-user-present",
+                "--confirm-volume-minimum",
+                "--confirm-routing-and-geometry",
+                *_fake_campaign_args(BATCH, monkeypatch, root=tmp_path),
+            ]
         )
-    )
-    assert len(failures) == 1
+    assert excinfo.value.code == 2
+    assert "historical forensic" in capsys.readouterr().err
+    assert child_calls == []
+    assert not list(out_root.glob("*/session.json"))
 
 
 def test_canonical_resume_rejects_progress_duration_mismatch(tmp_path, monkeypatch):
