@@ -97,11 +97,25 @@ def test_meter_verdict_exposes_exact_boundary_margin_without_relaxing_gate():
     at_boundary = set_amp_level.verdict(maximum)
     just_outside = set_amp_level.verdict(np.nextafter(maximum, np.inf))
 
-    assert "맞았습니다" in at_boundary
+    assert "허용 범위" in at_boundary
+    assert "조금 내리세요" in at_boundary
     assert "경계 여유 0.0000 dB" in at_boundary
+    assert "권장 0.2 dB 이상" in at_boundary
     assert "내리세요" in just_outside
     assert f"상한 {maximum:+.4f}" in just_outside
     assert "목표 대비 +2.0 dB" in just_outside
+
+
+def test_meter_verdict_only_says_stop_with_stable_interior_margin():
+    maximum = OFFICIAL_MEASUREMENT_LEVEL.meter_max_dbfs
+
+    near_upper = set_amp_level.verdict(maximum - 0.1)
+    interior = set_amp_level.verdict(maximum - 0.3)
+
+    assert "허용 범위" in near_upper
+    assert "조금 내리세요" in near_upper
+    assert "맞았습니다" not in near_upper
+    assert "맞았습니다" in interior
 
 
 def _hardware():

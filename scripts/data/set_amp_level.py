@@ -83,6 +83,11 @@ SPEAKER_PREFLIGHT_ABORT_NOTICE = (
     "스피커/앰프가 연결되어 있으면 지금 물리적으로 분리하세요."
 )
 
+# PASS 계약(±2 dB)은 그대로 유지하되, 노브를 경계에 멈추게 안내하면 자연 변동만으로
+# 다음 fresh meter가 PASS/FAIL을 오간다. 이 값은 판정 임계가 아니라 조작 안내용
+# 내부 여유다. 실제 PASS 여부는 계속 OFFICIAL_MEASUREMENT_LEVEL만 결정한다.
+RECOMMENDED_BOUNDARY_MARGIN_DB = 0.2
+
 # 목표 ERR 대역 RMS (dBFS) — 과거 실측 메모에서 유도된 후보값.
 #
 # 이 미터는 ch0 만 울리고, 기준이 되는 인터리브 측정은 두 채널을 함께 울린다.
@@ -131,6 +136,17 @@ def verdict(level: float) -> str:
         level - OFFICIAL_MEASUREMENT_LEVEL.meter_min_dbfs,
         OFFICIAL_MEASUREMENT_LEVEL.meter_max_dbfs - level,
     )
+    if margin < RECOMMENDED_BOUNDARY_MARGIN_DB:
+        direction = (
+            "조금 내리세요"
+            if level >= OFFICIAL_MEASUREMENT_LEVEL.meter_target_dbfs
+            else "조금 올리세요"
+        )
+        return (
+            "⚠ 허용 범위지만 경계 여유가 부족합니다 — "
+            f"{direction} (가장 가까운 경계 여유 {margin:.4f} dB; "
+            f"권장 {RECOMMENDED_BOUNDARY_MARGIN_DB:.1f} dB 이상)"
+        )
     return (
         "✅ 맞았습니다 — 여기서 멈추세요 "
         f"(가장 가까운 경계 여유 {margin:.4f} dB)"
