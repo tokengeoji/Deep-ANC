@@ -3,6 +3,19 @@
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
 > 최종 갱신: 2026-09-01. 현행 통합 개발 브랜치: `dev`.
 
+### 사용자 목표 갱신 — 1.6 kHz 우선 gate (2026-09-01)
+
+사용자 확정 기준은 **1.6 kHz sentinel `[1425.438, 1795.939) Hz`에서 family 평균·
+최악 10% 평균·cluster-bootstrap 95% CI 하단이 모두 `>= 6 dB`**인 것이다. 기존 2 kHz
+octave `>=3 dB` 하드 하한은 제거했으며, 2 kHz는 `>0 dB`(증폭 방지) 보조 진단으로만
+남긴다. 이 기준은 `configs/stage2_2khz_eval.yaml`, pretrain/fine-tune criterion,
+Stage-2 loss에 함께 봉인한다. **현재 이 기준을 충족한 checkpoint/raw는 없으며**, 목표를
+설정한 것과 달성한 것은 구분한다.
+
+이 변경으로 control contract도 v2로 분리했다: `broadband_2khz_octave_88_2828_v2`,
+SHA-256 `2dd8e1a9784093dded47ac0df9ab84789fc61dc37102f920dcb7d9f8933ac700`. v1의
+3 dB 의미를 새 결과에 섞지 않는다.
+
 ## 최우선 현행 상태 — physical P/S·pretrain 차단 원인 (2026-09-01)
 
 아래의 누적 기록은 forensic evidence로 보존한다. **현재 다음 행동과 학습 허용 판정은 이

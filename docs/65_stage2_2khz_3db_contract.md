@@ -1,21 +1,23 @@
-# Stage-2 2 kHz 최소 3 dB 계약
+# Stage-2 1.6 kHz 최소 6 dB 계약
 
 > 상태: 사용자 확정 목표, 구현·실측·학습 전 `BLOCKED`
-> 기준일: 2026-08-31
+> 기준일: 2026-09-01
 
 ## 1. 역할
 
 Stage-1의 150--1600 Hz 준비와 최종 full-octave v3의 125 Hz--8 kHz 역할 사이에
 실행 가능한 Stage-2를 둔다. 이 단계의 목적은 저역을 버리고 2 kHz만 맞추는 것이
 아니라, **125/250/500/1000/2000 Hz 중심 옥타브를 모두 보존하면서 실제 덕트의
-2 kHz 옥타브에서 최소 3 dB 감쇠를 입증하는 것**이다.
+1.6 kHz sentinel에서 최소 6 dB 감쇠를 입증하는 것**이다. 2 kHz octave는
+기존 3 dB 하드 하한을 제거하고, 증폭 방지용 양의 감쇠만 보조적으로 확인한다.
 
 4/8 kHz는 이 단계에서 양의 감쇠를 성공 조건으로 주장하지 않는다. 그러나 ANC ON이
 그 대역에 유해한 제어 에너지를 넣은 legacy 결함은 반복할 수 없으므로 기존 G4의
 do-no-harm 한도는 유지한다. 이 Stage-2 PASS를 4/8 kHz quiet-zone PASS로 승격하지
 않는다.
 
-별도 계약 ID는 `broadband_2khz_octave_88_2828_v1`로 한다. 기존
+별도 계약 ID는 `broadband_2khz_octave_88_2828_v2`로 한다. 기존 v1 계약을
+변경한 것으로 취급하지 않고 새 digest로 결속한다. 기존
 `broadband_full_octave_88_11314_v3`의 payload나 SHA를 수정·축소해 재사용하지 않는다.
 
 ## 2. 대역 정의
@@ -28,8 +30,8 @@ do-no-harm 한도는 유지한다. 이 Stage-2 PASS를 4/8 kHz quiet-zone PASS�
                        = [1414.213562, 2828.427125] Hz
 ```
 
-따라서 단일 2 kHz tone에서 3 dB가 나와도 speech/music/environment/machine의
-2 kHz octave PASS가 아니다. P/S 식별 자극과 source coverage는 최소 2,828.427125 Hz까지
+따라서 단일 2 kHz tone에서 결과가 나와도 speech/music/environment/machine의
+2 kHz octave PASS가 아니다. 1.6 kHz sentinel은 최소 6 dB를 요구하며, P/S 식별 자극과 source coverage는 최소 2,828.427125 Hz까지
 유효해야 한다. 125 Hz octave를 주장하려면 하단도 88.388348 Hz까지 실제로 덮어야 한다.
 
 물리 식별 구간은 다음 여섯 구간을 별도로 판정한다.
@@ -46,14 +48,13 @@ do-no-harm 한도는 유지한다. 이 Stage-2 PASS를 4/8 kHz quiet-zone PASS�
 ## 3. 성공 기준
 
 다음은 **합격 하한**이며, 목표 상한이나 현행 checkpoint의 성능 수치가 아니다.
-3 dB에서 최적화를 멈추지 않고 검증된 감쇠가 클수록 좋다. 다만 한 대역의 큰 평균으로
+6 dB에서 최적화를 멈추지 않고 검증된 감쇠가 클수록 좋다. 다만 한 대역의 큰 평균으로
 다른 대역·family의 실패를 상쇄하지 않는다.
 
-- 2 kHz octave의 각 family 평균·최악 10% 평균·독립 component cluster-bootstrap
-  95% CI 하단 감쇠가 모두 `>= 3.0 dB`
-- 이 2 kHz 본 판정 대역은 `[1414.214, 2828.427) Hz`이므로 1.6 kHz를 별도의
-  near-zero 허용 구간으로 빼지 않는다. 1.6 kHz 부근 source-density를 실제로 가진
-  segment와 독립 component가 위 평균·최악 10%·CI 하단 gate에 함께 들어가야 한다.
+- 1.6 kHz sentinel `[1425.438, 1795.939) Hz`의 각 family 평균·최악 10% 평균·독립
+  component cluster-bootstrap 95% CI 하단 감쇠가 모두 `>= 6.0 dB`
+- 2 kHz octave `[1414.214, 2828.427) Hz`의 각 family 평균·최악 10% 평균·CI 하단은
+  모두 `> 0 dB`여야 한다. 이는 3 dB 성능 목표가 아니라 증폭 방지용 보조 gate다.
 - 125/250/500/1000 Hz 각 octave의 family 평균·최악 10%·cluster-bootstrap CI 하단
   감쇠가 모두 `> 0 dB`; 합격 뒤에도 가능한 감쇠를 최대화
 - 2 kHz 좁은 tone, 1.6--2.2 kHz band, 2 kHz full-octave natural source를 서로
@@ -64,12 +65,12 @@ do-no-harm 한도는 유지한다. 이 Stage-2 PASS를 4/8 kHz quiet-zone PASS�
 - single-point 결과와 spatial quiet-zone 결과를 구분. 현 2입력 장비의 single-point
   PASS를 다점 quiet-zone PASS로 부르지 않음
 
-checkpoint 선택은 모든 필수 셀의 gate 여유 중 최솟값을 먼저 최대화한다. 그 값이
+checkpoint 선택은 1.6 kHz 6 dB를 포함한 모든 필수 셀의 gate 여유 중 최솟값을 먼저 최대화한다. 그 값이
 같거나 측정 오차 안이면 2 kHz octave 평균 감쇠가 더 큰 모델을 고른다. 따라서
 2 kHz만 과도하게 줄이면서 125 Hz--1 kHz, unseen family 또는 4/8 kHz DNH를 해치는
 모델은 선택되지 않는다.
 
-감쇠가 3 dB에 조금 못 미치는 것은 latency 결함을 허용하는 이유가 아니다. 성능과
+감쇠가 1.6 kHz 6 dB에 못 미치는 것은 latency 결함을 허용하는 이유가 아니다. 성능과
 runtime 안전은 독립 게이트다.
 
 ## 4. 데이터 계약
@@ -125,7 +126,7 @@ SHA가 다른 legacy optimizer/RNG 상태를 resume하거나 canonical init으�
 - Stage-2 88.388--2828.427 Hz strict P/S: 없음
 - Stage-2 source/recorded coverage: 미발행
 - Stage-2 scratch checkpoint: 없음
-- 실제 2 kHz octave 3 dB raw: 없음
+- 실제 1.6 kHz sentinel 6 dB raw: 없음
 
 125 Hz octave 하단 88.388--150 Hz는 코드만의 문제가 아니다. 기존 진단에서는 저역 S
 일관성이 약했고 72 Hz 응답도 작았으므로, 현 cancel speaker로 해당 구간을 authoritative

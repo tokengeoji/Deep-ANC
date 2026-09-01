@@ -5,9 +5,10 @@ segment다. 125/250/500/1000/2000 Hz objective는 OFF disturbance의 대역별
 source density를 먼저 통과한 segment만 집계한다. 4/8 kHz는 positive attenuation
 목표가 아니라 worst-10 증폭 do-no-harm gate다.
 
-2 kHz octave 평균이 1.6 kHz 부근의 near-zero 성능을 가리는 경로를 닫기 위해
-1600 Hz one-third-octave sentinel도 같은 source-density/group/평균/worst-10/CI
-strict-positive gate로 별도 집계한다. 이 sentinel은 immutable Stage-2 control-band
+2 kHz octave 평균이 1.6 kHz 부근의 부족한 성능을 가리는 경로를 닫기 위해
+1600 Hz one-third-octave sentinel은 최소 6 dB attenuation과 같은
+source-density/group/평균/worst-10/CI gate로 별도 집계한다. 2 kHz octave 자체는
+증폭 방지 목적의 양의 감쇠만 요구한다. 이 sentinel은 immutable Stage-2 control-band
 contract bytes를 바꾸지 않는 평가 admission이다.
 
 이 평가기의 PASS는 single-point 주파수 성능만 뜻한다. 다점 quiet-zone, runtime
@@ -37,7 +38,7 @@ DEFAULT_BOOTSTRAP_SEED = 20260831
 MIN_RAW_SEGMENT_SAMPLES = 4096
 ONE_POINT_SIX_KHZ_SENTINEL_CENTER_HZ = 1600.0
 ONE_POINT_SIX_KHZ_SENTINEL_BAND_HZ = (1425.437949, 1795.939277)
-ONE_POINT_SIX_KHZ_SENTINEL_MINIMUM_ATTENUATION_DB = 0.0
+ONE_POINT_SIX_KHZ_SENTINEL_MINIMUM_ATTENUATION_DB = 6.0
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -272,13 +273,17 @@ def _aggregate_objective_cell(
 
     coverage_pass = unique_groups >= contract.minimum_groups_per_family_octave
     is_two_khz = float(center_hz) == 2000.0
-    threshold = (
-        contract.two_khz_octave_minimum_attenuation_db
-        if is_two_khz
-        else contract.low_octave_minimum_attenuation_db
+    is_one_point_six_sentinel = (
+        float(center_hz) == ONE_POINT_SIX_KHZ_SENTINEL_CENTER_HZ
     )
+    if is_one_point_six_sentinel:
+        threshold = ONE_POINT_SIX_KHZ_SENTINEL_MINIMUM_ATTENUATION_DB
+    elif is_two_khz:
+        threshold = contract.two_khz_octave_minimum_attenuation_db
+    else:
+        threshold = contract.low_octave_minimum_attenuation_db
     finite = all(math.isfinite(value) for value in (mean, worst10, ci_lo))
-    if is_two_khz:
+    if is_one_point_six_sentinel:
         mean_pass = finite and mean >= threshold
         worst10_pass = finite and worst10 >= threshold
         ci_pass = finite and ci_lo >= threshold
@@ -501,7 +506,7 @@ def evaluate_stage2_2khz_raw_segments(
         if not sentinel_cell["passed"]:
             reasons.append(
                 f"{position}/{family}/1600Hz one-third-octave sentinel이 "
-                "source-density/group/strict-positive mean/worst10/CI-lower gate를 "
+                "source-density/group/6 dB 이상 mean/worst10/CI-lower gate를 "
                 "통과하지 못했습니다"
             )
 
@@ -606,7 +611,8 @@ def evaluate_stage2_2khz_raw_segments(
             else None
         ),
         "checkpoint_selection_policy": {
-            "three_db_is_minimum_not_optimization_target": True,
+            "two_khz_positive_is_secondary_diagnostic": True,
+            "one_point_six_khz_minimum_attenuation_db": 6.0,
             "eligibility_requires_all_band_family_density_group_dnh_gates_pass": True,
             "eligibility_requires_one_point_six_khz_sentinel_pass": True,
             "one_point_six_khz_sentinel_runtime_exact_zero_required": True,

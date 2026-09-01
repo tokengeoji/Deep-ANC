@@ -739,7 +739,8 @@ def test_default_stage2_profile_is_blocked_before_gpu_or_run_directory() -> None
     )
     assert report["scratch_pretrain_required"] is True
     assert report["legacy_init_or_resume_allowed"] is False
-    assert report["three_db_is_minimum_not_optimization_target"] is True
+    assert report["two_khz_positive_is_secondary_diagnostic"] is True
+    assert report["one_point_six_khz_minimum_attenuation_db"] == 6.0
     assert report["checkpoint_selection_primary"].startswith("maximize_minimum")
     assert report["checkpoint_selection_secondary"].startswith(
         "maximize_two_khz"

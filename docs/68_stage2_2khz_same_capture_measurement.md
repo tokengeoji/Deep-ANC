@@ -115,4 +115,5 @@ config의 `canonical_training_eligible=false`는 아직 raw/analysis/admission P
 
 이 결과는 **125 Hz 옥타브부터 2 kHz 옥타브까지의 단일 ERR 지점 P/S/lead 후보**다.
 1.633 kHz 위 PASS를 spatial quiet-zone PASS로 승격하지 않으며, 실제 ANC는 별도 physical
-source-valid 평가에서 2 kHz 옥타브 최소 +3 dB와 1.6 kHz near-zero 금지를 통과해야 한다.
+source-valid 평가에서 1.6 kHz sentinel 최소 6 dB와 2 kHz 옥타브 증폭 방지(감쇠 >0 dB)를
+통과해야 한다.

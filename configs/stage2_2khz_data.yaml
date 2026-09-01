@@ -4,8 +4,8 @@ schema: stage2_2khz_data_profile_v1
 role: stage2_lineage_and_frequency_coverage_only
 
 control_band_contract:
-  id: broadband_2khz_octave_88_2828_v1
-  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+  id: broadband_2khz_octave_88_2828_v2
+  sha256: 2dd8e1a9784093dded47ac0df9ab84789fc61dc37102f920dcb7d9f8933ac700
 
 required_source_families: [speech, music, environment, machine]
 required_splits: [train, val, test]

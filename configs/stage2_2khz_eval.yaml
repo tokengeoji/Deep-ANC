@@ -1,27 +1,28 @@
-# Stage-2 physical single-point 평가 정책. 3 dB는 2 kHz octave의 합격 하한이고
-# 최적화 상한이 아니다. 모든 cell 합격 뒤 최저 gate margin을 먼저 키운다.
+# Stage-2 physical single-point 평가 정책. 1.6 kHz sentinel은 최소 6 dB의
+# 필수 성능 gate다. 2 kHz octave의 기존 3 dB 하한은 제거하고, 증폭 방지를 위한
+# 양의 감쇠(>0 dB)만 보조 gate로 유지한다.
 schema: stage2_2khz_evaluation_policy_v1
 role: stage2_single_point_raw_off_on_evaluation
 
 control_band_contract:
-  id: broadband_2khz_octave_88_2828_v1
-  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+  id: broadband_2khz_octave_88_2828_v2
+  sha256: 2dd8e1a9784093dded47ac0df9ab84789fc61dc37102f920dcb7d9f8933ac700
 
 objective_octaves_hz: [125.0, 250.0, 500.0, 1000.0, 2000.0]
 low_mid_attenuation_threshold_db: 0.0
 low_mid_threshold_comparator: strictly_greater_than
-two_khz_attenuation_threshold_db: 3.0
-two_khz_threshold_comparator: greater_than_or_equal
+two_khz_attenuation_threshold_db: 0.0
+two_khz_threshold_comparator: strictly_greater_than
 required_statistics: [family_mean, family_worst10_mean, family_cluster_ci95_lower]
 minimum_independent_groups_per_family_octave: 4
 minimum_source_density_ratio: 0.25
 
-# 2 kHz octave 평균이 좋아도 1.6 kHz 전이부만 near-zero인 모델은 실패다.
+# 2 kHz octave 평균이 좋아도 1.6 kHz 전이부가 6 dB 미만인 모델은 실패다.
 # contract digest는 유지하고 auxiliary one-third-octave source-valid gate로 검사한다.
 one_point_six_khz_sentinel:
   band_hz: [1425.437949, 1795.939277]
-  attenuation_threshold_db: 0.0
-  comparator: strictly_greater_than
+  attenuation_threshold_db: 6.0
+  comparator: greater_than_or_equal
   required_statistics: [family_mean, family_worst10_mean, family_cluster_ci95_lower]
   minimum_independent_groups_per_family: 4
   minimum_source_density_ratio: 0.25
@@ -46,7 +47,8 @@ checkpoint_selection:
   all_frequency_family_dnh_runtime_gates_required: true
   primary_order: maximize_minimum_frequency_family_dnh_runtime_gate_margin
   secondary_order: maximize_two_khz_family_equal_mean_attenuation_db
-  three_db_is_minimum_not_optimization_target: true
+  two_khz_positive_is_secondary_diagnostic: true
+  one_point_six_khz_minimum_attenuation_db: 6.0
   one_point_six_khz_sentinel_runtime_exact_zero_required: true
   test_data_for_selection_allowed: false
 

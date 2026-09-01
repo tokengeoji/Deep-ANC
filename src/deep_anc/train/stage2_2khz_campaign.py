@@ -472,8 +472,8 @@ def _validate_evaluation_profile(payload: Mapping[str, Any]) -> None:
     _require_exact(root["objective_octaves_hz"], _OBJECTIVE_OCTAVES, label="objective octaves")
     _require_exact(root["low_mid_attenuation_threshold_db"], 0.0, label="low/mid threshold")
     _require_exact(root["low_mid_threshold_comparator"], "strictly_greater_than", label="low/mid comparator")
-    _require_exact(root["two_khz_attenuation_threshold_db"], 3.0, label="2 kHz threshold")
-    _require_exact(root["two_khz_threshold_comparator"], "greater_than_or_equal", label="2 kHz comparator")
+    _require_exact(root["two_khz_attenuation_threshold_db"], 0.0, label="2 kHz threshold")
+    _require_exact(root["two_khz_threshold_comparator"], "strictly_greater_than", label="2 kHz comparator")
     _require_exact(root["required_statistics"], ["family_mean", "family_worst10_mean", "family_cluster_ci95_lower"], label="required statistics")
     _require_exact(root["minimum_independent_groups_per_family_octave"], 4, label="evaluation group floor")
     _require_exact(root["minimum_source_density_ratio"], 0.25, label="evaluation source density")
@@ -481,8 +481,8 @@ def _validate_evaluation_profile(payload: Mapping[str, Any]) -> None:
         root["one_point_six_khz_sentinel"],
         {
             "band_hz": [1425.437949, 1795.939277],
-            "attenuation_threshold_db": 0.0,
-            "comparator": "strictly_greater_than",
+            "attenuation_threshold_db": 6.0,
+            "comparator": "greater_than_or_equal",
             "required_statistics": [
                 "family_mean",
                 "family_worst10_mean",
@@ -505,7 +505,7 @@ def _validate_evaluation_profile(payload: Mapping[str, Any]) -> None:
     )
     _require_exact(
         root["checkpoint_selection"],
-        {"all_frequency_family_dnh_runtime_gates_required": True, "primary_order": "maximize_minimum_frequency_family_dnh_runtime_gate_margin", "secondary_order": "maximize_two_khz_family_equal_mean_attenuation_db", "three_db_is_minimum_not_optimization_target": True, "one_point_six_khz_sentinel_runtime_exact_zero_required": True, "test_data_for_selection_allowed": False},
+        {"all_frequency_family_dnh_runtime_gates_required": True, "primary_order": "maximize_minimum_frequency_family_dnh_runtime_gate_margin", "secondary_order": "maximize_two_khz_family_equal_mean_attenuation_db", "two_khz_positive_is_secondary_diagnostic": True, "one_point_six_khz_minimum_attenuation_db": 6.0, "one_point_six_khz_sentinel_runtime_exact_zero_required": True, "test_data_for_selection_allowed": False},
         label="checkpoint selection",
     )
     _require_exact(
@@ -665,10 +665,10 @@ def _validate_training_profile(
     )
     _require_exact(
         criterion["one_point_six_khz_minimum_attenuation_db"],
-        0.0,
+        6.0,
         label="criterion 1.6 kHz threshold",
     )
-    _require_exact(criterion["two_khz_minimum_attenuation_db"], 3.0, label="criterion 2 kHz threshold")
+    _require_exact(criterion["two_khz_minimum_attenuation_db"], 0.0, label="criterion 2 kHz threshold")
     _require_exact(criterion["do_no_harm_octaves_hz"], _DNH_OCTAVES, label="criterion DNH octaves")
     _require_exact(root["checkpoint_required_bindings"], _CHECKPOINT_BINDINGS, label="checkpoint bindings")
     initialization_intent: tuple[str | None, str | None]
@@ -1064,7 +1064,8 @@ def audit_stage2_2khz_campaign(
         "generic_stage1_trainer_allowed": False,
         "legacy_init_or_resume_allowed": False,
         "scratch_pretrain_required": True,
-        "three_db_is_minimum_not_optimization_target": True,
+        "two_khz_positive_is_secondary_diagnostic": True,
+        "one_point_six_khz_minimum_attenuation_db": 6.0,
         "checkpoint_selection_primary": "maximize_minimum_frequency_family_dnh_runtime_gate_margin",
         "checkpoint_selection_secondary": "maximize_two_khz_family_equal_mean_attenuation_db",
         "audio_opened": False,

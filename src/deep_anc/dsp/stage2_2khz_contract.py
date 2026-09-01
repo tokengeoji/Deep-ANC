@@ -2,7 +2,8 @@
 
 이 계약은 기존 ``control_band_contract`` v1/v2 및 full-octave v3를 수정하거나
 축소해 재사용하지 않는다. Stage-2의 성공은 실제 덕트 한 ERR 위치에서
-125/250/500/1000 Hz를 보존하면서 2 kHz *옥타브 전체*를 최소 3 dB 줄이는 것이다.
+125/250/500/1000 Hz를 보존하면서 2 kHz *옥타브 전체*의 증폭을 막는 것이다.
+6 dB 성능 목표는 별도 1.6 kHz sentinel 평가 계약에서 강제한다.
 4/8 kHz는 제어 목표가 아니라 별도의 do-no-harm 관측 대역이며, Stage-2 PASS를
 다점 quiet-zone 또는 full-octave v3 PASS로 승격할 수 없다.
 
@@ -19,8 +20,8 @@ from typing import Literal, Sequence
 from pydantic import BaseModel, ConfigDict, model_validator
 
 
-STAGE2_2KHZ_CONTRACT_SCHEMA = "stage2_2khz_contract_v1"
-STAGE2_2KHZ_CONTRACT_ID = "broadband_2khz_octave_88_2828_v1"
+STAGE2_2KHZ_CONTRACT_SCHEMA = "stage2_2khz_contract_v2"
+STAGE2_2KHZ_CONTRACT_ID = "broadband_2khz_octave_88_2828_v2"
 
 STAGE2_2KHZ_PHYSICAL_IDENTIFICATION_SUBBANDS_HZ: tuple[
     tuple[float, float], ...
@@ -66,7 +67,7 @@ STAGE2_2KHZ_REQUIRED_EXCITATION_LOWER_MAX_HZ = 80.0
 STAGE2_2KHZ_REQUIRED_EXCITATION_UPPER_MIN_HZ = 2828.4271247462
 STAGE2_2KHZ_MIN_GROUPS_PER_FAMILY_OCTAVE = 4
 STAGE2_2KHZ_MIN_SOURCE_DENSITY_RATIO = 0.25
-STAGE2_2KHZ_MINIMUM_ATTENUATION_DB = 3.0
+STAGE2_2KHZ_MINIMUM_ATTENUATION_DB = 0.0
 STAGE2_2KHZ_DNH_MAX_WORST10_AMPLIFICATION_DB = 1.0
 
 
@@ -94,14 +95,14 @@ def _validate_contiguous(rows: Sequence[Sequence[float]], *, label: str) -> None
 
 
 class Stage2TwoKilohertzContract(BaseModel):
-    """2 kHz octave 최소 3 dB를 강제하는 별도 single-point 계약."""
+    """2 kHz octave 증폭 방지와 1.6 kHz sentinel 목표를 위한 single-point 계약."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["stage2_2khz_contract_v1"] = (
+    schema_version: Literal["stage2_2khz_contract_v2"] = (
         STAGE2_2KHZ_CONTRACT_SCHEMA
     )
-    contract_id: Literal["broadband_2khz_octave_88_2828_v1"] = (
+    contract_id: Literal["broadband_2khz_octave_88_2828_v2"] = (
         STAGE2_2KHZ_CONTRACT_ID
     )
     role: Literal["broadband_2khz_octave_single_point"] = (
@@ -139,8 +140,8 @@ class Stage2TwoKilohertzContract(BaseModel):
     two_khz_octave_minimum_attenuation_db: float = (
         STAGE2_2KHZ_MINIMUM_ATTENUATION_DB
     )
-    two_khz_threshold_semantics: Literal["greater_than_or_equal"] = (
-        "greater_than_or_equal"
+    two_khz_threshold_semantics: Literal["strictly_greater_than"] = (
+        "strictly_greater_than"
     )
     do_no_harm_max_worst10_amplification_db: float = (
         STAGE2_2KHZ_DNH_MAX_WORST10_AMPLIFICATION_DB
@@ -246,7 +247,7 @@ class Stage2TwoKilohertzContract(BaseModel):
         if float(self.two_khz_octave_minimum_attenuation_db) != (
             STAGE2_2KHZ_MINIMUM_ATTENUATION_DB
         ):
-            raise ValueError("2 kHz octave 최소 감쇠 3 dB를 변경할 수 없습니다")
+            raise ValueError("2 kHz octave 증폭 방지 하한 0 dB를 변경할 수 없습니다")
         if float(self.do_no_harm_max_worst10_amplification_db) != (
             STAGE2_2KHZ_DNH_MAX_WORST10_AMPLIFICATION_DB
         ):

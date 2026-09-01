@@ -86,7 +86,7 @@ def _band_component(value: torch.Tensor, lower: float, upper: float) -> torch.Te
     return torch.fft.irfft(filtered, n=samples, dim=-1)
 
 
-def test_stage2_loss_keeps_five_equal_octaves_and_three_db_is_not_cap() -> None:
+def test_stage2_loss_keeps_five_equal_octaves_and_two_khz_is_secondary() -> None:
     criterion = _loss()
     d = _objective_noise()
     y = 0.01 * d
@@ -104,7 +104,7 @@ def test_stage2_loss_keeps_five_equal_octaves_and_three_db_is_not_cap() -> None:
         source_families=families,
     )
     assert metrics_pass["stage2_exact_equal_octave_weight"] == pytest.approx(0.2)
-    assert metrics_better["stage2_two_khz_three_db_guard"] == pytest.approx(0.0)
+    assert metrics_better["stage2_two_khz_positive_guard"] == pytest.approx(0.0)
     assert float(better.detach()) < float(just_pass.detach())
 
 
@@ -121,7 +121,7 @@ def test_stage2_loss_two_khz_failure_is_not_hidden_by_low_octaves() -> None:
     )
     assert torch.isfinite(loss)
     assert metrics["stage2_two_khz_objective_nmse_db"] > -0.2
-    assert metrics["stage2_two_khz_three_db_guard"] > 2.8
+    assert metrics["stage2_two_khz_positive_guard"] == pytest.approx(0.0)
 
 
 def test_stage2_loss_one_point_six_near_zero_is_not_hidden_by_two_khz_mean() -> None:
@@ -139,6 +139,7 @@ def test_stage2_loss_one_point_six_near_zero_is_not_hidden_by_two_khz_mean() -> 
     assert metrics["stage2_two_khz_objective_nmse_db"] < -3.0
     assert metrics["stage2_one_point_six_khz_sentinel_nmse_db"] > -0.2
     assert metrics["stage2_one_point_six_khz_sentinel_positive_guard"] > 0.0
+    assert metrics["stage2_one_point_six_khz_minimum_attenuation_db"] == pytest.approx(6.0)
 
 
 def test_stage2_loss_cannot_hide_one_failed_family_behind_three_good_families() -> None:
@@ -147,7 +148,7 @@ def test_stage2_loss_cannot_hide_one_failed_family_behind_three_good_families() 
     balanced_loss, _ = criterion(
         torch.zeros_like(target),
         target,
-        -(1.0 - 10.0 ** (-5.0 / 20.0)) * target,
+        -(1.0 - 10.0 ** (-8.0 / 20.0)) * target,
         source_families=FAMILIES,
     )
     secondary = -0.9 * target
@@ -165,7 +166,7 @@ def test_stage2_loss_cannot_hide_one_failed_family_behind_three_good_families() 
         metrics[f"stage2_octave_{index}_family_worst_nmse_db"] > -0.1
         for index in range(5)
     )
-    assert metrics["stage2_two_khz_three_db_guard"] > 0.0
+    assert metrics["stage2_two_khz_positive_guard"] == pytest.approx(0.0)
 
 
 def test_stage2_loss_rejects_missing_density_and_unbalanced_actual_batch() -> None:

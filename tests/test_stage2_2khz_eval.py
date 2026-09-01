@@ -47,7 +47,7 @@ def _band_components(*, omit_objective: int | None = None) -> np.ndarray:
 
 def _campaign(
     *,
-    attenuation_db: tuple[float, ...] = (6.0, 6.0, 6.0, 6.0, 4.0, 0.0, 0.0),
+    attenuation_db: tuple[float, ...] = (8.0, 8.0, 8.0, 8.0, 8.0, 0.0, 0.0),
     omit_objective: int | None = None,
     groups: int = 4,
     families: tuple[str, ...] = ("speech", "music", "environment", "machine"),
@@ -110,7 +110,8 @@ def test_all_low_octaves_two_khz_minimum_and_dnh_pass() -> None:
     assert float(result["minimum_frequency_gate_margin_db"]) > 0.9
     assert float(result["two_khz_family_equal_mean_attenuation_db"]) > 3.9
     selection = result["checkpoint_selection_policy"]
-    assert selection["three_db_is_minimum_not_optimization_target"] is True
+    assert selection["two_khz_positive_is_secondary_diagnostic"] is True
+    assert selection["one_point_six_khz_minimum_attenuation_db"] == 6.0
     assert selection["eligibility_requires_external_physical_runtime_latency_gate_pass"] is True
     assert selection["eligibility_requires_one_point_six_khz_sentinel_pass"] is True
     assert selection["one_point_six_khz_sentinel_runtime_exact_zero_required"] is True
@@ -123,8 +124,8 @@ def test_all_low_octaves_two_khz_minimum_and_dnh_pass() -> None:
         cell for cell in result["objective_cells"] if cell["octave_center_hz"] == 2000.0
     ]
     assert len(two_khz) == 4
-    assert all(cell["attenuation_threshold_db"] == 3.0 for cell in two_khz)
-    assert all(cell["attenuation_threshold_comparator"] == ">=" for cell in two_khz)
+    assert all(cell["attenuation_threshold_db"] == 0.0 for cell in two_khz)
+    assert all(cell["attenuation_threshold_comparator"] == ">" for cell in two_khz)
     assert all(float(cell["attenuation_worst10_mean_db"]) > 3.9 for cell in two_khz)
 
 
@@ -156,6 +157,18 @@ def test_one_point_six_khz_near_zero_is_blocked_even_if_two_khz_octave_passes() 
     assert result["status"] == "BLOCKED"
 
 
+def test_one_point_six_khz_six_db_is_the_hard_floor() -> None:
+    result = _evaluate(
+        _campaign(attenuation_db=(8.0, 8.0, 8.0, 8.0, 5.99, 0.0, 0.0))
+    )
+
+    assert result["status"] == "BLOCKED"
+    sentinel = result["one_point_six_khz_sentinel_cells"]
+    assert all(cell["attenuation_threshold_db"] == 6.0 for cell in sentinel)
+    assert all(cell["attenuation_threshold_comparator"] == ">=" for cell in sentinel)
+    assert all(not cell["passed"] for cell in sentinel)
+
+
 def test_two_khz_source_density_missing_blocks_even_when_other_bands_are_good() -> None:
     result = _evaluate(_campaign(omit_objective=4))
 
@@ -181,7 +194,7 @@ def test_good_two_khz_cannot_hide_low_octave_amplification() -> None:
     assert {cell["octave_center_hz"] for cell in failed} == {125.0}
 
 
-def test_two_khz_below_three_db_is_blocked_not_rounded_up() -> None:
+def test_two_khz_below_old_three_db_is_allowed_when_positive() -> None:
     result = _evaluate(
         _campaign(attenuation_db=(8.0, 8.0, 8.0, 8.0, 2.9, 0.0, 0.0))
     )
@@ -190,14 +203,16 @@ def test_two_khz_below_three_db_is_blocked_not_rounded_up() -> None:
     two_khz = [
         cell for cell in result["objective_cells"] if cell["octave_center_hz"] == 2000.0
     ]
-    assert all(not cell["attenuation_mean_pass"] for cell in two_khz)
-    assert all(not cell["attenuation_worst10_pass"] for cell in two_khz)
-    assert all(not cell["attenuation_ci_lower_pass"] for cell in two_khz)
+    assert all(cell["attenuation_mean_pass"] for cell in two_khz)
+    assert all(cell["attenuation_worst10_pass"] for cell in two_khz)
+    assert all(cell["attenuation_ci_lower_pass"] for cell in two_khz)
+    assert all(cell["passed"] for cell in two_khz)
+    assert not result["all_one_point_six_khz_sentinel_gates_pass"]
 
 
 def test_four_or_eight_khz_one_db_amplification_limit_is_strict() -> None:
     failed = _evaluate(
-        _campaign(attenuation_db=(8.0, 8.0, 8.0, 8.0, 5.0, -1.1, 0.0))
+        _campaign(attenuation_db=(8.0, 8.0, 8.0, 8.0, 8.0, -1.1, 0.0))
     )
     assert failed["status"] == "BLOCKED"
     four_khz = [
@@ -207,7 +222,7 @@ def test_four_or_eight_khz_one_db_amplification_limit_is_strict() -> None:
     assert all(float(cell["worst10_amplification_db"]) > 1.0 for cell in four_khz)
 
     passed = _evaluate(
-        _campaign(attenuation_db=(8.0, 8.0, 8.0, 8.0, 5.0, -0.9, -0.9))
+        _campaign(attenuation_db=(8.0, 8.0, 8.0, 8.0, 8.0, -0.9, -0.9))
     )
     assert passed["status"] == "PASS"
 

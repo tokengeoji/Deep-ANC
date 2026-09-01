@@ -2,7 +2,7 @@
 
 기존 Stage-1 연속대역 손실이나 full-octave v3 손실의 숫자만 바꾸지 않는다. 이
 primitive는 다섯 octave를 각각 target 에너지로 정규화해 정확히 같은 baseline
-가중치를 주고, 최악 octave guard와 2 kHz 3 dB hard guard를 별도로 더한다.
+가중치를 주고, 최악 octave guard와 1.6 kHz 6 dB hard guard를 별도로 더한다.
 
 입력은 causal adapter가 만든 valid crop의 ``y``, ``d=P*n``, ``S*y``다. 측정 FIR의
 극성이 이미 ``S*y``에 있으므로 error는 오직 ``e=d+S*y``로 만든다. 4/8 kHz는
@@ -68,8 +68,12 @@ class Stage2TwoKilohertzLossConfig(BaseModel):
     octave_worst_guard_weight: Literal[0.7] = 0.7
     low_mid_positive_guard_weight: Literal[1.0] = 1.0
     one_point_six_khz_positive_guard_weight: Literal[1.0] = 1.0
+    one_point_six_khz_minimum_attenuation_db: Literal[6.0] = 6.0
     one_point_six_khz_training_margin_db: Literal[0.1] = 0.1
-    two_khz_three_db_guard_weight: Literal[1.0] = 1.0
+    # 2 kHz의 과거 3 dB 하드 게이트는 제거했다. 이 weight는 2 kHz 증폭을
+    # 막는 보조 hinge에만 적용되며, 실제 하한은 0 dB이다.
+    two_khz_positive_guard_weight: Literal[1.0] = 1.0
+    two_khz_minimum_attenuation_db: Literal[0.0] = 0.0
     relative_nmse_floor_db: Literal[-80.0] = STAGE2_2KHZ_NMSE_FLOOR_DB
     lambda_dnh: float
     dnh_margin_db: float = DEFAULT_DNH_MARGIN_DB
@@ -84,7 +88,7 @@ class Stage2TwoKilohertzLossConfig(BaseModel):
     objective_semantics: Literal[
         "five_exact_one_fifth_baseline_plus_additive_worst_and_gate_guards"
     ] = "five_exact_one_fifth_baseline_plus_additive_worst_and_gate_guards"
-    two_khz_three_db_is_minimum_not_cap: Literal[True] = True
+    two_khz_positive_is_secondary_diagnostic: Literal[True] = True
     generic_stage1_loss_allowed: Literal[False] = False
     full_octave_v3_loss_allowed: Literal[False] = False
 
@@ -127,7 +131,7 @@ class Stage2TwoKilohertzLossConfig(BaseModel):
 
 
 class Stage2TwoKilohertzLoss(nn.Module):
-    """다섯 octave, 2 kHz 3 dB guard, 4/8 kHz actuator DNH 소비자."""
+    """다섯 octave, 1.6 kHz 6 dB guard, 2 kHz positive guard, 4/8 kHz DNH 소비자."""
 
     def __init__(
         self,
@@ -490,26 +494,30 @@ class Stage2TwoKilohertzLoss(nn.Module):
             )
         sentinel_family_stack = torch.stack(tuple(sentinel_family_objectives))
         sentinel_objective = sentinel_family_stack.mean()
-        # 평가 comparator는 attenuation>0 dB다. 학습 hinge를 정확히 0에 두면
-        # 수치적으로 near-zero가 남을 수 있어 0.1 dB의 내부 여유를 둔다.
+        # 평가 comparator는 sentinel attenuation>=6 dB다. 학습 hinge에는
+        # 수치적으로 경계에 남지 않도록 0.1 dB의 내부 여유를 둔다.
         sentinel_guard = torch.relu(
             sentinel_family_stack.max()
+            + float(self.loss_config.one_point_six_khz_minimum_attenuation_db)
             + float(self.loss_config.one_point_six_khz_training_margin_db)
         )
         worst_with_sentinel = torch.maximum(worst, sentinel_raw[sentinel_valid].max())
-        # attenuation>=3 dB == NMSE<=-3 dB. 연속 objective가 따로 있어
-        # -3 dB에 도달한 뒤에도 더 좋은 2 kHz 성능을 최적화한다.
-        two_khz_guard = torch.relu(octave_family_worst[4] + 3.0)
+        # 2 kHz의 과거 3 dB hard gate는 제거하고, 양의 감쇠(증폭 방지)만
+        # 보조 hinge로 유지한다.
+        two_khz_guard = torch.relu(
+            octave_family_worst[4]
+            + float(self.loss_config.two_khz_minimum_attenuation_db)
+        )
         family_cells = torch.stack(tuple(octave_family_cells))
         thresholds = torch.tensor(
-            [0.0, 0.0, 0.0, 0.0, -3.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
             dtype=family_cells.dtype,
             device=family_cells.device,
         ).unsqueeze(1)
         cell_violations = torch.relu(family_cells - thresholds)
         sentinel_threshold = -float(
-            self.loss_config.one_point_six_khz_training_margin_db
-        )
+            self.loss_config.one_point_six_khz_minimum_attenuation_db
+        ) - float(self.loss_config.one_point_six_khz_training_margin_db)
         sentinel_violations = torch.relu(
             sentinel_family_stack - sentinel_threshold
         )
@@ -536,7 +544,7 @@ class Stage2TwoKilohertzLoss(nn.Module):
             + float(self.loss_config.low_mid_positive_guard_weight) * low_mid_guard
             + float(self.loss_config.one_point_six_khz_positive_guard_weight)
             * sentinel_guard
-            + float(self.loss_config.two_khz_three_db_guard_weight) * two_khz_guard
+            + float(self.loss_config.two_khz_positive_guard_weight) * two_khz_guard
             + self.lambda_dnh * dnh
         )
         if not torch.isfinite(objective):
@@ -569,13 +577,16 @@ class Stage2TwoKilohertzLoss(nn.Module):
                 "stage2_one_point_six_khz_training_margin_db": float(
                     self.loss_config.one_point_six_khz_training_margin_db
                 ),
+                "stage2_one_point_six_khz_minimum_attenuation_db": float(
+                    self.loss_config.one_point_six_khz_minimum_attenuation_db
+                ),
                 "stage2_one_point_six_khz_sentinel_valid_items": float(
                     sentinel_count
                 ),
                 "stage2_one_point_six_khz_sentinel_density_min_ratio": float(
                     sentinel_density[sentinel_valid].min().detach()
                 ),
-                "stage2_two_khz_three_db_guard": float(two_khz_guard.detach()),
+                "stage2_two_khz_positive_guard": float(two_khz_guard.detach()),
                 "stage2_two_khz_objective_nmse_db": float(stacked[4].detach()),
                 "stage2_dnh": float(dnh.detach()),
                 "stage2_dnh_lambda": self.lambda_dnh,
@@ -587,7 +598,7 @@ class Stage2TwoKilohertzLoss(nn.Module):
                 "stage2_actual_target_density_rechecked": 1.0,
                 "stage2_generic_stage1_loss_used": 0.0,
                 "stage2_full_octave_v3_loss_used": 0.0,
-                "stage2_two_khz_three_db_is_minimum_not_cap": 1.0,
+                "stage2_two_khz_positive_is_secondary_diagnostic": 1.0,
             }
         )
         return objective, metrics

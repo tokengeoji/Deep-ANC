@@ -30,8 +30,8 @@ channels:
 
 stage2_2khz:
   generation: rt5640_stage2_2khz_s32_v1
-  contract_id: broadband_2khz_octave_88_2828_v1
-  contract_sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+  contract_id: broadband_2khz_octave_88_2828_v2
+  contract_sha256: 2dd8e1a9784093dded47ac0df9ab84789fc61dc37102f920dcb7d9f8933ac700
   source_int16_plan_schema: stage2_2khz_time_separated_lower_guard_dpss_plan_v2
   source_int16_plan_role: signal_only_live_safe_fallback_no_audio_authority
   q15_to_s32_left_shift: 16

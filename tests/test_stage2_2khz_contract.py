@@ -13,7 +13,7 @@ from deep_anc.dsp.stage2_2khz_contract import (
 
 
 _STAGE2_FROZEN_DIGEST = (
-    "70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf"
+    "2dd8e1a9784093dded47ac0df9ab84789fc61dc37102f920dcb7d9f8933ac700"
 )
 _FULL_OCTAVE_V3_FROZEN_DIGEST = (
     "53579b9ff8419ac19fb2458c29a3e8a94ffbb2eeb88cc07f34b76c68033989f2"
@@ -23,7 +23,7 @@ _FULL_OCTAVE_V3_FROZEN_DIGEST = (
 def test_stage2_contract_is_separate_exact_and_frozen() -> None:
     contract = Stage2TwoKilohertzContract.canonical()
 
-    assert contract.contract_id == "broadband_2khz_octave_88_2828_v1"
+    assert contract.contract_id == "broadband_2khz_octave_88_2828_v2"
     assert contract.physical_identification_subbands_hz == (
         STAGE2_2KHZ_PHYSICAL_IDENTIFICATION_SUBBANDS_HZ
     )
@@ -45,7 +45,8 @@ def test_stage2_contract_is_separate_exact_and_frozen() -> None:
         "environment",
         "machine",
     )
-    assert contract.two_khz_octave_minimum_attenuation_db == 3.0
+    assert contract.two_khz_octave_minimum_attenuation_db == 0.0
+    assert contract.two_khz_threshold_semantics == "strictly_greater_than"
     assert contract.do_no_harm_max_worst10_amplification_db == 1.0
     assert contract.single_point_only is True
     assert contract.spatial_quiet_zone_claim_allowed is False
@@ -86,7 +87,7 @@ def test_stage2_addition_does_not_change_full_octave_v3_digest() -> None:
         ("required_excitation_upper_hz", 2828.4271247461, "2,828"),
         ("source_families", ("speech", "music"), "네 family"),
         ("minimum_groups_per_family_octave", 3, "하한 4"),
-        ("two_khz_octave_minimum_attenuation_db", 2.99, "최소 감쇠 3"),
+        ("two_khz_octave_minimum_attenuation_db", -0.01, "증폭 방지 하한 0"),
         ("do_no_harm_max_worst10_amplification_db", 1.01, "증폭 한도 1"),
     ],
 )

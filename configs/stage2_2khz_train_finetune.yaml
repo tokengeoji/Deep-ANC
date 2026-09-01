@@ -7,8 +7,8 @@ seed: 20260803
 init_eligible: false
 
 control_band_contract:
-  id: broadband_2khz_octave_88_2828_v1
-  sha256: 70fc33d20a43bedaa5a51f8e19aed12fff687d8fb3901501f4a49bf2746d97cf
+  id: broadband_2khz_octave_88_2828_v2
+  sha256: 2dd8e1a9784093dded47ac0df9ab84789fc61dc37102f920dcb7d9f8933ac700
 
 initialization:
   mode: completed_stage2_scratch_pretrain_weight_only
@@ -27,8 +27,8 @@ criterion:
   generic_stage1_criterion_allowed: false
   objective_octaves_hz: [125.0, 250.0, 500.0, 1000.0, 2000.0]
   one_point_six_khz_sentinel_band_hz: [1425.437949, 1795.939277]
-  one_point_six_khz_minimum_attenuation_db: 0.0
-  two_khz_minimum_attenuation_db: 3.0
+  one_point_six_khz_minimum_attenuation_db: 6.0
+  two_khz_minimum_attenuation_db: 0.0
   do_no_harm_octaves_hz: [4000.0, 8000.0]
   implementation_receipt:
     path: null
