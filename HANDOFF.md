@@ -45,9 +45,11 @@ PYTHONPATH=src .venv/bin/python scripts/jetson/check_rt5640_j511.py \
 ### 코드·데이터 준비 상태
 
 - same-card `S32_LE` 48 kHz/256-frame actual P/S의 full-PE **24초 plan**, no-audio
-  preflight, no-audio capture admission이 준비돼 있다. 현 capture adapter는 actual raw
-  publisher가 아직 없으므로 live backend 접근 전에 계속 fail-closed한다. 이는 실측을
-  건너뛰기 위한 우회가 아니라, 출력 전에 오류를 막는 경계다.
+  preflight, zero-only disarmed capture adapter, immutable no-replace raw publisher가
+  준비돼 있다. 새 CLI는 preflight·명시 gate·stream-start 후 실제 `hw_params`/route/
+  J511/PCM 점검이 모두 PASS하기 전에는 nonzero 출력을 arm하지 않는다. 현재 장비의
+  J511 `None` 때문에 live backend는 여전히 fail-closed한다. 이는 실측을 건너뛰기 위한
+  우회가 아니라, 출력 전에 오류를 막는 경계다.
 - Stage-2 2 kHz recorded coverage는 기존 19-row Stage-1과 분리했다. 필요한 최소량은
   **47 independent component/session** (`train=16`, `val=15`, `test=16`)이며, 모든 slot은
   2 kHz objective와 1.6 kHz sentinel을 요구한다. 아직 실제 candidate WAV/source-plan,
@@ -70,8 +72,8 @@ PYTHONPATH=src .venv/bin/python scripts/jetson/check_rt5640_j511.py \
 ### 다음 순서 (출력은 한 번의 짧은 창으로만)
 
 1. HDA breakout/harness를 실제 결합하고 no-audio `HP`/`HS` 3회 gate를 통과한다.
-2. actual raw publisher의 무음 dry-run과 post-start S32 route/hw_params receipt를
-   검증한다.
+2. `scripts/jetson/measure_stage2_2khz_actual_ps_s32.py --dry-run`과 post-start S32
+   receipt validator를 검증한다. (현재 코드 dry-run은 backend/PCM/file write가 0이다.)
 3. 사용자 입회·최소 볼륨에서 fresh level meter 20초와 full-PE P/S 24초를 한 번의
    출력 창(총 audible 약 44초)으로 실행한다. 종료 즉시 출력 종료·분리를 안내하고 raw를
    먼저 immutable SHA로 고정한다.
@@ -154,8 +156,8 @@ DAC를 다시 시도하지 않고 `ADMAIF1 ↔ I2S1 ↔ RT5640/J511` common-cloc
    `HS`인지 3회 확인한다. `None`이면 HDA harness/headphone-jack detect를 해결하며
    mixer/pinmux를 추측으로 변경하지 않는다. 단순 TRS/TRRS adapter는 header의 detect
    배선을 대체하지 않는다.
-2. PCM 전역 비점유와 새 S32 dry-run을 재확인한다. 그 뒤에만 actual P/S plan과
-   same-card disarmed capture adapter를 별도 review/commit한다.
+2. PCM 전역 비점유와 새 S32 dry-run을 재확인한다. 그 뒤 exact clean commit에서만
+   actual P/S live adapter를 실행한다.
 3. 그 adapter의 무음 dry-run이 통과하면 한 번의 짧은 fresh meter→P/S 출력 창을
    설계한다. raw를 먼저 고정하고, 분석/plant binding/pretrain은 raw receipt가 PASS한
    뒤에만 수행한다.

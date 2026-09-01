@@ -113,6 +113,12 @@ AUDIO_ENTRY_POINTS: dict[str, tuple[bool, bool, str]] = {
         True,
         "RT5640 공유-rate 후보의 exact-zero 전이중 smoke. 물리 분리와 APE 전역 점유 게이트",
     ),
+    "scripts/jetson/measure_stage2_2khz_actual_ps_s32.py": (
+        True,
+        True,
+        "RT5640/J511 same-card S32 actual P/S raw-first 측정. preflight·zero-only arm·"
+        "post-start hw_params/route/PCM receipt를 통과한 한 번의 캡처만 허용",
+    ),
     "scripts/demo/evaluate_fxlms_direct.py": (True, True, "FxLMS 실기 평가"),
 }
 
