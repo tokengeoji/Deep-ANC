@@ -16,6 +16,13 @@ Stage-2 loss에 함께 봉인한다. **현재 이 기준을 충족한 checkpoint
 SHA-256 `2dd8e1a9784093dded47ac0df9ab84789fc61dc37102f920dcb7d9f8933ac700`. v1의
 3 dB 의미를 새 결과에 섞지 않는다.
 
+기존 `assets/measured/primary_path_il_strict_5dc06fdd.npz`/`secondary...npz`에는
+1.6 kHz 주변 성분이 일부 들어 있지만, 이것은 현행 v2 authority가 아니다. 메타데이터상
+일관성 대역은 `150--1600 Hz`, 자극 상한은 P `1648 Hz`·S `1640 Hz`이고, 출력은
+USB AB13X `Audio` 카드였다. 새 sentinel 전체 `[1425.438, 1795.939) Hz`와 v2
+식별 상한 `2828.427 Hz`를 덮지 않으며, 현재 요구하는 RT5640/J511 same-card 경로에도
+결속되지 않는다. 따라서 이 파일은 진단용으로만 남기고 새 P/S raw 없이 학습을 열지 않는다.
+
 ## 최우선 현행 상태 — physical P/S·pretrain 차단 원인 (2026-09-01)
 
 아래의 누적 기록은 forensic evidence로 보존한다. **현재 다음 행동과 학습 허용 판정은 이
