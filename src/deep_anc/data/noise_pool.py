@@ -20,6 +20,24 @@ from .manifest import read_manifest
 MAX_DECODED_PCM_ABS = 2.0
 MIN_DECODED_RMS = 1e-8
 
+# audit_decoder_eligibility의 segment_grid는 파일 전체를 성기게(기본 8개
+# 65536-frame 창) 표본화한다 — 실측(dns_fullband/c5RJ2TPfSEM.wav)으로 grid
+# 지점 하나가 이미 rms=6.4e-05로 threshold 근접 통과함을 확인했다. 그 창보다
+# 짧거나 다르게 걸친 학습 시점 랜덤 위치가 진짜 무음(rms<=MIN_DECODED_RMS)
+# 서브구간에 걸리는 건 decoder drift가 아니라 grid가 놓친 자연스러운 조용한
+# 구간일 수 있다. 같은 파일 안에서만 몇 번 더 뽑아보고, 그래도 무음이면
+# (파일이 아니라 여전히 같은 파일) 기존과 같이 즉시 중단한다.
+MAX_SAME_FILE_SILENCE_RETRIES = 4
+
+
+class _DecodedSilenceError(RuntimeError):
+    """decoder segment RMS가 무음 임계값 이하일 때만 쓰는 전용 예외.
+
+    canonical_decoder_audited 모드에서 이 예외만 같은 파일 안 다른 위치로
+    제한된 횟수만큼 재시도한다. 그 외 decode 실패(OSError/rate 불일치/PCM
+    범위 초과/frame 수 불일치 등)는 여전히 첫 시도에 즉시 중단한다 — 그건
+    "grid가 놓친 조용한 구간"이 아니라 진짜 decoder drift다."""
+
 
 class NoisePool:
     """Manifest 기반 랜덤 세그먼트 샘플러.
@@ -160,89 +178,104 @@ class NoisePool:
                     raise ValueError(f"잘못된 sample rate: {file_sr}")
                 need_src = int(np.ceil(n_samples * file_sr / self.sample_rate)) + 16
 
-                validated_snapshot = entry.get("_validated_file_snapshot")
-                if isinstance(validated_snapshot, dict):
-                    # 먼저 header/stat를 읽고, 선택된 구간도 같은 검증 경로에서 다시
-                    # O_NOFOLLOW fd로 읽는다. 두 open 사이 retarget은 stat contract가 막는다.
-                    _probe, verified_rate, total = self._read_validated_audio(
-                        entry, start=0, stop=0
-                    )
-                    if verified_rate != file_sr:
-                        raise ValueError(
-                            f"manifest/sample-rate header 불일치: {verified_rate} != {file_sr}"
+                def _decode_once() -> np.ndarray:
+                    validated_snapshot = entry.get("_validated_file_snapshot")
+                    if isinstance(validated_snapshot, dict):
+                        # 먼저 header/stat를 읽고, 선택된 구간도 같은 검증 경로에서 다시
+                        # O_NOFOLLOW fd로 읽는다. 두 open 사이 retarget은 stat contract가 막는다.
+                        _probe, verified_rate, total = self._read_validated_audio(
+                            entry, start=0, stop=0
                         )
-                    if total <= need_src:
-                        data, decoded_rate, _total = self._read_validated_audio(
-                            entry, start=None, stop=None
-                        )
+                        if verified_rate != file_sr:
+                            raise ValueError(
+                                f"manifest/sample-rate header 불일치: {verified_rate} != {file_sr}"
+                            )
+                        if total <= need_src:
+                            data, decoded_rate, _total = self._read_validated_audio(
+                                entry, start=None, stop=None
+                            )
+                        else:
+                            start = int(draw_rng.integers(0, total - need_src))
+                            data, decoded_rate, _total = self._read_validated_audio(
+                                entry, start=start, stop=start + need_src
+                            )
+                        if decoded_rate != file_sr:
+                            raise ValueError(
+                                "manifest/decoder read sample-rate 불일치: "
+                                f"{decoded_rate} != {file_sr}"
+                            )
                     else:
-                        start = int(draw_rng.integers(0, total - need_src))
-                        data, decoded_rate, _total = self._read_validated_audio(
-                            entry, start=start, stop=start + need_src
+                        info = sf.info(path)
+                        total = int(info.frames)
+                        info_rate = int(info.samplerate)
+                        if info_rate != file_sr:
+                            raise ValueError(
+                                "manifest/decoder header sample-rate 불일치: "
+                                f"{info_rate} != {file_sr}"
+                            )
+                        if total <= need_src:
+                            data, decoded_rate = sf.read(
+                                path, dtype="float32", always_2d=True
+                            )
+                        else:
+                            start = int(draw_rng.integers(0, total - need_src))
+                            data, decoded_rate = sf.read(
+                                path,
+                                start=start,
+                                stop=start + need_src,
+                                dtype="float32",
+                                always_2d=True,
+                            )
+                        if int(decoded_rate) != file_sr:
+                            raise ValueError(
+                                "manifest/decoder read sample-rate 불일치: "
+                                f"{decoded_rate} != {file_sr}"
+                            )
+                    mono = data.mean(axis=1)
+                    if mono.size == 0 or not np.isfinite(mono).all():
+                        raise RuntimeError("비어 있거나 유한하지 않은 오디오")
+                    decoded_peak = float(np.max(np.abs(mono)))
+                    if decoded_peak > MAX_DECODED_PCM_ABS:
+                        raise RuntimeError(
+                            "decoder가 PCM 범위를 벗어난 값을 반환했습니다: "
+                            f"peak={decoded_peak:.6g} > {MAX_DECODED_PCM_ABS}"
                         )
-                    if decoded_rate != file_sr:
-                        raise ValueError(
-                            "manifest/decoder read sample-rate 불일치: "
-                            f"{decoded_rate} != {file_sr}"
+                    decoded_rms = float(np.sqrt(np.mean(mono * mono)))
+                    if decoded_rms <= MIN_DECODED_RMS:
+                        raise _DecodedSilenceError(
+                            "decoder segment가 무음/퇴화했습니다: "
+                            f"rms={decoded_rms:.6g} <= {MIN_DECODED_RMS}"
                         )
-                else:
-                    info = sf.info(path)
-                    total = int(info.frames)
-                    info_rate = int(info.samplerate)
-                    if info_rate != file_sr:
-                        raise ValueError(
-                            "manifest/decoder header sample-rate 불일치: "
-                            f"{info_rate} != {file_sr}"
-                        )
-                    if total <= need_src:
-                        data, decoded_rate = sf.read(
-                            path, dtype="float32", always_2d=True
-                        )
-                    else:
-                        start = int(draw_rng.integers(0, total - need_src))
-                        data, decoded_rate = sf.read(
-                            path,
-                            start=start,
-                            stop=start + need_src,
-                            dtype="float32",
-                            always_2d=True,
-                        )
-                    if int(decoded_rate) != file_sr:
-                        raise ValueError(
-                            "manifest/decoder read sample-rate 불일치: "
-                            f"{decoded_rate} != {file_sr}"
-                        )
-                mono = data.mean(axis=1)
-                if mono.size == 0 or not np.isfinite(mono).all():
-                    raise RuntimeError("비어 있거나 유한하지 않은 오디오")
-                decoded_peak = float(np.max(np.abs(mono)))
-                if decoded_peak > MAX_DECODED_PCM_ABS:
-                    raise RuntimeError(
-                        "decoder가 PCM 범위를 벗어난 값을 반환했습니다: "
-                        f"peak={decoded_peak:.6g} > {MAX_DECODED_PCM_ABS}"
-                    )
-                decoded_rms = float(np.sqrt(np.mean(mono * mono)))
-                if decoded_rms <= MIN_DECODED_RMS:
-                    raise RuntimeError(
-                        "decoder segment가 무음/퇴화했습니다: "
-                        f"rms={decoded_rms:.6g} <= {MIN_DECODED_RMS}"
-                    )
 
-                if file_sr != self.sample_rate:
-                    from math import gcd
+                    if file_sr != self.sample_rate:
+                        from math import gcd
 
-                    g = gcd(file_sr, self.sample_rate)
-                    mono = signal.resample_poly(
-                        mono, self.sample_rate // g, file_sr // g
-                    )
+                        g = gcd(file_sr, self.sample_rate)
+                        mono = signal.resample_poly(
+                            mono, self.sample_rate // g, file_sr // g
+                        )
 
-                if not np.isfinite(mono).all():
-                    raise RuntimeError("resample 뒤 오디오가 유한하지 않습니다")
+                    if not np.isfinite(mono).all():
+                        raise RuntimeError("resample 뒤 오디오가 유한하지 않습니다")
 
-                if mono.size < n_samples:
-                    reps = int(np.ceil(n_samples / mono.size))
-                    mono = np.tile(mono, reps)
-                return mono[:n_samples].astype(np.float32)
+                    if mono.size < n_samples:
+                        reps = int(np.ceil(n_samples / mono.size))
+                        mono = np.tile(mono, reps)
+                    return mono[:n_samples].astype(np.float32)
+
+                silence_retries = (
+                    MAX_SAME_FILE_SILENCE_RETRIES
+                    if self.canonical_decoder_audited
+                    else 0
+                )
+                for silence_attempt in range(silence_retries + 1):
+                    try:
+                        return _decode_once()
+                    except _DecodedSilenceError:
+                        if silence_attempt == silence_retries:
+                            raise
+                        continue
+                raise AssertionError("unreachable")
             except (OSError, RuntimeError, ValueError) as exc:
                 if self.canonical_decoder_audited:
                     raise self._canonical_decode_failure(entry, exc) from exc

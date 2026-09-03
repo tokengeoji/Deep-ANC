@@ -55,7 +55,14 @@ def _pool(tmp_path: Path, *, canonical_decoder_audited: bool) -> tuple[NoisePool
 
 @pytest.mark.parametrize(
     "fault",
-    ("read_error", "nonfinite", "peak", "header_rate_drift", "read_rate_drift"),
+    (
+        "read_error",
+        "nonfinite",
+        "peak",
+        "header_rate_drift",
+        "read_rate_drift",
+        "silence",
+    ),
 )
 def test_canonical_audited_pool_does_not_hide_decode_contract_failure(
     tmp_path, monkeypatch, fault
@@ -87,6 +94,8 @@ def test_canonical_audited_pool_does_not_hide_decode_contract_failure(
                 return np.full((128, 1), 4.0, dtype=np.float32), FS
             if fault == "read_rate_drift":
                 return np.ones((128, 1), dtype=np.float32), 44_100
+            if fault == "silence":
+                return np.full((128, 1), 1e-10, dtype=np.float32), FS
         return np.ones((128, 1), dtype=np.float32), FS
 
     monkeypatch.setattr("deep_anc.data.noise_pool.sf.info", fake_info)
@@ -116,6 +125,68 @@ def test_legacy_pool_retries_header_rate_drift(tmp_path, monkeypatch):
 
     def fake_read(path, **_kwargs):
         assert Path(path) == healthy
+        return np.ones((128, 1), dtype=np.float32), FS
+
+    monkeypatch.setattr("deep_anc.data.noise_pool.sf.info", fake_info)
+    monkeypatch.setattr("deep_anc.data.noise_pool.sf.read", fake_read)
+
+    segment = pool.sample_segment(64)
+
+    assert np.all(segment == 1.0)
+    assert pool._active_weights[0] == 0.0
+
+
+def test_canonical_audited_pool_retries_transient_silence_within_same_file(
+    tmp_path, monkeypatch
+):
+    """audit의 segment_grid는 파일 전체를 성기게 표본화하므로, grid가 놓친
+    짧은 자연스러운 무음 구간에 학습 시점 랜덤 위치가 걸릴 수 있다(실측:
+    dns_fullband/c5RJ2TPfSEM.wav). 이건 decoder drift가 아니므로 같은 파일
+    안에서 몇 번 더 시도해 살아나야 하고, healthy entry로 바꿔치기하면 안
+    되며 active_weights도 건드리면 안 된다."""
+
+    pool, corrupt, healthy = _pool(tmp_path, canonical_decoder_audited=True)
+    before = pool._active_weights.copy()
+    accessed: list[Path] = []
+    read_calls = {"n": 0}
+
+    def fake_info(path):
+        return SimpleNamespace(frames=128, samplerate=FS, channels=1)
+
+    def fake_read(path, **_kwargs):
+        candidate = Path(path)
+        accessed.append(candidate)
+        if candidate == corrupt:
+            read_calls["n"] += 1
+            if read_calls["n"] <= 2:
+                return np.full((128, 1), 1e-10, dtype=np.float32), FS
+            return np.full((128, 1), 0.5, dtype=np.float32), FS
+        return np.ones((128, 1), dtype=np.float32), FS
+
+    monkeypatch.setattr("deep_anc.data.noise_pool.sf.info", fake_info)
+    monkeypatch.setattr("deep_anc.data.noise_pool.sf.read", fake_read)
+
+    segment = pool.sample_segment(64)
+
+    assert np.all(segment == 0.5)
+    assert read_calls["n"] == 3
+    assert all(path != healthy for path in accessed)
+    assert np.array_equal(pool._active_weights, before)
+
+
+def test_legacy_pool_switches_file_immediately_on_silence(tmp_path, monkeypatch):
+    """legacy/diagnostic pool은 무음도 기존처럼 같은 위치를 다시 시도하지
+    않고 바로 다른 entry로 넘어간다 — canonical 전용 재시도가 새어들면 안
+    된다."""
+
+    pool, corrupt, healthy = _pool(tmp_path, canonical_decoder_audited=False)
+
+    def fake_info(path):
+        return SimpleNamespace(frames=128, samplerate=FS, channels=1)
+
+    def fake_read(path, **_kwargs):
+        if Path(path) == corrupt:
+            return np.full((128, 1), 1e-10, dtype=np.float32), FS
         return np.ones((128, 1), dtype=np.float32), FS
 
     monkeypatch.setattr("deep_anc.data.noise_pool.sf.info", fake_info)
