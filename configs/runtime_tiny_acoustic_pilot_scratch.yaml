@@ -55,14 +55,19 @@ safety:
   deadline_window_s: 1.0
   deadline_miss_rate_mute: 0.2
 
-  divergence_ratio: 4.0
-  divergence_hold_s: 0.5
+  # 2026-09-04: 실측(A키 대화형 nonlinear 테스트)에서 안티노이즈 자체가 에러를
+  # +5.7dB 키우는 발산이 실제로 발생·확정된 것을 확인했다. 성능이 낮은 것은
+  # 감수하되 증폭은 절대 허용하지 않는다는 요구에 맞춰, 의심 임계값(4.0→2.5배)과
+  # 반응 지연(0.5s→0.3s)을 낮춰 더 이르고 더 작은 증폭에서도 반응하게 한다.
+  # probe_confirm_ratio는 검증 규칙(1.0 < confirm < ratio)에 맞춰 함께 낮춘다.
+  divergence_ratio: 2.5
+  divergence_hold_s: 0.3
   divergence_rate_mute: 0.5
   baseline_floor_power: 1.0e-8
   baseline_tau_s: 1.0
   baseline_grace_s: 3.0
   divergence_probe_s: 1.0
-  divergence_probe_confirm_ratio: 2.0
+  divergence_probe_confirm_ratio: 1.8
   divergence_probe_limit: 3
   divergence_probe_clear_s: 10.0
 
