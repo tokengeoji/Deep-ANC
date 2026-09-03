@@ -291,6 +291,79 @@ def test_ort_failure_leaves_no_final_or_staging_orphan(tmp_path, monkeypatch):
     assert not list(output.parent.glob("*.partial"))
 
 
+def test_acoustic_reference_checkpoint_does_not_require_training_timing_contract(
+    tmp_path, monkeypatch
+):
+    """acoustic-reference checkpoint의 data config에는 digital 전용 timeline lead
+    유도용 training_timing_contract가 없다 — export가 이를 요구하면 안 된다
+    (실측: configs/data_sim_acoustic_pilot.yaml로 학습한 acoustic pilot checkpoint에서
+    재현됨). 이 필드가 없어도 export가 (여기선 mocked) ORT 단계까지 도달해야 한다."""
+
+    exporter = _load_exporter()
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint-fixture")
+    output = tmp_path / "export/model.onnx"
+    state = {
+        "cfg": {
+            "model": {"name": "hybrid_anc_tiny"},
+            "data": {"reference_mode": "acoustic"},
+            "control_band_contract_sha256": "a" * 64,
+        },
+        "model": {},
+    }
+
+    class FakeModel:
+        in_channels = 2
+        hop = 128
+        win = 256
+
+        def load_state_dict(self, _state):
+            return None
+
+        def eval(self):
+            return self
+
+        def init_states(self, _batch, _device):
+            return []
+
+    class SessionOptions:
+        intra_op_num_threads = 0
+        inter_op_num_threads = 0
+
+    def fake_export(_wrapper, _inputs, handle, **_kwargs):
+        handle.write(b"staged-onnx-before-ort-failure")
+
+    monkeypatch.setattr(exporter.torch, "load", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(exporter, "build_model", lambda _cfg: FakeModel())
+    monkeypatch.setattr(exporter, "ExportWrapper", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(exporter, "state_names", lambda _model: [])
+    monkeypatch.setattr(exporter, "flatten_states", lambda _states: [])
+    monkeypatch.setattr(exporter.torch.onnx, "export", fake_export)
+    monkeypatch.setattr(
+        exporter,
+        "validate_embedded_experiment_contract",
+        lambda _cfg: {"sha256": "b" * 64, "artifacts": {}},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "onnxruntime",
+        SimpleNamespace(
+            SessionOptions=SessionOptions,
+            InferenceSession=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("fixture ORT open failure")
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(SCRIPT), "--ckpt", str(checkpoint), "--out", str(output)],
+    )
+
+    with pytest.raises(RuntimeError, match="ORT open failure"):
+        exporter.main()
+
+
 def _runtime_identity_fixture(root: Path):
     primary = root / "primary.npz"
     secondary = root / "secondary.npz"

@@ -269,7 +269,18 @@ def main() -> int:
     if not isinstance(checkpoint_cfg, dict):
         raise ValueError("checkpoint에 resolved cfg가 없습니다")
     experiment_contract = validate_embedded_experiment_contract(checkpoint_cfg)
-    timing = TrainingTimingContract.from_data_config(checkpoint_cfg.get("data") or {})
+    # training_timing_contract는 digital-reference 전용 timeline lead 유도에만
+    # 쓰인다(runtime의 digital_reference_lead_samples와 달리, acoustic-reference
+    # checkpoint의 data config에는 애초에 이 필드가 없다 — reference mic 입력에는
+    # 이 lead 개념 자체가 전이되지 않는다, configs/runtime_tiny_mic_diagnostic.yaml
+    # 참고). 이 SHA는 canonical Stage-1/Stage-2 admission에서만 대조되고, 이 스크립트가
+    # 쓰는 단순 runtime 로딩 경로(engines.py)는 참조하지 않는다.
+    reference_mode = str((checkpoint_cfg.get("data") or {}).get("reference_mode", "digital"))
+    timing_sha = (
+        TrainingTimingContract.from_data_config(checkpoint_cfg.get("data") or {}).digest()
+        if reference_mode == "digital"
+        else ""
+    )
     control_band_sha = str(checkpoint_cfg.get("control_band_contract_sha256", ""))
     if len(control_band_sha) != 64:
         raise ValueError("checkpoint에 control_band_contract_sha256가 없습니다")
@@ -367,7 +378,7 @@ def main() -> int:
             "model_name": model_cfg.get("name"),
             "experiment_contract_sha256": experiment_contract["sha256"],
             "control_band_contract_sha256": control_band_sha,
-            "training_timing_contract_sha256": timing.digest(),
+            "training_timing_contract_sha256": timing_sha,
             "checkpoint_path": str(checkpoint_path),
             "checkpoint_sha256": checkpoint_sha,
             "digital_reference_lead_samples": checkpoint_digital_reference_lead_samples(state),
