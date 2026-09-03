@@ -1,0 +1,11 @@
+.venv
+.git
+data
+results
+runs/**
+!runs/export
+!runs/export/**
+tests
+docs
+*.pem
+notebook_todo.md

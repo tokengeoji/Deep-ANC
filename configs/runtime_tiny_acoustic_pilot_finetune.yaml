@@ -1,0 +1,91 @@
+# acoustic-reference pilot(finetune, pretrain_tiny_corrected에서 이어받음) 실측
+# — hybrid_anc_tiny + ONNX Runtime.
+#
+# configs/runtime_tiny_mic_diagnostic.yaml 과 engine/hardware/duct 는 완전히 같고
+# checkpoint만 configs/train_acoustic_pilot_finetune.yaml 로 방금 학습한 결과로
+# 바꾼 실측 전용 변형이다. 2026-09-03.
+#
+# ⚠ 이 checkpoint(runs/acoustic_pilot_finetune/ckpt/best.pt)는
+# reference_mode=acoustic, experiment_role=performance_pilot 으로 8000 step만
+# 학습한 pilot이다 — canonical 배포 자격이 아니다. 시뮬레이션 val NMSE가 학습
+# 초반부터 0.00dB에 고정된 상태라 실측으로 진짜 상쇄가 있는지부터 확인한다.
+#
+# 실행 예 (evaluate_session.py 실측 OFF/ON/OFF 리포트, composite 파형만):
+# .venv/bin/python scripts/demo/evaluate_session.py \
+#   --config configs/runtime_tiny_acoustic_pilot_finetune.yaml --controllers dl \
+#   --scenarios multitone_stage1 nonlinear_stage1 --dry-run
+# (dry-run PASS 확인 뒤에만) --confirm-speaker --confirm-user-present --confirm-volume-minimum 추가.
+
+hardware_config: configs/hardware_jetson.yaml
+duct_config: configs/duct.yaml
+
+hop: 256
+reference: mic
+controller: dl
+
+# acoustic-reference 전용 규약: 반드시 0.
+digital_reference_lead_samples: 0
+
+engine:
+  type: ort
+  ckpt: runs/acoustic_pilot_finetune/ckpt/best.pt
+  onnx: runs/export/acoustic_pilot_finetune.onnx
+  cpu_affinity: [4, 5, 6, 7]
+
+fxlms:
+  control_length: 256
+  mu: 0.05
+  leakage: 1.0e-6
+  weight_norm_limit: 20.0
+
+safety:
+  # configs/runtime_tiny.yaml 과 동일 규약 — 근거는 그 파일 주석과
+  # src/deep_anc/realtime/safety.py 의 SafetyLimits docstring.
+  control_limit: 0.2
+  fade_ms: 20
+
+  saturation_ratio: 0.95
+  saturation_fraction: 0.5
+  saturation_window_s: 1.0
+  saturation_rate_mute: 0.5
+
+  output_rms_ratio: 0.6
+  rms_window_s: 1.0
+  rms_rate_mute: 0.5
+
+  deadline_window_s: 1.0
+  deadline_miss_rate_mute: 0.2
+
+  divergence_ratio: 4.0
+  divergence_hold_s: 0.5
+  divergence_rate_mute: 0.5
+  baseline_floor_power: 1.0e-8
+  baseline_tau_s: 1.0
+  baseline_grace_s: 3.0
+  divergence_probe_s: 1.0
+  divergence_probe_confirm_ratio: 2.0
+  divergence_probe_limit: 3
+  divergence_probe_clear_s: 10.0
+
+  output_dc_limit_ratio: 0.05
+  output_dc_window_s: 0.2
+  output_dc_rate_mute: 0.5
+  output_dc_blocker_r: 0.9995
+  output_dc_lowpass_hz: 2.0
+  output_dc_ac_dominance: 0.3
+  output_dc_hard_ratio: 0.5
+
+  handoff_window_s: 1.0
+  handoff_drop_rate_mute: 0.2
+
+noise:
+  type: band
+  frequency: 300.0
+  amplitude: 0.03
+  band: [80.0, 1000.0]
+  file: null
+  seed: 20260801
+
+record: null
+run_seconds: 0.0
+start_on: false
