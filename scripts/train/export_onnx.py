@@ -281,9 +281,13 @@ def main() -> int:
         if reference_mode == "digital"
         else ""
     )
-    control_band_sha = str(checkpoint_cfg.get("control_band_contract_sha256", ""))
-    if len(control_band_sha) != 64:
-        raise ValueError("checkpoint에 control_band_contract_sha256가 없습니다")
+    # control_band_contract_sha256도 canonical Stage-1/Stage-2 admission이 통과한
+    # checkpoint에만 stamp된다 — performance_pilot 등 admission을 거치지 않은 실험
+    # role은 이 필드가 애초에 None이다(실측: acoustic pilot checkpoint에서 확인).
+    # 값이 있는데 sha256 형식이 아니면(길이 불일치) 여전히 손상 신호이므로 거부한다.
+    control_band_sha = str(checkpoint_cfg.get("control_band_contract_sha256") or "")
+    if control_band_sha and len(control_band_sha) != 64:
+        raise ValueError("checkpoint의 control_band_contract_sha256 형식이 올바르지 않습니다")
     model_cfg = state["cfg"]["model"]
     model = build_model(model_cfg)
     model.load_state_dict(state["model"])

@@ -295,9 +295,12 @@ def test_acoustic_reference_checkpoint_does_not_require_training_timing_contract
     tmp_path, monkeypatch
 ):
     """acoustic-reference checkpoint의 data config에는 digital 전용 timeline lead
-    유도용 training_timing_contract가 없다 — export가 이를 요구하면 안 된다
-    (실측: configs/data_sim_acoustic_pilot.yaml로 학습한 acoustic pilot checkpoint에서
-    재현됨). 이 필드가 없어도 export가 (여기선 mocked) ORT 단계까지 도달해야 한다."""
+    유도용 training_timing_contract가 없고, performance_pilot 등 canonical admission을
+    거치지 않은 role의 control_band_contract_sha256도 None이다 — export가 둘 다
+    요구하면 안 된다(실측: configs/data_sim_acoustic_pilot.yaml로 학습한 acoustic
+    pilot checkpoint에서 재현됨: control_band_contract_sha256=None, experiment_role=
+    performance_pilot). 이 필드들이 없어도 export가 (여기선 mocked) ORT 단계까지
+    도달해야 한다."""
 
     exporter = _load_exporter()
     checkpoint = tmp_path / "checkpoint.pt"
@@ -307,7 +310,8 @@ def test_acoustic_reference_checkpoint_does_not_require_training_timing_contract
         "cfg": {
             "model": {"name": "hybrid_anc_tiny"},
             "data": {"reference_mode": "acoustic"},
-            "control_band_contract_sha256": "a" * 64,
+            "experiment_role": "performance_pilot",
+            "control_band_contract_sha256": None,
         },
         "model": {},
     }
@@ -361,6 +365,39 @@ def test_acoustic_reference_checkpoint_does_not_require_training_timing_contract
     )
 
     with pytest.raises(RuntimeError, match="ORT open failure"):
+        exporter.main()
+
+
+def test_malformed_control_band_contract_sha256_still_rejected(tmp_path, monkeypatch):
+    """None(비-canonical role)은 허용하지만, 값이 있는데 sha256 형식이 아니면
+    여전히 손상 신호이므로 거부해야 한다(회귀 방지)."""
+
+    exporter = _load_exporter()
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint-fixture")
+    output = tmp_path / "export/model.onnx"
+    state = {
+        "cfg": {
+            "model": {"name": "hybrid_anc_tiny"},
+            "data": {"reference_mode": "acoustic"},
+            "control_band_contract_sha256": "not-a-real-sha256",
+        },
+        "model": {},
+    }
+
+    monkeypatch.setattr(exporter.torch, "load", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(
+        exporter,
+        "validate_embedded_experiment_contract",
+        lambda _cfg: {"sha256": "b" * 64, "artifacts": {}},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(SCRIPT), "--ckpt", str(checkpoint), "--out", str(output)],
+    )
+
+    with pytest.raises(ValueError, match="control_band_contract_sha256 형식이 올바르지 않습니다"):
         exporter.main()
 
 
