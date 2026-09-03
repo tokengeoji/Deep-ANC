@@ -56,14 +56,16 @@ safety:
   deadline_window_s: 1.0
   deadline_miss_rate_mute: 0.2
 
-  divergence_ratio: 4.0
-  divergence_hold_s: 0.5
+  # scratch 쪽과 동일하게 강화(2026-09-04, 근거는 presentation/04 4.6절):
+  # 성능이 낮아도 증폭은 절대 허용하지 않는다.
+  divergence_ratio: 2.5
+  divergence_hold_s: 0.3
   divergence_rate_mute: 0.5
   baseline_floor_power: 1.0e-8
   baseline_tau_s: 1.0
   baseline_grace_s: 3.0
   divergence_probe_s: 1.0
-  divergence_probe_confirm_ratio: 2.0
+  divergence_probe_confirm_ratio: 1.8
   divergence_probe_limit: 3
   divergence_probe_clear_s: 10.0
 
