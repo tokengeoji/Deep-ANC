@@ -2153,7 +2153,12 @@ download_mimii() {
     echo "[오류] cache mode에서 legacy MIMII pathname downloader/extractor 호출을 금지합니다. official network fallback도 하지 않습니다." >&2
     return 1
   fi
-  ensure_pget_zip "$ZEN/6529888/files/fan.zip?download=1" "$archive" 8 1
+  # 2026-09-03 실측: Zenodo(6529888/fan.zip)에 pget의 8-way parallel range 요청을
+  # 걸면 모든 워커가 "Last-Modified Range 응답 결속 실패"로 재시도를 소진하고 실패한다
+  # (같은 실행에서 같은 Zenodo 호스트의 DEMAND는 아래와 동일한 ensure_wget_zip 단일
+  # 스트림으로 성공했다 — 서버가 이 record의 범위 요청을 pget이 기대하는 방식으로
+  # 처리하지 못하는 것으로 보인다. DNS(Azure blob)는 pget 그대로 둔다).
+  ensure_wget_zip "$ZEN/6529888/files/fan.zip?download=1" "$archive" 1
   stage=$(mktemp -d "$PWD/.mimii-stage.XXXXXX")
   rmdir "$stage"
   safe_extract_zip "$archive" "$stage"
