@@ -32,6 +32,12 @@ Level-5 unseen, 최소 5개 ERR 위치를 추가로 요구한다. 권위는
 | 세그먼트 분포 | 1s 세그먼트 감쇠의 중앙값 / 최악 10% | — |
 | 실시간 건전성 | step P99(ms), deadline miss, xrun | ↓ |
 
+실시간 UI의 `저감`은 위의 주파수별 감쇠 지표를 대신하지 않는다. ANC OFF baseline과
+현재 ERR의 전력비를 잠정 표시할 뿐이며, 실제 output 데이터·full gate·유효 baseline과
+무결점 stream(xrun/fallback/deadline/engine error 0)이 모두 확인된 경우에만 `VALID`다.
+그 밖에는 `n/a`로 남기고 `INVALID:<사유>`를 표시한다. 주파수별 결과는 반드시 저장된
+OFF/ON raw를 대역별로 재분석한다.
+
 **신뢰 표기**: S(z) 보정 유효대역(현재 **150–1600Hz**, `consistency_band_hz`) 밖의 밴드 수치는 `trusted=False`(*)로
 표기한다 — 광대역 재보정(docs/02 §4) 후 유효대역을 갱신할 것 (설계 L2).
 
@@ -157,7 +163,8 @@ demonstrated/INCONCLUSIVE**로 판정한다. challenge 결과를 학습 데이�
 ```bash
 # 출력 장치를 열지 않는 선행 입력 게이트
 .venv/bin/python scripts/bench/check_audio_input.py
-.venv/bin/python scripts/demo/evaluate_session.py --controllers fxlms dl --scenarios tone300 multitone band nonlinear
+.venv/bin/python scripts/demo/evaluate_session.py --controllers fxlms dl --scenarios tone300 multitone band nonlinear \
+  --confirm-speaker --confirm-user-present --confirm-volume-minimum
 ```
 
 이 live ANC ON 프로토콜은 공식 recorded G4와 natural-crest challenge PASS 뒤에만 연다.

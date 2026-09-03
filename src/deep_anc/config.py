@@ -1092,7 +1092,12 @@ def _finalize_training_metadata(
             duct_cfg=duct,
             sample_rate=sample_rate,
         ).optimize.as_tuple()
-        best_metric_key = "nmse_trusted_cvar_db"
+        loss_cfg = cfg.get("loss") or {}
+        best_metric_key = (
+            "nmse_subband_objective_db"
+            if loss_cfg.get("nmse_objective") == "equal_subband"
+            else "nmse_trusted_cvar_db"
+        )
     derived = {
         "digital_reference_lead_samples": int(
             data.get("digital_reference_lead_samples", 0)

@@ -184,6 +184,78 @@ def test_trusted_nmse_gradient_flows() -> None:
     assert float(y.grad.norm()) > 0.0
 
 
+def test_equal_subband_objective_optimizes_all_four_stage1_bands() -> None:
+    """150–1600Hz 네 구간이 같은 비중으로 동시에 그래디언트를 받는지 검증."""
+
+    samples = FS
+    t = torch.arange(samples, dtype=torch.float32) / FS
+    d = sum(
+        torch.sin(2.0 * torch.pi * frequency * t)
+        for frequency in (200.0, 400.0, 800.0, 1200.0)
+    ).view(1, 1, -1)
+    y = (-0.5 * d).requires_grad_(True)
+    criterion = ANCLoss(
+        _identity_plant(),
+        _loss_cfg(
+            "equal_subband",
+            nmse_subband_guard_alpha=0.25,
+            nmse_cvar_min_k=1,
+        ),
+        FS,
+        trusted_band_hz=(150.0, 1600.0),
+    ).eval()
+
+    loss, metrics = criterion(y, d, perturb={"jitter": 0})
+    loss.backward()
+
+    expected = -6.0206
+    assert metrics["nmse_subband_equal_db"] == pytest.approx(expected, abs=0.02)
+    assert metrics["nmse_subband_objective_db"] == pytest.approx(expected, abs=0.02)
+    assert metrics["nmse_subband_worst_db"] == pytest.approx(expected, abs=0.02)
+    for index, (lo, hi) in enumerate(
+        ((150, 300), (300, 600), (600, 1000), (1000, 1600))
+    ):
+        prefix = f"nmse_subband_{index}_{lo}_{hi}"
+        assert metrics[f"{prefix}_mean_db"] == pytest.approx(expected, abs=0.02)
+        assert metrics[f"{prefix}_objective_db"] == pytest.approx(expected, abs=0.02)
+    assert y.grad is not None
+    assert torch.isfinite(y.grad).all()
+    assert float(y.grad.norm()) > 0.0
+
+
+def test_equal_subband_objective_does_not_optimize_above_1600hz() -> None:
+    """1.6kHz 밖은 equal-subband 목적이 아니라 do-no-harm 역할로 남는다."""
+
+    samples = FS
+    t = torch.arange(samples, dtype=torch.float32) / FS
+    target = sum(
+        torch.sin(2.0 * torch.pi * frequency * t)
+        for frequency in (200.0, 400.0, 800.0, 1200.0)
+    )
+    d = target.view(1, 1, -1)
+    d_with_high = (target + 4.0 * torch.sin(2.0 * torch.pi * 3000.0 * t)).view(
+        1, 1, -1
+    )
+    y = (-0.5 * d).detach()
+    y_with_high = (-0.5 * target + 4.0 * torch.sin(2.0 * torch.pi * 3000.0 * t)).view(
+        1, 1, -1
+    )
+    criterion = ANCLoss(
+        _identity_plant(),
+        _loss_cfg("equal_subband", nmse_subband_guard_alpha=0.25, nmse_cvar_min_k=1),
+        FS,
+        trusted_band_hz=(150.0, 1600.0),
+    ).eval()
+
+    base = criterion(y, d, perturb={"jitter": 0})[1]
+    with_high = criterion(y_with_high, d_with_high, perturb={"jitter": 0})[1]
+
+    assert with_high["nmse_subband_objective_db"] == pytest.approx(
+        base["nmse_subband_objective_db"], abs=1.0e-3
+    )
+    assert with_high["nmse_fullband_db"] > base["nmse_fullband_db"] + 5.0
+
+
 # ======================================================================================
 # 절대목표 2 — 집계가 최악값을 향하는가
 # ======================================================================================

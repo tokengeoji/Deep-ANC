@@ -101,6 +101,12 @@ ONNX·지연 파이프라인을 검증하는 데는 쓸 수 있지만, 실제 no
 ```
 
 - 콜백은 **절대 대기하지 않는다** — 추론 지연 시 무음 폴백 + 데드라인 워치독.
+- 실시간 `저감`은 현재 ERR과 직전 출력값의 단순 dB 차이가 아니다. ANC OFF baseline과
+  현재 ERR 전력의 `10log10(P_baseline/P_error)`이며, 실제 output-ring 데이터·full
+  gate·유효 baseline과 xrun/fallback/deadline/engine error 0을 모두 만족할 때만
+  `VALID`로 표시한다. 조건이 하나라도 깨지면 UI는 `저감=n/a`와
+  `판정=INVALID:<사유>`를 표시한다. 따라서 양의 저감 숫자가 있어도 `VALID`가
+  아니면 성능 주장으로 사용하지 않는다.
 - 파이프라인 핸드오프 = 정확히 1 hop → 학습 플랜트의 `handoff_extra_samples: 256` 와 정합.
   실효 지연 검증: `.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --calibrate --confirm-speaker --confirm-user-present --confirm-volume-minimum`
   (실측과 다르면 원인을 확인하고 P/S 지연·lead를 함께 재산출한 뒤 파인튜닝).
@@ -129,8 +135,19 @@ ONNX·지연 파이프라인을 검증하는 데는 쓸 수 있지만, 실제 no
 # acoustic-reference/recorded 수집은 두 채널 모두 필요
 .venv/bin/python scripts/bench/check_audio_input.py --require-both
 # 배포 후보 (tiny + ORT) — 항상 ANC OFF 시작, A 키로 ON
-# runtime_tiny.yaml 이 lead=109 와 tiny_corrected.onnx 를 이미 가리킨다
+# canonical 115-sample checkpoint/ONNX가 준비된 뒤에만 실행한다
 .venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml \
+  --confirm-speaker --confirm-user-present --confirm-volume-minimum
+# 기존에 학습한 Tiny surrogate 모델의 동작만 다시 확인할 때 (진단 전용, 녹음 금지,
+# strict P/S plant 계약을 검사하지 않음; ANC 감쇠 증거로 승격하지 않음)
+.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml \
+  --legacy-diagnostic --run-seconds 60 \
+  --set noise.type=tone --set noise.frequency=300 --set noise.amplitude=0.05 \
+  --confirm-speaker --confirm-user-present --confirm-volume-minimum
+# 기존 bandpass 조건(진폭 0.05)을 10초 OFF→30초 ON→5초 OFF로 재현하는 진단용 실행
+.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml \
+  --legacy-diagnostic --start-noise --run-seconds 45 \
+  --set noise.type=band --set noise.band='[80,1000]' --set noise.amplitude=0.05 \
   --confirm-speaker --confirm-user-present --confirm-volume-minimum
 # 다른 artifact 를 쓰려면 lead 를 그 artifact 메타와 반드시 같게 준다 (다르면 시작 전 거부)
 .venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime_tiny.yaml \
@@ -138,6 +155,16 @@ ONNX·지연 파이프라인을 검증하는 데는 쓸 수 있지만, 실제 no
     --set engine.type=ort --set engine.onnx=runs/export/tiny_corrected.onnx \
     --confirm-speaker --confirm-user-present --confirm-volume-minimum
 # 실재하는 artifact: runs/export/{tiny_corrected.onnx, tiny_corrected_fp16.plan, tiny_long.onnx}
+# 기존 Tiny surrogate의 150–1600Hz 주파수별 OFF→ON→OFF 진단과 raw/CSV/리포트
+# (5개 tone이면 45초×5 = 225초 재생; 먼저 --dry-run)
+.venv/bin/python scripts/demo/evaluate_session.py \
+  --config configs/runtime_tiny.yaml --legacy-diagnostic --controllers dl \
+  --tone-frequencies 200 450 800 1200 1500 --tone-amplitude 0.20 --dry-run
+# 실제 실행: 아래 명령은 총 약 225초 소리를 내며, 종료 후 스피커를 바로 분리한다.
+.venv/bin/python scripts/demo/evaluate_session.py \
+  --config configs/runtime_tiny.yaml --legacy-diagnostic --controllers dl \
+  --tone-frequencies 200 450 800 1200 1500 --tone-amplitude 0.20 \
+  --confirm-speaker --confirm-user-present --confirm-volume-minimum
 # FxLMS 회귀 기준선 (기존 시스템과 동일 동작 확인용)
 .venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --set controller=fxlms \
     --confirm-speaker --confirm-user-present --confirm-volume-minimum

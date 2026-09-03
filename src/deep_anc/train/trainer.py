@@ -451,6 +451,7 @@ CVaR 은 평균보다 **항상 크므로** 옛 best 가 영원히 이겨 best.pt
 
 _LEGACY_BEST_METRIC_KEY = "nmse_trusted_db"
 BROADBAND_BEST_METRIC_KEY = "nmse_subband_guard_cvar_db"
+STAGE1_EQUAL_SUBBAND_BEST_METRIC_KEY = "nmse_subband_objective_db"
 
 
 def _require_finite_tensor(name: str, value: torch.Tensor) -> None:
@@ -727,11 +728,12 @@ class Trainer:
             repo_root=REPO_ROOT,
             require_bound=True,
         )
-        expected_best_metric = (
-            BROADBAND_BEST_METRIC_KEY
-            if self._criterion_admission.role == BROADBAND_CRITERION_ROLE
-            else BEST_METRIC_KEY
-        )
+        if self._criterion_admission.role == BROADBAND_CRITERION_ROLE:
+            expected_best_metric = BROADBAND_BEST_METRIC_KEY
+        elif (cfg.get("loss") or {}).get("nmse_objective") == "equal_subband":
+            expected_best_metric = STAGE1_EQUAL_SUBBAND_BEST_METRIC_KEY
+        else:
+            expected_best_metric = BEST_METRIC_KEY
         self.best_metric_key = str(cfg.get("best_metric_key", expected_best_metric))
         if self.best_metric_key != expected_best_metric:
             raise ValueError(
@@ -1595,6 +1597,9 @@ class Trainer:
                 if self._criterion_admission.role == BROADBAND_CRITERION_ROLE:
                     val_mean = float(val_metrics["nmse_subband_equal_db"])
                     val_worst = float(val_metrics["nmse_subband_worst_db"])
+                elif self.best_metric_key == STAGE1_EQUAL_SUBBAND_BEST_METRIC_KEY:
+                    val_mean = float(val_metrics["nmse_subband_equal_db"])
+                    val_worst = float(val_metrics["nmse_subband_worst_db"])
                 else:
                     val_mean = float(val_metrics["nmse_trusted_db"])
                     val_worst = float(
@@ -1604,11 +1609,12 @@ class Trainer:
                 val_fullband_nmse = val_metrics["nmse_fullband_db"]
                 stop_flag = torch.zeros(1, device=self.device)
                 if self.is_main:
-                    metric_label = (
-                        "broadband subband CVaR"
-                        if self._criterion_admission.role == BROADBAND_CRITERION_ROLE
-                        else "trusted CVaR"
-                    )
+                    if self._criterion_admission.role == BROADBAND_CRITERION_ROLE:
+                        metric_label = "broadband subband CVaR"
+                    elif self.best_metric_key == STAGE1_EQUAL_SUBBAND_BEST_METRIC_KEY:
+                        metric_label = "Stage-1 equal-subband objective"
+                    else:
+                        metric_label = "trusted CVaR"
                     print(
                         f"[eval] step {self.step}: val {metric_label} {val_nmse:+.2f} dB "
                         f"(mean {val_mean:+.2f}, worst {val_worst:+.2f}) | "

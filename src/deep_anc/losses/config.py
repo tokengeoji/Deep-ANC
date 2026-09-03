@@ -281,8 +281,18 @@ class LossConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     # ---- 목적함수 ----
-    nmse_objective: Literal["trusted_band", "fullband"] | None = None
-    """None 이면 trusted_band_hz 주입 여부로 결정한다(기존 동작 보존)."""
+    nmse_objective: Literal["trusted_band", "fullband", "equal_subband"] | None = None
+    """None 이면 trusted_band_hz 주입 여부로 결정한다(기존 동작 보존).
+
+    ``equal_subband`` 는 현행 Stage-1 strict target [150,1600]을
+    [150,300], [300,600], [600,1000], [1000,1600] 네 구간으로 나누어
+    같은 비중으로 최적화한다. 1.6 kHz 밖은 이 목적함수에 포함하지 않고 기존
+    do-no-harm 항으로만 감시한다.
+    """
+
+    # 균등 대역 목적함수에서 band 간 worst 값에 주는 추가 guard 비중. 0이면
+    # 네 scalar의 균등 평균만, 1이면 가장 나쁜 band만 사용한다.
+    nmse_subband_guard_alpha: float = 0.25
 
     # ---- 최악값 집계 (절대목표 2) ----
     nmse_cvar_q: float = 0.25
@@ -342,6 +352,11 @@ class LossConfig(BaseModel):
         if self.nmse_cvar_min_k < 1:
             raise ValueError(
                 f"loss.nmse_cvar_min_k 는 1 이상이어야 합니다: {self.nmse_cvar_min_k}"
+            )
+        if not 0.0 <= self.nmse_subband_guard_alpha <= 1.0:
+            raise ValueError(
+                "loss.nmse_subband_guard_alpha 는 [0,1] 이어야 합니다: "
+                f"{self.nmse_subband_guard_alpha}"
             )
         for name in (
             "lambda_dnh",

@@ -5,7 +5,11 @@ import pytest
 
 from deep_anc.realtime import run_realtime
 from deep_anc.realtime.engines import FxLMSEngine
-from deep_anc.realtime.run_realtime import RealtimeANC, fxlms_adaptation_allowed
+from deep_anc.realtime.run_realtime import (
+    RealtimeANC,
+    fxlms_adaptation_allowed,
+    reduction_measurement_eligibility,
+)
 
 
 def test_start_on_true_is_rejected_before_hardware_initialization():
@@ -73,6 +77,98 @@ def test_fxlms_adaptation_gate_is_fail_closed():
         case = dict(ready)
         case[key] = unsafe
         assert not fxlms_adaptation_allowed(**case), key
+
+
+def test_reduction_measurement_is_invalid_when_anc_output_falls_back_to_silence():
+    """게이트가 열려도 fallback/xrun이면 ERR 변화량을 저감값으로 표시하지 않는다."""
+
+    valid = reduction_measurement_eligibility(
+        anc_enabled=True,
+        anc_output_active=True,
+        baseline_valid=True,
+        error_power=1.0e-3,
+        had_output_data=True,
+        callback_status=False,
+        xruns=0,
+        fallback_silence_blocks=0,
+        deadline_miss_blocks=0,
+        engine_error_blocks=0,
+        full_anc_gain=True,
+        full_noise_gain=True,
+    )
+    assert valid == (True, "ok")
+
+    invalid = reduction_measurement_eligibility(
+        anc_enabled=True,
+        anc_output_active=True,
+        baseline_valid=True,
+        error_power=1.0e-3,
+        had_output_data=False,
+        callback_status=False,
+        xruns=7,
+        fallback_silence_blocks=27,
+        deadline_miss_blocks=1,
+        engine_error_blocks=0,
+        full_anc_gain=True,
+        full_noise_gain=True,
+    )
+    assert invalid[0] is False
+    assert invalid[1] == "fallback,xrun,deadline"
+
+
+def test_legacy_diagnostic_descriptor_accepts_only_the_old_surrogate_artifact():
+    cfg = {
+        "reference": "digital",
+        "controller": "dl",
+        "digital_reference_lead_samples": 109,
+        "engine": {"type": "ort"},
+    }
+    checkpoint_cfg = {
+        "physics_status": "secondary_surrogate_representation_pretrain",
+        "data": {
+            "reference_mode": "digital",
+            "digital_primary_path_mode": "secondary_surrogate",
+        },
+    }
+
+    run_realtime.validate_legacy_diagnostic_descriptor(
+        cfg,
+        checkpoint_cfg=checkpoint_cfg,
+        checkpoint_lead=109,
+        artifact_lead=109,
+    )
+
+
+def test_legacy_diagnostic_descriptor_rejects_current_strict_lead():
+    cfg = {
+        "reference": "digital",
+        "controller": "dl",
+        "digital_reference_lead_samples": 115,
+        "engine": {"type": "ort"},
+    }
+    checkpoint_cfg = {
+        "physics_status": "secondary_surrogate_representation_pretrain",
+        "data": {
+            "reference_mode": "digital",
+            "digital_primary_path_mode": "secondary_surrogate",
+        },
+    }
+
+    with pytest.raises(ValueError, match="lead=109"):
+        run_realtime.validate_legacy_diagnostic_descriptor(
+            cfg,
+            checkpoint_cfg=checkpoint_cfg,
+            checkpoint_lead=109,
+            artifact_lead=109,
+        )
+
+
+def test_acoustic_reference_does_not_compare_digital_checkpoint_lead():
+    """acoustic-reference는 ref_mic 시간축을 쓰므로 digital lead=109를 무시한다."""
+
+    assert run_realtime.validate_digital_reference_lead("mic", 0, 109) == 0
+    with pytest.raises(ValueError, match="reference=digital"):
+        run_realtime.validate_digital_reference_lead("mic", 109, 109)
 
 
 def test_runtime_input_preflight_rejects_stuck_error_channel(monkeypatch):

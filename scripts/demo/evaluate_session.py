@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """자동 실기 평가 — 시나리오별 OFF(베이스라인)→ON→OFF 프로토콜, md 리포트 생성.
 
-  .venv/bin/python scripts/demo/evaluate_session.py --controllers fxlms dl --scenarios tone300 band
+  .venv/bin/python scripts/demo/evaluate_session.py --controllers fxlms dl --scenarios tone300 band \
+    --confirm-speaker --confirm-user-present --confirm-volume-minimum
 ⚠ 스피커에서 소음이 재생된다. TPA3116D2 볼륨을 낮춘 상태에서, 사용자 입회 하에 실행.
 """
 
 import argparse
 import datetime
+import json
 import sys
 import time
 from pathlib import Path
@@ -32,7 +34,10 @@ from deep_anc.eval.metrics import (                                        # noq
     nmse_db,
     octave_band_attenuation,
 )
-from deep_anc.realtime.run_realtime import RealtimeANC                  # noqa: E402
+from deep_anc.realtime.run_realtime import (                             # noqa: E402
+    RealtimeANC,
+    validate_legacy_diagnostic_config,
+)
 
 
 # ``source`` 는 ANC ON/OFF와 무관하게 실제 noise 출력 ch0으로 보낸 재생 파형이다.
@@ -46,13 +51,24 @@ _SOURCE_ENERGY_EPS = 1e-30
 LIVE_PROTOCOL_SCHEMA = "anc_off_on_with_continuous_noise_source_v1"
 
 
-def run_scenario(cfg: dict, protocol: dict) -> dict:
+def run_scenario(
+    cfg: dict,
+    protocol: dict,
+    *,
+    validate_plant_contract: bool = True,
+) -> dict:
     base_s = float(protocol.get("baseline_seconds", 10))
     on_s = float(protocol.get("on_seconds", 30))
     tail_s = float(protocol.get("tail_seconds", 5))
     total = base_s + on_s + tail_s
 
-    anc = RealtimeANC(cfg, record_seconds=total + 2.0)
+    anc_kwargs = {"record_seconds": total + 2.0}
+    # 기본 strict 경로는 RealtimeANC 생성자의 기본값을 사용한다. legacy 진단일
+    # 때만 명시적으로 우회해, 오디오 없는 기존 FakeANC fixture처럼
+    # record_seconds만 받는 호환 구현도 계속 검증할 수 있게 한다.
+    if not validate_plant_contract:
+        anc_kwargs["validate_plant_contract"] = False
+    anc = RealtimeANC(cfg, **anc_kwargs)
     try:
         anc.start()
         # OFF/ON은 **ANC control의 상태만** 뜻한다. noise source까지 OFF이면
@@ -72,6 +88,8 @@ def run_scenario(cfg: dict, protocol: dict) -> dict:
     if anc.state.fatal_error is not None:
         raise RuntimeError("실기 평가 오디오 콜백이 실패했습니다") from anc.state.fatal_error
 
+    clock_receipt_fn = getattr(anc, "clock_telemetry_receipt", None)
+    clock_receipt = clock_receipt_fn() if callable(clock_receipt_fn) else None
     data = anc.session_data()
     fs = anc.fs
     err = data["err"]
@@ -112,6 +130,7 @@ def run_scenario(cfg: dict, protocol: dict) -> dict:
         "tail": tail_seg,
         "on_duty": on_duty,
         "stats": stats,
+        "clock_receipt": clock_receipt,
         "protocol_state": {
             "noise_enabled_requested": True,
             "anc_enabled_baseline_requested": False,
@@ -267,6 +286,35 @@ def main() -> int:
     parser.add_argument("--eval-config", default="configs/eval.yaml")
     parser.add_argument("--controllers", nargs="+", default=["fxlms", "dl"])
     parser.add_argument("--scenarios", nargs="+", default=None)
+    parser.add_argument(
+        "--tone-frequencies",
+        nargs="+",
+        type=float,
+        default=None,
+        help="지정하면 각 주파수에 대해 tone OFF→ON→OFF를 자동 수행 (150–1600Hz)",
+    )
+    parser.add_argument(
+        "--tone-amplitude",
+        type=float,
+        default=0.20,
+        help="--tone-frequencies의 소스 peak amplitude (기본 0.20)",
+    )
+    parser.add_argument(
+        "--legacy-diagnostic",
+        action="store_true",
+        help=(
+            "기존 Tiny surrogate(lead=109) 동작만 진단. strict plant 계약을 건너뛰며 "
+            "결과는 물리 성능/배포 증거가 아님"
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="스피커·마이크를 열지 않고 예정된 주파수/시간만 출력",
+    )
+    parser.add_argument("--confirm-speaker", action="store_true")
+    parser.add_argument("--confirm-user-present", action="store_true")
+    parser.add_argument("--confirm-volume-minimum", action="store_true")
     parser.add_argument("--out", default=None)
     parser.add_argument(
         "--input-probe-seconds",
@@ -276,14 +324,57 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.legacy_diagnostic and any(controller != "dl" for controller in args.controllers):
+        parser.error("--legacy-diagnostic은 controller=dl만 지원합니다")
+    if args.tone_frequencies is not None and args.scenarios is not None:
+        parser.error("--tone-frequencies와 --scenarios는 함께 사용할 수 없습니다")
+    if args.tone_frequencies is not None:
+        if not args.tone_frequencies:
+            parser.error("--tone-frequencies에는 하나 이상의 주파수가 필요합니다")
+        if any(
+            not np.isfinite(frequency) or not 150.0 <= frequency <= 1600.0
+            for frequency in args.tone_frequencies
+        ):
+            parser.error("--tone-frequencies의 모든 값은 150–1600Hz여야 합니다")
+        if not np.isfinite(args.tone_amplitude) or not 0.0 < args.tone_amplitude <= 0.20:
+            parser.error("--tone-amplitude는 0보다 크고 0.20 이하여야 합니다")
+    if not args.dry_run and not (
+        args.confirm_speaker
+        and args.confirm_user_present
+        and args.confirm_volume_minimum
+    ):
+        parser.error(
+            "실제 출력에는 --confirm-speaker, --confirm-user-present, "
+            "--confirm-volume-minimum이 모두 필요합니다"
+        )
+
     eval_cfg = load_yaml(REPO_ROOT / args.eval_config)
     scenarios = {s["name"]: s for s in eval_cfg["scenarios"]}
     chosen = []
-    for name in args.scenarios or list(scenarios.keys()):
-        if name in scenarios:
+    if args.tone_frequencies is not None:
+        scenarios = {}
+        for frequency in args.tone_frequencies:
+            label = f"{frequency:g}".replace(".", "p")
+            name = f"tone_{label}Hz"
+            scenarios[name] = {
+                "name": name,
+                "measure_band_hz": [
+                    max(150.0, frequency - 25.0),
+                    min(1600.0, frequency + 25.0),
+                ],
+                "noise": {
+                    "type": "tone",
+                    "frequency": frequency,
+                    "amplitude": args.tone_amplitude,
+                },
+            }
             chosen.append(name)
-        else:
-            print(f"[skip] 알 수 없는 시나리오 '{name}' — eval.yaml scenarios: {list(scenarios)}")
+    else:
+        for name in args.scenarios or list(scenarios.keys()):
+            if name in scenarios:
+                chosen.append(name)
+            else:
+                print(f"[skip] 알 수 없는 시나리오 '{name}' — eval.yaml scenarios: {list(scenarios)}")
     protocol = eval_cfg.get("protocol", {})
     bands = eval_cfg.get("octave_bands_hz", [125, 250, 500, 1000, 2000, 4000, 8000])
     # 잘못된 정책값 때문에 입력 probe를 통과한 뒤 스피커를 여는 일을 막는다.
@@ -294,6 +385,32 @@ def main() -> int:
         )
     )
     initial_cfg = load_runtime_config(args.config)
+    if args.legacy_diagnostic:
+        try:
+            validate_legacy_diagnostic_config(initial_cfg)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[중단] legacy diagnostic preflight 실패: {exc}", file=sys.stderr)
+            return 2
+    if args.dry_run:
+        protocol_total = sum(
+            float(protocol.get(key, default))
+            for key, default in (
+                ("baseline_seconds", 10.0),
+                ("on_seconds", 30.0),
+                ("tail_seconds", 5.0),
+            )
+        )
+        repetitions = len(chosen) * len(args.controllers)
+        print("[DRY-RUN] 오디오 장치를 열지 않습니다.")
+        print(f"[DRY-RUN] scenarios={chosen}")
+        print(f"[DRY-RUN] controllers={args.controllers}")
+        print(
+            f"[DRY-RUN] 각 실행: OFF {protocol.get('baseline_seconds', 10)}s → "
+            f"ON {protocol.get('on_seconds', 30)}s → "
+            f"OFF {protocol.get('tail_seconds', 5)}s = {protocol_total:.1f}s"
+        )
+        print(f"[DRY-RUN] 총 재생 예상 시간: {protocol_total * repetitions:.1f}s")
+        return 0
     try:
         if not input_preflight(initial_cfg, seconds=args.input_probe_seconds):
             return 2
@@ -330,7 +447,11 @@ def main() -> int:
             cfg["controller"] = controller
             cfg["noise"] = dict(scenarios[name]["noise"])
             print(f"\n=== {name} × {controller} ===")
-            result = run_scenario(cfg, protocol)
+            result = run_scenario(
+                cfg,
+                protocol,
+                validate_plant_contract=not args.legacy_diagnostic,
+            )
             if result["fs"] != sp.sample_rate:
                 raise ValueError(
                     f"세션 sample_rate={result['fs']}Hz != S(z) sample_rate={sp.sample_rate}Hz"
@@ -407,10 +528,21 @@ def main() -> int:
                 nmse_trusted_db=nmse_trusted,
                 nmse_fullband_db=nmse_fullband,
                 nmse_gap_trusted_minus_fullband_db=nmse_trusted - nmse_fullband,
+                tone_frequency_hz=np.asarray(
+                    float(cfg["noise"].get("frequency", float("nan"))),
+                    dtype=np.float64,
+                ),
+                measure_band_hz=np.asarray(measure, dtype=np.float64),
                 off_segment=result["off"],
                 off_source_segment=result["off_source"],
                 on_segment=result["on"],
+                tail_segment=result["tail"],
+                attenuation_vs_initial_db=np.asarray(att_vs_initial, dtype=np.float64),
+                attenuation_vs_tail_db=np.asarray(att_vs_tail, dtype=np.float64),
+                headline_attenuation_db=np.asarray(headline_att, dtype=np.float64),
+                baseline_drift_db=np.asarray(att_vs_initial - att_vs_tail, dtype=np.float64),
                 live_protocol_schema=np.asarray(LIVE_PROTOCOL_SCHEMA),
+                legacy_diagnostic=np.asarray(args.legacy_diagnostic, dtype=np.bool_),
                 # requested state는 source/anc_gain raw 파형으로 교차검증할 수 있다.
                 # OFF/ON이 noise 재생 자체를 끈 실험으로 오해되지 않게 immutable raw에
                 # 명시한다.
@@ -471,9 +603,21 @@ def main() -> int:
                 **result["data"],
             )
 
+            clock_path = run_dir / "raw" / f"{key}.clock.json"
+            with clock_path.open("x", encoding="utf-8") as handle:
+                json.dump(
+                    result["clock_receipt"],
+                    handle,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+                handle.write("\n")
+
             row = {
                 "scenario": name,
                 "controller": controller,
+                "legacy_diagnostic": bool(args.legacy_diagnostic),
                 "sample_rate_hz": fs,
                 "noise_type": str(cfg["noise"].get("type", "")),
                 "noise_amplitude": float(cfg["noise"].get("amplitude", float("nan"))),
@@ -535,6 +679,12 @@ def main() -> int:
     lines = [
         f"# 실기 평가 리포트 ({stamp})",
         "",
+        (
+            "- 모드: **legacy diagnostic** (strict P/S plant 계약을 검사하지 않음; "
+            "물리 성능·배포 증거로 승격 불가)"
+            if args.legacy_diagnostic
+            else "- 모드: strict runtime plant contract"
+        ),
         f"- Trusted 대역: **{trusted[0]:.0f}–{trusted[1]:.0f} Hz** "
         "(S(z) 실측 대역 ∩ 덕트 목표 대역)",
         f"- 프로토콜: OFF {protocol.get('baseline_seconds', 10)}s → "

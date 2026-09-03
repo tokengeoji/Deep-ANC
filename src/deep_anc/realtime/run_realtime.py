@@ -40,6 +40,7 @@ from ..config import REPO_ROOT, load_runtime_config
 from ..dsp.filters import DCBlocker
 from .engines import (
     build_engine,
+    checkpoint_digital_reference_lead_samples,
     engine_digital_reference_lead_samples_from_config,
     secondary_path_npz,
 )
@@ -92,6 +93,55 @@ def fxlms_adaptation_allowed(
         and float(reference_power) > 1.0e-12
         and stream_ok
     )
+
+
+def reduction_measurement_eligibility(
+    *,
+    anc_enabled: bool,
+    anc_output_active: bool,
+    baseline_valid: bool,
+    error_power: float,
+    had_output_data: bool,
+    callback_status: bool,
+    xruns: int,
+    fallback_silence_blocks: int,
+    deadline_miss_blocks: int,
+    engine_error_blocks: int,
+    full_anc_gain: bool,
+    full_noise_gain: bool,
+) -> tuple[bool, str]:
+    """실시간 ``저감``을 유효한 OFF/ON 비교로 표시할 수 있는지 판정한다.
+
+    ``anc_output_active``만 보면 안 된다. 게이트가 열려 있어도 output ring이 비어
+    fallback 무음을 냈거나, 페이드 중이거나, callback/inference timing 오류가 있으면
+    현재 ERR은 상쇄음에 대한 측정값이 아니다. 이 함수는 UI 숫자를 성능 증거로
+    오인하지 않도록 fail-closed 한다.
+    """
+
+    reasons: list[str] = []
+    if not anc_enabled:
+        reasons.append("anc_off")
+    if not anc_output_active:
+        reasons.append("output_gate")
+    if not baseline_valid:
+        reasons.append("baseline")
+    if not np.isfinite(error_power) or error_power <= 0.0:
+        reasons.append("error_power")
+    if not had_output_data:
+        reasons.append("fallback")
+    if callback_status:
+        reasons.append("callback_status")
+    if int(xruns) > 0:
+        reasons.append("xrun")
+    if int(fallback_silence_blocks) > 0:
+        reasons.append("fallback")
+    if int(deadline_miss_blocks) > 0:
+        reasons.append("deadline")
+    if int(engine_error_blocks) > 0:
+        reasons.append("engine_error")
+    if not full_anc_gain or not full_noise_gain:
+        reasons.append("fade")
+    return (not reasons, ",".join(dict.fromkeys(reasons)) or "ok")
 
 
 def input_preflight(cfg: dict, seconds: float = 2.0) -> bool:
@@ -301,14 +351,26 @@ def validate_digital_reference_lead(
     configured_lead: int,
     checkpoint_lead: int | None = None,
 ) -> int:
-    """reference 모드와 학습/배포 lead 정합을 검증하고 정규화된 값을 반환한다."""
+    """reference 모드와 digital lead 정합을 검증하고 정규화된 값을 반환한다.
+
+    ``digital_reference_lead_samples``는 digital-reference에서만 의미가 있다.
+    acoustic-reference에서는 체크포인트의 digital lead metadata를 비교하면 안 된다.
+    두 모드는 같은 ``[reference, error]`` 입력 모양을 쓰더라도 reference의 시간축
+    계약이 서로 다르기 때문이다. acoustic 모드는 runtime lead=0만 허용하고, 실제
+    inference 입력 선택은 ``ref_mic`` 경로가 담당한다.
+    """
     lead = int(configured_lead)
     if lead < 0:
         raise ValueError("digital_reference_lead_samples는 0 이상이어야 합니다")
-    if reference != "digital" and lead:
-        raise ValueError(
-            "digital_reference_lead_samples는 reference=digital에서만 사용할 수 있습니다"
-        )
+    if reference != "digital":
+        if lead:
+            raise ValueError(
+                "digital_reference_lead_samples는 reference=digital에서만 사용할 수 있습니다"
+            )
+        # acoustic-reference에서는 checkpoint/ONNX의 digital lead를 검증 대상에서
+        # 제외한다. checkpoint가 digital로 학습됐는지는 별도의 실험 경고/모델 계약
+        # 문제이며, acoustic 입력을 선택하는 런타임 자체를 막는 값은 아니다.
+        return 0
     if checkpoint_lead is not None and lead != int(checkpoint_lead):
         raise ValueError(
             "digital-reference lead 불일치: "
@@ -316,6 +378,109 @@ def validate_digital_reference_lead(
             "학습과 배포의 digital_reference_lead_samples를 동일하게 맞추세요."
         )
     return lead
+
+
+_LEGACY_DIAGNOSTIC_LEAD_SAMPLES = 109
+_LEGACY_DIAGNOSTIC_PHYSICS_STATUS = "secondary_surrogate_representation_pretrain"
+
+
+def validate_legacy_diagnostic_descriptor(
+    cfg: dict,
+    *,
+    checkpoint_cfg: dict,
+    checkpoint_lead: int,
+    artifact_lead: int,
+) -> None:
+    """기존 surrogate pretrain을 다시 확인할 때만 허용하는 명시적 계약.
+
+    이 경로는 strict P/S를 느슨하게 만드는 일반 우회로가 아니다. 현재 저장소에
+    남아 있는 ``secondary_surrogate_representation_pretrain`` + lead=109 artifact만
+    지정된 ``--legacy-diagnostic`` CLI 경로에서 허용한다. checkpoint/ONNX가 서로
+    맞는지는 계속 검사하고, 실제 plant가 맞는지는 별도의 current strict 계약으로
+    판정한다.
+    """
+
+    reference = str(cfg.get("reference", "digital"))
+    controller = str(cfg.get("controller", "dl"))
+    engine_type = str((cfg.get("engine") or {}).get("type", "torch"))
+    if reference != "digital" or controller != "dl" or engine_type != "ort":
+        raise ValueError(
+            "--legacy-diagnostic은 reference=digital, controller=dl, engine.type=ort인 "
+            "기존 Tiny surrogate runtime에서만 사용할 수 있습니다"
+        )
+
+    configured_lead = validate_digital_reference_lead(
+        reference, cfg.get("digital_reference_lead_samples", 0)
+    )
+    if configured_lead != _LEGACY_DIAGNOSTIC_LEAD_SAMPLES:
+        raise ValueError(
+            "--legacy-diagnostic은 legacy lead=109 설정에서만 사용할 수 있습니다: "
+            f"runtime={configured_lead}"
+        )
+    if str(checkpoint_cfg.get("physics_status", "")) != _LEGACY_DIAGNOSTIC_PHYSICS_STATUS:
+        raise ValueError(
+            "--legacy-diagnostic 대상 checkpoint가 기존 surrogate pretrain이 아닙니다: "
+            f"physics_status={checkpoint_cfg.get('physics_status')!r}"
+        )
+    checkpoint_data = checkpoint_cfg.get("data") or {}
+    if str(checkpoint_data.get("reference_mode", "digital")) != "digital":
+        raise ValueError("legacy diagnostic checkpoint의 reference_mode가 digital이 아닙니다")
+    if str(checkpoint_data.get("digital_primary_path_mode", "")) != "secondary_surrogate":
+        raise ValueError(
+            "legacy diagnostic checkpoint의 digital_primary_path_mode가 "
+            "secondary_surrogate가 아닙니다"
+        )
+
+    if int(checkpoint_lead) != _LEGACY_DIAGNOSTIC_LEAD_SAMPLES:
+        raise ValueError(
+            "legacy diagnostic checkpoint lead가 109가 아닙니다: "
+            f"checkpoint={int(checkpoint_lead)}"
+        )
+    if int(artifact_lead) != _LEGACY_DIAGNOSTIC_LEAD_SAMPLES:
+        raise ValueError(
+            "legacy diagnostic ONNX metadata lead가 109가 아닙니다: "
+            f"onnx={int(artifact_lead)}"
+        )
+    validate_digital_reference_lead(reference, configured_lead, int(checkpoint_lead))
+    validate_digital_reference_lead(reference, configured_lead, int(artifact_lead))
+
+
+def validate_legacy_diagnostic_config(cfg: dict) -> None:
+    """legacy diagnostic 실행 전 checkpoint/ONNX의 정체성과 lead를 검증한다."""
+
+    engine = cfg.get("engine") or {}
+    checkpoint_value = engine.get("ckpt")
+    if not checkpoint_value:
+        raise ValueError("--legacy-diagnostic에는 engine.ckpt가 필요합니다")
+    checkpoint_path = Path(str(checkpoint_value)).expanduser()
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = REPO_ROOT / checkpoint_path
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"legacy diagnostic checkpoint가 없습니다: {checkpoint_path}"
+        )
+
+    import torch
+
+    try:
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise ValueError(
+            f"legacy diagnostic checkpoint를 읽을 수 없습니다: {checkpoint_path}: {exc}"
+        ) from exc
+    if not isinstance(state, dict) or not isinstance(state.get("cfg"), dict):
+        raise ValueError(
+            f"legacy diagnostic checkpoint에 resolved cfg가 없습니다: {checkpoint_path}"
+        )
+    checkpoint_cfg = state["cfg"]
+    checkpoint_lead = checkpoint_digital_reference_lead_samples(state)
+    artifact_lead = engine_digital_reference_lead_samples_from_config(cfg)
+    validate_legacy_diagnostic_descriptor(
+        cfg,
+        checkpoint_cfg=checkpoint_cfg,
+        checkpoint_lead=checkpoint_lead,
+        artifact_lead=int(artifact_lead if artifact_lead is not None else -1),
+    )
 
 
 class RealtimeANC:
@@ -680,16 +845,62 @@ class RealtimeANC:
                 self.rec_pos += n
 
             baseline = self.safety.baseline
+            # 일부 오디오 없는 callback fixture는 구형 BaselineTracker 대역을
+            # ``initialized``만 가진 SimpleNamespace로 주입한다. 실제 Tracker는
+            # ``valid``를 제공하지만, 판정 의미는 둘 다 "유효한 baseline인가"로
+            # 동일하므로 callback 테스트/호환 경로에서도 예외를 내지 않는다.
+            baseline_valid = bool(
+                getattr(
+                    baseline,
+                    "valid",
+                    getattr(baseline, "initialized", False),
+                )
+            )
+            reduction_valid, reduction_reason = reduction_measurement_eligibility(
+                anc_enabled=bool(self.state.anc_enabled),
+                anc_output_active=anc_output_active,
+                baseline_valid=baseline_valid,
+                error_power=float(err_power),
+                had_output_data=bool(had_data),
+                callback_status=bool(status),
+                xruns=int(self.xruns),
+                fallback_silence_blocks=int(
+                    getattr(self, "_fallback_silence_blocks", 0)
+                ),
+                deadline_miss_blocks=int(
+                    getattr(self, "_deadline_miss_blocks", 0)
+                ),
+                engine_error_blocks=int(
+                    getattr(self, "_engine_error_blocks", 0)
+                ),
+                full_anc_gain=full_anc_gain,
+                full_noise_gain=full_noise_gain,
+            )
             reduction = float("nan")
-            if baseline.initialized and err_power > 0:
+            # 기준은 상쇄 출력이 닫힌 동안 수집한 ERR power다. 다만 fallback/xrun/
+            # deadline이 한 번이라도 있으면 현재 session의 OFF/ON 비교를 성능값으로
+            # 승격하지 않는다. 이전 구현은 게이트가 열려 있다는 사실만 보고 fallback
+            # 무음도 정상 상쇄음처럼 계산했다.
+            if reduction_valid:
                 reduction = 10.0 * np.log10((baseline.power + 1e-30) / (err_power + 1e-30))
             self.state.latest_stats = {
                 "anc": self.state.anc_enabled,
                 "anc_output": anc_output_active,
                 "divergence_probe": self.safety.probe_active,
                 "err_dbfs": power_to_db(err_power),
+                # acoustic-reference 현장에서 실제 REF 입력이 들어오는지를 확인하기
+                # 위한 raw block meter. model input은 아래 inference loop에서 별도로
+                # ref_mic를 선택하며, ref_digital은 이 값 계산에 사용하지 않는다.
+                "ref_mic_dbfs": power_to_db(
+                    float(np.mean(ref_mic.astype(np.float64) ** 2))
+                ),
                 "ctrl_dbfs": power_to_db(ctrl_power),
                 "reduction_db": reduction,
+                "baseline_dbfs": (
+                    power_to_db(baseline.power) if baseline_valid else float("nan")
+                ),
+                "reduction_valid": reduction_valid,
+                "reduction_reason": reduction_reason,
                 "fxlms_adapt_allowed": adapt_allowed,
                 "fxlms_adapt_hold_samples": self._adaptation_hold_samples,
                 "underruns": self.out_ring.underruns,
@@ -983,13 +1194,27 @@ def _prepare_runtime_record_targets(record_path: str | Path) -> tuple[Path, Path
     return npz_path, receipt_path
 
 
-def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
+def run_cli(
+    cfg: dict,
+    run_seconds: float,
+    record_path: str | None,
+    *,
+    validate_plant_contract: bool = True,
+    start_noise: bool = False,
+) -> int:
     # target 충돌을 소리를 낸 뒤 발견하면 실험과 speaker 연결 시간을 낭비한다.
     # 끝의 xb/O_EXCL 검사도 유지해 이 preflight 뒤 TOCTOU를 다시 막는다.
     record_targets = (
         _prepare_runtime_record_targets(record_path) if record_path else None
     )
-    anc = RealtimeANC(cfg, record_seconds=run_seconds if record_path else 0.0)
+    anc = RealtimeANC(
+        cfg,
+        record_seconds=run_seconds if record_path else 0.0,
+        validate_plant_contract=validate_plant_contract,
+    )
+    # ANC는 항상 OFF로 시작하되, 대화형 band/tone 재현에서는 사용자가 N을
+    # 먼저 누르지 않아도 소음 source만 켜 둘 수 있다.
+    anc.state.noise_enabled = bool(start_noise)
     keyboard = KeyboardController(anc.state)
 
     engine_desc = cfg.get("controller", "dl")
@@ -998,6 +1223,14 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
     print("=" * 72)
     print(f"Deep ANC 실시간 런타임 | 컨트롤러: {engine_desc} | reference: {cfg.get('reference')}")
     print(f"블록 {anc.block} ({1000*anc.block/anc.fs:.2f}ms) @ {anc.fs}Hz | 시작: ANC OFF")
+    print(f"소음 시작: {'ON' if anc.state.noise_enabled else 'OFF'} | A=ANC 토글 | N=소음 토글")
+    if str(cfg.get("reference", "digital")) == "mic":
+        print("음향 레퍼런스: 실제 reference_mic ch1 → 모델 입력 | ref_digital 미사용")
+        if str(cfg.get("controller", "dl")) == "dl":
+            print(
+                "[경고] 현재 DL artifact는 digital-reference 학습본입니다. "
+                "mic 입력 실행은 acoustic 경로 일회성 실험입니다."
+            )
     budget = anc.handoff_budget
     print(
         f"실효 핸드오프 {budget.effective_handoff_samples}샘플 "
@@ -1031,9 +1264,18 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
                 if s:
                     red = s.get("reduction_db", float("nan"))
                     red_txt = "  n/a" if not np.isfinite(red) else f"{red:6.2f}"
+                    if s.get("reduction_valid"):
+                        reduction_status = "VALID"
+                    elif s.get("anc"):
+                        reduction_status = f"INVALID:{s.get('reduction_reason', 'unknown')}"
+                    else:
+                        reduction_status = "OFF"
                     print(
                         f"[{'ON ' if s['anc'] else 'OFF'}] e={s['err_dbfs']:7.2f} dBFS | "
+                        f"ref_mic={s.get('ref_mic_dbfs', float('nan')):7.2f} dBFS | "
+                        f"base={s.get('baseline_dbfs', float('nan')):7.2f} dBFS | "
                         f"ctrl={s['ctrl_dbfs']:7.2f} | 저감={red_txt} dB | "
+                        f"판정={reduction_status} | "
                         f"step={s['step_ms']:5.2f}ms | "
                         f"deadline={s.get('deadline_miss_blocks', 0)} | "
                         f"fallback={s.get('fallback_silence_blocks', s['underruns'])} | "
@@ -1187,6 +1429,19 @@ def main() -> int:
     parser.add_argument("--run-seconds", type=float, default=None)
     parser.add_argument("--record", default=None, help="세션 npz 저장 경로")
     parser.add_argument("--calibrate", action="store_true", help="실효 지연 측정 모드")
+    parser.add_argument(
+        "--start-noise",
+        action="store_true",
+        help="ANC는 OFF로 유지하고 소음 source만 시작부터 ON",
+    )
+    parser.add_argument(
+        "--legacy-diagnostic",
+        action="store_true",
+        help=(
+            "기존 Tiny surrogate(lead=109) ANC 재현용. strict P/S plant 계약을 "
+            "건너뛰며 물리 성능/녹음 증거로 사용할 수 없음"
+        ),
+    )
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--confirm-speaker", action="store_true")
     parser.add_argument("--confirm-user-present", action="store_true")
@@ -1199,6 +1454,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.calibrate and args.legacy_diagnostic:
+        parser.error("--calibrate와 --legacy-diagnostic은 함께 사용할 수 없습니다")
+
     if args.list_devices:
         print(format_sounddevice_devices())
         return 0
@@ -1209,14 +1467,50 @@ def main() -> int:
         print(f"[중단] runtime 설정 해석 실패: {exc}", file=sys.stderr)
         return 2
 
+    run_seconds = (
+        args.run_seconds
+        if args.run_seconds is not None
+        else float(cfg.get("run_seconds", 0.0))
+    )
+    record = args.record or cfg.get("record")
+    if args.legacy_diagnostic:
+        if record:
+            print(
+                "[중단] --legacy-diagnostic은 녹음 경로를 허용하지 않습니다. "
+                "기존 모델 재현은 진단용 무저장 실행만 지원합니다.",
+                file=sys.stderr,
+            )
+            return 2
+        if not (0.0 < run_seconds <= 60.0):
+            print(
+                "[중단] --legacy-diagnostic은 --run-seconds를 0 초과 60초 이하로 "
+                "명시해야 합니다.",
+                file=sys.stderr,
+            )
+            return 2
+
     # 이 검사는 파일/metadata만 읽으며 스피커·마이크를 열지 않는다. 사용자 확인보다
-    # 앞서 수행해 legacy lead 불일치를 즉시 드러내되, 실제 출력은 아래 확인 세 개가
-    # 모두 있어야만 가능하다.
+    # 앞서 수행해 legacy artifact를 명시적으로 요청했는지와 현재 strict plant 정합을
+    # 구분한다. 기본 경로의 strict 검사는 계속 fail-closed다.
     if not args.calibrate:
         try:
-            validate_runtime_plant_contract(cfg)
+            if args.legacy_diagnostic:
+                validate_legacy_diagnostic_config(cfg)
+                print(
+                    "[경고] legacy diagnostic: 기존 surrogate checkpoint/ONNX(lead=109)를 "
+                    "재현합니다. strict P/S plant 계약은 검사하지 않으며 ANC 감쇠·녹음 "
+                    "증거로 승격할 수 없습니다.",
+                    file=sys.stderr,
+                )
+            else:
+                validate_runtime_plant_contract(cfg)
         except (OSError, RuntimeError, ValueError) as exc:
-            print(f"[중단] strict runtime plant 계약 실패: {exc}", file=sys.stderr)
+            label = (
+                "legacy diagnostic preflight"
+                if args.legacy_diagnostic
+                else "strict runtime plant 계약"
+            )
+            print(f"[중단] {label} 실패: {exc}", file=sys.stderr)
             return 2
 
     # 엔진 artifact와 lead metadata도 hardware를 열기 전에 검사한다. 그 뒤에야
@@ -1256,11 +1550,15 @@ def main() -> int:
         return 2
     if args.calibrate:
         return run_calibrate(cfg)
-    run_seconds = args.run_seconds if args.run_seconds is not None else float(cfg.get("run_seconds", 0.0))
-    record = args.record or cfg.get("record")
     if record and run_seconds <= 0:
         parser.error("--record 는 녹음 버퍼 크기 산정을 위해 --run-seconds 가 필요합니다")
-    return run_cli(cfg, run_seconds, record)
+    return run_cli(
+        cfg,
+        run_seconds,
+        record,
+        validate_plant_contract=not args.legacy_diagnostic,
+        start_noise=args.start_noise,
+    )
 
 
 if __name__ == "__main__":

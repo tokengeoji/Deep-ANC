@@ -46,6 +46,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..dsp.control_band_contract import STAGE1_STRICT_SUBBANDS_HZ
 from ..dsp.nonlinear import RandomNonlinear
 from ..dsp.secondary_path import DifferentiableSecondaryPath
 # 대역 산술의 단일 출처. 예전에는 이 파일과 eval/metrics.py 에 같은 함수가 한 벌씩
@@ -170,6 +171,7 @@ class ANCLoss(nn.Module):
         self.nmse_cvar_q = float(cfg.nmse_cvar_q)
         self.nmse_cvar_alpha = float(cfg.nmse_cvar_alpha)
         self.nmse_cvar_min_k = int(cfg.nmse_cvar_min_k)
+        self.nmse_subband_guard_alpha = float(cfg.nmse_subband_guard_alpha)
 
         # 직접 ANCLoss를 생성하는 기존 코드는 trusted band를 넘기지 않으므로
         # 기존 fullband 동작을 유지한다. Trainer는 항상 실측∩목표 대역을 주입한다.
@@ -184,6 +186,27 @@ class ANCLoss(nn.Module):
                 trusted_band_hz,
                 trusted_band_hz,
                 sample_rate / 2.0,
+            )
+
+        # ``equal_subband`` 는 현재 Stage-1 strict contract의 네 구간만 양측
+        # 최적화한다. 계약 밖(특히 1.6 kHz 초과)은 아래 do-no-harm 힌지의
+        # 단측 보호 대상으로만 남겨, 측정되지 않은 위상으로 상쇄를 요구하지 않는다.
+        self.subband_bands_hz: tuple[tuple[float, float], ...] = ()
+        if self.nmse_objective == "equal_subband":
+            if self.trusted_band_hz is None:
+                raise ValueError(
+                    "nmse_objective=equal_subband 이면 trusted_band_hz가 필요합니다"
+                )
+            target_lo, target_hi = self.trusted_band_hz
+            contract_lo, contract_hi = STAGE1_STRICT_SUBBANDS_HZ[0][0], STAGE1_STRICT_SUBBANDS_HZ[-1][1]
+            if target_lo > contract_lo or target_hi < contract_hi:
+                raise ValueError(
+                    "nmse_objective=equal_subband은 Stage-1 strict target "
+                    f"[{contract_lo:g},{contract_hi:g}]Hz 전체를 포함해야 합니다: "
+                    f"trusted=[{target_lo:g},{target_hi:g}]Hz"
+                )
+            self.subband_bands_hz = tuple(
+                (float(lo), float(hi)) for lo, hi in STAGE1_STRICT_SUBBANDS_HZ
             )
 
         # ---- 대역 밖 악화 금지 ----
@@ -324,6 +347,53 @@ class ANCLoss(nn.Module):
         d_band_pow = (d_pow * weights).sum(dim=-1)
         return 10.0 * torch.log10((e_band_pow + _EPS) / (d_band_pow + _EPS))
 
+    def _subband_nmse_db(self, e: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        """네 Stage-1 subband의 NMSE를 한 번의 FFT로 계산한다.
+
+        반환 shape은 ``[B, 4]``이다. 각 대역은 ``[lo, hi)``로 나누되 마지막
+        대역만 상단 bin을 포함한다. 대역별로 FFT를 다시 계산하지 않아 GPU
+        학습에서 균등 대역 목적함수의 추가 비용을 최소화한다.
+        """
+
+        if not self.subband_bands_hz:
+            raise RuntimeError("equal-subband 대역이 초기화되지 않았습니다")
+        samples = e.shape[-1]
+        if samples < 2:
+            raise ValueError(f"subband NMSE FFT에 필요한 샘플이 부족합니다: {samples}")
+        E = torch.fft.rfft(e, dim=-1, norm="ortho")
+        D = torch.fft.rfft(d, dim=-1, norm="ortho")
+        e_pow = E.real.square() + E.imag.square()
+        d_pow = D.real.square() + D.imag.square()
+
+        values: list[torch.Tensor] = []
+        last_index = len(self.subband_bands_hz) - 1
+        for index, (lo, hi) in enumerate(self.subband_bands_hz):
+            lo_bin, hi_bin = self._band_bins(samples, lo, hi)
+            if index != last_index:
+                hi_bin = min(
+                    hi_bin,
+                    int(math.ceil(float(hi) * samples / self.sample_rate)) - 1,
+                )
+            if lo_bin > hi_bin:
+                raise ValueError(
+                    f"세그먼트 {samples}샘플 FFT에 subband [{lo:g},{hi:g})Hz "
+                    "bin이 없습니다"
+                )
+            weights = torch.full(
+                (hi_bin - lo_bin + 1,),
+                2.0,
+                dtype=e_pow.dtype,
+                device=e.device,
+            )
+            if lo_bin == 0:
+                weights[0] = 1.0
+            if samples % 2 == 0 and hi_bin == samples // 2:
+                weights[-1] = 1.0
+            e_band_pow = (e_pow[..., lo_bin : hi_bin + 1] * weights).sum(dim=-1)
+            d_band_pow = (d_pow[..., lo_bin : hi_bin + 1] * weights).sum(dim=-1)
+            values.append(10.0 * torch.log10((e_band_pow + _EPS) / (d_band_pow + _EPS)))
+        return torch.stack(values, dim=1)
+
     def _main_nmse_objective(
         self,
         e: torch.Tensor,
@@ -338,6 +408,39 @@ class ANCLoss(nn.Module):
         분리하면 기존 150--1600 Hz 설정에 광대역 키를 섞거나, 광대역 구현을 위해
         :meth:`_forward_fp32` 전체를 복제할 필요가 없다.
         """
+
+        if self.nmse_objective == "equal_subband":
+            per_item = self._subband_nmse_db(e, d)
+            band_objectives: list[torch.Tensor] = []
+            metrics: dict[str, float] = {}
+            for index, (band, values) in enumerate(
+                zip(self.subband_bands_hz, per_item.unbind(dim=1), strict=True)
+            ):
+                aggregate = self._worst_aggregate(values)
+                band_objectives.append(aggregate)
+                lo, hi = band
+                prefix = f"nmse_subband_{index}_{int(round(lo))}_{int(round(hi))}"
+                metrics[f"{prefix}_mean_db"] = float(values.mean().detach())
+                metrics[f"{prefix}_cvar_db"] = float(self._cvar(values).detach())
+                metrics[f"{prefix}_worst_db"] = float(values.max().detach())
+                metrics[f"{prefix}_objective_db"] = float(aggregate.detach())
+
+            band_values = torch.stack(band_objectives)
+            equal_subband = band_values.mean()
+            guard = band_values.max()
+            objective = (
+                (1.0 - self.nmse_subband_guard_alpha) * equal_subband
+                + self.nmse_subband_guard_alpha * guard
+            )
+            metrics.update(
+                {
+                    "nmse_subband_equal_db": float(equal_subband.detach()),
+                    "nmse_subband_guard_db": float(guard.detach()),
+                    "nmse_subband_objective_db": float(objective.detach()),
+                    "nmse_subband_worst_db": float(per_item.max().detach()),
+                }
+            )
+            return objective, metrics
 
         del e, d  # 기본 구현은 위에서 계산한 연속 대역/fullband 값만 사용한다.
         if self.nmse_objective == "trusted_band":
