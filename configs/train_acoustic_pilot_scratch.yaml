@@ -75,7 +75,7 @@ log_every: 100
 early_stop_patience: 0
 required_world_size: 1
 contract_run_dir: false
-run_until_step: 8000
+run_until_step: 16000
 ckpt_dir: runs/acoustic_pilot_scratch
 init_ckpt: null
 resume: null
