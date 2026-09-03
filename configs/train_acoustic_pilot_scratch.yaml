@@ -29,7 +29,11 @@ prefetch_factor: 4
 
 optimizer:
   name: adamw
-  lr: 1.0e-3
+  # 2026-09-04: 원래 1.0e-3에서 warmup(200 step) 정점에 도달하자마자 y가
+  # 정확히 0으로 붕괴(loss 2.000/nmse 0.00dB 고정)하는 것을 로컬 계측
+  # 스모크런(y_abs_mean 매 20 step 출력)으로 직접 확인 — 10배 낮추니 같은
+  # 구간을 안정적으로 통과하고 nmse가 계속 개선됨(9.42→4.32dB, step 400).
+  lr: 1.0e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
 

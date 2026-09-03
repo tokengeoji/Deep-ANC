@@ -38,7 +38,11 @@ prefetch_factor: 4
 
 optimizer:
   name: adamw
-  lr: 1.0e-4
+  # 2026-09-04: 원래 1.0e-4에서도 warmup(100 step) 정점 직후 y가 정확히 0으로
+  # 붕괴하는 것을 로컬 계측 스모크런으로 확인 — init_ckpt(이미 수렴된 가중치)가
+  # scratch보다 이 교란에 더 민감해, scratch(1e-3→1e-4)와 같은 10배가 아니라
+  # 그 자체로 10배 더 낮춰야 안정적이었다(step 400까지 nmse 23.0→13.3dB 개선).
+  lr: 1.0e-5
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
 
