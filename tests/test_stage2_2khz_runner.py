@@ -487,11 +487,18 @@ def test_default_campaign_blocks_runner_before_cuda_or_run_directory(
         runner_module, "load_ready_stage2_pretrain_launch", unexpected_admission
     )
     before = tuple((root / "runs").glob("stage2_pretrain_*"))
-    # dirty checkout은 external-contract/corpus/CUDA보다 먼저 fail-closed하는
-    # 정상 경로다. 어느 조기 authority gate든 run directory나 CUDA에 닿지 않아야 한다.
+    # dirty checkout(또는 committed authority anchor 부재)은 external-contract/
+    # corpus/CUDA보다 먼저 fail-closed하는 정상 경로다. 어느 조기 authority gate든
+    # run directory나 CUDA에 닿지 않아야 한다. "Stage-2 Git authority 검증 실패"는
+    # stage2_2khz_git_authority._git()의 모든 git 하위프로세스 실패(예: ls-files
+    # --error-unmatch로 잡히는 untracked anchor)가 공유하는 접두어다 — 정확히
+    # clean origin/dev HEAD일 때만 이 경로로 떨어진다(그 외엔 위 두 메시지가 먼저 뜬다).
     with pytest.raises(
         ValueError,
-        match="origin/dev exact HEAD|authority checkout이 clean하지 않습니다|external contract/commit",
+        match=(
+            "origin/dev exact HEAD|authority checkout이 clean하지 않습니다|"
+            "external contract/commit|Stage-2 Git authority 검증 실패"
+        ),
     ):
         runner_module.Stage2ScratchPretrainRunner(
             repository_root=root,
