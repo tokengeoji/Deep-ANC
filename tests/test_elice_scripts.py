@@ -1810,6 +1810,116 @@ def test_plain_pget_final_injection_is_no_replace_and_resume_path_is_stable(
     assert outputs[0] == outputs[1]
 
 
+def test_prepare_pget_download_stage_auto_quarantines_orphaned_completed_download(
+    tmp_path: Path,
+):
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    prepare_function = text[
+        text.index("prepare_pget_download_stage() {") : text.index(
+            "# ZIP은 live corpus", text.index("prepare_pget_download_stage() {")
+        )
+    ]
+    archive = tmp_path / "shard001.tar.bz2"
+    stage_dir = tmp_path / ".shard001.tar.bz2.official-pget-download"
+    stage_dir.mkdir(mode=0o700)
+    orphan = stage_dir / "shard001.tar.bz2"
+    orphan.write_bytes(b"orphaned-complete-download")
+
+    script = (
+        "set -u\n"
+        f"VENV_PYTHON={sys.executable!r}\n"
+        + prepare_function
+        + f"\nprepare_pget_download_stage {str(archive)!r}\n"
+        + f"prepare_pget_download_stage {str(archive)!r}\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(stage_dir), str(stage_dir)]
+    assert result.stderr.count("[auto-quarantine]") == 1
+    assert not orphan.exists()
+
+    quarantine_dirs = [
+        p
+        for p in stage_dir.iterdir()
+        if p.name.startswith(".shard001.tar.bz2.part.quarantine.")
+    ]
+    assert len(quarantine_dirs) == 1
+    preserved = quarantine_dirs[0] / "shard001.tar.bz2.part"
+    assert preserved.read_bytes() == b"orphaned-complete-download"
+
+
+def test_prepare_pget_download_stage_still_rejects_unexplained_leftover_name(
+    tmp_path: Path,
+):
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    prepare_function = text[
+        text.index("prepare_pget_download_stage() {") : text.index(
+            "# ZIP은 live corpus", text.index("prepare_pget_download_stage() {")
+        )
+    ]
+    archive = tmp_path / "shard001.tar.bz2"
+    stage_dir = tmp_path / ".shard001.tar.bz2.official-pget-download"
+    stage_dir.mkdir(mode=0o700)
+    (stage_dir / "some-other-file.bin").write_bytes(b"not the archive name")
+
+    script = (
+        "set -u\n"
+        f"VENV_PYTHON={sys.executable!r}\n"
+        + prepare_function
+        + f"\nprepare_pget_download_stage {str(archive)!r}\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "unexpected/unsafe deterministic pget staging entry" in result.stderr
+    assert "[auto-quarantine]" not in result.stderr
+
+
+def test_prepare_pget_download_stage_does_not_auto_quarantine_a_symlinked_orphan(
+    tmp_path: Path,
+):
+    text = ELICE_SCRIPTS[0].read_text(encoding="utf-8")
+    prepare_function = text[
+        text.index("prepare_pget_download_stage() {") : text.index(
+            "# ZIP은 live corpus", text.index("prepare_pget_download_stage() {")
+        )
+    ]
+    archive = tmp_path / "shard001.tar.bz2"
+    stage_dir = tmp_path / ".shard001.tar.bz2.official-pget-download"
+    stage_dir.mkdir(mode=0o700)
+    elsewhere = tmp_path / "elsewhere.bin"
+    elsewhere.write_bytes(b"symlink target")
+    (stage_dir / "shard001.tar.bz2").symlink_to(elsewhere)
+
+    script = (
+        "set -u\n"
+        f"VENV_PYTHON={sys.executable!r}\n"
+        + prepare_function
+        + f"\nprepare_pget_download_stage {str(archive)!r}\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "unexpected/unsafe deterministic pget staging entry" in result.stderr
+    assert "[auto-quarantine]" not in result.stderr
+
+
 def test_plain_bootstrap_rejects_intermediate_archive_parent_symlink_before_setup(
     tmp_path: Path,
 ):

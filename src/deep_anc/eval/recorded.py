@@ -710,6 +710,16 @@ def iter_recorded_segments(
             reference_mode,
             allow_legacy_source_timeline=allow_legacy_source_timeline,
         )
+        if reference_mode == "digital" and str(
+            (metadata.get("program") or {}).get("type", "")
+        ) == "file":
+            # "file" 세션은 실제 environment/machine 녹음 파일을 재생한 것이라
+            # 재생 시점에 "digital로 미리 아는 파형"이라는 전제 자체가 성립하지
+            # 않는다. 그 소스에는 자연스러운 무음 구간이 있을 수 있고
+            # (source_aligned.wav가 이를 그대로 반영), ref-only 계약의 "digital
+            # reference는 절대 all-zero가 아니다" 가정은 합성 톤 생성기 전용이라
+            # 여기엔 안 맞는다 — 진짜 ref/error mic(mics.wav)은 그대로 온전하다.
+            continue
         lead = constant_lead
         recorded_delay = -1.0
         if reference_mode == "digital":

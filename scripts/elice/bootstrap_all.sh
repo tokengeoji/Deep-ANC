@@ -1809,6 +1809,7 @@ prepare_pget_download_stage() {
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 archive = Path(sys.argv[1])
@@ -1836,7 +1837,7 @@ quarantine_members = {
     f"{archive.name}.part",
     f"{archive.name}.part.state.json",
 }
-for child in stage.iterdir():
+for child in list(stage.iterdir()):
     child_info = child.lstat()
     if child.name.startswith(quarantine_prefix):
         suffix = child.name.removeprefix(quarantine_prefix)
@@ -1866,14 +1867,28 @@ for child in stage.iterdir():
             ):
                 raise SystemExit(f"unsafe deterministic pget quarantine member: {member}")
         continue
-    if (
-        child.name not in allowed
-        or child.is_symlink()
-        or not stat.S_ISREG(child_info.st_mode)
-        or child_info.st_nlink != 1
-        or child_info.st_uid != os.geteuid()
-    ):
-        raise SystemExit(f"unexpected/unsafe deterministic pget staging entry: {child}")
+    structurally_safe = (
+        not child.is_symlink()
+        and stat.S_ISREG(child_info.st_mode)
+        and child_info.st_nlink == 1
+        and child_info.st_uid == os.geteuid()
+    )
+    if child.name in allowed and structurally_safe:
+        continue
+    if structurally_safe and child.name == archive.name:
+        # 이전 실행이 pget 완료 후 ln+rm -rf(정리) 전에 죽으면 완성된 산출물이
+        # 고아로 남는다 — provenance는 추측하지 않고(재사용/삭제 금지) 이미
+        # 검증된 quarantine 스키마로만 격리한 뒤 새로 받는다.
+        token = f"orphan_{int(time.time())}_{os.urandom(4).hex()}"
+        quarantine_dir = stage / f"{quarantine_prefix}{token}"
+        os.mkdir(quarantine_dir, 0o700)
+        os.rename(child, quarantine_dir / f"{archive.name}.part")
+        print(
+            f"[auto-quarantine] 정리되지 못한 완료 잔여물 격리: {child} -> {quarantine_dir}",
+            file=sys.stderr,
+        )
+        continue
+    raise SystemExit(f"unexpected/unsafe deterministic pget staging entry: {child}")
 print(stage)
 PY
 }
