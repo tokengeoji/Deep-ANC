@@ -55,15 +55,22 @@ source_mix_ratio:
   esc50: 0.05
 
 # acoustic-ref 모드 전용 구성 [로드맵 A2] — reference_mode: acoustic 이므로 이 표를 쓴다.
-# 주기성/공진(P≈30ms 에서 유일하게 예측 가능) 비중을 키우되, 예측 불가 광대역도 명시 포함
-# (do-no-harm — "출력 0" 이 최적인 성분을 분포에 넣어야 증폭 안 하는 법을 배운다).
+# 2026-09-04 재조정: S(z) 실측 지연(1501 샘플 ≈ 31ms)이 RIR 뱅크로 확인한 실제
+# ref→err 물리 선행시간(≈138 샘플 ≈ 2.9ms)을 훨씬 초과해, 광대역 소스는 이 인과
+# 예산 안에서 원천적으로 예측 불가능하다. 기존 40% 광대역 비중이
+# equal_subband objective의 이중 최악값(subband CVaR → subband guard) 집계와
+# 상호작용해 모든 subband의 "최악" 버킷을 광대역이 항상 차지 → 주기성분을 잘
+# 상쇄해도 objective가 개선되지 않는 정체(flat NMSE)를 만든 것으로 진단됨
+# (scratch/finetune 두 checkpoint 모두 동일 증상, 100% synthetic 스모크런은
+# 정상 수렴 확인). 광대역 비중을 do-no-harm 최소 수준(20%)으로 낮추고 주기성
+# (synthetic+machine) 비중을 80%로 올린다.
 source_mix_ratio_acoustic:
-  synthetic: 0.45
-  machine: 0.15
-  dns_fullband: 0.20
-  demand: 0.10
-  speech: 0.05
-  esc50: 0.05
+  synthetic: 0.60
+  machine: 0.20
+  dns_fullband: 0.10
+  demand: 0.05
+  speech: 0.03
+  esc50: 0.02
 
 noise_manifest_dir: data/manifests/canonical_v4
 allow_missing_source_manifests: false
