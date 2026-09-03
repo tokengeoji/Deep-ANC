@@ -39,7 +39,10 @@ optimizer:
 
 schedule:
   warmup_steps: 200
-  total_steps: 8000
+  # 2026-09-04: 8000 step 완주 후 실측에서 처음으로 방향이 맞는 상쇄(-0.16~-0.67dB
+  # trusted NMSE)를 확인했으나 폭이 작았다. lr 값은 그대로 두고(다시 붕괴 재현 방지)
+  # 예산만 2배로 늘려 더 개선되는지 확인한다. last.pt에서 resume.
+  total_steps: 16000
   min_lr: 1.0e-5
 
 amp: bf16
