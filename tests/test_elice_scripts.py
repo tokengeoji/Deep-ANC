@@ -1885,7 +1885,7 @@ def test_archive_cache_active_never_falls_back_for_dns_demand_or_mimii():
         "ensure_wget_zip"
     )
     assert mimii_function.index('archive_cache_argument_count" -eq 3') < mimii_function.index(
-        "ensure_pget_zip"
+        "ensure_wget_zip"
     )
     assert "official network fallback" in demand_function
     assert "official network fallback" in mimii_function
