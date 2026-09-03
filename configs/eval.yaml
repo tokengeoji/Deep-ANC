@@ -32,6 +32,12 @@ scenarios:                      # scripts/demo/evaluate_session.py 시나리오
      noise: {type: band, band: [800, 1600], amplitude: 0.04}}
   - {name: nonlinear, measure_band_hz: [150, 900],
      noise: {type: nonlinear, frequency: 210, amplitude: 0.06}}
+  # 2026-09-03 사용자 요청 — 단순 사인파가 아니라 합성파로 150-1600Hz 전체(현행 Stage-1
+  # 4개 subband: [150,300],[300,600],[600,1000],[1000,1600])를 한 번에 실측한다.
+  - {name: multitone_stage1, measure_band_hz: [150, 1600],
+     noise: {type: multitone, frequencies: [225, 450, 800, 1300], amplitude: 0.04}}
+  - {name: nonlinear_stage1, measure_band_hz: [150, 1600],
+     noise: {type: nonlinear, frequency: 300, amplitude: 0.06}}
 
 # 측정 대역에 소스 에너지가 이 비율 미만이면 headline 감쇠를 발행하지 않는다.
 min_source_energy_fraction_in_measure_band: 0.5

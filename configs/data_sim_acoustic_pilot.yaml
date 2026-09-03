@@ -1,0 +1,90 @@
+# 시뮬레이션 학습 데이터 생성 설정 (on-the-fly 합성) — acoustic-reference 파일럿 전용.
+#
+# configs/data_sim.yaml 과 완전히 같고 reference_mode 한 줄만 acoustic 으로 바꾼
+# 파일이다. 2026-09-03 — "레퍼런스 마이크로 실제 acoustic 입력을 받았을 때 기존
+# 파인튜닝 vs 새로 학습 중 뭐가 더 나은가"를 가장 빠르게 실측 이전 단계에서
+# 가늠하기 위한 pilot(configs/train_acoustic_pilot_*.yaml)만 이 파일을 가리킨다.
+# canonical data_sim.yaml 은 건드리지 않는다 — reference_mode 는 CLI 로 즉흥적으로
+# 바꾸지 않고 이렇게 별도 파일로 고정해, 실수로 digital 모드로 도는 것을 막는다.
+
+sample_rate: 48000
+segment_seconds: 1.5
+
+bootstrap_receipt: data/manifests/elice_bootstrap_receipt.json
+bootstrap_receipt_sha256: null
+archive_cache_root: null
+archive_cache_manifest: null
+archive_cache_manifest_sha256: null
+recorded_generation: null
+recorded_generation_sha256: null
+
+recorded_level_calibration: null
+recorded_level_calibration_sha256: null
+recorded_current_strict_min_fraction: 0.5
+
+# 레퍼런스 모드 [교차검증 C2 — 두 모드의 지연 물리가 다르다]
+#   digital : 소음원을 Jetson이 생성 → 출력버퍼 지연이 소음/상쇄 양경로에 공통 → 광대역 상쇄 가능
+#   acoustic: 외부 소음을 레퍼런스 마이크로 수음 → P≈30ms 예측 필요 → 주기성/협대역 한정
+reference_mode: acoustic
+
+digital_primary_path_mode: secondary_surrogate
+
+recorded_lead_mode: timeline
+
+recorded_sampling: family_plant_domain_component_session_balanced
+
+recorded_augment:
+  enabled: true
+  level_db_range: [-12.0, 6.0]
+  polarity_flip: true
+  mic_noise_snr_db: [12.0, 40.0]
+  eq_tilt_db: 6.0
+  eq_band_db: 4.0
+  eq_bands_hz: [100.0, 300.0, 700.0, 1400.0]
+  mix_probability: 0.0
+  mix_weight_range: [0.0, 0.7]
+  lead_jitter_samples: 0.0
+
+source_mix_ratio:
+  synthetic: 0.25
+  dns_fullband: 0.30
+  speech: 0.15
+  music: 0.10
+  demand: 0.08
+  machine: 0.07
+  esc50: 0.05
+
+# acoustic-ref 모드 전용 구성 [로드맵 A2] — reference_mode: acoustic 이므로 이 표를 쓴다.
+# 주기성/공진(P≈30ms 에서 유일하게 예측 가능) 비중을 키우되, 예측 불가 광대역도 명시 포함
+# (do-no-harm — "출력 0" 이 최적인 성분을 분포에 넣어야 증폭 안 하는 법을 배운다).
+source_mix_ratio_acoustic:
+  synthetic: 0.45
+  machine: 0.15
+  dns_fullband: 0.20
+  demand: 0.10
+  speech: 0.05
+  esc50: 0.05
+
+noise_manifest_dir: data/manifests/canonical_v4
+allow_missing_source_manifests: false
+rir_bank: data/rir_bank/duct_rirs_v1.npz
+
+level_dbfs: [-45, -20]
+snr_mic_noise_db: [5, 30]
+dc_hum_prob: 0.2
+
+nonlinear:
+  sef_eta_choices: [10.0]
+  drive_range: [1.0, 1.0]
+  hardclip_prob: 0.0
+
+plant_perturbation:
+  delay_jitter_range: [0, 0]
+  gain_tilt_db_per_octave: [0, 0]
+  gain_db: [0, 0]
+  allpass_perturb: false
+
+closed_loop:
+  feedback_delay_samples: [512, 1024]
+  warmup_seconds: 0.25
+  unroll_group_frames: 4

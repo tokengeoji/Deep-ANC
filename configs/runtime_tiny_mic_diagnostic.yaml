@@ -1,0 +1,101 @@
+# acoustic-reference(ref_mic) 일회성 진단 — hybrid_anc_tiny + ONNX Runtime.
+#
+# 이 파일은 configs/runtime_tiny.yaml 과 engine/hardware/duct 는 완전히 같고
+# reference 만 mic 으로 바꾼 진단 전용 변형이다. 2026-09-03 사용자 요청 —
+# "reference mic 로 실제 acoustic-reference 입력을 기존 DL 가중치에 걸었을 때
+# 지금 성능이 실측으로 얼마나 나오는가"를 확인하기 위한 것이다.
+#
+# ⚠ 이 checkpoint(runs/pretrain_tiny_corrected/ckpt/best.pt)는
+# reference_mode=digital, physics_status=secondary_surrogate_representation_pretrain 으로
+# 학습됐다. 즉 학습 중에는 "Jetson이 직접 생성해 아는 소음 파형"만 reference로 봤고,
+# 실제 reference mic가 잡는 지연·잔향·마이크 잡음이 섞인 신호는 한 번도 본 적이 없다.
+# 이 실행은 그 mismatch가 실측으로 얼마나 나쁜지 재는 것이지, acoustic-reference용으로
+# 파인튜닝된 모델의 배포 성능이 아니다. PROJECT_STATUS.md §7.2 의 일회성 진단과 같은
+# 계약이며, run_realtime.py의 validate_runtime_plant_contract는 reference!=digital일 때
+# strict P/S 계약 자체를 요구하지 않는다(별도 acoustic 인과성 규약 — docs/01_physics_limits.md §3).
+#
+# acoustic-reference는 digital_reference_lead_samples를 반드시 0으로 둔다 — lead는
+# digital-reference 전용 자유변수라 mic 입력에는 전이되지 않는다
+# (validate_digital_reference_lead가 이를 강제하고, checkpoint의 digital lead=109는
+# 이 모드에서 비교 대상에서 제외된다).
+#
+# 실행 예 (evaluate_session.py 실측 OFF/ON/OFF 리포트, composite 파형만):
+# .venv/bin/python scripts/demo/evaluate_session.py \
+#   --config configs/runtime_tiny_mic_diagnostic.yaml --controllers dl \
+#   --scenarios multitone_stage1 nonlinear_stage1 --dry-run
+# (dry-run PASS 확인 뒤에만) --confirm-speaker --confirm-user-present --confirm-volume-minimum 추가.
+
+hardware_config: configs/hardware_jetson.yaml
+duct_config: configs/duct.yaml
+
+hop: 256
+reference: mic
+controller: dl
+
+# acoustic-reference 전용 규약: 반드시 0.
+digital_reference_lead_samples: 0
+
+engine:
+  type: ort
+  ckpt: runs/pretrain_tiny_corrected/ckpt/best.pt
+  onnx: runs/export/tiny_corrected.onnx
+  plan: runs/export/tiny_corrected_fp16.plan
+  cpu_affinity: [4, 5, 6, 7]
+
+fxlms:
+  control_length: 256
+  mu: 0.05
+  leakage: 1.0e-6
+  weight_norm_limit: 20.0
+
+safety:
+  # configs/runtime_tiny.yaml 과 동일 규약 — 근거는 그 파일 주석과
+  # src/deep_anc/realtime/safety.py 의 SafetyLimits docstring.
+  control_limit: 0.2
+  fade_ms: 20
+
+  saturation_ratio: 0.95
+  saturation_fraction: 0.5
+  saturation_window_s: 1.0
+  saturation_rate_mute: 0.5
+
+  output_rms_ratio: 0.6
+  rms_window_s: 1.0
+  rms_rate_mute: 0.5
+
+  deadline_window_s: 1.0
+  deadline_miss_rate_mute: 0.2
+
+  divergence_ratio: 4.0
+  divergence_hold_s: 0.5
+  divergence_rate_mute: 0.5
+  baseline_floor_power: 1.0e-8
+  baseline_tau_s: 1.0
+  baseline_grace_s: 3.0
+  divergence_probe_s: 1.0
+  divergence_probe_confirm_ratio: 2.0
+  divergence_probe_limit: 3
+  divergence_probe_clear_s: 10.0
+
+  output_dc_limit_ratio: 0.05
+  output_dc_window_s: 0.2
+  output_dc_rate_mute: 0.5
+  output_dc_blocker_r: 0.9995
+  output_dc_lowpass_hz: 2.0
+  output_dc_ac_dominance: 0.3
+  output_dc_hard_ratio: 0.5
+
+  handoff_window_s: 1.0
+  handoff_drop_rate_mute: 0.2
+
+noise:
+  type: band
+  frequency: 300.0
+  amplitude: 0.03
+  band: [80.0, 1000.0]
+  file: null
+  seed: 20260801
+
+record: null
+run_seconds: 0.0
+start_on: false

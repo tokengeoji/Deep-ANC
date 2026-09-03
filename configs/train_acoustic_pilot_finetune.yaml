@@ -1,0 +1,82 @@
+# Acoustic-reference 파일럿 (기존 checkpoint 파인튜닝) — 2026-09-03
+#
+# 짝 config: configs/train_acoustic_pilot_scratch.yaml — 그 파일과 seed·data·loss·
+# step 예산이 완전히 같고 init_ckpt/lr/warmup만 다르다. 두 실행을 각각 끝까지
+# 돌려 val nmse_subband_objective_db/nmse_subband_worst_db 곡선을 비교하면
+# "파인튜닝 vs 재학습" 질문에 이론이 아니라 실측(값 없이는) 가까운 근거로 답할 수 있다.
+#
+# init_ckpt는 runs/pretrain_tiny_corrected/ckpt/best.pt — 현재 배포 중인 Tiny
+# 모델이다. 이 checkpoint는 reference_mode=digital로 학습됐고 init_eligible
+# 필드 자체가 없는(None) 구형 pretrain이라 require_init_eligible: false로 canonical
+# admission(및 completion-receipt 대조)을 명시적으로 우회한다 — strict P/S나 데이터
+# 계약을 느슨하게 만드는 것이 아니라, 이 pilot이 애초에 canonical 산출물이 아니기
+# 때문이다(experiment_role: performance_pilot, init_eligible: false, 위와 동일).
+# lr은 사전학습 대비 1/10 — configs/train_finetune.yaml과 같은 관례(파인튜닝은
+# 낮은 lr로 기존 표현을 크게 흔들지 않는다).
+#
+# 실행(Elice, GPU 필요): .venv/bin/python scripts/train/train.py \
+#   --config configs/train_acoustic_pilot_finetune.yaml
+stage: open_loop
+experiment_role: performance_pilot
+init_eligible: false
+require_init_eligible: false
+# init checkpoint는 digital-reference lead=109로 학습됐고 이 pilot의 acoustic 학습은
+# lead=0(acoustic은 항상 0 — validate_digital_reference_lead)이다. Trainer의 init_ckpt
+# lead-일치 검사는 기본 허용치가 0이라 이 차이를 그대로 두면 거부된다(로컬 스모크
+# 테스트로 실제 확인, 2026-09-03). 이 109는 "측정 오차 허용"이 아니라 두 reference
+# mode의 정의상 다른 lead 값 그 자체이므로, 정확히 그 값으로 명시해 우회가 아니라
+# "가중치만 옮기고 물리 모드는 다르다"(validate_resume_physics 주석)는 의도를 코드로 남긴다.
+readiness:
+  max_init_lead_mismatch_samples: 109
+model_config: configs/model_tiny.yaml
+data_config: configs/data_sim_acoustic_pilot.yaml
+duct_config: configs/duct.yaml
+
+batch_size: 96
+num_workers: 14
+prefetch_factor: 4
+
+optimizer:
+  name: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+schedule:
+  warmup_steps: 100
+  total_steps: 8000
+  min_lr: 1.0e-6
+
+amp: bf16
+grad_clip: 5.0
+
+loss:
+  nmse_objective: equal_subband
+  nmse_subband_guard_alpha: 0.25
+  nmse_cvar_q: 0.25
+  nmse_cvar_alpha: 0.7
+  nmse_cvar_min_k: 4
+  lambda_dnh: 0.00075
+  dnh_weight_below: 1.0
+  dnh_weight_above: 2.0
+  lambda_frame: 0.0
+  nmse_frame_samples: 8192
+  nmse_frame_silence_db: -40.0
+  mrstft_ffts: [256, 512, 1024, 2048]
+  lambda_mrstft: 1.0
+  band_weight: trusted_only
+  lambda_pow: 0.0
+  lambda_sat: 1.0
+  sat_margin: 2.0
+
+val_items: 64
+eval_every: 500
+log_every: 100
+early_stop_patience: 0
+required_world_size: 1
+contract_run_dir: false
+run_until_step: 8000
+ckpt_dir: runs/acoustic_pilot_finetune
+init_ckpt: runs/pretrain_tiny_corrected/ckpt/best.pt
+resume: null
+seed: 20260903

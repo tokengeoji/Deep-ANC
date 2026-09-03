@@ -1,9 +1,93 @@
 # HANDOFF — 파인튜닝 준비 복구 상태
 
 > “이어서 진행해줘”를 받으면 이 파일과 `AGENTS.md`를 먼저 읽는다.
-> 최종 갱신: 2026-09-01. 현행 통합 개발 브랜치: `dev`.
+> 최종 갱신: 2026-09-03. 현행 통합 개발 브랜치: `dev`.
+> 반복 확인을 줄이기 위한 현재 프로젝트 요약은 [PROJECT_STATUS.md](PROJECT_STATUS.md)를
+> 함께 읽는다. 모델 목록·실행 명령·digital/mic·DL/FxLMS 구분은 그 문서를 우선 참고하고,
+> 이 파일은 physical/training/canonical blocker의 상세 근거로 사용한다.
 
-### 사용자 목표 갱신 — 1.6 kHz 우선 gate (2026-09-01)
+### 2026-09-03 acoustic-reference 실측 진단 + 파인튜닝-vs-재학습 pilot
+
+기존 배포 Tiny checkpoint(`runs/pretrain_tiny_corrected/ckpt/best.pt`, digital-reference
+lead=109)에 실제 reference mic 입력(`reference: mic`)을 연결해 실측했다. 새 진단 config
+[configs/runtime_tiny_mic_diagnostic.yaml](configs/runtime_tiny_mic_diagnostic.yaml)와
+`configs/eval.yaml`의 신규 합성파 시나리오(`multitone_stage1`: 225/450/800/1300Hz 동시
+재생, `nonlinear_stage1`: 300Hz+3·5차 고조파+소프트클립)를 썼다 — 사용자 요구대로 단순
+사인파가 아닌 합성파, 150–1600Hz 전체 대상. `reference: mic`은
+`validate_runtime_plant_contract`가 애초에 strict P/S 계약을 요구하지 않는 경로라
+(`runtime_requires_strict_plant_contract`는 `reference=digital` 전용) RT5640/J511 하드웨어
+blocker와 무관하게 기존 AB13X 경로로 바로 실행 가능했다.
+
+결과(raw: `results/session_20260903_110233/`): `multitone_stage1`은 150–1600Hz 전체
+감쇠 **−0.57 dB**(사실상 무반응~미세 증폭), `nonlinear_stage1`은 ANC ON 유효구간이
+91.3%(<95% 요구)라 세이프티 mute가 걸려 **수치를 내지 못했다**(raw도 저장 전에
+스크립트가 종료돼 남지 않음). 즉 기존 digital-trained checkpoint는 실제 ref mic
+입력에 대해 지금 사실상 아무 것도 학습하지 못한 상태다 — 이유는 학습이 애초에
+`reference_mode=digital`(Jetson 자기생성 파형)로만 됐고 실제 mic의 지연·잔향·잡음
+통계를 한 번도 본 적이 없기 때문이다. 도구(`reduction_measurement_eligibility` fail-closed
+게이트)는 의도대로 작동했다 — fallback/mute를 성능으로 위장하지 않았다.
+
+**파인튜닝 vs 재학습**은 이 한 번의 zero-shot 진단만으로 결정할 수 없다(파인튜닝했을 때
+하위 표현이 전이되는지는 다른 질문). 결정을 실측 전에 가장 빠르게 근거 있게 하기 위해
+paired pilot을 만들고 로컬에서 실제로 몇 스텝 돌려 배선을 검증했다(이론이 아니라 실행
+확인):
+
+- [configs/data_sim_acoustic_pilot.yaml](configs/data_sim_acoustic_pilot.yaml):
+  `data_sim.yaml`과 동일하고 `reference_mode: acoustic`만 다르다. RIR bank
+  (`data/rir_bank/duct_rirs_v1.npz`)에 `p_ref`(NS→REF)·`f_fb`(CS→REF, feedback
+  경로)·`p_err`가 이미 300개씩 있어 **새 물리 측정 없이** 지금 시뮬레이션 학습이
+  가능하다(로컬 확인 완료).
+- [configs/train_acoustic_pilot_scratch.yaml](configs/train_acoustic_pilot_scratch.yaml) /
+  [configs/train_acoustic_pilot_finetune.yaml](configs/train_acoustic_pilot_finetune.yaml):
+  seed·data·loss(`equal_subband`, 오늘 이미 확정한 4-subband 균등 목표와 동일)·스텝
+  예산(8000)을 완전히 같게 하고 `init_ckpt`만 다르게 한 pair. 로컬 스모크(각 10스텝,
+  synthetic-only override)에서 둘 다 실제로 끝까지 돌았다. 그 과정에서 실제 blocker를
+  하나 발견·수정했다: init checkpoint의 digital lead(109)와 acoustic 학습의 lead(0)
+  불일치를 Trainer가 기본 허용치 0에서 거부했고, `readiness.max_init_lead_mismatch_samples:
+  109`로 “측정오차가 아니라 두 reference mode 정의상 다른 값”임을 명시해 열었다
+  (`train_acoustic_pilot_finetune.yaml` 주석 참조).
+- 이 pilot의 val 숫자는 canonical 성능 근거가 **아니다** — 승자를 골라 실제 덕트에서
+  오늘과 같은 방식(`evaluate_session.py` + 위 두 시나리오)으로 다시 실측해야 한다.
+
+**Elice 상태(2026-09-03 SSH 확인)**: `central-01.tcp.tunnel.elice.io:34280` 인스턴스는
+A100 80GB idle(0% util), `~/Deep_ANC`가 `2b444a099...`(3커밋 rewind, uncommitted 없음)에
+clean checkout돼 있지만 `data/manifests/`, `data/rir_bank/`, `runs/`가 전부 없다 —
+이 기기의 corpus bootstrap은 아직 실행된 적이 없다. RIR bank(13MB)와 기존 Tiny
+checkpoint(14MB)는 크기가 작아 scp로 직접 옮긴다. 전체 corpus bootstrap
+(`scripts/elice/bootstrap_all.sh`, 최초 다운로드 약 18.23GB)은 시간이 걸리므로, 먼저
+`source_mix_ratio_acoustic`을 synthetic-only로 좁힌 빠른 1차 pilot을 A100에서 돌려
+fine-tune vs scratch 수렴 경향만 먼저 본 뒤, 필요하면 전체 corpus로 재현하는 순서로
+진행한다.
+
+### 사용자 목표 갱신 — 1.6 kHz 이하 전체 최적화 (2026-09-02)
+
+사용자는 **1.6 kHz 이상은 최적화 대상에서 포기하고, 현재 검증 가능한 150–1600 Hz
+전체를 고르게 개선**하는 방향으로 변경했다. 따라서 현행 strict 네 부대역
+`[150,300]`, `[300,600]`, `[600,1000]`, `[1000,1600]`을 active target으로 유지하고,
+1.6 kHz 초과 결과는 do-no-harm 진단만 남긴다. 기존 1.6 kHz sentinel/2 kHz Stage-2
+목표는 과거 계획으로 보존하며 새 성능 근거로 섞지 않는다. 80–150 Hz는 현재 P/S
+일관성·권한 증거가 없어 strict target에 임의로 포함하지 않는다.
+
+기존에 학습된 Tiny surrogate를 다시 켜 보는 경우에는
+`run_realtime.py --legacy-diagnostic --run-seconds 60`을 사용한다. 이 경로는
+checkpoint/ONNX의 legacy lead=109와 surrogate metadata만 확인하고 strict P/S 계약을
+명시적으로 건너뛰는 진단 전용 경로이며, 녹음·ANC 감쇠·배포 증거를 만들지 않는다.
+
+### 최신 runtime 표시 정정 — ERR dBFS와 `저감`의 관계 (2026-09-02)
+
+최근 legacy 실행에서 OFF 마지막 `e=-44.62 dBFS`, ON `e=-49.72…-52.61 dBFS`가
+관측됐다. dBFS는 더 음수일수록 전력이 낮으므로, 값 자체가 증가한 것이 아니다. 과거
+`저감`은 직전 줄의 차이가 아니라 ANC OFF 동안 수집한 baseline EMA와 현재 ERR power의
+`10log10(P_baseline/P_error)`였다.
+
+다만 그 세션은 `xrun=120`, `fallback=29`, `deadline=2`였으므로 정상적인 상쇄 출력과
+무음 fallback이 섞였다. 과거 runtime이 이 상태에서도 양의 저감을 표시한 것이 문제다.
+현재 callback은 baseline, 실제 output-ring 데이터, full gate, xrun/fallback/deadline/
+engine error 0을 모두 확인하고, 하나라도 깨지면 `저감=n/a`와
+`판정=INVALID:<사유>`를 출력한다. 이 수치는 주파수별 감쇠가 아니며, 주파수별 판단은
+legacy diagnostic `evaluate_session.py`의 OFF→ON→OFF raw에서 대역별로 해야 한다.
+
+### 과거 사용자 목표 — 1.6 kHz 우선 gate (2026-09-01)
 
 사용자 확정 기준은 **1.6 kHz sentinel `[1425.438, 1795.939) Hz`에서 family 평균·
 최악 10% 평균·cluster-bootstrap 95% CI 하단이 모두 `>= 6 dB`**인 것이다. 기존 2 kHz
