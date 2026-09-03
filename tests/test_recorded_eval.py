@@ -331,14 +331,19 @@ def test_recorded_segments_skip_all_zero_digital_reference_for_file_type_session
     """"file" 세션(실제 environment/machine 오디오 파일 재생)은 재생 시점에
     "digital로 미리 아는 파형"이라는 전제가 성립하지 않으므로, 그 source에 있는
     자연스러운 무음 구간이 ref-only 계약의 all-zero 하드 체크에 걸려선 안 된다
-    — digital 모드에서는 세션째로 건너뛴다. 반대로 "file"이 아닌 세션의 진짜
-    all-zero digital reference는 여전히 거부되어야 한다(회귀 방지)."""
+    — digital 모드에서는 all-zero인 segment만 건너뛴다(세션 전체를 버리지
+    않는다: 이 데이터셋은 세션이 전부 "file" 타입이라 세션째로 버리면 split
+    coverage가 통째로 0이 된다). 반대로 "file"이 아닌 세션의 진짜 all-zero
+    digital reference는 여전히 거부되어야 한다(회귀 방지)."""
 
-    def _build(name: str, *, program_type: str | None) -> Path:
+    def _build(
+        name: str, *, program_type: str | None, source: np.ndarray | None = None
+    ) -> Path:
         path = tmp_path / name
         path.mkdir()
         samples = 64
-        source = np.zeros(samples, dtype=np.float32)
+        if source is None:
+            source = np.zeros(samples, dtype=np.float32)
         mics = np.stack([source, np.full_like(source, 0.01)], axis=1)
         sf.write(path / "mics.wav", mics, FS, subtype="FLOAT")
         sf.write(path / "source.wav", source, FS, subtype="FLOAT")
@@ -373,6 +378,22 @@ def test_recorded_segments_skip_all_zero_digital_reference_for_file_type_session
         )
     )
     assert segments == []
+
+    mixed_source = np.concatenate(
+        [np.zeros(32, dtype=np.float32), np.full(32, 0.02, dtype=np.float32)]
+    )
+    mixed_session = _build("mixed_sess", program_type="file", source=mixed_source)
+    mixed_segments = list(
+        iter_recorded_segments(
+            [_entry(mixed_session, "test", "mixed_sess", "g1", "environment")],
+            data,
+            model_hop=4,
+            max_segments_per_session=8,
+            edge_trim_seconds=0.0,
+            allow_legacy_source_timeline=True,
+        )
+    )
+    assert [segment.start_sample for segment in mixed_segments] == [32, 40, 48, 56]
 
     tone_session = _build("tone_sess", program_type="tone")
     with pytest.raises(ValueError, match="digital reference 전체가 0"):
