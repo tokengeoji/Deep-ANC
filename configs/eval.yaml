@@ -38,6 +38,10 @@ scenarios:                      # scripts/demo/evaluate_session.py 시나리오
      noise: {type: multitone, frequencies: [225, 450, 800, 1300], amplitude: 0.04}}
   - {name: nonlinear_stage1, measure_band_hz: [150, 1600],
      noise: {type: nonlinear, frequency: 300, amplitude: 0.06}}
+  # 2026-09-03 진단 — nonlinear_stage1(0.06)이 ANC ON 91.3%(<95%) 세이프티 mute로
+  # 유효값을 못 낸 원인을 좁히기 위한 절반 진폭 재시도.
+  - {name: nonlinear_stage1_lowamp, measure_band_hz: [150, 1600],
+     noise: {type: nonlinear, frequency: 300, amplitude: 0.03}}
 
 # 측정 대역에 소스 에너지가 이 비율 미만이면 headline 감쇠를 발행하지 않는다.
 min_source_energy_fraction_in_measure_band: 0.5
