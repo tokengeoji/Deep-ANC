@@ -21,16 +21,23 @@
    `.gitignore`의 앵커 패턴(`/data/` 등)을 비앵커로 바꾸지 말 것 (과거 사고: `data/`가 `src/deep_anc/data/`까지 무시).
 5. **커밋 메시지에 AI 표기 금지.** Co-Authored-By: Claude/Codex 등 붙이지 말 것 (사용자 요청).
 6. **소통은 한국어.** 문서도 한국어로 작성.
+7. **Docker 안에서만 작업.** 코드 읽기·수정·Python 실행·테스트는 컨테이너 내부에서만 한다.
+   호스트에서는 Docker 빌드/시작/접속 등 환경 관리만 수행한다. 호스트 `.venv`는 사용하지 않는다.
+   절차는 [docker/README.md](docker/README.md). x86 CPU 검증을 Jetson GPU/오디오 실측으로 보고하지 않는다.
+8. **이 PC에서 가능한 작업은 이 PC의 Docker에서 진행한다.** 코드·합성 회귀·오프라인 분석·문서화는
+   Jetson 연결을 기다리며 멈추지 않는다. 실제 ARM64/CUDA/TensorRT·I/O 지연·덕트 측정만 Jetson에서 한다.
+   작업별 선행조건·완료 기준·회수 산출물은 [docs/14](docs/14_pc_jetson_workplan.md)를 따른다.
 
 ## 환경 요약
 
 | 위치 | 내용 |
 |---|---|
-| 이 PC | Jetson AGX Orin (JetPack 6/R36.4.4) = **추론 타깃이자 개발 머신** |
-| venv | `.venv` — torch 2.5.0a0(NVIDIA JP6.1 wheel) + CUDA 동작. **onnxruntime==1.18.1 고정**(1.19+는 Tegra 크래시). venv 재생성 시 `bash scripts/jetson/setup_jetson.sh` (lib preload 훅 포함 — 필수) |
+| 추론 타깃 | Jetson AGX Orin (JetPack 6/R36.4.4). 현재 접속 호스트의 아키텍처와 구분할 것 |
+| 개발 환경 | Docker 전용. x86 호스트는 `cpu`, 실제 ARM64 Jetson은 `jetson` 이미지 사용 |
+| venv | 컨테이너 `/workspace/Deep-ANC/.venv`, 이미지별 Docker 볼륨. **onnxruntime==1.18.1 고정**(1.19+는 Tegra 크래시). Jetson 이미지는 NVIDIA PyTorch wheel과 lib preload 훅을 설치하며 실기 CUDA 검증은 별도 |
 | 학습 | Elice Cloud A100 (SSH 접속 — HANDOFF.md 참조), torch 2.5.1+cu121 |
-| GitHub | https://github.com/Roka-jsj/Deep-ANC (공개). push 인증: 이 PC의 `~/.ssh/id_ed25519` |
-| 실행 | 모든 파이썬 실행은 `.venv/bin/python`. 테스트: `.venv/bin/python -m pytest -q` (전부 통과 유지) |
+| GitHub | https://github.com/tokengeoji/Deep-ANC (공개, 이전 Roka-jsj 주소도 같은 저장소로 연결). 현재 checkout의 origin/작성자/인증은 별도 확인하고 사용자 승인 대상으로만 push한다. 과거 Jetson 키 경로를 현재 PC에 있다고 가정하지 않는다 |
+| 실행 | `bash scripts/docker/dev.sh exec .venv/bin/python ...`. 테스트: `bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q` (전부 통과 유지) |
 
 ## 프로젝트 이해에 필요한 문서 (우선순위순)
 

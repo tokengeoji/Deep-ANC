@@ -1,0 +1,7 @@
+# CPU/Jetson 컨테이너 공통 검증 도구. torch는 각 Dockerfile에서 설치한다.
+-r ../requirements.txt
+sounddevice==0.5.6
+onnx==1.22.0
+onnxruntime==1.18.1
+tensorboard==2.21.0
+pytest==9.1.1

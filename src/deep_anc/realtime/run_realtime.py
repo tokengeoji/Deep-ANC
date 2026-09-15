@@ -32,7 +32,7 @@ from ..audio_io import (
 )
 from ..config import DEFAULT_HANDOFF_SAMPLES, load_runtime_config
 from ..dsp.filters import DCBlocker
-from .engines import build_engine, secondary_path_npz
+from .engines import build_engine, secondary_path_npz, validate_secondary_calibration
 from .noise_gen import DigitalReferenceBuffer, NoiseProgram
 from .ring_buffer import SPSCRing
 from .safety import FadeGate, PowerEMA, SafetySupervisor
@@ -45,6 +45,11 @@ def power_to_db(power: float, floor_db: float = -200.0) -> float:
     return max(floor_db, 10.0 * float(np.log10(power)))
 
 
+def _validate_reference_mode(reference: str) -> None:
+    if reference not in {"digital", "mic"}:
+        raise ValueError(f"reference는 digital 또는 mic이어야 합니다: {reference!r}")
+
+
 def fxlms_adaptation_allowed(
     *,
     requested: bool,
@@ -55,15 +60,18 @@ def fxlms_adaptation_allowed(
     input_clip_fraction: float,
     reference_power: float,
     stream_ok: bool,
+    reference: str = "digital",
 ) -> bool:
     """FxLMS가 현재 ERR 블록으로 갱신해도 되는 안전 조건."""
+    _validate_reference_mode(reference)
     return bool(
         requested
         and full_anc_gain
-        and full_noise_gain
+        and (reference == "mic" or full_noise_gain)
         and int(hold_samples) == 0
         and float(output_clip_fraction) == 0.0
         and float(input_clip_fraction) == 0.0
+        and np.isfinite(reference_power)
         and float(reference_power) > 1.0e-12
         and stream_ok
     )
@@ -71,6 +79,7 @@ def fxlms_adaptation_allowed(
 
 def input_preflight(cfg: dict, seconds: float = 2.0) -> bool:
     """스피커를 열기 전에 필수 I2S 입력 채널이 살아 있는지 확인한다."""
+    _validate_reference_mode(str(cfg.get("reference", "digital")))
     report = capture_input_probe(cfg["hardware"]["audio"], seconds=seconds)
     names = ("ERR", "REF")
     for item in report["channels"][:2]:
@@ -105,6 +114,7 @@ def validate_digital_reference_lead(
     checkpoint_lead: int | None = None,
 ) -> int:
     """reference 모드와 학습/배포 lead 정합을 검증하고 정규화된 값을 반환한다."""
+    _validate_reference_mode(reference)
     lead = int(configured_lead)
     if lead < 0:
         raise ValueError("digital_reference_lead_samples는 0 이상이어야 합니다")
@@ -163,6 +173,22 @@ class RealtimeANC:
         validate_digital_reference_lead(
             self.reference, self.digital_reference_lead, checkpoint_lead
         )
+        # DL 단독도 같은 실제 S 지연·FIR 꼬리를 기다려야 한다. 엔진에 이 속성이
+        # 없다는 이유로 지연을 0으로 가정하지 않고 공용 측정 자산에서 읽는다.
+        from ..baselines.fxlms_core import load_secondary_path
+
+        secondary = load_secondary_path(secondary_path_npz(cfg))
+        validate_secondary_calibration(cfg, secondary)
+        handoff = int(cfg["duct"]["secondary_path"].get("handoff_extra_samples", self.block))
+        if secondary.sample_rate != self.fs:
+            raise ValueError("S(z) sample_rate가 런타임 sample_rate와 다릅니다")
+        if handoff != self.block:
+            raise ValueError("런타임 handoff_extra_samples는 실제 1 block과 같아야 합니다")
+        self.secondary_total_length = int(secondary.delay_samples + handoff + secondary.fir.size)
+        adaptive = getattr(self.engine, "adaptive", self.engine)
+        control_length = int(getattr(getattr(adaptive, "controller", None), "control_len", 0))
+        self.adaptive_input_memory_samples = self.secondary_total_length + control_length
+        self._has_neural_controller = cfg.get("controller", "dl") in {"dl", "hybrid"}
         self.program = NoiseProgram(cfg.get("noise", {}), self.fs)
         self.digital_reference_buffer = DigitalReferenceBuffer(self.digital_reference_lead)
 
@@ -174,12 +200,13 @@ class RealtimeANC:
         fade = int(float(safety_cfg.get("fade_ms", 20.0)) * self.fs / 1000.0)
         self._fade_samples = fade
         self.state = RuntimeState(start_on=False)
+        self.state.noise_enabled = bool(cfg.get("noise", {}).get("enabled", True))
         self.anc_gate = FadeGate(fade, initial=0.0)
         self.noise_gate = FadeGate(max(fade, int(0.1 * self.fs)), initial=0.0)
-        self.noise_gate.set_target(1.0)
+        self.noise_gate.set_target(1.0 if self.state.noise_enabled else 0.0)
 
-        # 네 번째 채널은 callback이 판정한 FxLMS 적응 허용 플래그다. 가중치
-        # 소유자인 추론 스레드만 이 플래그를 읽어 adapt 상태를 바꾼다.
+        # 네 번째 채널: 1=적응 허용, 0=동결, -1=손상된 NN 입력(폐기+reset).
+        # 가중치/NN 상태는 소유자인 추론 스레드만 변경한다.
         self.in_ring = SPSCRing(4, self.hop * 64)      # err, ref_mic, ref_digital, adapt
         self.out_ring = SPSCRing(1, self.hop * 64)
 
@@ -191,6 +218,11 @@ class RealtimeANC:
         self.xruns = 0
         self._last_anc = False
         self._adaptation_hold_samples = 0
+        self._baseline_hold_samples = 0
+        # infer→callback 통지 전용. 사용자 reset_event는 추론 스레드만 소비한다.
+        self._adaptation_rewarm_event = threading.Event()
+        self._neural_input_reset_pending = threading.Event()
+        self._neural_input_fault_active = False
 
         self.record_len = int(record_seconds * self.fs)
         self.rec_pos = 0
@@ -216,8 +248,35 @@ class RealtimeANC:
                 self.xruns += 1
 
             mics = pcm_int32_to_float32(indata[:, :2])
-            err = self.err_dc.process(mics[:, self.ch_err])
-            ref_mic = self.ref_dc.process(mics[:, self.ch_ref])
+            required_channels = [self.ch_err, self.ch_ref] if self.reference == "mic" else [self.ch_err]
+            required_input = mics[:, required_channels]
+            input_clip_fraction = float(np.mean(
+                ~np.isfinite(required_input) | (np.abs(required_input) >= 0.98)
+            ))
+            input_disrupted = self.reference == "mic" and input_clip_fraction > 0.0
+            neural_input_disrupted = input_disrupted and self._has_neural_controller
+            if neural_input_disrupted:
+                self._neural_input_reset_pending.set()
+                if not self._neural_input_fault_active:
+                    self.state.messages.put(
+                        "REF/ERR 입력 손상: 신경망 상태를 reset하고 ANC를 OFF로 전환합니다. "
+                        "입력 복구 후 현장에서 다시 켜세요."
+                    )
+            self._neural_input_fault_active = neural_input_disrupted
+            if self._neural_input_reset_pending.is_set():
+                self.state.anc_enabled = False
+            # 손상된 블록을 적응/기준선에서 제외하면서 DC 필터 상태의 NaN 전파도 막는다.
+            finite_mics = np.nan_to_num(mics, nan=0.0, posinf=0.0, neginf=0.0)
+            if input_disrupted:
+                self.err_dc.reset()
+                self.ref_dc.reset()
+                # 측정·녹음에는 실제 유한 PCM을 남긴다. 엔진으로 보낼 블록만
+                # 아래에서 0/폐기 표식으로 바꾸어 가짜 감쇠를 기록하지 않는다.
+                err = finite_mics[:, self.ch_err].copy()
+                ref_mic = finite_mics[:, self.ch_ref].copy()
+            else:
+                err = self.err_dc.process(finite_mics[:, self.ch_err])
+                ref_mic = self.ref_dc.process(finite_mics[:, self.ch_ref])
 
             noise_gain = self.noise_gate.process(frames)
             self.noise_gate.set_target(1.0 if self.state.noise_enabled else 0.0)
@@ -238,15 +297,38 @@ class RealtimeANC:
             if self.state.anc_enabled != self._last_anc:
                 self.anc_gate.set_target(1.0 if self.state.anc_enabled else 0.0)
                 if self.state.anc_enabled:
-                    secondary_total = int(
-                        getattr(self.engine, "secondary_total_length", 0)
+                    self._adaptation_hold_samples = max(
+                        self._adaptation_hold_samples, self.secondary_total_length + self._fade_samples
                     )
-                    self._adaptation_hold_samples = secondary_total + self._fade_samples
                 else:
-                    self._adaptation_hold_samples = 0
+                    if self.reference == "mic":
+                        self._baseline_hold_samples = self.secondary_total_length + self._fade_samples
                 self._last_anc = self.state.anc_enabled
             gain = self.anc_gate.process(frames)
             control = y_lim * gain
+
+            rewarm = self._adaptation_rewarm_event.is_set()
+            if rewarm:
+                self._adaptation_rewarm_event.clear()
+                if self.reference == "mic":
+                    self._baseline_hold_samples = max(
+                        self._baseline_hold_samples, self.secondary_total_length + frames
+                    )
+            # 합산 clipping/끊긴 출력은 S 지연 뒤의 ERR도 오염한다. 해당 출력
+            # 블록 끝부터 FIR 꼬리까지 지난 뒤에만 선형 filtered-x 적응을 재개한다.
+            output_disrupted = bool(
+                clip_frac > 0.0 or status or not had_data or not np.all(np.isfinite(y_blk))
+            )
+            if rewarm or output_disrupted:
+                self._adaptation_hold_samples = max(
+                    self._adaptation_hold_samples, self.secondary_total_length + frames
+                )
+            if input_disrupted:
+                # 손상 REF는 S FIR뿐 아니라 control filter의 filtered-x 탭 이력에도
+                # 영향을 준다. 실제 S+W 메모리가 비워질 때까지 갱신을 중단한다.
+                self._adaptation_hold_samples = max(
+                    self._adaptation_hold_samples, self.adaptive_input_memory_samples + frames
+                )
 
             out = np.zeros((frames, 2), dtype=np.float32)
             out[:, self.ch_noise] = source
@@ -256,14 +338,33 @@ class RealtimeANC:
             err_power = self.err_meter.update(err)
             ctrl_power = self.ctrl_meter.update(control)
 
-            # 베이스라인: ANC 게이트가 닫혀 있고 소음이 켜진 구간의 에러 파워
-            if float(np.max(gain)) <= 0.001 and float(np.min(played_noise_gain)) >= 0.999:
+            full_noise_gain = bool(
+                played_noise_gain.size and float(np.min(played_noise_gain)) >= 0.999
+            )
+            selected_reference = ref_digital if self.reference == "digital" else ref_mic
+            reference_power = float(np.mean(selected_reference.astype(np.float64) ** 2))
+            finite_inputs = bool(np.all(np.isfinite(err)) and np.isfinite(reference_power))
+            # mic 모드의 기준선은 외부 REF가 유효한 ANC OFF 블록에서만 수집한다.
+            # OFF 직후에는 실제 상쇄음 꼬리를 기다리고 ON 중 EMA가 섞이지 않게 한다.
+            baseline_allowed = full_noise_gain
+            baseline_sample = err_power
+            if self.reference == "mic":
+                baseline_allowed = bool(
+                    self._baseline_hold_samples == 0
+                    and not status
+                    and finite_inputs
+                    and input_clip_fraction == 0.0
+                    and reference_power > 1.0e-12
+                )
+                baseline_sample = float(np.mean(err.astype(np.float64) ** 2))
+            if float(np.max(gain)) <= 0.001 and baseline_allowed:
                 alpha = float(np.exp(-frames / (self.fs * 1.0)))
                 if not self.baseline_init:
-                    self.baseline_power = err_power
+                    self.baseline_power = baseline_sample
                     self.baseline_init = True
                 else:
-                    self.baseline_power = alpha * self.baseline_power + (1 - alpha) * err_power
+                    self.baseline_power = alpha * self.baseline_power + (1 - alpha) * baseline_sample
+            self._baseline_hold_samples = max(0, self._baseline_hold_samples - frames)
 
             mute = self.safety.check_block(
                 self.state.anc_enabled, clip_frac, err_power, self.baseline_power,
@@ -274,21 +375,7 @@ class RealtimeANC:
             for msg in self.safety.drain_messages():
                 self.state.messages.put(msg)
 
-            if self._adaptation_hold_samples > 0:
-                self._adaptation_hold_samples = max(
-                    0, self._adaptation_hold_samples - frames
-                )
             full_anc_gain = bool(gain.size and float(np.min(gain)) >= 0.999)
-            full_noise_gain = bool(
-                played_noise_gain.size and float(np.min(played_noise_gain)) >= 0.999
-            )
-            input_clip_fraction = float(
-                np.mean(np.abs(mics[:, self.ch_err]) >= 0.98)
-            )
-            selected_reference = ref_digital if self.reference == "digital" else ref_mic
-            reference_power = float(
-                np.mean(selected_reference.astype(np.float64) ** 2)
-            )
             adapt_allowed = fxlms_adaptation_allowed(
                 requested=self.state.anc_enabled and not mute,
                 full_anc_gain=full_anc_gain,
@@ -297,10 +384,16 @@ class RealtimeANC:
                 output_clip_fraction=clip_frac,
                 input_clip_fraction=input_clip_fraction,
                 reference_power=reference_power,
-                stream_ok=not bool(status) and had_data,
+                stream_ok=not bool(status) and had_data and finite_inputs,
+                reference=self.reference,
             )
-            adapt_gate = np.full(frames, float(adapt_allowed), dtype=np.float32)
-            self.in_ring.push(np.stack([err, ref_mic, ref_digital, adapt_gate]))
+            adapt_gate = np.full(
+                frames, -1.0 if neural_input_disrupted else float(adapt_allowed), dtype=np.float32
+            )
+            engine_err = np.zeros_like(err) if input_disrupted else err
+            engine_ref = np.zeros_like(ref_mic) if input_disrupted else ref_mic
+            self.in_ring.push(np.stack([engine_err, engine_ref, ref_digital, adapt_gate]))
+            self._adaptation_hold_samples = max(0, self._adaptation_hold_samples - frames)
 
             if self.rec is not None and self.rec_pos < self.record_len:
                 n = min(frames, self.record_len - self.rec_pos)
@@ -322,6 +415,7 @@ class RealtimeANC:
                 "reduction_db": reduction,
                 "fxlms_adapt_allowed": adapt_allowed,
                 "fxlms_adapt_hold_samples": self._adaptation_hold_samples,
+                "input_clip_fraction": input_clip_fraction,
                 "underruns": self.out_ring.underruns,
                 "drops": self.out_ring.drops,
                 "xruns": self.xruns,
@@ -335,6 +429,22 @@ class RealtimeANC:
 
     # ---------- 추론 스레드 ----------
 
+    def _step_input_block(self, blk: np.ndarray) -> np.ndarray:
+        """callback 블록을 소비한다. 손상 NN 입력은 reset 전후 어느 쪽에도 넣지 않는다."""
+        err, ref_mic, ref_digital, adapt_gate = blk
+        if np.any(adapt_gate < 0.0) or self._neural_input_reset_pending.is_set():
+            self.engine.reset()
+            self._adaptation_rewarm_event.set()
+            self._neural_input_reset_pending.clear()
+            return np.zeros(self.hop, dtype=np.float32)
+        ref = ref_digital if self.reference == "digital" else ref_mic
+        set_adapt = getattr(self.engine, "set_adapt_enabled", None)
+        if set_adapt is not None:
+            set_adapt(bool(
+                np.all(adapt_gate >= 0.5) and not self._adaptation_rewarm_event.is_set()
+            ))
+        return self.engine.step(ref.copy(), err.copy())
+
     def _inference_loop(self) -> None:
         affinity = self.cfg.get("engine", {}).get("cpu_affinity")
         if affinity:
@@ -345,6 +455,7 @@ class RealtimeANC:
         while not self.state.quit_event.is_set():
             if self.state.reset_event.is_set():
                 self.engine.reset()
+                self._adaptation_rewarm_event.set()
                 # SPSC: 이 스레드는 in_ring 의 소비자만이다 — out_ring 의 read_pos 는
                 # 콜백 소유이므로 건드리지 않는다 (콜백의 pop_latest 가 자연 배출).
                 self.in_ring.consumer_reset()
@@ -355,16 +466,14 @@ class RealtimeANC:
             blk, ok = self.in_ring.pop_latest(self.hop, keep_backlog=self.hop * 8)
             if not ok:
                 continue
-            err, ref_mic, ref_digital, adapt_gate = blk
-            ref = ref_digital if self.reference == "digital" else ref_mic
             t0 = time.perf_counter()
             try:
-                set_adapt = getattr(self.engine, "set_adapt_enabled", None)
-                if set_adapt is not None:
-                    set_adapt(bool(np.all(adapt_gate >= 0.5)))
-                y = self.engine.step(ref.copy(), err.copy())
+                y = self._step_input_block(blk)
             except Exception as exc:
                 self.state.messages.put(f"엔진 오류: {exc!r} — 무음 출력")
+                self.engine.reset()
+                self._adaptation_rewarm_event.set()
+                self.in_ring.consumer_reset()
                 y = np.zeros(self.hop, dtype=np.float32)
             dt = (time.perf_counter() - t0) * 1000.0
             self.step_times_ms.append(dt)

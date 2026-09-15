@@ -1,0 +1,21 @@
+.git
+.venv
+**/__pycache__
+**/*.egg-info
+.pytest_cache
+# 대용량 산출물만 제외한다. src/deep_anc/data는 빌드에 포함한다.
+/data/
+/runs/
+/results/
+/transfer/
+*.log
+*.pt
+*.onnx
+*.plan
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+id_ecdsa*
+.env
+.env.*

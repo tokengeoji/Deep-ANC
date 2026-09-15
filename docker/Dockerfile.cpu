@@ -1,0 +1,30 @@
+# x86 개발·회귀 테스트 전용. Jetson CUDA/오디오 지연 에뮬레이터가 아니다.
+FROM python:3.10-slim-bookworm@sha256:68d914ec641a0b69267ce65184d000a2bc3a9ee2590ab702b82250ab2385735a
+
+ARG DEV_UID=1000
+ARG DEV_GID=1000
+ENV DEEP_ANC_CONTAINER=cpu \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/workspace/Deep-ANC/src \
+    OMP_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=2 \
+    GIT_OPTIONAL_LOCKS=0
+
+# 아래 설치는 이미지 파일시스템 안에서만 이뤄진다. 호스트 시스템은 변경하지 않는다.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ripgrep curl ca-certificates libportaudio2 libsndfile1 && apt-get clean
+RUN groupadd --gid ${DEV_GID} ancdev && \
+    useradd --uid ${DEV_UID} --gid ${DEV_GID} --create-home ancdev
+WORKDIR /workspace/Deep-ANC
+COPY requirements.txt ./
+COPY docker/requirements-dev.txt docker/requirements-dev.txt
+RUN python3 -m venv .venv && .venv/bin/python -m pip install 'pip==26.2.1' && \
+    .venv/bin/python -m pip install 'torch==2.5.1' --index-url https://download.pytorch.org/whl/cpu && \
+    .venv/bin/python -m pip install -r docker/requirements-dev.txt
+COPY pyproject.toml README.md ./
+COPY src/ src/
+RUN .venv/bin/python -m pip install -e . && chown -R ${DEV_UID}:${DEV_GID} /workspace
+USER ancdev
+CMD ["sleep", "infinity"]

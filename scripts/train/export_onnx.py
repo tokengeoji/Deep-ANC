@@ -25,6 +25,7 @@ from deep_anc.models.streaming import (                                   # noqa
 )
 from deep_anc.realtime.engines import (                                   # noqa: E402
     checkpoint_digital_reference_lead_samples,
+    checkpoint_reference_mode,
 )
 
 
@@ -93,6 +94,7 @@ def main() -> int:
     meta = {
         "model_name": model_cfg.get("name"),
         "digital_reference_lead_samples": checkpoint_digital_reference_lead_samples(state),
+        "reference_mode": checkpoint_reference_mode(state),
         "block_samples": args.block,
         "hop": model.hop,
         "win": model.win,

@@ -1,0 +1,34 @@
+# 외부 acoustic REF → ERR 한 지점 제어의 FxNLMS 기준선.
+# 실행 전 docs/13_acoustic_hybrid.md 확인. 사용자 입회·최저 볼륨에서만 출력한다.
+# 현 S는 150–600Hz 검증본이다. 이 설정을 만든 것으로 1kHz 이상 성능을 주장하지 않는다.
+hardware_config: configs/hardware_jetson.yaml
+duct_config: configs/duct.yaml
+
+hop: 256
+reference: mic
+controller: fxlms                # 기존 코어는 정규화된 block FxNLMS를 구현한다.
+digital_reference_lead_samples: 0
+
+fxlms:
+  control_length: 256
+  mu: 0.001                     # 기존 실기 baseline의 보수적 시작값. 현장 최적값은 미측정.
+  leakage: 1.0e-6
+  weight_norm_limit: 20.0
+
+safety:
+  control_limit: 0.10
+  fade_ms: 20
+  clip_streak_mute: 20
+  divergence_ratio: 4.0
+  divergence_hold_s: 0.5
+  deadline_miss_mute: 3
+
+noise:
+  enabled: false                # 외부 소리만 사용. 내부 소음 출력은 시작 시 OFF.
+  type: tone
+  frequency: 300.0
+  amplitude: 0.005               # 현장에서 내부 재생을 명시적으로 켠 경우에만 사용.
+
+record: null
+run_seconds: 0.0
+start_on: false

@@ -1,0 +1,36 @@
+# Jetson AGX Orin / JetPack 6 / L4T R36.4용. ARM64 Jetson에서 빌드한다.
+# 컨테이너는 호스트 RT 커널/드라이버를 공유한다. 호스트 설정을 변경하지 않는다.
+ARG JETSON_BASE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
+FROM ${JETSON_BASE}
+
+ARG DEV_UID=1000
+ARG DEV_GID=1000
+ENV DEEP_ANC_CONTAINER=jetson \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/workspace/Deep-ANC/src \
+    OMP_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=2 \
+    GIT_OPTIONAL_LOCKS=0
+
+RUN test "$(uname -m)" = aarch64 && apt-get update && \
+    apt-get install -y --no-install-recommends python3-venv python3-pip \
+    git ripgrep curl ca-certificates libportaudio2 libsndfile1 && apt-get clean
+RUN groupadd --gid ${DEV_GID} ancdev && \
+    useradd --uid ${DEV_UID} --gid ${DEV_GID} --create-home ancdev
+WORKDIR /workspace/Deep-ANC
+COPY requirements.txt requirements-jetson.txt ./
+COPY docker/requirements-dev.txt docker/requirements-dev.txt
+COPY docker/preload_jetson.py docker/preload_jetson.py
+RUN python3 -m venv --system-site-packages .venv && .venv/bin/python -m pip install 'pip==26.2.1' && \
+    .venv/bin/python -m pip install -r requirements-jetson.txt -r docker/requirements-dev.txt && \
+    .venv/bin/python -m pip install \
+    https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl && \
+    .venv/bin/python -m pip install 'nvidia-nvtx-cu12==12.6.77' nvidia-cuda-cupti-cu12 nvidia-cusparselt-cu12 && \
+    .venv/bin/python docker/preload_jetson.py
+COPY pyproject.toml README.md ./
+COPY src/ src/
+RUN .venv/bin/python -m pip install -e . && chown -R ${DEV_UID}:${DEV_GID} /workspace
+USER ancdev
+CMD ["sleep", "infinity"]

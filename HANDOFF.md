@@ -1,10 +1,97 @@
 # HANDOFF — 세션 인수인계 (다음 AI 에이전트/개발자용)
 
-> **"이어서 진행해줘"를 받았다면**: §0 라이브 상태 → §2 현재 상태 → §3 다음 단계 순으로 실행하라.
+> **"이어서 진행해줘"를 받았다면**: 먼저 아래 **2026-09-15 현재 작업**을 읽어라.
 > 규칙은 [AGENTS.md](AGENTS.md)가 단일 출처. 이 파일은 작업 상태가 바뀔 때마다 갱신할 것.
-> 최종 갱신: 2026-08-04 14:40 KST
+> 최종 갱신: 2026-09-15. 아래 과거 §0 이후의 서버/PID/실험 현황은 역사 기록이며 현재 상태가 아니다.
 
-## 0. 라이브 상태 (가장 먼저 확인할 것 — 시각은 참고용, 실상태는 아래 명령으로)
+## 현재 작업 — 2026-09-15 acoustic 전환 및 Docker 전용 개발
+
+### 사용자 확정 사항
+
+- 실제 acoustic REF 마이크를 사용한다. 감쇠 기준은 ERR **한 점**, 고주파는 **1 kHz 이상**이다.
+- 저역·고역을 함께 감쇠하고 음성·음악을 포함한 모든 소리를 대상으로 한다.
+- 같은 덕트와 Jetson AGX Orin이 추론 타깃이다. 필요한 하드웨어 변경은 검토 가능하나 제품은 미선정이다.
+- Deep ANC만 고집하지 않고 FxLMS/FxNLMS 및 경로 추정과 결합한다.
+- **최신 지시: Docker 환경을 만들고 그 안에서만 작업한다.** 호스트에서는 Docker 환경 관리만 한다.
+- 커밋·push는 승인됐다. **이 PC에서 가능한 작업은 이 PC에서 진행하고**, Jetson 필수 작업은 [docs/14](docs/14_pc_jetson_workplan.md)의 현장 체크리스트로 분리한다.
+- 시스템 설정 변경과 무입회 스피커 출력 금지는 그대로다. 이번 작업에서는 오디오를 실행하지 않았다.
+
+### 현재 환경과 실행
+
+실제 접속 호스트는 x86_64다. 과거 문서의 "이 PC=Jetson"을 현재 호스트 사실로 간주하지 않는다.
+CPU 이미지 `deep-anc-cpu:dev`와 개발 컨테이너 `deep-anc-dev`를 빌드·시작했다.
+컨테이너 Python은 `/workspace/Deep-ANC/.venv/bin/python`, torch `2.5.1+cpu`, ORT `1.18.1`이다.
+호스트 저장소를 바인드하고 `.venv`는 이미지 ID별 Docker 볼륨으로 가린다. 기존 호스트 `.venv`는 보존했지만 사용하지 않는다.
+기본 환경은 비특권 사용자이며 오디오 장치를 노출하지 않는다.
+
+```bash
+bash scripts/docker/dev.sh status
+bash scripts/docker/dev.sh exec git status --short
+bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --json
+bash scripts/docker/dev.sh shell
+```
+
+Jetson용 `docker/Dockerfile.jetson`도 준비했지만 **실제 ARM64 Jetson 빌드·CUDA/TensorRT·실시간 오디오 검증은 아직 하지 않았다**.
+L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공유한다. x86 CPU Docker가 이를 에뮬레이션하지 않는다.
+명령·재시작·볼륨 규약은 [docker/README.md](docker/README.md)를 따른다.
+현재 체크아웃에는 과거 `runs/`, `results/`, 학습 데이터와 acoustic 학습 artifact가 없다.
+과거 Elice 접속이나 리소스 삭제는 이번 작업 범위가 아니며 자동 수행하지 않는다.
+
+### 구현 범위와 해석
+
+- `configs/runtime_acoustic.yaml`: acoustic FxNLMS 기준선, 내부 소음 OFF, ANC OFF 시작.
+- `configs/runtime_acoustic_hybrid.yaml`: DNN 파형 출력 + FxNLMS 잔차 제어. acoustic artifact는 아직 placeholder다.
+- `HybridEngine`: 공통 REF/ERR, `e=d+S*y` 부호, 합산 뒤 런타임 리미터, 양쪽 초기화.
+- 학습 `reference_mode`를 ONNX 메타로 내보내고 mic DL/hybrid에서 digital/모드미상 artifact를 거부한다.
+- mic 모드에서 내부 소음 OFF여도 외부 REF/ERR로 OFF 기준선을 수집하고 조건부 적응한다.
+- 페이드·클리핑·xrun·출력 누락·초기화 후의 지연된 ERR/이력도 적응 허용 판정에 반영한다.
+- acoustic S의 측정 block/latency 메타 누락·불일치를 런타임에서 거부한다.
+- 입력 손상 후 FxNLMS는 S+제어 FIR 이력을 기다린다. mic DL/hybrid는 손상 블록 폐기+reset+ANC OFF이며 자동 ON하지 않는다. 실제 클리핑 녹음은 보존한다.
+- 무출력 `check_acoustic_readiness.py`는 설정/측정 S만 읽는다. 기본 exit 0은 선택 게이트 없는 보고 성공이지 감쇠 준비 완료가 아니다.
+- 이 단계는 **초기 비교용 API**다. DNN 계수 생성, 온라인 S/F 식별, F 보상, 실제 비선형 모델은 미구현이다.
+- 고정 REF 전용 가짜 신경망 수렴 테스트는 ERR를 사용하는 실제 DNN과의 폐루프 안정성 검증을 대체하지 않는다.
+
+### 이번 검증 결과
+
+- `deep-anc-dev` 내부에서 `.venv/bin/python -m pytest -q -o addopts= -ra`: **443 passed, 2 skipped (33.01초)**.
+- 건너뛴 2개는 현장 raw 진단 파일과 실측 `metrics.md` 부재 때문이다. GPU/실기 검증으로 해석하지 않는다.
+- `pip check`: 의존성 충돌 없음. Docker 관리 스크립트 `bash -n` 및 tracked diff 공백 검사 통과.
+- Docker의 `.venv` 전용 볼륨, `ancdev` 사용자, `Privileged=false`, 오디오 장치 미노출을 확인했다.
+- 커밋·push가 승인됐다. 실제 반영 상태는 컨테이너의 `git status`, `git log`, 원격 ref로 확인한다.
+
+### 현 자산 진단 — 새 감쇠 실측이 아님
+
+컨테이너의 무출력 진단으로 다음 값을 확인했다.
+
+| 항목 | 값 |
+|---|---|
+| S NPZ 순수지연 / 런타임 handoff | 1465 / 256 samples @ 48 kHz |
+| 제어음 지연 합계 | 1721 samples = 35.854 ms |
+| REF→ERR 기하선행 추정 | 139.94 samples = 2.915 ms |
+| 필요한 예측 | 1581.06 samples = **32.939 ms** |
+| S 반복 일관성 검증 대역 | **150–600 Hz**, 대역 일관성 0.9556 |
+
+`--require-band 1000 1600 --require-broadband`는 두 조건 미달로 예상대로 exit 1이다.
+약 1.6 kHz 평면파 차단을 ERR 한 점 감쇠의 절대 상한으로 해석하지 않는다.
+반복 정렬 후 일관성이 높다는 사실도 실시간 클록/위상 안정성을 증명하지 않는다.
+과거 clock-warp 해석을 하드웨어 원인으로 확정하지 말고 독립적인 타이밍 측정으로 확인한다.
+
+### 다음 단계
+
+작업 위치·명령・중단조건의 실행 문서는 [docs/14](docs/14_pc_jetson_workplan.md)다.
+연구/설계 근거는 [docs/13](docs/13_acoustic_hybrid.md)를 따른다.
+
+1. **이 PC에서 계속**: Docker 회귀 테스트, 합성 closed-loop 시험, 경로/녹음 분석 도구와 artifact 메타 규약을 발전시킨다. 실측 자료가 필요한 항목만 별도 대기시킨다.
+2. **Jetson에서만**: 실제 ARM64 이미지 빌드·CUDA/TensorRT·추론 마감 검증. 호스트 시스템 변경으로 실패를 우회하지 않는다.
+3. **Jetson 현장**: 장치 접근을 별도로 준비하고 입력-only 점검 후, 사용자 입회·최저 볼륨에서 광대역 S와 별도 F를 측정한다.
+4. **자료 회수 후 이 PC**: 원자료 QA, 신뢰대역·지연·클록 안정성·밴드별 감쇠 분석. 설정의 S 지연이나 신뢰대역 숫자를 임의로 바꾸지 않는다.
+5. **Jetson 현장**: 사전 S를 쓰는 acoustic FxNLMS의 OFF→ON→OFF 기준선 확보. 기존 digital-ref 체크포인트로 acoustic 성능을 대신 판정하지 않는다.
+6. **이 PC와 학습 자원 / 이후 Jetson**: acoustic 학습·독립 closed-loop 검증 후 하이브리드 비교. 이후 느린 DNN 계수 생성 + 빠른 FIR 및 온라인 경로 추정을 발전시킨다. 외부 학습 자원 재가동은 별도 확인한다.
+
+---
+
+## 0. 과거 라이브 상태 (2026-08-04 기록 — 현재 상태로 간주하지 말 것)
 
 - **Elice 인스턴스**: `elicer@central-01.tcp.tunnel.elice.io` **포트 47863**, 2×A100 80GB.
   pem = 이 Jetson의 `~/.ssh/elice.pem` (커밋 금지). 32 vCPU, 디스크 84G 여유.

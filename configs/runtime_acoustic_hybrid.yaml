@@ -1,0 +1,39 @@
+# acoustic 신경망 + FxNLMS 잔차 결합 비교용 템플릿. 현재 배포 가능한 학습본은 없다.
+# reference_mode=acoustic, lead=0인 검증된 artifact가 필요하다.
+# 계수 생성형 신경망이나 온라인 S/F 추정은 이 초기 결합에 포함되지 않는다.
+hardware_config: configs/hardware_jetson.yaml
+duct_config: configs/duct.yaml
+
+hop: 256
+reference: mic
+controller: hybrid
+digital_reference_lead_samples: 0
+
+engine:
+  type: ort
+  onnx: runs/export/acoustic_validated.onnx   # 향후 검증본 경로. 기존 digital 모델 사용 금지.
+  cpu_affinity: [4, 5, 6, 7]
+
+fxlms:
+  control_length: 256
+  mu: 0.001
+  leakage: 1.0e-6
+  weight_norm_limit: 20.0
+
+safety:
+  control_limit: 0.10             # 합산한 출력에 적용. 모델 출력 제한과 별도로 검증 필요.
+  fade_ms: 20
+  clip_streak_mute: 20
+  divergence_ratio: 4.0
+  divergence_hold_s: 0.5
+  deadline_miss_mute: 3
+
+noise:
+  enabled: false
+  type: tone
+  frequency: 300.0
+  amplitude: 0.005
+
+record: null
+run_seconds: 0.0
+start_on: false
