@@ -35,6 +35,20 @@ FMA 실패 ID는 `098565`, `098567`, `098569`, `099134`, `107535`, `108925`, `13
 원본 archive checksum은 ESC를 제외한 12개에서 공식 배포 값과 일치했다. ESC는 아래의
 고정 Git 객체 출처 검증을 사용한다. 조각 결합/Drive 업로드 상태는 개별 transfer receipt를 따른다.
 
+이와 별도로 **13개 archive의 192조각 + 13개 manifest 전송을 완료**했다. 조각별 후속
+ID/이름/크기/부모와 최종 폴더 목록을 확인했다. PC의 원본·조각 37,198,071,604 byte 및
+임시 Git clone·실패 병렬 파일 2,004,557,468 byte, **총 39,202,629,072 byte를 삭제**했다.
+해당 staging의 원본/조각/clone/병렬 폴더 잔여는 0이고 메타데이터·합성 준비물은 남겼다.
+원격 내용 hash와 Drive에서 재다운로드한 전체 복원은 아직 미검증이다.
+
+최종 기록은 ignored `results/drive_transfer_receipts/20260915_01/`의 전송 13개·정리 3개와
+`results/drive_preparation/20260915_01/final_drive_archive_audit.json`,
+`final_local_cleanup_audit.json`이다. 다운로드 receipt와 parts manifest의 false 상태는
+각 작성 시점의 이력이므로 고쳐 쓰지 않고, 최신 상태는 이 최종 전송/정리 기록으로 판단한다.
+`acoustic_preparation_20260915_pc_bundle.zip`은 최신 bootstrap·합성 필터 뱅크·QA·이 기록과
+복원/Jetson 문서를 묶는 파일명이다. 생성·업로드 성공 여부와 Drive ID는 별도
+`bundle_upload_receipt.json`을 확인한다. 기존 원본 archive나 코드 전체를 중복 백업하지 않는다.
+
 ## 2. Drive 최적화와 원본 정책
 
 기존 `DeepANC`의 snapshot·bootstrap cache·과거 manifest를 확인했다. 선택한 과거 QA에는
@@ -158,6 +172,7 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/data/split_staged_archi
 선택적 `stage_public_archive_parallel.py`는 최대 4개 HTTPS Range와 공식 전체 checksum을
 검사하는 도구다. 현재 실전 시도에서는 Libri 연결 실패가 있었고 FMA는 기존 전송과 중복되어
 중단했다. 속도 개선/완주를 주장하지 않는다. 실패 부분 파일은 정식 원본 전송 확인 전 보존한다.
+이번 FMA/Libri의 실패 부분 파일은 정식 원본 전송 확인 후 삭제했고 별도 cleanup receipt를 남겼다.
 
 인증된 별도 환경용 `stream_public_to_drive.py`도 준비돼 있다. 기본은 계획만 출력하고,
 실행은 운영자가 승인된 원격 환경으로 표시했을 때만 가능하다. 현재 PC는 연결 Drive의

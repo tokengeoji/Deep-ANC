@@ -157,36 +157,49 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 - 현재 **strict 그룹 분할 전수 QA·독립 acoustic 학습·학습된 선택기·온라인 S/F·live 통합**은
   완료 상태가 아니다. "Jetson 실측만 남았다"고 보고하지 않는다.
 
-#### 현재 진행 중인 전송 — 중단/재개 시 필독
+#### 원본 전송·PC 정리 완료 — 재개 시 중복 다운로드 금지
 
 사용자의 PC 임시 다운로드 허용 후 `results/drive_staging_20260915_vhZnb7/`를 새로 생성했다.
 기존 `data/`나 과거 백업은 건드리지 않는다. 공식 출처별 checksum receipt, 무추출 PCM QA,
-96MiB 분할/결합 checksum 도구를 구현했다. 공개 원본 13개(18,599,035,802 byte)의 확보·
-아카이브 순회를 완료했고, 대용량 FMA small/Libri train의 Drive 전송은 아직 진행 중이다.
+96MiB 분할/결합 checksum 도구를 구현했다. 공개 원본 **13개(18,599,035,802 byte)**의 확보·
+아카이브 순회와 **192조각 + 13개 manifest의 Drive 전송**을 모두 완료했다.
 연결 Drive 업로드는 **파일당 100MiB 상한**이라 원본 archive 하나를 직접 올리지 않는다.
 Drive의 새 public_archives/{source_id}에는 parts와 manifest.json만 보관하고,
 개별 Drive ID·업로드 확인·PC 삭제 상태는 별도 transfer_receipts에 기록한다.
-동일 기록은 `results/drive_transfer_receipts/20260915_01/`에 남긴다.
+동일 기록은 `results/drive_transfer_receipts/20260915_01/`에 남긴다(최종 전송 13개 + 추가 정리 3개).
 **이미 업로드된 조각을 다시 올리지 말고 receipt/Drive 목록부터 대조할 것.**
 
-- 첫 `fma_metadata`의 4개 조각과 manifest 업로드·후속 ID/이름/부모/크기 확인을 마쳤다.
-  해당 PC archive+parts 716,824,882 byte를 삭제했고 QA/receipt/manifest는 보존했다.
-  원격 hash는 도구가 제공하지 않아 미검증이며 복원 시 전체 checksum 재검증이 필요하다.
-- Libri dev/test와 DEMAND 6개 환경 archive는 공식 checksum 통과했다. 추가 전송·정리 상태는 receipt를 따른다.
+- 모든 조각의 업로드 응답·후속 ID/이름/부모/크기를 확인하고 마지막에 13개 폴더 목록도 대조했다.
+  공식 배포 checksum은 ESC 이외 12개 archive에서 통과했다. 로컬 조각 결합 hash도 확인했다.
+  **원격 내용 hash·Drive에서 다시 받은 전체 복원은 미검증**이다. 복원 시 checksum 재검증이 필요하다.
+- PC archive+parts **37,198,071,604 byte**, ESC 임시 clone·실패한 병렬 다운로드 파일
+  **2,004,557,468 byte**, 총 **39,202,629,072 byte**를 삭제했다. 해당 staging의 원본·조각·
+  clone·병렬 폴더 잔여는 0이다. QA/receipt/manifest 등 메타데이터와 합성 준비물은 보존했다.
+  원본은 Drive의 정식 archive로 복원할 수 있다. 기존 `data/`와 옛 Drive 백업은 삭제하지 않았다.
+- 다운로드 `receipt.json`과 분할 `manifest.json`의 false 상태는 **작성 시점의 기록**이다.
+  이를 사후 수정하지 않는다. 최종 업로드·삭제 여부는 별도 `transfer_receipts`와
+  `results/drive_preparation/20260915_01/final_drive_archive_audit.json`,
+  `final_local_cleanup_audit.json`을 기준으로 판단한다.
 - ESC-50은 공식 Git repo의 고정 commit `33c8ce9eb2cf0b1c2f8bcf322eb349b6be34dbb6`를
   clone/fsck 후 Git archive로 포장했다. 공개 archive digest가 없으므로 source_checksum_verified=false,
-  Git 객체 출처 검증을 별도 표시한다. 원본 `.git` 임시 clone도 해당 Drive 전송 확인 후 정리 대상이다.
+  Git 객체 출처 검증을 별도 표시한다. 원본 `.git` 임시 clone도 해당 Drive 전송 확인 후 삭제했다.
 - Libri 3개 subset 33,862음원, ESC 2,000, DEMAND 96, MIMII 3,600은 PCM 수치 QA를 통과했다.
   FMA 8,000음원 중 7,993개 수치 통과/7개 실패이고 metadata archive는 12개 metadata-only다.
   FMA 실패 ID는 098565/098567/098569/099134/107535/108925/133297이며
   soft decoder 경고 영향은 추가 미확인이다. 실패 파일을 버리거나 manifest READY를 만들지 않았다.
   요약은 `results/drive_preparation/20260915_01/public_archive_audit_summary.json`에 있다.
-- MIMII 10조각+manifest 업로드와 PC archive/parts 삭제도 완료했다. source 간 완료 상태는
-  transfer receipt를 기준으로 판단하고 진행 중 전송을 중복 실행하지 않는다.
+- MIMII 3개 attribute CSV와 3,600개 음원 이름을 대조했다. section은 물리적 fan ID가 아니며
+  원녹음·배경 재사용의 독립성 정보가 없다. 학습 보조 전용 제한 여부는 사용자에게 질문한 상태다.
+  답변 없이 가상 group을 만들거나 section holdout을 독립 평가로 승격하지 않는다.
 - `split_staged_archive.py --restore-manifest ... --archive-out NEWPATH`는 전체 조각·결합·출력
   재읽기 검증을 수행하는 새 파일 전용 복원이다. 실패 출력 보존 규약과 명령은 docs/16을 따른다.
 - 추가 병렬 Range 시험은 Libri 연결 실패, FMA는 중복 전송을 줄이기 위해 중단했다.
-  `_parallel/range_parts`는 미완료 보존본이며 원본의 정식 완료/Drive 전송 확인 후 함께 정리한다.
+  해당 `_parallel/range_parts` 보존본은 원본의 정식 완료/Drive 전송 확인 후 함께 삭제했다.
+- 최종 메타데이터·합성 준비 묶음 이름은 `acoustic_preparation_20260915_pc_bundle.zip`이다.
+  생성·업로드 결과는 ignored `results/drive_preparation/20260915_01/`의 README와
+  `bundle_upload_receipt.json`으로 확인한다. 원본 archive나 전체 코드 백업이 아니며,
+  최신 bootstrap `_02`·필터 뱅크 `_03`·QA·최종 전송/삭제 기록·복원/Jetson 문서를 포함한다.
+  코드 구현은 `1bb9663`에 반영됐다. 실제 corpus 학습 완료로 해석하지 않는다.
 - 현 단계에서 외부 GPU 학습·새 유료 서버·Jetson 소리 출력은 실행하지 않았다.
 
 ### 현 자산 진단 — 새 감쇠 실측이 아님
