@@ -2,6 +2,7 @@
 
 > 기준일: 2026-09-15. 목표는 기존 Jetson AGX Orin·덕트에서 acoustic REF를 사용하여
 > ERR 한 점의 저역과 1 kHz 이상 소리, 음성·음악까지 감쇠시키는 것이다.
+> **우선 개선 대역은 800–1600Hz. 현재 마이크·USB DAC를 포함한 하드웨어를 모두 유지한다.**
 > 모든 코드 작업·분석·Python 실행은 Docker 안에서 한다. 호스트 `.venv`는 사용하지 않는다.
 
 ## 1. 어디에서 무엇을 할 것인가
@@ -32,7 +33,7 @@ bash scripts/docker/dev.sh status
 bash scripts/docker/dev.sh exec .venv/bin/python -m pip check
 bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q
 bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --json
-bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --require-band 1000 1600 --require-broadband
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --require-band 800 1600 --require-broadband
 ```
 
 기본 readiness는 보고용이다. exit 0을 준비 완료로 해석하지 않는다.
@@ -57,6 +58,7 @@ acoustic 녹음 후처리와 runtime 저장 메타데이터 연결은 구현했�
 ## 3. Jetson 현장 작업의 공통 선행조건
 
 - [ ] 실제 ARM64 Jetson AGX Orin이며 기존 JetPack/L4T와 Docker가 준비되어 있다.
+- [ ] 현재 마이크·USB DAC·Jetson·덕트를 유지한다. 장치 교체/구매를 선행조건으로 삼지 않는다.
 - [ ] 호스트 RT 커널·NVIDIA 드라이버·전원 모드·핀 설정·오디오 서비스를 변경하지 않는다.
 - [ ] **기본 `dev.sh up jetson`은 오디오 장치를 노출하지 않는다.** 장치 연결을 확정하고
       해당 장치에 접근하는 컨테이너 구성을 마련하기 전까지 아래 오디오 작업은 보류한다.
@@ -214,6 +216,8 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/eval/analyze_acoustic_s
 저장한다. 기존 경로·출력 경로의 심볼릭 링크는 거부한다. 실제 ERR는 이미 잔류음이므로
 S를 다시 적용하지 않는다. REF 변화는 진단값이며 감쇠를 보정하는 분모로 쓰지 않는다.
 저역 `[0,1000)`·고역 `[1000,Nyquist]`, 전체·옥타브 경계 대역과 신뢰대역을 별도로 남긴다.
+현재 자동 대역은 새 우선 범위의 800–1000Hz/1000–1600Hz 정확한 개별 지표를 대신하지 않는다.
+이 두 구간의 명시적 보고는 다음 PC 개발 항목이며 기존 전체 고역 값을 1–1.6kHz 값으로 표기하지 않는다.
 
 기본 1초 창, 초기 OFF 1초·ON 워밍업 2초·경계 0.5초 제외를 사용한다.
 각 구간 앞에서는 `max(해당 guard, S.delay + FIR 길이 − 1)`을 제외한다.
@@ -240,4 +244,5 @@ exit 2는 비교 불가·불완전 사이클이며 진단 산출물은 보존한
 - S의 검증 대역 밖 결과는 미검증으로 표시한다. `e = d + S·y` 극성과 실제 핸드오프를 유지한다.
 - CPU 테스트, Jetson 추론 벤치마크, 실제 acoustic 감쇠를 구분하고 원자료 경로·설정·코드 버전을 연결한다.
 - 과거 [docs/12](12_system_summary.md)의 수치를 이번 구조의 신규 실기 결과로 재사용하지 않는다.
-- 하드웨어 변경 검토는 가능하지만 제품 구매·장치 교체·호스트 시스템 변경이 완료된 것으로 기록하지 않는다.
+- 현재 마이크·USB DAC를 포함한 하드웨어 유지가 최신 조건이다. 이전의 교체 허용 문구는 적용하지 않는다.
+  기존 장치 지연·지터를 재검증하고 Docker·사용자 공간 개선만 검토한다. 호스트 시스템은 변경하지 않는다.

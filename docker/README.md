@@ -51,7 +51,7 @@ bash scripts/docker/dev.sh shell
 ```bash
 bash scripts/docker/dev.sh exec git status --short
 bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --json
-bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --require-band 1000 1600 --require-broadband
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --require-band 800 1600 --require-broadband
 ```
 
 readiness는 설정과 저장된 S 경로만 읽는 무출력 검사다. 기본 보고의 exit 0은 광대역

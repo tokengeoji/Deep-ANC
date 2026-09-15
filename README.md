@@ -19,8 +19,9 @@
 
 > **2026-09-15 개발 기준:** 작업은 [Docker 환경](docker/README.md) 안에서만 수행한다.
 > acoustic REF 마이크, ERR 한 점 감쇠, 저역과 1 kHz 이상 및 음성·음악을 포함하는
-> [새 실행 계획](docs/13_acoustic_hybrid.md)을 따른다. 아래 과거 digital-ref 실기 수치는
-> 새 acoustic FxNLMS/하이브리드의 검증 결과가 아니다. 기존 호스트 설치 명령은 이력용이다.
+> [새 실행 계획](docs/13_acoustic_hybrid.md)을 따른다.
+> 우선 개선 대역은 **800–1600Hz**이며 **현재 마이크·USB DAC를 포함한 하드웨어를 모두 유지**한다.
+> 아래 과거 digital-ref 실기 수치는 새 acoustic FxNLMS/하이브리드의 검증 결과가 아니다. 기존 호스트 설치 명령은 이력용이다.
 > [이 PC / Jetson 작업 분담과 현장 체크리스트](docs/14_pc_jetson_workplan.md)에 실행 위치·선행조건·산출물·중단 기준을 정리했다.
 > acoustic 녹음 전용 무출력 분석 CLI와 기록 메타데이터 연결을 구현했다. 사용법은 [docs/14 §5](docs/14_pc_jetson_workplan.md), 관측 감소량의 한계는 [docs/07 §8](docs/07_evaluation_protocol.md)을 따른다.
 
