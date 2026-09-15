@@ -1,0 +1,36 @@
+# acoustic 학습 준비/CPU smoke용. 이 파일을 만들거나 QA하는 행위는 학습 실행이 아니다.
+# 명시적 학습 호출 시에만 최대 2 step. 기존 checkpoint 재개/외부 학습 자동 실행 없음.
+stage: open_loop
+model_config: configs/model_tiny.yaml
+data_config: configs/data_acoustic_prepared.yaml
+duct_config: configs/duct.yaml
+batch_size: 1
+num_workers: 0
+prefetch_factor: 2
+optimizer:
+  name: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+schedule:
+  warmup_steps: 1250
+  total_steps: 100000
+  min_lr: 1.0e-5
+run_until_step: 2
+amp: null
+grad_clip: 5.0
+loss:
+  # 측정 S의 기존 검증 대역을 유지한다. 800–1600 Hz 가중/신뢰 승격을 하지 않는다.
+  nmse_objective: trusted_band
+  mrstft_ffts: [256, 512, 1024, 2048]
+  lambda_mrstft: 1.0
+  lambda_pow: 1.0e-3
+  lambda_clip: 1.0
+  clip_margin: 0.18
+  band_weight: curriculum_a
+eval_every: 1
+log_every: 1
+early_stop_patience: 0
+ckpt_dir: runs/acoustic_prepared_cpu_smoke
+resume: null
+seed: 20260915

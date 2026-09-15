@@ -23,17 +23,174 @@ d 경로만 만든다 (소음 ch0 은 콜백에서 직접 생성되므로 핸드
 
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from ..config import _resolve_path, default_d_noise_delay, duct_distance_samples
+from ..config import DEFAULT_HANDOFF_SAMPLES, _resolve_path, default_d_noise_delay, duct_distance_samples
 from ..dsp.duct_sim import build_rir_bank
 from ..dsp.filters import fft_filter
 from ..dsp.secondary_path import load_secondary_path
 from .noise_pool import NoisePool
+from .manifest import read_manifest, validate_group_splits, validate_source_family
 from .primary_path import resolve_digital_primary_path
 from .synthetic_signals import SyntheticNoise
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _check_hash(path: Path, expected) -> str:
+    if (not isinstance(expected, str) or len(expected) != 64
+            or any(c not in "0123456789abcdef" for c in expected)):
+        raise ValueError(f"SHA-256 메타가 없거나 잘못됐습니다: {path}")
+    actual = _sha256_file(path)
+    if actual != expected:
+        raise ValueError(f"SHA-256 불일치: {path}")
+    return actual
+
+
+def _source_mix(data_cfg: dict) -> dict:
+    if data_cfg.get("reference_mode") == "acoustic" and data_cfg.get("source_mix_ratio_acoustic"):
+        return dict(data_cfg["source_mix_ratio_acoustic"])
+    return dict(data_cfg.get("source_mix_ratio", {"synthetic": 1.0}))
+
+
+def validate_prepared_handoff(duct_cfg: dict) -> int:
+    """명시 prepared 경로의 handoff는 반올림/절단 없는 0 이상 정수여야 한다."""
+    handoff = duct_cfg["secondary_path"].get("handoff_extra_samples", DEFAULT_HANDOFF_SAMPLES)
+    if type(handoff) is not int or handoff < 0:
+        raise ValueError("prepared handoff_extra_samples는 0 이상의 정수여야 합니다")
+    return handoff
+
+
+def validate_prepared_data(data_cfg: dict) -> tuple[dict, dict[str, np.ndarray]]:
+    """명시 stage된 자료만 검사한다. 다운로드/Drive 조회/합성 fallback은 하지 않는다.
+
+    qa.json은 준비 도구의 감사 기록이지 서명된 신뢰 루트나 음향 성능 인증은 아니다.
+    원본/공식 metadata/manifest hash와 split을 다시 검사해 준비 후 변조를 거부한다.
+    """
+    import soundfile as sf
+
+    if data_cfg.get("reference_mode") != "acoustic" or data_cfg.get("digital_reference_lead_samples") != 0:
+        raise ValueError("prepared 데이터는 acoustic reference/lead=0만 지원합니다")
+    mix = _source_mix(data_cfg)
+    if (not mix or any(isinstance(v, (bool, str)) or not np.isfinite(v) or v < 0 for v in mix.values())
+            or not np.isclose(sum(mix.values()), 1.0, rtol=0, atol=1e-12)):
+        raise ValueError("prepared source_mix_ratio는 유한한 비음수이며 합이 1이어야 합니다")
+    families = sorted(tag for tag, ratio in mix.items() if tag != "synthetic" and ratio > 0)
+    for family in families:
+        validate_source_family(family)
+    manifest_dir = _resolve_path(data_cfg["noise_manifest_dir"]).resolve()
+    qa_path = manifest_dir / "qa.json"
+    qa_bytes = qa_path.read_bytes()
+    qa = json.loads(qa_bytes)
+    qa_hash = hashlib.sha256(qa_bytes).hexdigest()
+    # 해시는 실제 파싱한 QA 바이트에 고정한다. 모든 입력을 종료 시 다시 대조해
+    # 긴 raw 검사 중 바뀐 metadata/manifest/PCM에 과거 PASS를 결합하지 않는다.
+    input_hashes: dict[Path, str] = {qa_path: qa_hash}
+    if (not isinstance(qa, dict) or type(qa.get("schema_version")) is not int or qa["schema_version"] != 1
+            or qa.get("data_ready") is not True or qa.get("diagnostic_only") is not True
+            or qa.get("performance_claim_allowed") is not False):
+        raise ValueError("로컬 prepared QA data_ready/schema/진단 범위를 확인할 수 없습니다")
+    if not set(families).issubset(qa.get("families", [])):
+        raise ValueError("prepared QA에 요청한 모든 source family가 필요합니다")
+    if not isinstance(qa.get("manifest_sha256"), dict) or not isinstance(qa.get("split_counts"), dict):
+        raise ValueError("prepared QA manifest_sha256/split_counts가 필요합니다")
+    raw_root = Path(qa["raw_root"])
+    if not raw_root.is_absolute() or not raw_root.is_dir():
+        raise ValueError("prepared QA raw_root는 명시 stage된 절대 디렉터리여야 합니다")
+    raw_root = raw_root.resolve()
+    inventory_hash = _check_hash(manifest_dir / "inventory.jsonl", qa.get("inventory_sha256"))
+    input_hashes[manifest_dir / "inventory.jsonl"] = inventory_hash
+    inventory_rows = read_manifest(manifest_dir / "inventory.jsonl")
+    metadata = qa.get("source_metadata_sha256")
+    if not isinstance(metadata, dict) or not metadata:
+        raise ValueError("공식 source metadata SHA-256이 필요합니다")
+    for relative, digest in metadata.items():
+        meta_path = (raw_root / relative).resolve()
+        if Path(relative).is_absolute() or not meta_path.is_relative_to(raw_root):
+            raise ValueError("source metadata 경로가 raw_root 밖입니다")
+        input_hashes[meta_path] = _check_hash(meta_path, digest)
+    entries, hashes, counts, seen_hashes = [], {}, {}, set()
+    for family in families:
+        manifest_path = manifest_dir / f"{family}.jsonl"
+        hashes[manifest_path.name] = _check_hash(manifest_path, qa.get("manifest_sha256", {}).get(manifest_path.name))
+        input_hashes[manifest_path] = hashes[manifest_path.name]
+        rows = read_manifest(manifest_path)
+        counts[family] = {split: 0 for split in ("train", "val", "test")}
+        for row in rows:
+            if (row.get("source_family") != family or row.get("tag") != family
+                    or row.get("path_base") != "manifest" or not row.get("group_id")
+                    or row.get("qa_valid") is not True
+                    or row.get("split") not in counts[family]):
+                raise ValueError(f"prepared manifest family/group/split/path 메타 오류: {manifest_path}")
+            raw_path = Path(row["path"]).resolve()
+            if not raw_path.is_relative_to(raw_root):
+                raise ValueError("음원 경로가 staged raw_root 밖입니다")
+            digest = _check_hash(raw_path, row.get("sha256"))
+            input_hashes[raw_path] = digest
+            if digest in seen_hashes:
+                raise ValueError("prepared 원본 SHA-256 중복: split/group 누수 위험")
+            seen_hashes.add(digest)
+            info = sf.info(raw_path)
+            if (info.frames <= 0 or any(row.get(key) != value for key, value in (
+                    ("sample_rate", info.samplerate), ("channels", info.channels), ("frames", info.frames)))
+                    or not np.isfinite(row.get("duration_s", np.nan))
+                    or abs(row["duration_s"] - info.frames / info.samplerate) > 1 / info.samplerate):
+                raise ValueError(f"prepared 원본 오디오 header 불일치: {raw_path}")
+            counts[family][row["split"]] += 1
+        if any(count == 0 for count in counts[family].values()):
+            raise ValueError(f"prepared {family}: 비어 있는 train/val/test split")
+        if qa.get("split_counts", {}).get(family) != counts[family]:
+            raise ValueError(f"prepared QA split_counts 불일치: {family}")
+        entries.extend(rows)
+    validate_group_splits(entries)
+    inventory_subset = [row for row in inventory_rows if row.get("source_family") in families]
+    key = lambda row: (row["source_family"], row["path"])
+    if (len(inventory_subset) != len(entries)
+            or {key(row): row for row in inventory_subset} != {key(row): row for row in entries}):
+        raise ValueError("prepared inventory와 family manifest 행이 다릅니다")
+    bank_path = _resolve_path(data_cfg["rir_bank"]).resolve()
+    rir_hash = _sha256_file(bank_path)
+    with np.load(bank_path, allow_pickle=False) as archive:
+        fs = np.asarray(archive["sample_rate"])
+        if fs.ndim != 0 or fs.dtype.kind not in "iu" or fs.item() != data_cfg["sample_rate"]:
+            raise ValueError("prepared RIR sample_rate 불일치")
+        rirs = {key: archive[key] for key in ("p_ref", "p_err", "f_fb")}
+    if (len({value.shape for value in rirs.values()}) != 1
+            or any(value.ndim != 2 or value.shape[0] < 3 or value.shape[1] == 0
+                   or value.dtype.kind not in "fiu" or not np.isfinite(value).all()
+                   or not np.all(np.any(value != 0, axis=1)) for value in rirs.values())):
+        raise ValueError("prepared RIR는 동일 shape의 유한 nonzero 2D 경로/최소3변형이 필요합니다")
+    with np.errstate(over="ignore", under="ignore"):
+        rirs = {key: value.astype(np.float32) for key, value in rirs.items()}
+    if any(not np.isfinite(value).all() or not np.all(np.any(value != 0, axis=1)) for value in rirs.values()):
+        raise ValueError("prepared RIR가 float32 처리 범위를 벗어납니다")
+    variant_hashes = [hashlib.sha256(b"".join(rirs[key][i].tobytes() for key in sorted(rirs))).hexdigest()
+                      for i in range(rirs["p_ref"].shape[0])]
+    if len(set(variant_hashes)) != len(variant_hashes):
+        raise ValueError("prepared RIR 변형 중복: split 누수 위험")
+    if _sha256_file(bank_path) != rir_hash:
+        raise ValueError("검사 중 RIR 파일이 변경됐습니다")
+    for input_path, digest in input_hashes.items():
+        _check_hash(input_path, digest)
+    return {
+        "data_ready": True, "diagnostic_only": True, "performance_claim_allowed": False,
+        "raw_root": str(raw_root), "qa_sha256": qa_hash,
+        "inventory_sha256": inventory_hash, "manifest_sha256": hashes,
+        "source_metadata_sha256": metadata, "split_counts": counts,
+        "rir_sha256": rir_hash, "rir_path": str(bank_path), "rir_variants": len(variant_hashes),
+    }, rirs
 
 
 def _delay_np(x: np.ndarray, delay: int) -> np.ndarray:
@@ -60,7 +217,18 @@ class SynthANCDataset(IterableDataset):
         self.duct_cfg = duct_cfg
         self.split = split
         self.seed = int(seed)
+        self.require_prepared_data = data_cfg.get("require_prepared_data", False)
+        if type(self.require_prepared_data) is not bool:
+            raise ValueError("require_prepared_data는 bool이어야 합니다")
+        self.prepared_data_metadata = None
+        if self.require_prepared_data:
+            validate_prepared_handoff(duct_cfg)
+            if rir_bank is not None:
+                raise ValueError("prepared 모드의 RIR 파일 검증을 인메모리 값으로 우회할 수 없습니다")
+            self.prepared_data_metadata, rir_bank = validate_prepared_data(data_cfg)
         self.fs = int(data_cfg["sample_rate"])
+        # 목표 분포 설정도 iterator 첫 호출까지 미루지 않고 검증한다.
+        self.synthetic_generator(seed=0)
         # 세그먼트를 런타임 블록(256 = 모델 hop 128×2)의 배수로 내림 — 모델 입력 요건
         raw_segment = int(round(float(data_cfg["segment_seconds"]) * self.fs))
         self.segment = max(256, (raw_segment // 256) * 256)
@@ -112,10 +280,7 @@ class SynthANCDataset(IterableDataset):
         # manifest(data/manifests/<tag>.jsonl)가 없는 태그는 합성원으로 자동 폴백하므로,
         # 데이터셋을 나중에 추가해도 설정 변경 없이 활성화된다 (speech/music 등).
         # acoustic-ref 는 전용 소스 구성을 사용 (주기성↑ + 예측불가 성분 무해화 학습) [로드맵 A2]
-        if self.reference_mode == "acoustic" and data_cfg.get("source_mix_ratio_acoustic"):
-            self.mix_ratio = dict(data_cfg["source_mix_ratio_acoustic"])
-        else:
-            self.mix_ratio = dict(data_cfg.get("source_mix_ratio", {"synthetic": 1.0}))
+        self.mix_ratio = _source_mix(data_cfg)
         manifest_dir = _resolve_path(data_cfg.get("noise_manifest_dir", "data/manifests"))
         self.pools: dict[str, list] = {
             tag: [str(manifest_dir / f"{tag}.jsonl")]
@@ -129,6 +294,8 @@ class SynthANCDataset(IterableDataset):
         # D_noise 총지연을 resolver가 분리해 반환하므로 둘을 각각 정확히 한 번 적용한다.
         # legacy rir_surrogate만 p_err 안의 음향 onset을 고려해 추가지연을 계산한다.
         sp = load_secondary_path(_resolve_path(duct_cfg["secondary_path"]["npz"]))
+        if self.require_prepared_data and sp.sample_rate != self.fs:
+            raise ValueError("prepared S sample_rate와 데이터 sample_rate가 다릅니다")
         self.digital_primary_path = None
         self.digital_primary_path_mode = str(
             data_cfg.get("digital_primary_path_mode", "rir_surrogate")
@@ -167,10 +334,17 @@ class SynthANCDataset(IterableDataset):
             return None
         if tag not in self._pool_objs:
             try:
+                if self.require_prepared_data:
+                    for manifest in self.pools[tag]:
+                        path = Path(manifest)
+                        _check_hash(path, self.prepared_data_metadata["manifest_sha256"][path.name])
                 self._pool_objs[tag] = NoisePool(
-                    self.pools[tag], self.split, self.fs, seed=int(rng.integers(1 << 31))
+                    self.pools[tag], self.split, self.fs, seed=int(rng.integers(1 << 31)),
+                    strict=self.require_prepared_data,
                 )
             except (FileNotFoundError, ValueError):
+                if self.require_prepared_data:
+                    raise
                 print(f"[synth_dataset] {tag} manifest 없음 — 합성원으로 대체합니다")
                 self.pools.pop(tag)
                 return None
@@ -259,6 +433,11 @@ class SynthANCDataset(IterableDataset):
             x_ref = np.zeros_like(x_ref)
 
         x = np.stack([x_ref, err_in]).astype(np.float32)   # [2, T]
+        if self.require_prepared_data:
+            with np.errstate(over="ignore", invalid="ignore"):
+                d = d.astype(np.float32)
+        if self.require_prepared_data and (not np.isfinite(x).all() or not np.isfinite(d).all()):
+            raise ValueError("prepared acoustic item의 수치 범위를 벗어났습니다")
         return {
             "x": torch.from_numpy(x),
             "d": torch.from_numpy(d.astype(np.float32)).unsqueeze(0),  # [1, T]
@@ -271,9 +450,15 @@ class SynthANCDataset(IterableDataset):
         worker_id = worker.id if worker is not None else 0
         split_offset = {"train": 0, "val": 7919, "test": 15859}[self.split]
         rng = np.random.default_rng(self.seed + split_offset + worker_id * 1009)
-        synth = SyntheticNoise(self.fs, seed=int(rng.integers(1 << 31)))
+        synth = self.synthetic_generator(seed=int(rng.integers(1 << 31)))
         while True:
             yield self._make_item(rng, synth)
+
+    def synthetic_generator(self, seed: int) -> SyntheticNoise:
+        return SyntheticNoise(
+            self.fs, seed=seed, target_band_hz=self.data_cfg.get("synthetic_target_band_hz"),
+            target_probability=self.data_cfg.get("synthetic_target_probability", 0.0),
+        )
 
 
 def make_eval_batch(
@@ -281,7 +466,7 @@ def make_eval_batch(
 ) -> dict[str, torch.Tensor]:
     """고정 시드 검증 배치 — 학습 중 val NMSE 추적용 (매번 동일 데이터)."""
     rng = np.random.default_rng(seed)
-    synth = SyntheticNoise(dataset.fs, seed=seed)
+    synth = dataset.synthetic_generator(seed=seed)
     items = [dataset._make_item(rng, synth) for _ in range(n_items)]
     return {
         "x": torch.stack([it["x"] for it in items]),

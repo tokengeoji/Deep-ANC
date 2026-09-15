@@ -15,11 +15,39 @@ KINDS = ("tone_harmonics", "machine", "narrowband", "chirp", "multitone")
 
 
 class SyntheticNoise:
-    def __init__(self, sample_rate: int, seed: int | None = None) -> None:
+    def __init__(
+        self, sample_rate: int, seed: int | None = None, *,
+        target_band_hz: tuple[float, float] | list[float] | None = None,
+        target_probability: float = 0.0,
+    ) -> None:
         self.fs = int(sample_rate)
         self.rng = np.random.default_rng(seed)
+        self.target_band = None
+        if isinstance(target_probability, (bool, str, np.bool_)):
+            raise ValueError("target_probability는 [0,1]의 유한 수여야 합니다")
+        try:
+            probability = float(target_probability)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("target_probability는 [0,1]의 유한 수여야 합니다") from exc
+        if not np.isfinite(probability) or not 0 <= probability <= 1:
+            raise ValueError("target_probability는 [0,1]의 유한 수여야 합니다")
+        if target_band_hz is not None:
+            band = np.asarray(target_band_hz)
+            if (band.shape != (2,) or band.dtype.kind not in "fiu"
+                    or not np.isfinite(band).all() or not 0 < band[0] < band[1] < 0.45 * self.fs):
+                raise ValueError("target_band_hz는 0 < low < high < 0.45*sample_rate여야 합니다")
+            self.target_band = tuple(float(value) for value in band)
+        elif probability != 0:
+            raise ValueError("target_probability > 0에는 target_band_hz가 필요합니다")
+        self.target_probability = probability
+
+    def _use_target(self) -> bool:
+        # opt-in이 아니면 난수도 추가 소비하지 않아 기존 seed/파형을 그대로 보존한다.
+        return self.target_probability > 0 and self.rng.random() < self.target_probability
 
     def _pick_f0(self) -> float:
+        if self._use_target():
+            return float(self.rng.uniform(*self.target_band))
         if self.rng.random() < 0.4:
             base = float(self.rng.choice(DUCT_RESONANCES))
             return base * float(self.rng.uniform(0.95, 1.05))
@@ -66,8 +94,11 @@ class SyntheticNoise:
         return self._filtered_noise(n, center - bw / 2, center + bw / 2).astype(np.float32)
 
     def chirp(self, n: int) -> np.ndarray:
-        f_start = float(self.rng.uniform(60.0, 500.0))
-        f_end = f_start * float(self.rng.uniform(0.5, 2.0))
+        if self._use_target():
+            f_start, f_end = (float(value) for value in self.rng.uniform(*self.target_band, size=2))
+        else:
+            f_start = float(self.rng.uniform(60.0, 500.0))
+            f_end = f_start * float(self.rng.uniform(0.5, 2.0))
         t = np.arange(n) / self.fs
         return signal.chirp(t, f_start, t[-1], f_end, method="logarithmic").astype(np.float32)
 

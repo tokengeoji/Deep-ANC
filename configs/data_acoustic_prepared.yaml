@@ -1,0 +1,57 @@
+# Drive 원본을 승인된 학습 환경에 명시적으로 stage한 뒤 사용하는 연구 설정.
+# PC 자동 다운로드/장치 실행/학습 실행은 하지 않는다. 누락 자료의 합성 대체 금지.
+sample_rate: 48000
+segment_seconds: 0.5
+reference_mode: acoustic
+digital_reference_lead_samples: 0
+require_prepared_data: true
+noise_manifest_dir: data/acoustic/manifests
+rir_bank: data/acoustic/rir_bank/duct_rirs_v1.npz
+
+# 기존 digital 분포에서 optional DNS를 제외하고 0.70으로 나눈 연구 출발점.
+# 최적 비율/실기 감쇠 근거가 아니다. 음성·음악·저역·고역을 함께 보존한다.
+source_mix_ratio:
+  synthetic: 0.35714285714285715
+  speech: 0.21428571428571427
+  music: 0.14285714285714285
+  demand: 0.11428571428571428
+  machine: 0.10
+  esc50: 0.07142857142857142
+
+# 기존 저역 분포와 목표 기본주파수 분포의 혼합. legacy 기본 생성기는 불변이다.
+# 비율 0.5는 검증용 출발점이며 신뢰대역/성공률을 의미하지 않는다.
+synthetic_target_band_hz: [800, 1600]
+synthetic_target_probability: 0.5
+
+level_dbfs: [-45, -20]
+snr_mic_noise_db: [5, 30]
+dc_hum_prob: 0.2
+nonlinear:
+  sef_eta_choices: [10.0]
+  drive_range: [1.0, 1.0]
+  hardclip_prob: 0.0
+plant_perturbation:
+  delay_jitter_range: [0, 0]
+  gain_tilt_db_per_octave: [0, 0]
+  gain_db: [0, 0]
+  allpass_perturb: false
+closed_loop:
+  feedback_delay_samples: [512, 1024]
+  warmup_seconds: 0.25
+  unroll_group_frames: 4
+
+source_metadata:
+  preparation_scope: staged_drive_audio_and_synthetic_acoustic_rir
+  checkpoint_physics_status: acoustic_rir_training
+  primary_path: synthetic_1d_p_ref_and_p_err
+  secondary_path: configured_measured_S_plus_handoff_in_loss_only
+  primary_gain_calibration_validated: false
+  secondary_target_band_validated: false
+  feedback_path_in_open_loop: not_applied
+  real_nonlinearity_validated: false
+  performance_claim_allowed: false
+  real_time_claim_allowed: false
+  local_stage_required: true
+  drive_inventory_is_data_ready: false
+  raw_download_by_this_config: false
+  use_scope: noncommercial_academic_research_subject_to_each_source_license

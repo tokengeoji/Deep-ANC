@@ -17,7 +17,9 @@ FxNLMS 적응을 결합한다. 이 저장소는 두 연구의 **선택/준비 �
 논문의 부호를 그대로 복사하지 않고 기존 `e=d+S*y`, 음의 gradient update를 유지한다.
 
 이번 구현의 **기준 FIR + 별도 FxNLMS 잔차 유지 + 선형 crossfade**는 논문 그대로가 아닌
-이 프로젝트의 실험 정책이다. CNN·온라인 선택기·생성기는 아직 없으며 준비한 후보 한 개만 시험한다.
+이 프로젝트의 실험 정책이다. 아래 §2–3은 준비한 후보 한 개를 시험한 첫 단계 기록이다.
+후속으로 조건별 bank와 과거 REF만 사용하는 PSD 선택기를 구현했다([docs/16 §6](16_drive_acoustic_preparation.md#6-논문-구조를-확장한-합성-필터-뱅크)).
+학습된 CNN/계수 생성기·live 선택기는 아직 없다.
 선형 FIR만으로 비선형 왜곡이 해결됐다고 주장하지 않는다.
 
 ## 2. 구현된 연구용 API
@@ -112,7 +114,8 @@ tanh 옵션 역시 실측 비선형 모델이 아니라 스트레스 조건이�
 - `results/prepared_fir/pc_20260915_linear_01/{report.json,metrics.csv,summary.md}`
 - `results/prepared_fir/pc_20260915_tanh_01/{report.json,metrics.csv,summary.md}`
 
-전체 CPU 회귀는 **632 passed, 2 skipped**다. 건너뜀은 현장 raw/실측 metrics 부재이며 실기 PASS가 아니다.
+이 첫 단계 당시 CPU 회귀는 **632 passed, 2 skipped**였다. 최신 회귀는 HANDOFF를 따른다.
+건너뜀은 현장 raw/실측 metrics 부재이며 실기 PASS가 아니다.
 
 ## 4. 저장 ESS의 대역별 검증 준비
 
@@ -146,8 +149,9 @@ SNR·실시간 위상/클록 안정성은 이 도구로 증명하지 않는다.
 
 ## 5. 다음 연결과 Jetson에 남은 일
 
-이 PC에서 가능한 후속 작업은 실제 회수 자료 재현, 다양한 조건의 사전 필터 bank 준비,
-과거 REF 특징만 쓰는 선택기 학습, 독립 소스/경로/레벨의 강건성 비교다.
+다양한 조건의 합성 bank와 비학습 REF-only 선택기, 독립 seed/레벨/주파수 스트레스는
+[docs/16](16_drive_acoustic_preparation.md)에 추가했다. 실제 회수 자료 재현·음성/음악 검증과
+과거 REF 특징만 쓰는 선택기의 학습은 아직 남아 있다.
 훈련/검증/test의 녹음 그룹 분리와 후보의 S/조건 메타를 먼저 갖춘다.
 현재 한 후보 시험을 완성된 SFANC/CNN으로 부르거나 데이터 없는 모델 학습을 성공으로 기록하지 않는다.
 

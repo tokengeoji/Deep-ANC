@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "research_use": "noncommercial_academic",
+  "storage_policy": "drive_canonical_temporary_local_staging",
+  "notes": "공식 checksum 기반 전송 후보 목록입니다. 기존 Drive 음원과 중복 여부를 확인하기 전 실행하지 않습니다. 이 목록은 다운로드 완료 기록이나 학습 데이터 분할이 아닙니다.",
+  "sources": {
+    "fma_small": {
+      "name": "fma_small.zip",
+      "url": "https://os.unil.cloud.switch.ch/fma/fma_small.zip",
+      "checksum_algorithm": "sha1",
+      "checksum": "ade154f733639d52e35e32f5593efe5be76c6d70",
+      "license": "트랙별 Creative Commons; fma_metadata/tracks.csv의 track.license 및 원저작자 표시 보존",
+      "official_reference": "https://github.com/mdeff/fma"
+    },
+    "fma_metadata": {
+      "name": "fma_metadata.zip",
+      "url": "https://os.unil.cloud.switch.ch/fma/fma_metadata.zip",
+      "checksum_algorithm": "sha1",
+      "checksum": "f0df49ffe5f2a6008d7dc83c6915b31835dfe733",
+      "license": "CC BY 4.0 (metadata)",
+      "official_reference": "https://github.com/mdeff/fma"
+    },
+    "librispeech_train_clean_100": {
+      "name": "train-clean-100.tar.gz",
+      "url": "https://www.openslr.org/resources/12/train-clean-100.tar.gz",
+      "checksum_algorithm": "md5",
+      "checksum": "2a93770f6d5c6c964bc36631d331a522",
+      "license": "CC BY 4.0",
+      "official_reference": "https://www.openslr.org/resources/12/md5sum.txt"
+    },
+    "librispeech_dev_clean": {
+      "name": "dev-clean.tar.gz",
+      "url": "https://www.openslr.org/resources/12/dev-clean.tar.gz",
+      "checksum_algorithm": "md5",
+      "checksum": "42e2234ba48799c1f50f24a7926300a1",
+      "license": "CC BY 4.0",
+      "official_reference": "https://www.openslr.org/resources/12/md5sum.txt"
+    },
+    "librispeech_test_clean": {
+      "name": "test-clean.tar.gz",
+      "url": "https://www.openslr.org/resources/12/test-clean.tar.gz",
+      "checksum_algorithm": "md5",
+      "checksum": "32fa31d27d2e1cad72775fee3f4849a9",
+      "license": "CC BY 4.0",
+      "official_reference": "https://www.openslr.org/resources/12/md5sum.txt"
+    },
+    "mimii_dg_fan": {
+      "name": "mimii_dg_fan.zip",
+      "url": "https://zenodo.org/records/6529888/files/fan.zip?download=1",
+      "checksum_algorithm": "md5",
+      "checksum": "a1a9b488934a82426bacc933d87aacde",
+      "license": "CC BY-NC-SA 4.0",
+      "official_reference": "https://zenodo.org/records/6529888"
+    },
+    "demand_kitchen": {
+      "name": "DKITCHEN_48k.zip",
+      "url": "https://zenodo.org/records/1227121/files/DKITCHEN_48k.zip?download=1",
+      "checksum_algorithm": "md5",
+      "checksum": "b4d38241fbd50d8a17f8742ca6870c10",
+      "license": "CC BY-SA 3.0",
+      "official_reference": "https://zenodo.org/records/1227121"
+    },
+    "demand_washing": {
+      "name": "DWASHING_48k.zip",
+      "url": "https://zenodo.org/records/1227121/files/DWASHING_48k.zip?download=1",
+      "checksum_algorithm": "md5",
+      "checksum": "ecf765f12b8d3ada7ef0ec664b8f8d73",
+      "license": "CC BY-SA 3.0",
+      "official_reference": "https://zenodo.org/records/1227121"
+    },
+    "demand_office": {
+      "name": "OOFFICE_48k.zip",
+      "url": "https://zenodo.org/records/1227121/files/OOFFICE_48k.zip?download=1",
+      "checksum_algorithm": "md5",
+      "checksum": "6f87edf8a6b03f17b3f693af1754aab4",
+      "license": "CC BY-SA 3.0",
+      "official_reference": "https://zenodo.org/records/1227121"
+    },
+    "demand_hallway": {
+      "name": "OHALLWAY_48k.zip",
+      "url": "https://zenodo.org/records/1227121/files/OHALLWAY_48k.zip?download=1",
+      "checksum_algorithm": "md5",
+      "checksum": "cb9227a75d2c1342de0b6548da4bbb1b",
+      "license": "CC BY-SA 3.0",
+      "official_reference": "https://zenodo.org/records/1227121"
+    },
+    "demand_metro": {
+      "name": "TMETRO_48k.zip",
+      "url": "https://zenodo.org/records/1227121/files/TMETRO_48k.zip?download=1",
+      "checksum_algorithm": "md5",
+      "checksum": "00d895020233f94348aafce7140d671f",
+      "license": "CC BY-SA 3.0",
+      "official_reference": "https://zenodo.org/records/1227121"
+    },
+    "demand_car": {
+      "name": "TCAR_48k.zip",
+      "url": "https://zenodo.org/records/1227121/files/TCAR_48k.zip?download=1",
+      "checksum_algorithm": "md5",
+      "checksum": "8550f03e8356d8054ae845e8b4b6c773",
+      "license": "CC BY-SA 3.0",
+      "official_reference": "https://zenodo.org/records/1227121"
+    }
+  }
+}

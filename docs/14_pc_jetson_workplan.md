@@ -17,7 +17,8 @@
 | REF/ERR 입력, S·F 전달경로·THD/IMD | **Jetson과 덕트 현장** | 연결된 장치 → 원시 녹음·반복 측정·메타데이터 |
 | 외부 소리의 OFF→ON→OFF 감쇠 | **Jetson과 덕트 현장** | 사전 측정 S → acoustic FxNLMS 기준선 |
 | 회수 자료의 품질·대역·왜곡 분석 | **자료 회수 후 현재 PC** | 현장 원자료 → 독립 분석·다음 측정 항목 |
-| acoustic 데이터 처리·학습·계수 생성 개발 | **현재 PC에서 가능한 규모부터** | 검증된 자료 → 코드·소규모 검증·학습 산출물 |
+| acoustic 데이터 처리·학습·계수 생성 개발 | **현재 PC에서 가능한 규모부터** | Drive 보관 자료 → 코드·소규모 검증·학습 산출물 |
+| 공개 원본의 임시 다운로드·검증·Drive 전송 | **현재 PC, CPU Docker + 연결 Drive** | 공식 checksum → Drive 파일 확인 → 해당 PC 원본 삭제·receipt 보존 |
 
 Jetson 현장이 준비되지 않아도 현재 PC의 테스트·경로 진단·합성 회귀·후처리 개발은 계속한다.
 현재 PC 결과를 Jetson 실시간 성능이나 덕트 감쇠 성능으로 표기하지 않는다.
@@ -55,7 +56,9 @@ bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q \
 acoustic 녹음 후처리와 runtime 저장 메타데이터 연결은 구현했고 합성 회귀로 검사한다.
 저장 ESS 반복의 대역별 진단과 계수 전달형 FIR/FxNLMS 연구 API·합성 비교도 구현했다.
 이는 S 신뢰대역 자동 승격이나 live 제어기 완성이 아니다. 실행·해석은 [docs/15](15_prepared_fir_research.md)를 따른다.
-후속 개발은 원시 자료 재현 검증, 사전 필터 bank·선택기 준비, 실제 스레드 전달 규약 검토다.
+조건별 합성 bank·과거 REF만 사용하는 PSD 선택기·다중 seed 스트레스와 strict acoustic
+데이터 준비 코드는 [docs/16](16_drive_acoustic_preparation.md)에 정리했다. 실제 PCM 전수 QA와
+학습된 선택기, 실제 스레드 전달 규약 검토는 별도이며 합성 시험만으로 완료 처리하지 않는다.
 온라인 S/F 추정, F 보상, 학습된 계수 생성기는 아직 구현·검증 완료 상태가 아니다.
 
 ## 3. Jetson 현장 작업의 공통 선행조건

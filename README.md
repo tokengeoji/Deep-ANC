@@ -25,6 +25,7 @@
 > [이 PC / Jetson 작업 분담과 현장 체크리스트](docs/14_pc_jetson_workplan.md)에 실행 위치·선행조건·산출물·중단 기준을 정리했다.
 > acoustic 녹음 전용 무출력 분석 CLI와 기록 메타데이터 연결을 구현했다. 사용법은 [docs/14 §5](docs/14_pc_jetson_workplan.md), 관측 감소량의 한계는 [docs/07 §8](docs/07_evaluation_protocol.md)을 따른다.
 > [논문 반영 PC 연구 준비](docs/15_prepared_fir_research.md): 사전 FIR+FxNLMS 계수 전달 규약, 독립 합성 비교, ESS 대역 진단을 구현했다. 오디오 런타임·학습된 선택기는 아직 연결하지 않았다.
+> [Drive 중심 데이터·bootstrap 준비](docs/16_drive_acoustic_preparation.md): 원본은 PC 임시 검증 후 Drive 업로드 확인 뒤 PC에서 삭제한다. 합성 RIR·REF-only 필터 뱅크·strict 학습 QA는 실제 음원 확보/실기 성능과 구분한다.
 
 ---
 
@@ -60,7 +61,7 @@ v1.1/v2 연구 항목은 [docs/11](docs/11_v2_roadmap.md)에 승인·기각 근�
 
 | 항목 | 결과 | 상태 |
 |---|---|:---:|
-| 자동 회귀 테스트 (2026-09-15 CPU Docker) | **632개 통과**, 현장 자료 부재 2개 건너뜀 | 소프트웨어 검증 |
+| 자동 회귀 테스트 (2026-09-15 CPU Docker) | **1109개 통과**, 현장 자료 부재 2개 건너뜀 | 소프트웨어 검증 |
 | 오프라인↔스트리밍 수치 등가성 | 최대 오차 약 `3e-8` | 통과 |
 | PyTorch↔ONNX Runtime 등가성 | 최대 오차 `8e-8` 이하 | 통과 |
 | tiny + ORT CPU P99 | **1.84ms** / 게이트 `<3ms` | 통과 |

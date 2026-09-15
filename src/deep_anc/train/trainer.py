@@ -259,11 +259,20 @@ class Trainer:
                 total_missing = sum(float(mix[t]) for t in missing)
                 print("=" * 70)
                 print(f"[trainer 경고] manifest 부재 태그 {missing} (비율 합 {total_missing:.0%})")
-                print("  → 해당 비율은 합성원으로 대체됩니다. 의도가 아니면 학습을 중단하고")
-                print("    scripts/data/prepare_noise_pool.py 를 실행하세요.")
+                if data_cfg.get("require_prepared_data"):
+                    print("  → strict 준비 설정: 합성 대체 없이 아래 데이터 검사에서 중단합니다.")
+                else:
+                    print("  → 해당 비율은 합성원으로 대체됩니다. 의도가 아니면 학습을 중단하고")
+                    print("    scripts/data/prepare_noise_pool.py 를 실행하세요.")
                 print("=" * 70)
 
         synth_train = SynthANCDataset(cfg["data"], duct, split="train", seed=seed)
+        if cfg["data"].get("require_prepared_data"):
+            # 설정의 자기 선언 대신 실제 loader 검증 시점 hash를 checkpoint에 보존.
+            # Drive 원격 완전성/실기 성능의 인증으로 승격하지 않는다.
+            cfg["data"].setdefault("source_metadata", {})["prepared_data_snapshot"] = copy.deepcopy(
+                synth_train.prepared_data_metadata
+            )
         loader = DataLoader(
             synth_train,
             batch_size=int(cfg["batch_size"]),

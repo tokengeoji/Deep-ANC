@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 
 import numpy as np
 import soundfile as sf
@@ -18,7 +19,9 @@ class NoisePool:
         split: str,
         sample_rate: int,
         seed: int | None = None,
+        strict: bool = False,
     ) -> None:
+        self.strict = strict
         self.sample_rate = int(sample_rate)
         self.rng = np.random.default_rng(seed)
         self.entries: list[dict] = []
@@ -51,6 +54,13 @@ class NoisePool:
             entry = self.entries[index]
             path = entry["path"]
             try:
+                if self.strict:
+                    digest = hashlib.sha256()
+                    with Path(path).open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    if digest.hexdigest() != entry.get("sha256"):
+                        raise ValueError(f"strict 음원 SHA-256 불일치: {path}")
                 file_sr = int(entry.get("sample_rate", self.sample_rate))
                 if file_sr <= 0:
                     raise ValueError(f"잘못된 sample rate: {file_sr}")
@@ -86,6 +96,8 @@ class NoisePool:
                     mono = np.tile(mono, reps)
                 return mono[:n_samples].astype(np.float32)
             except (OSError, RuntimeError, ValueError) as exc:
+                if self.strict:
+                    raise RuntimeError(f"strict 음원 읽기 실패: {path}") from exc
                 last_error = exc
                 self._active_weights[index] = 0.0
 

@@ -22,6 +22,10 @@
   `SEUNG JOON JEONG <155646237+tokengeoji@users.noreply.github.com>`이다(과거 이름은 Roka-jsj).
   이 저장소의 local Git 작성자 설정만 맞췄으며 전역 설정은 변경하지 않았다.
 - 시스템 설정 변경과 무입회 스피커 출력 금지는 그대로다. 이번 작업에서는 오디오를 실행하지 않았다.
+- **데이터 최신 지시:** 비상업 학업 실험이다. PC Docker에 원본을 임시 다운로드하고
+  Drive 업로드를 확인한 파일은 PC에서 삭제한다. 이전 PC 원본 다운로드 금지는 이 지시로 대체됐다.
+  기존 Drive 자료를 우선 활용하고 새 업로드의 중복을 막는다. 완전성을 모르는 옛 백업은 보존한다.
+  사용자는 별도의 완전한 데이터 폴더가 없다고 확인했으므로 같은 링크를 다시 요청하지 않는다.
 
 ### 현재 환경과 실행
 
@@ -42,7 +46,9 @@ bash scripts/docker/dev.sh shell
 Jetson용 `docker/Dockerfile.jetson`도 준비했지만 **실제 ARM64 Jetson 빌드·CUDA/TensorRT·실시간 오디오 검증은 아직 하지 않았다**.
 L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공유한다. x86 CPU Docker가 이를 에뮬레이션하지 않는다.
 명령·재시작·볼륨 규약은 [docker/README.md](docker/README.md)를 따른다.
-현재 체크아웃에는 과거 `runs/`, `results/`, 학습 데이터와 acoustic 학습 artifact가 없다.
+현재 체크아웃에는 과거 `runs/`, 현장 `results/`, strict 학습용으로 배치된 원본/manifest와
+배포용 acoustic 학습 artifact가 없다. 새 공개 원본 아카이브는 임시 확보해 Drive로 보관한다.
+이번 CPU 준비의 합성 결과와 검증·전송 기록은 ignored `results/`에 별도로 생성했다.
 과거 Elice 접속이나 리소스 삭제는 이번 작업 범위가 아니며 자동 수행하지 않는다.
 
 ### 구현 범위와 해석
@@ -61,7 +67,7 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 
 ### 이번 검증 결과
 
-- `deep-anc-dev` 내부에서 `.venv/bin/python -m pytest -q -o addopts= -ra`: **632 passed, 2 skipped (41.65초)**.
+- `deep-anc-dev` 내부에서 `.venv/bin/python -m pytest -q -o addopts= -ra`: **1109 passed, 2 skipped (59.95초)**.
 - 건너뛴 2개는 현장 raw 진단 파일과 실측 `metrics.md` 부재 때문이다. GPU/실기 검증으로 해석하지 않는다.
 - `pip check`: 의존성 충돌 없음. Docker 관리 스크립트 `bash -n` 및 tracked diff 공백 검사 통과.
 - Docker의 `.venv` 전용 볼륨, `ancdev` 사용자, `Privileged=false`, 오디오 장치 미노출을 확인했다.
@@ -121,6 +127,68 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 - 이번 추가 회귀는 109개: 대역/CLI 14 + 준비 FIR 36 + 합성 bench 22 + ESS 진단 37.
   전부 장치 없는 검증이며 새 오디오·Jetson/GPU/외부 학습 작업은 실행하지 않았다.
 
+### Drive·데이터·필터 뱅크 준비 — 실제 corpus 학습과 구분
+
+명령·라이선스·staging 계약·해석은 **[docs/16](docs/16_drive_acoustic_preparation.md)**를 따른다.
+
+- Drive `DeepANC`의 과거 snapshot/manifest/bootstrap 메타데이터를 읽었다. 선택한 목록 관측은
+  `results/drive_preparation/20260915_01/inventory.json`에 저장했다(ignored, 개인 Drive ID 비공개).
+  10분할 archive 중 9개/37,004,038,144 byte 관측, part5 미확인이다. 삭제/분실 확정이 아니다.
+  과거 canonical QA의 계열별 수량은 현재 PCM 전수 검증이 아니고 recorded subband 전체 통과도 false였다.
+- 새 `acoustic_preparation_20260915` 폴더와 하위 `public_archives`를 만들었다. 기존 Drive 백업·공유 설정은
+  변경하지 않았다. 공식 checksum/라이선스 catalog를 업로드했고 새 원본은 별도 전송 receipt로 추적한다.
+- `scripts/data/bootstrap_acoustic.py`를 실제 실행: 최신 `results/acoustic_preparation/pc_20260915_02/`에
+  300×8192의 합성 P_ref/P_err/F, `preparation.json` 생성. 의존성 검사 PASS.
+  `pc_bootstrap_complete=true`지만 `dataset_training_ready=false`, `jetson_ready=false`다.
+- `prepare_acoustic_corpus.py`: 5계열의 공식/검토 metadata·전체 PCM·SHA·그룹 split·정확한 중복 QA.
+  실패 시 inventory/QA만, 성공 시 5계열 JSONL도 생성. 재사용은 원본까지 재검증하고 덮어쓰지 않는다.
+  DEMAND/MIMII 완전성은 staging 작성자 선언이며 Libri chapter의 metadata+PCM 동시 누락은 외부 완전 목록 없이는 검출 못한다.
+- `configs/data_acoustic_prepared.yaml`: acoustic lead0, strict 원본/RIR 검증, legacy 설정 불변.
+  source mix는 기존에서 DNS를 제외한 정규화 연구 출발점이다. 합성원에만 목표대역 분포를 opt-in으로 섞는다.
+  `check_acoustic_training_data.py`는 기본 checkout에 strict 원본/manifest가 없어 exit1/data_ready=false다.
+  공식 아카이브 확보·Drive 보관 완료와 학습 로더의 로컬 준비 완료는 다른 상태다.
+- `train_acoustic_prepared.yaml`은 **최대2step CPU 연결 검사 설정**이다. fixture 전용 Trainer2step과
+  checkpoint의 acoustic/lead0/기존S trusted대역/검증시점 데이터 snapshot 연결까지 테스트한다.
+  이는 실제 공개 음원 학습·유용한 acoustic 모델·목표대역 학습 완료가 아니다.
+- `prepare_filter_bank.py`: 조건별 10후보×2 bank, train/validation/test seed 분리, 과거 REF PSD/RMS 선택기,
+  4대조군/주파수·레벨·tanh·P gain 변화의 기본896 run을 CPU에서 실행했다.
+  최신 결과는 `results/filter_bank/pc_20260915_baseline_03/`이며 `_01/`, `_02/`는 과거 실행 보존본이다.
+  긴 지연에서 selected가 cold보다 못하고 증폭 사례도 있다. 성공 사례만 선별하지 않았다.
+- 현재 **strict 그룹 분할 전수 QA·독립 acoustic 학습·학습된 선택기·온라인 S/F·live 통합**은
+  완료 상태가 아니다. "Jetson 실측만 남았다"고 보고하지 않는다.
+
+#### 현재 진행 중인 전송 — 중단/재개 시 필독
+
+사용자의 PC 임시 다운로드 허용 후 `results/drive_staging_20260915_vhZnb7/`를 새로 생성했다.
+기존 `data/`나 과거 백업은 건드리지 않는다. 공식 출처별 checksum receipt, 무추출 PCM QA,
+96MiB 분할/결합 checksum 도구를 구현했다. 공개 원본 13개(18,599,035,802 byte)의 확보·
+아카이브 순회를 완료했고, 대용량 FMA small/Libri train의 Drive 전송은 아직 진행 중이다.
+연결 Drive 업로드는 **파일당 100MiB 상한**이라 원본 archive 하나를 직접 올리지 않는다.
+Drive의 새 public_archives/{source_id}에는 parts와 manifest.json만 보관하고,
+개별 Drive ID·업로드 확인·PC 삭제 상태는 별도 transfer_receipts에 기록한다.
+동일 기록은 `results/drive_transfer_receipts/20260915_01/`에 남긴다.
+**이미 업로드된 조각을 다시 올리지 말고 receipt/Drive 목록부터 대조할 것.**
+
+- 첫 `fma_metadata`의 4개 조각과 manifest 업로드·후속 ID/이름/부모/크기 확인을 마쳤다.
+  해당 PC archive+parts 716,824,882 byte를 삭제했고 QA/receipt/manifest는 보존했다.
+  원격 hash는 도구가 제공하지 않아 미검증이며 복원 시 전체 checksum 재검증이 필요하다.
+- Libri dev/test와 DEMAND 6개 환경 archive는 공식 checksum 통과했다. 추가 전송·정리 상태는 receipt를 따른다.
+- ESC-50은 공식 Git repo의 고정 commit `33c8ce9eb2cf0b1c2f8bcf322eb349b6be34dbb6`를
+  clone/fsck 후 Git archive로 포장했다. 공개 archive digest가 없으므로 source_checksum_verified=false,
+  Git 객체 출처 검증을 별도 표시한다. 원본 `.git` 임시 clone도 해당 Drive 전송 확인 후 정리 대상이다.
+- Libri 3개 subset 33,862음원, ESC 2,000, DEMAND 96, MIMII 3,600은 PCM 수치 QA를 통과했다.
+  FMA 8,000음원 중 7,993개 수치 통과/7개 실패이고 metadata archive는 12개 metadata-only다.
+  FMA 실패 ID는 098565/098567/098569/099134/107535/108925/133297이며
+  soft decoder 경고 영향은 추가 미확인이다. 실패 파일을 버리거나 manifest READY를 만들지 않았다.
+  요약은 `results/drive_preparation/20260915_01/public_archive_audit_summary.json`에 있다.
+- MIMII 10조각+manifest 업로드와 PC archive/parts 삭제도 완료했다. source 간 완료 상태는
+  transfer receipt를 기준으로 판단하고 진행 중 전송을 중복 실행하지 않는다.
+- `split_staged_archive.py --restore-manifest ... --archive-out NEWPATH`는 전체 조각·결합·출력
+  재읽기 검증을 수행하는 새 파일 전용 복원이다. 실패 출력 보존 규약과 명령은 docs/16을 따른다.
+- 추가 병렬 Range 시험은 Libri 연결 실패, FMA는 중복 전송을 줄이기 위해 중단했다.
+  `_parallel/range_parts`는 미완료 보존본이며 원본의 정식 완료/Drive 전송 확인 후 함께 정리한다.
+- 현 단계에서 외부 GPU 학습·새 유료 서버·Jetson 소리 출력은 실행하지 않았다.
+
 ### 현 자산 진단 — 새 감쇠 실측이 아님
 
 컨테이너의 무출력 진단으로 다음 값을 확인했다.
@@ -147,9 +215,10 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 작업 위치·명령・중단조건의 실행 문서는 [docs/14](docs/14_pc_jetson_workplan.md)다.
 연구/설계 근거는 [docs/13](docs/13_acoustic_hybrid.md)를 따른다.
 
-1. **이 PC에서 계속**: 목표 대역 지표·ESS 반복 진단·계수 전달 연구 API와 합성 대조군은 구현했다.
-   다음은 다양한 seed/조건에서 후보 준비·재사용의 강건성 시험, 사전 filter bank의 데이터/조건 메타 규격,
-   과거 REF 특징 기반 선택기 준비, 실제 스레드 전달/라이브 연결 전의 소유권 리뷰다.
+1. **이 PC에서 계속**: 목표 대역 지표·ESS 반복 진단·계수 전달 연구 API·다중 seed 필터 뱅크와
+   과거 REF 특징 선택 기준선은 구현했다. 다음은 DEMAND/MIMII 출처 그룹 검토, FMA 디코더 경고의
+   트랙별 검증, 승인된 임시 staging에서 strict 그룹 manifest QA와 실제 음성·음악 독립 평가다.
+   이후 실제 스레드 전달/라이브 연결 전의 소유권·마감·안전 리뷰를 수행한다.
    실측 원자료가 오면 PCM→IR 재추출 정합·SNR/지연/대역 검증과 기록 기반 재현을 연결한다.
    현재 `calibrate_wideband.py` ESS 산출물은 `consistency_band_hz`가 없어 readiness에 가진 대역을 대신 넣으면 안 된다.
    새 ESS 진단도 모델 승격 도구가 아니다. 고정 하드웨어 지연이 해결됐다고 가정하지 않는다.

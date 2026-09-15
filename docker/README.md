@@ -16,7 +16,7 @@
 CPU 이미지는 Jetson 에뮬레이터가 아니다. CPU 테스트가 통과해도 Jetson의 CUDA,
 TensorRT, 처리 지연, 실제 오디오 경로가 검증된 것은 아니다.
 Jetson Dockerfile은 준비된 빌드 정의이며 **현재 실제 Jetson에서의 이미지 빌드·CUDA·TensorRT 검증은 미완료**다.
-2026-09-15 CPU 컨테이너의 전체 테스트는 632개 통과, 현장 자료 부재 2개 건너뜀이며 `pip check`도 통과했다.
+2026-09-15 CPU 컨테이너의 전체 테스트는 1109개 통과, 현장 자료 부재 2개 건너뜀이며 `pip check`도 통과했다.
 
 환경 정의는 [Dockerfile.cpu](Dockerfile.cpu), [Dockerfile.jetson](Dockerfile.jetson),
 공통 검증 패키지는 [requirements-dev.txt](requirements-dev.txt)에 있다.
