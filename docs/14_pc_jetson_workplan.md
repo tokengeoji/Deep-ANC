@@ -44,12 +44,14 @@ S 파일이 없거나 메타데이터가 잘못되면 그 결손을 기록하고
 
 ```bash
 bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q \
-  tests/test_acoustic_readiness.py tests/test_acoustic_runtime.py tests/test_hybrid_engine.py
+  tests/test_acoustic_readiness.py tests/test_acoustic_runtime.py tests/test_hybrid_engine.py \
+  tests/test_runtime_recording.py tests/test_acoustic_session.py tests/test_acoustic_session_cli.py
 ```
 
 이 검사는 외부 REF 기준선, 지연된 ERR에 대한 적응, 클립·xrun·입력 손상 대응 등을 다룬다.
 합성 하이브리드 수렴은 실제 ERR를 입력으로 받는 DNN의 폐루프 안정성 증명이 아니다.
-후속 개발은 acoustic 녹음의 후처리 규격, 실측 경로 기반 재현, 느린 계수 생성 API 순으로 진행한다.
+acoustic 녹음 후처리와 runtime 저장 메타데이터 연결은 구현했고 합성 회귀로 검사한다.
+후속 개발은 S 반복 측정의 신뢰대역 검증, 실측 경로 기반 재현, 느린 계수 생성 API 순으로 진행한다.
 온라인 S/F 추정, F 보상, 학습된 계수 생성기는 아직 구현·검증 완료 상태가 아니다.
 
 ## 3. Jetson 현장 작업의 공통 선행조건
@@ -147,7 +149,6 @@ S의 실제 측정 조건·극성·유효대역을 확인한 후 아래 명령�
 제한된 대역의 주기 신호 진단을 하더라도 그 범위와 한계를 기록한다.
 
 ```bash
-test ! -e results/acoustic_SESSION_ID/fxlms_trial_01.npz && \
 .venv/bin/python -m deep_anc.realtime.run_realtime \
   --config configs/runtime_acoustic.yaml \
   --set duct.secondary_path.npz=results/acoustic_SESSION_ID/secondary_path.npz \
@@ -155,12 +156,19 @@ test ! -e results/acoustic_SESSION_ID/fxlms_trial_01.npz && \
 ```
 
 현장에서 10초 OFF → `A`로 ON 30초 → `A`로 OFF 5초를 기록한다. `Q`는 종료다.
+**요청한 45초 녹음 버퍼 안에서 수동 OFF까지 완료**한다. 종료 처리의 fade/무음은 녹음에
+포함된다고 보장하지 않는다. 조작 지연·S 꼬리가 길면 녹음 시간을 늘리고 충분한 후행 OFF를 확보한다.
 설정의 `reference=mic`, digital lead 0, `noise.enabled=false`를 유지한다.
 외부 소리만 평가하는 세션에서 `N`으로 내부 소음 재생을 켜지 않는다.
-**산출물:** `fs`, `err`, `ref`, `source`, `control`, `anc_gain`이 담긴 녹음 NPZ.
-별도로 소스 종류·위치·출력 레벨·실행 설정·S 파일 해시·터미널 통계를 남긴다.
+**산출물:** `fs`, `err`, `ref`, `source`, `control`, `anc_gain` 및 scalar
+`recording_schema_version=1`, `recording_meta_json`이 담긴 녹음 NPZ.
+메타에는 생성 시점 S SHA-256, reference/controller, fs/block/hop/latency, handoff,
+채널 매핑, 제어 제한/DC blocker, 요청·실제 샘플 수와 누적 runtime health를 저장한다.
+별도로 소스 종류·위치·출력 레벨·전체 실행 설정·S 원본·터미널 통계를 남긴다.
+메타는 전체 설정 스냅샷이나 시점별 적응·클립·장애 이력이 아니다.
 **중단 조건:** 발산·반복 클립·xrun·출력 누락·입력 손상. 자동 OFF 후 원인 확인 없이 다시 켜지 않는다.
-같은 경로에 다시 녹음하면 기존 파일이 덮어써질 수 있어 예시의 파일 존재 검사를 유지한다.
+기존 `.npz` 경로는 입력 장치 사전점검 전에 거부하고 실제 저장도 exclusive 생성한다.
+저장 도중 실패하면 부분 파일이 남을 수 있다. 원인을 확인하고 다음 시도는 새 경로를 쓴다.
 
 ### F. 실시간 비용과 장기 하이브리드 검증
 
@@ -188,9 +196,41 @@ test ! -e results/acoustic_SESSION_ID/fxlms_trial_01.npz && \
 5. 검증한 실측 경로로 FxNLMS·초기 하이브리드의 오프라인 재현을 추가하고 회귀 테스트를 만든다.
    후처리와 데이터 변환, acoustic 학습의 소규모 검증은 현재 PC에서 진행한다.
 
-현재 `run_realtime --record`의 NPZ에는 `trusted_band_hz`가 없다.
-따라서 이를 해당 키가 필요한 `scripts/eval/rebuild_session_artifacts.py`에 바로 넣지 않는다.
-실측 S와 세션 조건을 결합하는 후처리 연결은 현재 PC에서 구현할 다음 작업이다.
+### Acoustic 녹음 전용 후처리 — 현재 PC, 무출력
+
+§4-E의 녹음과 **동일한 설정 및 S 파일**을 회수한 뒤 다음 명령을 쓴다.
+`SESSION_ID`와 `machine`은 실제 세션 식별자·소스 종류로 바꾼다.
+
+```bash
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/eval/analyze_acoustic_session.py \
+  --npz results/acoustic_SESSION_ID/fxlms_trial_01.npz \
+  --config configs/runtime_acoustic.yaml \
+  --set duct.secondary_path.npz=results/acoustic_SESSION_ID/secondary_path.npz \
+  --source-family machine \
+  --out results/acoustic_SESSION_ID/analysis_trial_01
+```
+
+`report.json`, `metrics.csv`, `summary.md`와 유효 창이 있으면 `windows.csv`를 **새 디렉터리**에
+저장한다. 기존 경로·출력 경로의 심볼릭 링크는 거부한다. 실제 ERR는 이미 잔류음이므로
+S를 다시 적용하지 않는다. REF 변화는 진단값이며 감쇠를 보정하는 분모로 쓰지 않는다.
+저역 `[0,1000)`·고역 `[1000,Nyquist]`, 전체·옥타브 경계 대역과 신뢰대역을 별도로 남긴다.
+
+기본 1초 창, 초기 OFF 1초·ON 워밍업 2초·경계 0.5초 제외를 사용한다.
+각 구간 앞에서는 `max(해당 guard, S.delay + FIR 길이 − 1)`을 제외한다.
+출력 callback에서 녹음한 control/gain이므로 handoff를 다시 더하지 않는다.
+ON이 OFF보다 길어도 ON 후반을 버리지 않으며, 사이클별 앞뒤 OFF 중 작은 평균 파워와 비교한다.
+분석 창 미만의 말미는 별도 discarded 샘플 수로 남긴다. 자세한 정의는 [docs/07 §8](07_evaluation_protocol.md#8-acoustic-런타임-녹음-진단--현재-pc-무출력)을 따른다.
+
+exit 0은 모든 사이클의 구간이 완전하고 **최소 한 사이클**의 전체 대역 비교가 계산 가능하다는 뜻이다.
+exit 2는 비교 불가·불완전 사이클이며 진단 산출물은 보존한다. exit 1은 입력·설정·I/O 오류다.
+**어떤 exit 코드도 감쇠 성공을 인증하지 않으며 `performance_claim_allowed=false`다.**
+무신호 대역은 `null`, ON에서 새로 생긴 에너지는 `emergent_on_energy`로 표시한다.
+메타 없는 구형 녹음도 읽지만 설정·S 일치는 미확인이고 runtime health는 `null`이다.
+신규 schema 녹음의 설정·S 해시가 다르면 비교를 거부한다.
+
+`run_realtime --record` NPZ를 `trusted_band_hz`가 필요한 기존
+`scripts/eval/rebuild_session_artifacts.py`에 바로 넣지 않는다. 새 도구는 S의
+`consistency_band_hz`와 반복 일관성을 읽고 가진 대역을 신뢰대역으로 대신하지 않는다.
 기존 recorded QA/파인튜닝의 manifest 규격과 acoustic 녹음도 자동 호환된다고 가정하지 않는다.
 자료가 부족하면 부족한 필드·실험을 명시하고 가능한 신호 품질 분석과 합성 검증을 계속한다.
 

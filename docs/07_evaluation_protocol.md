@@ -7,8 +7,11 @@
 | **기능1 — 저주파+고주파 노이즈 제거** | 옥타브밴드별 감쇠(125~8000Hz), 저역(tone300/multitone/band) + 고역(hf_tone/hf_band) 시나리오, held-out 비선형 η NMSE | evaluate_offline §기능1, evaluate_session |
 | **기능2 — 모든 소리 제거 (quiet zone)** | **소스 종류별** 감쇠(합성/실환경소음/음성/음악/지속환경/기계음/이벤트음), file 시나리오(음성·음악 wav 재생→상쇄) | evaluate_offline §기능2, run_realtime `--set noise.type=file` |
 
-한쪽 대역·한쪽 소스만 좋은 결과는 목표 미달로 판정한다. 고역(>800Hz)은 광대역 S(z)
-재보정(docs/02 §4)이 선행 게이트, 1633Hz 이상은 물리 한계 명시(docs/01).
+한쪽 대역·한쪽 소스만 좋은 결과는 목표 미달로 판정한다. **2026-09-15 사용자 확정 기준은
+acoustic REF, ERR 한 점, 고역 1 kHz 이상**이다. 고역은 광대역 S(z) 반복 검증이 선행 게이트다.
+약 1633Hz의 평면파 모드 차단을 ERR 한 점 감쇠의 절대 상한으로 해석하지 않는다(docs/01).
+위 표의 기존 digital 시나리오와 아래 과거 실적은 acoustic 실기 검증을 대신하지 않는다.
+현재 acoustic 녹음의 무출력 분석은 **§8**을 따르며, 외부 소리 세션의 내부 소음은 OFF로 유지한다.
 현 Stage-1의 `secondary_surrogate` 결과는 표현 사전학습 검증일 뿐이다. 실측
 `P(z)`/`S(z)`와 독립 recorded test 전에는 어떤 NMSE도 덕트 물리 성능으로
 주장하지 않는다.
@@ -223,3 +226,57 @@ G0의 고정-batch 수치는 의도적 과적합 진단이지 일반화 성능�
 `results/eval_report_*.md` 표 + 다음 플롯(오프라인 도구 재사용):
 ANC OFF/ON 스펙트로그램, PSD 오버레이(off/FxLMS/DL), 옥타브밴드 막대(신뢰 회색 표기).
 캡스톤 보고서에는 시나리오 표 + 밴드 막대 + 물리 한계 요약(docs/01 §5)을 함께 실을 것.
+
+## 8. Acoustic 런타임 녹음 진단 — 현재 PC, 무출력
+
+`scripts/eval/analyze_acoustic_session.py`는 장치·신경망을 열지 않고 런타임 NPZ를 분석한다.
+실행 명령, 현장 OFF→ON→OFF 확보와 회수 목록은 [docs/14 §4-E·§5](14_pc_jetson_workplan.md)를 따른다.
+이 도구의 양수 dB는 **서로 다른 시각에 관측한 ERR 감소량**이지 ANC의 인과적 효과 인증이 아니다.
+외부 음원 변화·S/F 변동·입력 SNR은 별도 통제와 실측이 필요하므로 항상
+`diagnostic_only=true`, `performance_claim_allowed=false`를 남긴다.
+
+### 8.1 구간·대역·통계
+
+- `anc_gain <= 0.001`은 OFF, `>= 0.999`는 ON이며 사이 값은 전환이다.
+  각 ON마다 바로 앞뒤 OFF가 있어야 한다. 중간 OFF나 마지막 미완료 사이클을 합치거나 삭제하지 않는다.
+- 기본 창은 1초, 초기 OFF guard 1초, ON 워밍업 2초, 양쪽 경계 guard 0.5초다.
+  구간 앞 guard는 S의 `delay_samples + FIR 길이 − 1`보다 짧을 수 없다.
+  저장 control/gain은 출력 callback 시각이므로 handoff를 중복 가산하지 않는다.
+  창 미만의 말미 샘플 수는 보존해 보고하고, OFF 길이에 맞춰 긴 ON을 잘라내지 않는다.
+- ERR/REF를 고정 길이 창별 **한쪽 FFT Parseval 에너지**로 계산한다. 저역은 `[0,1000)`,
+  고역은 `[1000,Nyquist]`라 1 kHz 성분은 고역에만 속한다. DC는 저역/전체 대역에 포함한다.
+  옥타브 경계 `f/√2 ~ f√2`도 FFT bin 적분이며, §1의 기존 Butterworth 4차 출력과 동일 지표가 아니다.
+  유한 창의 스펙트럼 누설·주파수 분해능 한계가 있고 실제 마이크 SNR을 측정한 것은 아니다.
+- ON과 비교할 기준 파워는 `min(mean(앞 OFF 창 파워), mean(뒤 OFF 창 파워))`다.
+  관측 감소량은 `10 log10(기준 파워 / ON 평균 파워)`이며 양수 감소·음수 증가다.
+  앞·뒤 OFF 각각과 비교한 값, OFF 간 변화량, REF 변화량도 따로 남긴다.
+  실제 ERR에 S를 재적용하거나 `ERR − S*control`을 정답 d로 재구성하지 않는다.
+  ON REF에는 F(CS→REF)가 섞일 수 있어 REF 정규화로 감쇠값을 만들지 않는다.
+- 중앙값·p10·최악 창·**최악 10% 평균**은 별도 값이다. 최악 10% 평균은 ON 창 N개 중
+  관측 감소량이 작은 `ceil(N*0.1)`개 평균이다. 무효 창을 버리고 분포를 좋게 만들지 않는다.
+- `power_floor=1e-12`는 **수치 계산 바닥**이며 실측 마이크 noise floor가 아니다.
+  분모·기준이 바닥 이하이면 감소량은 `null`이지 0dB·무한 감쇠가 아니다.
+  기준이 바닥 이하인데 ON 창에 에너지가 생기면 `emergent_on_energy=true`와 파워 차이를 남긴다.
+- `consistency_band_hz`와 반복 일관성 `>=0.9`가 있어야 검증 대역을 표시한다.
+  **밴드 전체 경계가 검증 대역 안에 있어야** `trusted=true`이며 중심 주파수만으로 판정하지 않는다.
+  예를 들어 150–600Hz 검증에서 500Hz 옥타브(약 354–707Hz)는 미검증이다.
+  가진 대역으로 대체하거나 미검증 고역 행을 삭제하지 않는다.
+
+### 8.2 기록 추적성과 보고 한계
+
+새 runtime 녹음은 scalar `recording_schema_version=1`, JSON 문자열 `recording_meta_json`을 저장한다.
+S 해시, 모드·샘플레이트·블록·handoff·채널·출력 제한 등의 주요 조건이 분석 설정과 다르면 거부한다.
+녹음 당시 S 원본과 전체 실행 설정도 별도로 회수한다. 메타는 모든 DNN/FxNLMS 파라미터나
+모델 artifact의 전체 스냅샷은 아니며 `recording_context_verified`는 저장된 필드의 일치만 뜻한다.
+메타 없는 구형 파일은 사용자 제공 설정을 사용하되 `legacy_recording_context_unverified`를 표시한다.
+
+`runtime_health`는 시작·종료 처리를 포함한 **전체 실행 누적치**다. ring drops는 폐기 샘플 수,
+xrun·underrun은 카운터, fatal_error는 bool이다. 구간별 장애·적응/리미터 이력은 아직 없으므로
+0 카운터만으로 선택한 ON 창이 건전하다고 인증하지 않는다. 구형 녹음의 누락값은 `null`이다.
+저장 입력의 `abs(x)>=0.98` 비율은 가공된 녹음의 clipping **대용 지표**이며 raw ADC clip을 대체하지 않는다.
+비선형성·위상/클록 안정성·저역/고역 전체 목표·quiet zone 성공은 이 보고서만으로 판정하지 않는다.
+
+산출물은 전체 JSON·대역별 CSV·요약 Markdown이며 유효 창이 있을 때만 창 파워 CSV도 만든다.
+계산 불가 사이클/대역은 CSV·요약에 `null` 행으로 남긴다. 기존 출력은 덮어쓰지 않는다.
+exit 0은 모든 사이클의 구간 완전성과 **최소 한 사이클**의 전체 대역 계산 가능, exit 2는 불완전/계산 불가,
+exit 1은 입력·설정·I/O 실패다. exit 0이어도 신뢰대역 미달·음원 변화·증폭이 있을 수 있다.

@@ -54,11 +54,35 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 
 ### 이번 검증 결과
 
-- `deep-anc-dev` 내부에서 `.venv/bin/python -m pytest -q -o addopts= -ra`: **443 passed, 2 skipped (33.01초)**.
+- `deep-anc-dev` 내부에서 `.venv/bin/python -m pytest -q -o addopts= -ra`: **523 passed, 2 skipped (36.71초)**.
 - 건너뛴 2개는 현장 raw 진단 파일과 실측 `metrics.md` 부재 때문이다. GPU/실기 검증으로 해석하지 않는다.
 - `pip check`: 의존성 충돌 없음. Docker 관리 스크립트 `bash -n` 및 tracked diff 공백 검사 통과.
 - Docker의 `.venv` 전용 볼륨, `ancdev` 사용자, `Privileged=false`, 오디오 장치 미노출을 확인했다.
 - 커밋·push가 승인됐다. 실제 반영 상태는 컨테이너의 `git status`, `git log`, 원격 ref로 확인한다.
+
+### 후속 구현 — acoustic 녹음과 PC 진단 연결
+
+- `src/deep_anc/realtime/recording.py`: 기존 5배열/fs와 함께 schema v1 scalar JSON 메타 저장.
+  생성 시점 S SHA-256·주요 설정·기록 길이·전체 실행 누적 xrun/누락/fatal을 남긴다.
+  기존 NPZ/깨진 symlink는 입력 사전점검 전에 거부하며 저장도 exclusive 생성이다.
+  저장 실패의 부분 파일은 자동 삭제하지 않는다. 새 경로로 재시도한다.
+- `src/deep_anc/eval/acoustic_session.py`와 `scripts/eval/analyze_acoustic_session.py`:
+  장치/torch/ORT를 열지 않는 순수 오프라인 acoustic 녹음 분석. 명령은 [docs/14 §5](docs/14_pc_jetson_workplan.md).
+  새 폴더에 JSON·metrics CSV·Markdown 및 유효 창이 있으면 windows CSV를 저장한다.
+- 각 ON 사이클은 앞뒤 OFF가 필수다. 기본 1초 창, 초기 OFF 1초·ON 워밍업 2초·경계 0.5초와
+  측정 S 꼬리를 제외한다. 녹음 control/gain은 출력 callback 기준이라 handoff를 중복 가산하지 않는다.
+  짧은 OFF 길이에 맞춰 긴 ON 후반을 버리지 않는다. 미완료 사이클도 보고서에 남긴다.
+- ERR 감소량은 앞뒤 OFF 중 작은 평균 파워 기준의 **시간이 다른 관측 비교**다.
+  실제 ERR에 S를 다시 적용하지 않고 REF 변화도 정규화하지 않는다. 항상 `performance_claim_allowed=false`다.
+  1 kHz 미만/이상·전체·옥타브 경계 FFT 파워·검증 대역, 중앙/p10/최악/최악 10% 평균을 따로 남긴다.
+  무신호는 null, ON 신규 에너지는 별도 플래그다. FFT 옥타브는 기존 Butterworth 지표와 구분한다.
+- 신뢰대역은 `consistency_band_hz`와 반복 일관성 ≥0.9로만 표시하고 **밴드 전체 경계**가 들어가야 한다.
+  구형 메타 없는 녹음은 설정/S 일치 미확인·health unknown이다. 새 메타의 S/주요 설정 불일치는 거부한다.
+  health는 시작/종료 포함 누적값일 뿐 시점별 적응·장애 기록이 아니며 전체 모델/설정 스냅샷도 아니다.
+- 신규 테스트 80개(분석 33 + CLI 17 + 녹음 30), writer→analyzer 연결 포함. 모두 합성/fake 장치다.
+  이번 변경으로 새 소리를 출력하거나 실측 자료를 수집하지 않았다. 실제 감쇠 개선의 증거로 인용하지 않는다.
+- exit 0은 모든 사이클 구간 완전·최소 한 사이클 전체 대역 계산 가능, exit 2는 불완전/비교 불가(산출물 보존),
+  exit 1은 입력·설정·I/O 실패다. 어느 코드도 실기 감쇠 성공 판정이 아니다.
 
 ### 현 자산 진단 — 새 감쇠 실측이 아님
 
@@ -82,7 +106,10 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 작업 위치·명령・중단조건의 실행 문서는 [docs/14](docs/14_pc_jetson_workplan.md)다.
 연구/설계 근거는 [docs/13](docs/13_acoustic_hybrid.md)를 따른다.
 
-1. **이 PC에서 계속**: Docker 회귀 테스트, 합성 closed-loop 시험, 경로/녹음 분석 도구와 artifact 메타 규약을 발전시킨다. 실측 자료가 필요한 항목만 별도 대기시킨다.
+1. **이 PC에서 계속**: 녹음 후처리는 구현했다. 다음은 반복 측정의 **S 신뢰대역 검증 도구**,
+   실측 경로 재현용 입력 규격·합성 closed-loop 시험, 느린 DNN 계수 생성/빠른 FIR의 안전한 전달 API다.
+   현재 `calibrate_wideband.py` ESS 산출물은 `consistency_band_hz`가 없어 readiness에 가진 대역을 대신 넣으면 안 된다.
+   설계에 영향을 주는 측정/계수 교체 선택이 불명확하면 먼저 질문한다. 실제 자료가 필요한 항목만 별도 대기시킨다.
 2. **Jetson에서만**: 실제 ARM64 이미지 빌드·CUDA/TensorRT·추론 마감 검증. 호스트 시스템 변경으로 실패를 우회하지 않는다.
 3. **Jetson 현장**: 장치 접근을 별도로 준비하고 입력-only 점검 후, 사용자 입회·최저 볼륨에서 광대역 S와 별도 F를 측정한다.
 4. **자료 회수 후 이 PC**: 원자료 QA, 신뢰대역·지연·클록 안정성·밴드별 감쇠 분석. 설정의 S 지연이나 신뢰대역 숫자를 임의로 바꾸지 않는다.

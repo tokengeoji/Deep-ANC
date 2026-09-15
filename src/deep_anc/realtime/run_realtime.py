@@ -34,6 +34,12 @@ from ..config import DEFAULT_HANDOFF_SAMPLES, load_runtime_config
 from ..dsp.filters import DCBlocker
 from .engines import build_engine, secondary_path_npz, validate_secondary_calibration
 from .noise_gen import DigitalReferenceBuffer, NoiseProgram
+from .recording import (
+    build_recording_payload,
+    capture_recording_provenance,
+    prepare_recording_path,
+    save_recording,
+)
 from .ring_buffer import SPSCRing
 from .safety import FadeGate, PowerEMA, SafetySupervisor
 from .ui import KeyboardController, RuntimeState
@@ -226,7 +232,11 @@ class RealtimeANC:
 
         self.record_len = int(record_seconds * self.fs)
         self.rec_pos = 0
+        self._recording_provenance = None
         if self.record_len > 0:
+            self._recording_provenance = capture_recording_provenance(
+                self, secondary, secondary_path_npz(cfg)
+            )
             self.rec = {
                 "err": np.zeros(self.record_len, dtype=np.float32),
                 "ref": np.zeros(self.record_len, dtype=np.float32),
@@ -525,7 +535,10 @@ class RealtimeANC:
         return {k: v[:n].copy() for k, v in self.rec.items()}
 
 
-def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
+def run_cli(cfg: dict, run_seconds: float, record_path: str | Path | None) -> int:
+    out = prepare_recording_path(record_path) if record_path else None
+    if out is not None and (not np.isfinite(run_seconds) or run_seconds <= 0):
+        raise ValueError("녹음에는 유한한 양수 run_seconds가 필요합니다")
     anc = RealtimeANC(cfg, record_seconds=run_seconds if record_path else 0.0)
     keyboard = KeyboardController(anc.state)
 
@@ -573,13 +586,11 @@ def run_cli(cfg: dict, run_seconds: float, record_path: str | None) -> int:
         keyboard.stop()
         anc.stop()
 
-    if record_path:
+    if out is not None:
         data = anc.session_data()
         if data:
-            out = Path(record_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(out.with_suffix(".npz"), fs=anc.fs, **data)
-            print(f"세션 저장: {out.with_suffix('.npz')}")
+            saved = save_recording(out, build_recording_payload(anc, data))
+            print(f"세션 저장: {saved}")
     print("종료 — 양 채널 무음.")
     return 0
 
@@ -686,6 +697,15 @@ def main() -> int:
         return 0
 
     cfg = load_runtime_config(args.config, args.overrides)
+    run_seconds = args.run_seconds if args.run_seconds is not None else float(cfg.get("run_seconds", 0.0))
+    record = args.record or cfg.get("record")
+    if not args.calibrate and record:
+        if not np.isfinite(run_seconds) or run_seconds <= 0:
+            parser.error("--record 는 유한한 양수 --run-seconds 가 필요합니다")
+        try:
+            record = prepare_recording_path(record)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     try:
         if not input_preflight(cfg, seconds=args.input_probe_seconds):
             return 2
@@ -694,10 +714,6 @@ def main() -> int:
         return 2
     if args.calibrate:
         return run_calibrate(cfg)
-    run_seconds = args.run_seconds if args.run_seconds is not None else float(cfg.get("run_seconds", 0.0))
-    record = args.record or cfg.get("record")
-    if record and run_seconds <= 0:
-        parser.error("--record 는 녹음 버퍼 크기 산정을 위해 --run-seconds 가 필요합니다")
     return run_cli(cfg, run_seconds, record)
 
 
