@@ -18,7 +18,7 @@
 - 커밋·push는 승인됐다. **이 PC에서 가능한 작업은 이 PC에서 진행하고**, Jetson 필수 작업은 [docs/14](docs/14_pc_jetson_workplan.md)의 현장 체크리스트로 분리한다.
 - `Roka-jsj/Deep-ANC`와 `tokengeoji/Deep-ANC`는 **계정명 변경 전후의 같은 저장소**라고 사용자가 확인했다.
   현재 `origin=https://github.com/tokengeoji/Deep-ANC.git`을 유지한다. push 대상 재질문은 불필요하다.
-- 커밋 작성자는 최근 커밋과 동일하게 사용하도록 승인됐다. 실제 최신 `fe80121`의 작성자는
+- 커밋 작성자는 최근 커밋과 동일하게 사용하도록 승인됐다. 작성자 확정 때 확인한 `fe80121`의 작성자는
   `SEUNG JOON JEONG <155646237+tokengeoji@users.noreply.github.com>`이다(과거 이름은 Roka-jsj).
   이 저장소의 local Git 작성자 설정만 맞췄으며 전역 설정은 변경하지 않았다.
 - 시스템 설정 변경과 무입회 스피커 출력 금지는 그대로다. 이번 작업에서는 오디오를 실행하지 않았다.
@@ -61,7 +61,7 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 
 ### 이번 검증 결과
 
-- `deep-anc-dev` 내부에서 `.venv/bin/python -m pytest -q -o addopts= -ra`: **523 passed, 2 skipped (36.71초)**.
+- `deep-anc-dev` 내부에서 `.venv/bin/python -m pytest -q -o addopts= -ra`: **632 passed, 2 skipped (41.65초)**.
 - 건너뛴 2개는 현장 raw 진단 파일과 실측 `metrics.md` 부재 때문이다. GPU/실기 검증으로 해석하지 않는다.
 - `pip check`: 의존성 충돌 없음. Docker 관리 스크립트 `bash -n` 및 tracked diff 공백 검사 통과.
 - Docker의 `.venv` 전용 볼륨, `ancdev` 사용자, `Privileged=false`, 오디오 장치 미노출을 확인했다.
@@ -91,6 +91,36 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 - exit 0은 모든 사이클 구간 완전·최소 한 사이클 전체 대역 계산 가능, exit 2는 불완전/비교 불가(산출물 보존),
   exit 1은 입력·설정·I/O 실패다. 어느 코드도 실기 감쇠 성공 판정이 아니다.
 
+### 논문 반영 후속 구현 — Jetson 없이 완료한 연구 준비
+
+자세한 적용 근거·명령·합성 결과·한계는 **[docs/15](docs/15_prepared_fir_research.md)**에 있다.
+
+- acoustic 분석에 `target_800_1600`, `target_800_1000`, `target_1000_1600`을 추가했다.
+  target 상한은 제외하고 1kHz는 상위 하위대역에만 넣는다. fs<3200은 거부하며 기존 full/high Nyquist 규약은 유지한다.
+- `src/deep_anc/baselines/prepared_fir.py`: 불변 기준 FIR 제안 + 인과 FIR + FxNLMS 잔차 연구 API.
+  context/S 복사·reset generation·revision·제안 관측 끝/나이 검증, 동일 REF 이력 crossfade,
+  전환+S/handoff 꼬리의 적응 보류, 합산 후 단일 limit/clip 기록, 입력/수치 실패 reset을 구현했다.
+  fast path는 모델을 호출/대기하지 않는다. 단일 소비자용이며 스레드 안전 mailbox는 아니다.
+- **live factory/runtime/callback과 연결하지 않았다.** 기존 `HybridEngine`은 그대로이며 별도 대조군이다.
+  기준 FIR+잔차 유지/crossfade는 우리 실험 정책이다. 논문의 4REF 방향 분류를 복제한 것이 아니다.
+  학습된 CNN/선택기/계수 생성기·온라인 S/F 추정·실측 비선형 모델은 아직 미구현이다.
+- `scripts/bench/benchmark_prepared_fir.py`: 독립 white train 후보 한 개를 heldout 5계열에 적용,
+  zero/cold/fixed/prepared 4군·선행 여유 toy/긴 지연 스트레스·gain 변화 전후를 모두 보고한다.
+  긴 지연에는 toy에서 준비한 후보를 재학습 없이 쓰므로 후보의 primary preview도 불일치한다.
+  해당 조건 최적 필터/일반적 성능으로 해석하지 않는다. 학습 clipping은 후보 무효·exit1이며 보고서가 없을 수 있다.
+- 기본 및 tanh(0.03) CLI를 **CPU Docker에서 실제 실행**해 다음 로컬 보고서를 남겼다(ignored, 미커밋).
+  `results/prepared_fir/pc_20260915_linear_01/`, `results/prepared_fir/pc_20260915_tanh_01/`.
+  선형 toy white/fullband 초기 cold 0.52dB vs prepared 17.15dB,
+  gain 변화 후 fixed 11.99dB vs prepared 20.12dB. 긴 지연 prepared는 −0.04dB로 사실상 무감쇠다.
+  **단일 seed 합성 구조 진단이지 800–1600Hz 덕트 실측 개선이 아니다.**
+- `scripts/eval/analyze_path_bands.py` + `eval/path_band_diagnostics.py`: 저장 ESS cancel/ch1 반복 IR의
+  같은 compact FFT를 지연 위상 복원/제거하여 대역별 모든 반복을 비교한다. 최악 pair 극성·크기비·지연 spread 분리.
+  raw clip/출력 채널/수집 길이/health를 있는 필드로 확인하고 누락은 unknown이다.
+  저장 delay가 없으면 거부한다. 원시 PCM→IR 재추출·입력 SNR·실시간 클록 검증은 아직 하지 않는다.
+  S NPZ/`consistency_band_hz`를 만들거나 승격하지 않는다. `promote_secondary_allowed=false`다.
+- 이번 추가 회귀는 109개: 대역/CLI 14 + 준비 FIR 36 + 합성 bench 22 + ESS 진단 37.
+  전부 장치 없는 검증이며 새 오디오·Jetson/GPU/외부 학습 작업은 실행하지 않았다.
+
 ### 현 자산 진단 — 새 감쇠 실측이 아님
 
 컨테이너의 무출력 진단으로 다음 값을 확인했다.
@@ -117,11 +147,12 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 작업 위치·명령・중단조건의 실행 문서는 [docs/14](docs/14_pc_jetson_workplan.md)다.
 연구/설계 근거는 [docs/13](docs/13_acoustic_hybrid.md)를 따른다.
 
-1. **이 PC에서 계속**: 녹음 후처리는 구현했다. 다음은 반복 측정의 **S 신뢰대역 검증 도구**,
-   실측 경로 재현용 입력 규격·합성 closed-loop 시험, 느린 DNN 계수 생성/빠른 FIR의 안전한 전달 API다.
-   새 우선 대역 800–1600Hz 전체를 검증하고, 분석기의 **800–1000/1000–1600Hz 명시적 지표 추가**도 필요하다.
-   현재 자동 보고의 저역(<1k)/고역(≥1k~Nyquist)은 이 두 구간의 정확한 개별 지표를 대신하지 않는다.
+1. **이 PC에서 계속**: 목표 대역 지표·ESS 반복 진단·계수 전달 연구 API와 합성 대조군은 구현했다.
+   다음은 다양한 seed/조건에서 후보 준비·재사용의 강건성 시험, 사전 filter bank의 데이터/조건 메타 규격,
+   과거 REF 특징 기반 선택기 준비, 실제 스레드 전달/라이브 연결 전의 소유권 리뷰다.
+   실측 원자료가 오면 PCM→IR 재추출 정합·SNR/지연/대역 검증과 기록 기반 재현을 연결한다.
    현재 `calibrate_wideband.py` ESS 산출물은 `consistency_band_hz`가 없어 readiness에 가진 대역을 대신 넣으면 안 된다.
+   새 ESS 진단도 모델 승격 도구가 아니다. 고정 하드웨어 지연이 해결됐다고 가정하지 않는다.
    설계에 영향을 주는 측정/계수 교체 선택이 불명확하면 먼저 질문한다. 실제 자료가 필요한 항목만 별도 대기시킨다.
 2. **Jetson에서만**: 실제 ARM64 이미지 빌드·CUDA/TensorRT·추론 마감 검증. 호스트 시스템 변경으로 실패를 우회하지 않는다.
 3. **Jetson 현장**: 장치 접근을 별도로 준비하고 입력-only 점검 후, 사용자 입회·최저 볼륨에서 광대역 S와 별도 F를 측정한다.

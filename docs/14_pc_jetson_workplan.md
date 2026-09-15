@@ -46,13 +46,16 @@ S 파일이 없거나 메타데이터가 잘못되면 그 결손을 기록하고
 ```bash
 bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q \
   tests/test_acoustic_readiness.py tests/test_acoustic_runtime.py tests/test_hybrid_engine.py \
-  tests/test_runtime_recording.py tests/test_acoustic_session.py tests/test_acoustic_session_cli.py
+  tests/test_runtime_recording.py tests/test_acoustic_session.py tests/test_acoustic_session_cli.py \
+  tests/test_prepared_fir.py tests/test_prepared_fir_bench.py tests/test_path_band_diagnostics.py
 ```
 
 이 검사는 외부 REF 기준선, 지연된 ERR에 대한 적응, 클립·xrun·입력 손상 대응 등을 다룬다.
 합성 하이브리드 수렴은 실제 ERR를 입력으로 받는 DNN의 폐루프 안정성 증명이 아니다.
 acoustic 녹음 후처리와 runtime 저장 메타데이터 연결은 구현했고 합성 회귀로 검사한다.
-후속 개발은 S 반복 측정의 신뢰대역 검증, 실측 경로 기반 재현, 느린 계수 생성 API 순으로 진행한다.
+저장 ESS 반복의 대역별 진단과 계수 전달형 FIR/FxNLMS 연구 API·합성 비교도 구현했다.
+이는 S 신뢰대역 자동 승격이나 live 제어기 완성이 아니다. 실행·해석은 [docs/15](15_prepared_fir_research.md)를 따른다.
+후속 개발은 원시 자료 재현 검증, 사전 필터 bank·선택기 준비, 실제 스레드 전달 규약 검토다.
 온라인 S/F 추정, F 보상, 학습된 계수 생성기는 아직 구현·검증 완료 상태가 아니다.
 
 ## 3. Jetson 현장 작업의 공통 선행조건
@@ -121,6 +124,8 @@ bash scripts/docker/dev.sh exec .venv/bin/python -c 'import tensorrt; print(tens
 실패한 경로를 정식 S로 사용하거나 성공 반복만 골라 통과시키지 않는다.
 현재 ESS 산출물에는 `consistency_band_hz`가 없으므로 고역 readiness가 자동 통과하지 않는다.
 대역별 반복 검증을 거친 새 메타데이터 산출물을 준비해야 하며 가진 대역으로 임의 대체하지 않는다.
+회수한 `raw_measurement.npz`는 PC의 `analyze_path_bands.py`로 모든 반복·대역·지연을 진단할 수 있다.
+해당 도구도 S NPZ나 `consistency_band_hz`를 생성하지 않으므로 진단 저장 성공을 모델 승격으로 해석하지 않는다.
 
 ### D. REF 선행 시간과 F(CS→REF) 영향 확인
 
@@ -216,8 +221,11 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/eval/analyze_acoustic_s
 저장한다. 기존 경로·출력 경로의 심볼릭 링크는 거부한다. 실제 ERR는 이미 잔류음이므로
 S를 다시 적용하지 않는다. REF 변화는 진단값이며 감쇠를 보정하는 분모로 쓰지 않는다.
 저역 `[0,1000)`·고역 `[1000,Nyquist]`, 전체·옥타브 경계 대역과 신뢰대역을 별도로 남긴다.
-현재 자동 대역은 새 우선 범위의 800–1000Hz/1000–1600Hz 정확한 개별 지표를 대신하지 않는다.
-이 두 구간의 명시적 보고는 다음 PC 개발 항목이며 기존 전체 고역 값을 1–1.6kHz 값으로 표기하지 않는다.
+추가된 `target_800_1600`, `target_800_1000`, `target_1000_1600`은 각각 [800,1600),
+[800,1000), [1000,1600)의 정확한 개별 파워다. 1000Hz는 상위 하위대역에만 포함하며
+1600Hz는 target에서 제외한다. 전체 범위를 볼 수 없는 `fs < 3200`은 거부한다.
+fs=3200에서도 target 상한은 제외하지만 기존 full/high 대역의 Nyquist 포함은 유지한다.
+기존 전체 고역 값을 1–1.6kHz 값으로 표기하지 않는다.
 
 기본 1초 창, 초기 OFF 1초·ON 워밍업 2초·경계 0.5초 제외를 사용한다.
 각 구간 앞에서는 `max(해당 guard, S.delay + FIR 길이 − 1)`을 제외한다.
@@ -237,6 +245,24 @@ exit 2는 비교 불가·불완전 사이클이며 진단 산출물은 보존한
 `consistency_band_hz`와 반복 일관성을 읽고 가진 대역을 신뢰대역으로 대신하지 않는다.
 기존 recorded QA/파인튜닝의 manifest 규격과 acoustic 녹음도 자동 호환된다고 가정하지 않는다.
 자료가 부족하면 부족한 필드·실험을 명시하고 가능한 신호 품질 분석과 합성 검증을 계속한다.
+
+### ESS 경로 진단과 사전 FIR 비교 — 현재 PC, 무출력
+
+```bash
+# 실제 회수 원자료가 있을 때만. RAW_SESSION을 실제 진단 세션 디렉터리로 바꾼다.
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/eval/analyze_path_bands.py \
+  --raw-npz results/acoustic_SESSION_ID/calibration/RAW_SESSION/raw_measurement.npz \
+  --band 800 1600 --out results/acoustic_SESSION_ID/path_band_trial_01
+
+# 실제 원자료가 없어도 독립 합성 데이터로 실행 가능
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/benchmark_prepared_fir.py \
+  --out results/prepared_fir/pc_trial_01
+```
+
+두 도구 모두 새 폴더에 JSON·CSV·Markdown만 쓰며 exit 0은 보고 생성이다. 성능 PASS가 아니다.
+ESS 진단은 저장된 모든 반복/지연을 사용하되 원시 PCM→IR 재추출이나 SNR/실시간 클록 검증은 하지 않는다.
+FIR 비교는 독립 train 후보 한 개의 초기 수렴·gain 변화·긴 지연 스트레스다. 실제 S/F나 음성/음악 재현이 아니다.
+논문에서 차용한 범위, 연구 API의 live 미연결 상태, 합성 숫자는 [docs/15](15_prepared_fir_research.md)를 따른다.
 
 ## 6. 결과를 남기는 기준
 

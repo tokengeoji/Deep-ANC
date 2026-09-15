@@ -95,6 +95,12 @@ def test_complete_legacy_session_keeps_untrusted_bands_and_one_numeric_source(se
     assert float(full["observed_err_reduction_db"]) == expected["observed_err_reduction_db"]
     assert float(full["observed_err_reduction_db"]) == pytest.approx(20 * np.log10(2), abs=1e-8)
     assert next(row for row in rows if row["band"] == "high_1000_nyquist")["trusted"] == "false"
+    for name in ("target_800_1600", "target_800_1000", "target_1000_1600"):
+        exported = next(row for row in rows if row["band"] == name)
+        reported = next(row for row in report["metrics"] if row["band"] == name)
+        assert exported["trusted"] == "false"
+        assert float(exported["off_pre_power"]) == reported["off_pre_power"]
+        assert float(exported["on_power"]) == reported["on_power"]
     assert len(rows) == len(report["metrics"])
     summary = (session["out"] / "summary.md").read_text(encoding="utf-8")
     assert full["observed_err_reduction_db"] in summary
@@ -108,6 +114,61 @@ def test_complete_legacy_session_keeps_untrusted_bands_and_one_numeric_source(se
         "metrics.csv", "windows.csv", "report.json", "summary.md",
     }
     assert {key: hashlib.sha256(session[key].read_bytes()).hexdigest() for key in before} == before
+
+
+@pytest.mark.parametrize("frequency,active_bands", [
+    (800, {"target_800_1600", "target_800_1000"}),
+    (1000, {"target_800_1600", "target_1000_1600"}),
+    (1600, set()),
+])
+def test_cli_target_boundary_tones_keep_json_csv_and_windows_consistent(session, frequency, active_bands):
+    signals = session["signals"]
+    time = np.arange(signals["err"].size) / session["fs"]
+    signals["ref"] = 0.04 * np.sin(2 * np.pi * frequency * time)
+    signals["err"] = signals["ref"] * (1 - 0.5 * signals["anc_gain"])
+    np.savez(session["recording"], **signals)
+    result = _run(session)
+    assert result.returncode == 0, result.stderr
+    report = _report(session)
+    metrics = _csv(session["out"] / "metrics.csv")
+    windows = _csv(session["out"] / "windows.csv")
+    summary = (session["out"] / "summary.md").read_text(encoding="utf-8")
+    for name, expected_bins in (("target_800_1600", 800), ("target_800_1000", 200),
+                                ("target_1000_1600", 600)):
+        row = next(row for row in report["metrics"] if row["band"] == name)
+        exported = next(row for row in metrics if row["band"] == name)
+        assert name in summary
+        assert row["trusted"] is False and exported["trusted"] == "false"
+        if name in active_bands:
+            assert row["observed_err_reduction_db"] == pytest.approx(20 * np.log10(2), abs=1e-8)
+            assert float(exported["observed_err_reduction_db"]) == row["observed_err_reduction_db"]
+        else:
+            assert row["observed_err_reduction_db"] is None
+            assert exported["observed_err_reduction_db"] == "null"
+        selected = [window for window in windows if window["band"] == name]
+        assert selected and all(int(window["fft_bins"]) == expected_bins for window in selected)
+    assert report["diagnostic_only"] and not report["performance_claim_allowed"]
+
+
+def test_cli_rejects_partial_target_frequency_range_without_output(session):
+    fs = 3199
+    session["signals"]["fs"] = fs
+    np.savez(session["recording"], **session["signals"])
+    with np.load(session["secondary"], allow_pickle=False) as archive:
+        secondary = {key: archive[key] for key in archive.files}
+    secondary.update(sample_rate=fs, excitation_band_hz=[80.0, fs / 2])
+    np.savez(session["secondary"], **secondary)
+    runtime = yaml.safe_load(session["config"].read_text(encoding="utf-8"))
+    hardware_path = Path(runtime["hardware_config"])
+    hardware = yaml.safe_load(hardware_path.read_text(encoding="utf-8"))
+    hardware["audio"]["sample_rate"] = fs
+    hardware_path.write_text(yaml.safe_dump(hardware), encoding="utf-8")
+    before = session["recording"].read_bytes()
+    result = _run(session)
+    assert result.returncode == 1, result.stderr
+    assert "sample_rate >= 3200" in result.stderr
+    assert not session["out"].exists()
+    assert session["recording"].read_bytes() == before
 
 
 def test_silent_complete_cycle_is_null_not_zero_or_success(session):

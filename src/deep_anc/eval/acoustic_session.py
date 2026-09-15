@@ -136,8 +136,8 @@ def _ratio_db(numerator: float, denominator: float, floor: float) -> float | Non
 
 def _frequency_bands(fs: int, secondary: dict) -> list[dict]:
     nyquist = fs / 2
-    if nyquist <= 1000:
-        raise ValueError("1 kHz 이상 진단에는 sample_rate > 2000이 필요합니다")
+    if nyquist < 1600:
+        raise ValueError("800–1600 Hz 전체 우선대역 진단에는 sample_rate >= 3200이 필요합니다")
     trusted = secondary["consistency_band_hz"]
     quality = secondary["repeat_consistency"]
     validated = trusted is not None and quality is not None and quality >= MIN_PATH_CONSISTENCY
@@ -148,6 +148,11 @@ def _frequency_bands(fs: int, secondary: dict) -> list[dict]:
         low, high = center / np.sqrt(2), center * np.sqrt(2)
         if high < nyquist:
             bands.append((f"octave_{center}", low, high))
+    bands.extend([
+        ("target_800_1600", 800, 1600),
+        ("target_800_1000", 800, 1000),
+        ("target_1000_1600", 1000, 1600),
+    ])
     return [
         {"band": name, "low_hz": float(low), "high_hz": float(high),
          "trusted": bool(validated and trusted[0] <= low and high <= trusted[1])}
@@ -162,7 +167,12 @@ def _window_rows(values: dict, span: dict, fs: int, size: int, bands: list, cycl
     if size % 2 == 0:
         weights[-1] = 1.0
     masks = [
-        (frequency >= b["low_hz"]) & ((frequency < b["high_hz"]) if b["high_hz"] < fs / 2 else (frequency <= b["high_hz"]))
+        # 우선대역은 Nyquist와 겹쳐도 상한을 제외한다. 기존 대역의 Nyquist 포함은 유지한다.
+        (frequency >= b["low_hz"]) & (
+            (frequency < b["high_hz"])
+            if b["high_hz"] < fs / 2 or b["band"].startswith("target_")
+            else (frequency <= b["high_hz"])
+        )
         for b in bands
     ]
     out = []
@@ -313,7 +323,7 @@ def analyze_acoustic_session(
                       "on_warmup_samples": warmup, "edge_guard_samples": edge, "secondary_tail_samples": tail,
                       "handoff_added_to_recorded_output": False, "power_floor": floor},
         "method": {"power": "one_sided_parseval_per_fixed_window",
-                   "frequency_edges": "[low, high), Nyquist 포함; low에는 DC 포함",
+                   "frequency_edges": "[low, high); target_*는 Nyquist여도 high 제외, 기존 대역은 Nyquist 포함; low에는 DC 포함",
                    "baseline": "min(mean(pre_OFF_window_power), mean(post_OFF_window_power))",
                    "worst10": "작은 관측 감소량 ceil(N*0.1)개 평균; p10과 별도",
                    "ref_normalization": False, "secondary_reapplied_to_error": False},

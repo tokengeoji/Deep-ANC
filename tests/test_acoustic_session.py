@@ -30,19 +30,19 @@ def session_config(tmp_path):
     return cfg
 
 
-def _session(*, seconds=17, on_intervals=((3, 13),), scales=(0.5,), frequency=None):
-    t = np.arange(seconds * FS, dtype=np.float64) / FS
+def _session(*, seconds=17, on_intervals=((3, 13),), scales=(0.5,), frequency=None, fs=FS):
+    t = np.arange(seconds * fs, dtype=np.float64) / fs
     base = 0.04 * np.sin(2 * np.pi * (300 if frequency is None else frequency) * t)
     if frequency is None:
         base += 0.04 * np.sin(2 * np.pi * 1500 * t)
     gain = np.zeros(t.size, dtype=np.float32)
     err = base.copy()
     for (start, stop), scale in zip(on_intervals, scales):
-        sl = slice(int(start * FS), int(stop * FS))
+        sl = slice(int(start * fs), int(stop * fs))
         gain[sl] = 1.0
         err[sl] *= scale
     return {
-        "fs": np.int64(FS), "err": err, "ref": base.copy(),
+        "fs": np.int64(fs), "err": err, "ref": base.copy(),
         "source": np.zeros(t.size, dtype=np.float32),
         "control": 0.005 * np.sin(2 * np.pi * 300 * t) * gain,
         "anc_gain": gain,
@@ -235,6 +235,113 @@ def test_1khz_boundary_is_counted_once_across_low_and_high(tmp_path, session_con
     for key in ("off_pre_power", "on_power", "off_post_power"):
         assert low[key] + high[key] == pytest.approx(full[key], rel=1e-6, abs=1e-12)
         assert high[key] > low[key]
+
+
+@pytest.mark.parametrize("frequency,lower_has_energy,upper_has_energy", [
+    (800, True, False), (1000, False, True), (1600, False, False),
+])
+def test_target_tone_boundaries_are_half_open(
+    tmp_path, session_config, frequency, lower_has_energy, upper_has_energy,
+):
+    report = _analyze(tmp_path, session_config, _session(frequency=frequency))
+    full = _row(report, "full")
+    target = _row(report, "target_800_1600")
+    lower = _row(report, "target_800_1000")
+    upper = _row(report, "target_1000_1600")
+    assert (target["low_hz"], target["high_hz"]) == (800, 1600)
+    assert (lower["low_hz"], lower["high_hz"]) == (800, 1000)
+    assert (upper["low_hz"], upper["high_hz"]) == (1000, 1600)
+    for key in ("off_pre_power", "on_power", "off_post_power",
+                "ref_pre_power", "ref_on_power", "ref_post_power"):
+        assert lower[key] + upper[key] == pytest.approx(target[key], rel=1e-10, abs=1e-15)
+        for row, has_energy in ((lower, lower_has_energy), (upper, upper_has_energy),
+                                (target, lower_has_energy or upper_has_energy)):
+            if has_energy:
+                assert row[key] == pytest.approx(full[key], rel=1e-9, abs=1e-15)
+            else:
+                assert row[key] < report["selection"]["power_floor"]
+    for row, has_energy in ((lower, lower_has_energy), (upper, upper_has_energy),
+                            (target, lower_has_energy or upper_has_energy)):
+        if has_energy:
+            assert row["observed_err_reduction_db"] == pytest.approx(20 * np.log10(2), abs=1e-8)
+        else:
+            assert row["observed_err_reduction_db"] is None
+        assert row["trusted"] is False
+
+
+def test_target_amplification_is_visible_despite_full_and_lower_band_improvement(tmp_path, session_config):
+    data = _session(scales=(1.0,))
+    t = np.arange(data["err"].size) / FS
+    outside = 0.12 * np.sin(2 * np.pi * 300 * t)
+    lower = 0.04 * np.sin(2 * np.pi * 900 * t)
+    upper = 0.04 * np.sin(2 * np.pi * 1200 * t)
+    data["ref"] = outside + lower + upper
+    data["err"] = data["ref"].copy()
+    on = data["anc_gain"] >= 0.999
+    data["err"][on] = 0.5 * outside[on] + 0.5 * lower[on] + 2 * upper[on]
+    report = _analyze(tmp_path, session_config, data)
+    assert _row(report, "full")["observed_err_reduction_db"] > 0
+    assert _row(report, "low_0_1000")["observed_err_reduction_db"] > 0
+    assert _row(report, "target_800_1000")["observed_err_reduction_db"] == pytest.approx(20 * np.log10(2), abs=1e-8)
+    assert _row(report, "target_1000_1600")["observed_err_reduction_db"] == pytest.approx(-20 * np.log10(2), abs=1e-8)
+    target = _row(report, "target_800_1600")
+    assert target["observed_err_reduction_db"] == pytest.approx(10 * np.log10(2 / 4.25), abs=1e-8)
+    assert target["worst_observed_db"] == pytest.approx(10 * np.log10(2 / 4.25), abs=1e-8)
+    assert report["diagnostic_only"] and not report["performance_claim_allowed"]
+
+
+@pytest.mark.parametrize("consistency_band,expected", [
+    ([800.0, 1600.0], (True, True, True)),
+    ([800.0, 1500.0], (False, True, False)),
+    ([900.0, 1600.0], (False, False, True)),
+])
+def test_target_trust_requires_entire_declared_band(tmp_path, session_config, consistency_band, expected):
+    path = Path(session_config["duct"]["secondary_path"]["npz"])
+    with np.load(path, allow_pickle=False) as archive:
+        values = {key: archive[key] for key in archive.files}
+    values["consistency_band_hz"] = consistency_band
+    np.savez(path, **values)
+    report = _analyze(tmp_path, session_config, _session())
+    names = ("target_800_1600", "target_800_1000", "target_1000_1600")
+    assert tuple(_row(report, name)["trusted"] for name in names) == expected
+    assert _row(report, "trusted")["trusted"] is True
+    assert _row(report, "full")["trusted"] is False
+
+
+def _set_session_sample_rate(cfg, fs):
+    cfg["hardware"]["audio"]["sample_rate"] = fs
+    path = Path(cfg["duct"]["secondary_path"]["npz"])
+    with np.load(path, allow_pickle=False) as archive:
+        values = {key: archive[key] for key in archive.files}
+    values.update(sample_rate=fs, excitation_band_hz=[80.0, fs / 2])
+    np.savez(path, **values)
+
+
+def test_target_excludes_1600_at_nyquist_without_changing_existing_bands(tmp_path, session_config):
+    fs = 3200
+    _set_session_sample_rate(session_config, fs)
+    data = _session(fs=fs, scales=(1.0,))
+    # Nyquist의 sin은 영신호이므로 교대 부호로 정확한 1600 Hz를 만든다.
+    data["ref"] = np.where(np.arange(data["err"].size) % 2, -0.04, 0.04)
+    data["err"] = data["ref"] * (1 - 0.5 * data["anc_gain"])
+    report = _analyze(tmp_path, session_config, data)
+    full = _row(report, "full")
+    high = _row(report, "high_1000_nyquist")
+    for key in ("off_pre_power", "on_power", "off_post_power"):
+        assert full[key] > report["selection"]["power_floor"]
+        assert high[key] == pytest.approx(full[key], rel=1e-9)
+        for name in ("target_800_1600", "target_800_1000", "target_1000_1600"):
+            assert _row(report, name)[key] < report["selection"]["power_floor"]
+            assert _row(report, name)["observed_err_reduction_db"] is None
+    assert "target_*" in report["method"]["frequency_edges"]
+    assert "high 제외" in report["method"]["frequency_edges"]
+
+
+@pytest.mark.parametrize("fs", [2400, 3199])
+def test_incomplete_target_frequency_range_is_rejected(tmp_path, session_config, fs):
+    _set_session_sample_rate(session_config, fs)
+    with pytest.raises(ValueError, match="800–1600.*sample_rate >= 3200"):
+        _analyze(tmp_path, session_config, _session(fs=fs, frequency=800))
 
 
 def test_missing_consistency_band_does_not_promote_excitation_band(tmp_path, session_config):
