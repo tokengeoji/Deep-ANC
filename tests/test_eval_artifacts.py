@@ -11,8 +11,12 @@
 from __future__ import annotations
 
 import csv
+import copy
+import importlib.util
 import json
 import wave
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -162,3 +166,158 @@ def test_markdown_table_matches_csv_columns(tmp_path):
     lines = list(markdown_table(rows, columns))
     assert lines[0] == "| scenario | att_db |"
     assert read_csv(tmp_path / "m.csv")[0]["scenario"] == "tone300"
+
+
+@pytest.fixture
+def offline_eval():
+    path = Path(__file__).resolve().parents[1] / "scripts/eval/evaluate_offline.py"
+    spec = importlib.util.spec_from_file_location("offline_source_policy_contract", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def acoustic_source_policy():
+    return {
+        "sample_rate": 8000,
+        "reference_mode": "acoustic",
+        "train_only_source_families": ["machine"],
+        "source_mix_ratio": {"synthetic": 0.4, "esc50": 0.4, "machine": 0.2},
+        "source_mix_ratio_acoustic": {"synthetic": 0.3, "speech": 0.5, "machine": 0.2},
+    }
+
+
+def test_offline_policy_reports_actual_test_denominator(offline_eval, acoustic_source_policy):
+    cfg = acoustic_source_policy
+    before = copy.deepcopy(cfg)
+    mix = offline_eval.source_mix_for_split(cfg, "test")
+    policy = offline_eval.source_evaluation_policy(cfg, mix)
+    assert cfg == before
+    assert policy["configured_training_source_mix"] == cfg["source_mix_ratio_acoustic"]
+    assert policy["excluded_train_only_source_families"] == ["machine"]
+    assert policy["retained_training_weight_sum"] == pytest.approx(0.8)
+    assert policy["training_weight_sum"] == pytest.approx(1.0)
+    assert policy["effective_evaluation_source_mix"] == pytest.approx({"synthetic": 0.375, "speech": 0.625})
+    assert policy["per_source_requested"] == ["synthetic", "speech"]
+    assert policy["diagnostic_only"] is True
+    assert policy["performance_claim_allowed"] is False
+    json.dumps(policy, allow_nan=False)
+
+
+@pytest.mark.parametrize("tag", ["synthetic", "speech"])
+def test_offline_per_source_also_overrides_acoustic_mix(offline_eval, acoustic_source_policy, tag):
+    cfg = acoustic_source_policy
+    before = copy.deepcopy(cfg)
+    active = offline_eval.source_mix_for_split(cfg, "test")
+    isolated = offline_eval.per_source_config(cfg, tag, active)
+    assert cfg == before
+    assert isolated["source_mix_ratio"] == {tag: 1.0}
+    assert isolated["source_mix_ratio_acoustic"] == {tag: 1.0}
+    assert isolated["train_only_source_families"] == ["machine"]
+    assert offline_eval.source_mix_for_split(isolated, "test") == {tag: 1.0}
+
+
+@pytest.mark.parametrize("tag", ["machine", "esc50", "music"])
+def test_offline_per_source_rejects_excluded_or_inactive(offline_eval, acoustic_source_policy, tag):
+    with pytest.raises(ValueError, match="허용하지 않는 소스"):
+        offline_eval.per_source_config(
+            acoustic_source_policy, tag,
+            offline_eval.source_mix_for_split(acoustic_source_policy, "test"),
+        )
+
+
+def test_offline_does_not_force_zero_weight_synthetic(offline_eval):
+    cfg = {"source_mix_ratio": {"synthetic": 0.0, "speech": 1.0}}
+    policy = offline_eval.source_evaluation_policy(cfg, cfg["source_mix_ratio"])
+    assert policy["per_source_requested"] == ["speech"]
+    assert policy["excluded_train_only_source_families"] == []
+    assert policy["effective_evaluation_source_mix"] == {"speech": 1.0}
+    assert offline_eval.per_source_config(cfg, "speech", cfg["source_mix_ratio"])["source_mix_ratio"] == {"speech": 1.0}
+
+
+@pytest.mark.parametrize("mix", [{}, {"synthetic": 0.0}, {"machine": 1.0}])
+def test_offline_report_rejects_empty_or_train_only_evaluation(offline_eval, acoustic_source_policy, mix):
+    with pytest.raises(ValueError):
+        offline_eval.source_evaluation_policy(acoustic_source_policy, mix)
+
+
+@pytest.mark.parametrize("fail_speech", [False, True])
+def test_offline_main_records_exclusions_and_source_failures(
+    offline_eval, acoustic_source_policy, monkeypatch, tmp_path, fail_speech,
+):
+    """합성 tensor/가짜 플랜트만 사용한다. 원본 준비·실기 성능 통과 검사가 아니다."""
+    torch = offline_eval.torch
+    cfg = acoustic_source_policy
+    manifest = tmp_path / "fixture_manifest.jsonl"
+    manifest.write_text("{}\n", encoding="utf-8")
+    seen = []
+
+    class Dataset:
+        def __init__(self, data_cfg, duct_cfg, *, split, seed):
+            assert split == "test"
+            self.mix_ratio = offline_eval.source_mix_for_split(data_cfg, split)
+            self.pools = {tag: [manifest] for tag in self.mix_ratio if tag != "synthetic"}
+            seen.append(copy.deepcopy(data_cfg))
+
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return torch.zeros_like(x)
+
+    class Plant(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def forward(self, y, params):
+            return y
+
+    def batch(dataset, n_items, seed):
+        assert "machine" not in dataset.mix_ratio
+        if fail_speech and dataset.mix_ratio == {"speech": 1.0}:
+            raise ValueError("합성 fixture의 speech 실패")
+        t = torch.arange(512, dtype=torch.float32) / cfg["sample_rate"]
+        d = torch.sin(2 * torch.pi * 1000 * t).repeat(n_items, 1).unsqueeze(1)
+        return {"x": d.clone(), "d": d}
+
+    state = {"cfg": {"data": cfg, "duct": {
+        "secondary_path": {"npz": "unused_fixture.npz", "handoff_extra_samples": 0},
+        "acoustics": {"realistic_target_band_hz": [100, 2000]},
+    }, "model": {}}, "model": {}}
+    monkeypatch.setattr(offline_eval.torch, "load", lambda *a, **k: state)
+    monkeypatch.setattr(offline_eval.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(offline_eval, "load_yaml", lambda path: {"octave_bands_hz": [1000]})
+    monkeypatch.setattr(offline_eval, "build_model", lambda model_cfg: Model())
+    monkeypatch.setattr(offline_eval, "load_secondary_path", lambda path: SimpleNamespace(
+        sample_rate=8000, trusted_band_hz=lambda: (100, 2000),
+    ))
+    monkeypatch.setattr(offline_eval, "DifferentiableSecondaryPath", Plant)
+    monkeypatch.setattr(offline_eval, "SynthANCDataset", Dataset)
+    monkeypatch.setattr(offline_eval, "make_eval_batch", batch)
+    for name in ("spectrogram_pair", "psd_overlay", "band_bar"):
+        monkeypatch.setattr(offline_eval, name, lambda *a, **k: None)
+    out = tmp_path / "eval"
+    monkeypatch.setattr(offline_eval.sys, "argv", [
+        "evaluate_offline.py", "--ckpt", "unused.pt", "--n-items", "2", "--out", str(out),
+    ])
+    assert offline_eval.main() == 0
+    assert len(seen) == 3
+    assert seen[1]["source_mix_ratio_acoustic"] == {"synthetic": 1.0}
+    assert seen[2]["source_mix_ratio_acoustic"] == {"speech": 1.0}
+    assert seen[1]["source_mix_ratio"] == {"synthetic": 1.0}
+    assert seen[2]["source_mix_ratio"] == {"speech": 1.0}
+    with np.load(out / "metrics.npz", allow_pickle=False) as metrics:
+        policy = json.loads(str(metrics["source_evaluation_policy_json"]))
+        assert metrics["per_item_fullband_db"].shape == (2,)
+    assert policy["per_source_requested"] == ["synthetic", "speech"]
+    assert policy["per_source_evaluated"] == (["synthetic"] if fail_speech else ["synthetic", "speech"])
+    assert policy["per_source_skipped"] == ([{
+        "source_family": "speech", "reason": "합성 fixture의 speech 실패",
+    }] if fail_speech else [])
+    report = (out / "metrics.md").read_text(encoding="utf-8")
+    assert "독립 평가 제외(train-only): machine" in report
+    assert "남은 학습 가중치 합 0.8" in report
+    assert '"speech": 0.625' in report
+    assert "실기 감쇠" in report
+    if fail_speech:
+        assert "| speech | 미평가 | 미평가 |" in report
+    assert "| machine |" not in report

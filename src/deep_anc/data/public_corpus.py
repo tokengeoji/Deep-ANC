@@ -3,6 +3,8 @@
 ESC-50/FMA/LibriSpeech는 공식 메타데이터를 읽는다. DEMAND/MIMII는 검토된
 source_index.csv와 source_index_meta.json을 요구한다. 후자는 staging 작성자의
 목록 완전성 선언이며 외부 출처 진위를 자동으로 인증하는 기능은 아니다.
+machine(MIMII)은 원녹음 독립성이 미확인된 학습 보조 전용이다. 공식 분할은
+metadata에만 보존하고 ANC split=train 및 보수적인 단일 그룹을 강제한다.
 오류가 하나라도 있으면 inventory/QA만 발급하고 학습 manifest는 발급하지 않는다.
 새 출력 폴더만 쓰며 --reuse는 내용을 재검증할 뿐 어떤 파일도 변경하지 않는다.
 쓰기 중 실패한 새 폴더에는 부분 파일이 남을 수 있으므로 재사용하지 말아야 한다.
@@ -26,6 +28,10 @@ FAMILIES = ("esc50", "music", "speech", "demand", "machine")
 SPLITS = ("train", "val", "test")
 AUDIO_SUFFIXES = {".wav", ".flac", ".mp3"}
 DEFAULT_RATIOS = {"train": 0.9, "val": 0.05, "test": 0.05}
+TRAIN_ONLY_FAMILIES = ("machine",)
+MACHINE_USAGE_POLICY = "train_only_auxiliary"
+MACHINE_GROUP_ID = "machine:mimii-dg-unresolved"
+MACHINE_GROUPING_BASIS = "conservative_unresolved_mimii_train_only_pool"
 
 
 def sha256_file(path: Path) -> str:
@@ -100,6 +106,21 @@ class _Audit:
 
     def add(self, family: str, root: Path, path: Path, group: str,
             metadata: dict[str, Any], split: str | None = None) -> None:
+        if family in TRAIN_ONLY_FAMILIES:
+            # 이 그룹은 원녹음 ID가 아니라 평가 누수를 피하기 위한 보수적 풀이다.
+            # 오류/미등재 행도 val/test 또는 독립 원녹음으로 오해되지 않게 남긴다.
+            metadata = dict(metadata)
+            recording = metadata.get("official", {}).get("source_recording_id", "")
+            if "grouping_basis" in metadata:
+                metadata["declared_grouping_basis"] = metadata["grouping_basis"]
+            metadata.update({
+                "usage_policy": MACHINE_USAGE_POLICY,
+                "independent_evaluation_allowed": False,
+                "grouping_basis": MACHINE_GROUPING_BASIS,
+                "source_recording_id_status": "declared_unverified" if recording.strip() else "unknown",
+                "source_recording_independence": "unknown",
+            })
+            group, split = MACHINE_GROUP_ID, "train"
         entry: dict[str, Any] = {
             "path": manifest_relative_path(path, self.out / f"{family}.jsonl"),
             "path_base": "manifest", "source_family": family, "tag": family,
@@ -341,6 +362,19 @@ def _indexed(audit: _Audit, root: Path, family: str) -> None:
         if not isinstance(meta.get(key), str) or not meta[key].strip():
             raise ValueError(f"source_index_meta {key} 근거 누락")
     audit.source_provenance[family] = {**meta, "external_authenticity_verified": False}
+    if family in TRAIN_ONLY_FAMILIES:
+        if meta.get("usage_policy") != MACHINE_USAGE_POLICY:
+            raise ValueError("machine source_index_meta usage_policy=train_only_auxiliary 명시 필요")
+        if "independent_evaluation_allowed" in meta and meta["independent_evaluation_allowed"] is not False:
+            raise ValueError("machine independent_evaluation_allowed는 false만 허용합니다")
+        audit.source_provenance[family].update({
+            "usage_policy": MACHINE_USAGE_POLICY,
+            "independent_evaluation_allowed": False,
+            "declared_grouping_basis": meta["grouping_basis"],
+            "grouping_basis": MACHINE_GROUPING_BASIS,
+            "group_id": MACHINE_GROUP_ID,
+            "source_recording_independence": "unknown",
+        })
     rows = _csv_rows(audit.metadata(root / "source_index.csv"), {
         "path", "group_id", "official_split", "license", "source_recording_id",
     })
@@ -348,13 +382,16 @@ def _indexed(audit: _Audit, root: Path, family: str) -> None:
     recording_groups = {}
     for row in rows:
         path = _relative_source(root, row["path"])
-        group = f"{family}:{row['group_id']}"
-        if not row["license"].strip() or not row["source_recording_id"].strip():
+        group = MACHINE_GROUP_ID if family in TRAIN_ONLY_FAMILIES else f"{family}:{row['group_id']}"
+        if not row["license"].strip() or (family not in TRAIN_ONLY_FAMILIES and not row["source_recording_id"].strip()):
             raise ValueError("source_index license/source_recording_id 누락")
+        if family in TRAIN_ONLY_FAMILIES and row["official_split"] not in ("", *SPLITS):
+            raise ValueError("machine 공식 split metadata가 잘못됐습니다")
         recording = row["source_recording_id"]
-        if recording in recording_groups and recording_groups[recording] != group:
+        if recording.strip() and recording in recording_groups and recording_groups[recording] != group:
             audit.issue(family, "recording_cross_group", "같은 원본/동시녹음이 여러 group에 있습니다", path)
-        recording_groups[recording] = group
+        if recording.strip():
+            recording_groups[recording] = group
         expected.append(path)
         audit.add(family, root, path, group, {
             "official": row, "license": row["license"],
@@ -436,9 +473,12 @@ def _audit_corpus(raw_root: Path, out: Path, seed: int, ratios: dict[str, float]
             audit.issue("all", "duplicate_sha256", f"{digest}: " + ", ".join(entry["path"] for entry in entries))
     counts = {family: {split: sum(entry["source_family"] == family and entry["split"] == split and entry["qa_valid"] for entry in audit.entries) for split in SPLITS} for family in FAMILIES}
     for family, splits in counts.items():
-        for split, count in splits.items():
-            if not count:
+        required = ("train",) if family in TRAIN_ONLY_FAMILIES else SPLITS
+        for split in required:
+            if not splits[split]:
                 audit.issue(family, "empty_split", split)
+        if family in TRAIN_ONLY_FAMILIES and any(splits[split] for split in ("val", "test")):
+            audit.issue(family, "train_only_split_violation", "학습 보조 원본을 독립 평가에 사용할 수 없습니다")
     audit.entries.sort(key=lambda entry: (entry["source_family"], entry["path"]))
     payloads = {"inventory.jsonl": b"".join(_json_bytes(entry) for entry in audit.entries)}
     ready = not audit.issues
@@ -450,6 +490,7 @@ def _audit_corpus(raw_root: Path, out: Path, seed: int, ratios: dict[str, float]
         "performance_claim_allowed": False, "raw_root": str(raw_root),
         "stage_required": True, "network_or_download_performed": False,
         "families": list(FAMILIES), "split_counts": counts, "seed": seed,
+        "train_only_source_families": list(TRAIN_ONLY_FAMILIES),
         "split_ratios": ratios, "speech_split_policy": "official_subsets",
         "duplicate_policy": "reject_all_exact_file_hash_duplicates_no_selection",
         "issues": audit.issues, "source_provenance": audit.source_provenance,
@@ -469,6 +510,7 @@ def _audit_corpus(raw_root: Path, out: Path, seed: int, ratios: dict[str, float]
             "16 kHz 음원은 8 kHz 이상 정보가 없고 800–1600 Hz 표본화 가능 여부만 검사",
             "원본 전체 해시의 정확한 중복만 검출; 재인코딩·부분복제·출처 그룹 외 누수는 미검증",
             "DEMAND/MIMII 목록 완전성과 그룹 근거는 staging 작성자의 선언; 외부 진위 자동 인증 없음",
+            "machine(MIMII)은 단일 미확정 그룹의 train-only 보조 자료이며 원녹음 독립성/평가 성능을 주장하지 않음",
             "LibriSpeech는 존재하는 transcript 기준 대조; transcript와 음원 전체가 함께 빠진 chapter/speaker는 공식 완전 목록 없이는 검출 불가",
         ],
     }
@@ -484,6 +526,9 @@ def prepare_public_corpus(raw_root: str | Path, out_dir: str | Path, *, seed: in
     data_ready는 관측된 metadata 기준 PCM/그룹 분할 정합이며 공식 archive 전체
     보유의 증명이 아니다. 특히 LibriSpeech의 transcript와 해당 음원이 함께 빠진
     경우는 외부 완전 inventory/검증된 archive 추출 receipt 없이 검출할 수 없다.
+    machine(MIMII)은 source_index_meta의 train_only_auxiliary 선언이 필수다.
+    machine 원녹음 ID의 빈값은 unknown으로 남기며 공식 split/group은 metadata에
+    보존한다. 출력은 모두 train/단일 미확정 그룹이며 독립 평가에 사용할 수 없다.
 
     반환 data_ready=False는 QA 실패이며 family manifest는 없다. 잘못된 호출/출력
     경로/재사용 불일치는 ValueError/FileExistsError. reuse는 전체 raw PCM까지

@@ -92,6 +92,7 @@ def check_acoustic_training_data(cfg: dict) -> dict:
             "입력 REF 비율에는 합성 RIR·마이크 잡음·채널 dropout이 포함된다.",
             "합성 P_ref/P_err의 장치 절대 gain은 미검증이며 F 피드백은 open-loop에 없다.",
             "로컬 SHA 검증은 Drive 원격 원본이나 라이선스 완전성 인증을 대신하지 않는다.",
+            "MIMII machine은 학습 보조 전용이며 val/test 표본과 평가 분모에서 제외한다.",
         ],
     }
 

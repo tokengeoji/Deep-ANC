@@ -1,16 +1,18 @@
 # HANDOFF — 세션 인수인계 (다음 AI 에이전트/개발자용)
 
-> **"이어서 진행해줘"를 받았다면**: 먼저 아래 **2026-09-15 현재 작업**을 읽어라.
+> **"이어서 진행해줘"를 받았다면**: 먼저 아래 **2026-09-17 현재 작업**을 읽어라.
 > 규칙은 [AGENTS.md](AGENTS.md)가 단일 출처. 이 파일은 작업 상태가 바뀔 때마다 갱신할 것.
-> 최종 갱신: 2026-09-15. 아래 과거 §0 이후의 서버/PID/실험 현황은 역사 기록이며 현재 상태가 아니다.
+> 최종 갱신: 2026-09-17. 아래 과거 §0 이후의 서버/PID/실험 현황은 역사 기록이며 현재 상태가 아니다.
 
-## 현재 작업 — 2026-09-15 acoustic 전환 및 Docker 전용 개발
+## 현재 작업 — 2026-09-17 MIMII 학습 보조 확정·Jetson 고역 역할
 
 ### 사용자 확정 사항
 
 - **최우선은 acoustic-ref**다. 외부 소리를 실제 REF 마이크로 받으며 소음 원본/미래 샘플을 제어 입력으로 쓰지 않는다.
-- 감쇠 기준은 ERR **한 점**, 고주파 정의는 **1 kHz 이상**, 이번 **우선 개선 대역은 800–1600 Hz**다.
-- 저역·고역을 함께 감쇠하고 음성·음악을 포함한 모든 소리를 대상으로 한다.
+- 감쇠 기준은 ERR **한 점**, 고주파 정의는 **1 kHz 이상**이다. 2026-09-17 사용자는
+  기존 DSP를 바탕으로 **Jetson을 고역 감쇠에 집중**시키는 목표를 제시했다.
+  2026-09-15의 800–1600 Hz 설정·지표는 보존하며, 새 1–1.6 kHz 우선 범위는 아직 응답 대기다.
+- **시스템 전체의 저역·고역 동시 감쇠와 음성·음악을 포함한 quiet zone 목표는 유지한다.**
 - **Jetson AGX Orin·덕트·현재 마이크·USB DAC를 모두 유지한다.** 최신 지시가 이전 하드웨어 변경 검토 허용을 대체한다.
   장치 교체/구매/공통 클록 장치 통합을 이번 해결책으로 제안하지 않는다. 기존 시스템 설정 불가침도 유지한다.
 - Deep ANC만 고집하지 않고 FxLMS/FxNLMS 및 경로 추정과 결합한다.
@@ -26,6 +28,47 @@
   Drive 업로드를 확인한 파일은 PC에서 삭제한다. 이전 PC 원본 다운로드 금지는 이 지시로 대체됐다.
   기존 Drive 자료를 우선 활용하고 새 업로드의 중복을 막는다. 완전성을 모르는 옛 백업은 보존한다.
   사용자는 별도의 완전한 데이터 폴더가 없다고 확인했으므로 같은 링크를 다시 요청하지 않는다.
+- **MIMII DG fan은 학습 보조 전용으로 확정했다(2026-09-17).** `machine`은 ANC train에만
+  사용하고 validation/test에서는 제외한다. 공식 split 메타데이터와 Drive 원본 보관은 유지한다.
+
+### 2026-09-17 신규 DSP 보고·미확정 연결 조건
+
+사용자는 `omap138` DSP(사용자 표기)의 FxNLMS로 **10 dB 이상 감쇠**했지만
+**1 kHz 이상을 잘 잡지 못한다**고 보고했다. 이는 사용자 보고이며 이 저장소에서 재검증한
+성능 수치가 아니다. 감쇠한 대역·소리 종류·측정 조건·동일 덕트 여부는 아직 확인되지 않았다.
+Jetson의 고역 보완이라는 역할 목표를 시스템 전체 대역의 성공 판정과 구분한다.
+
+현재 사용자 응답을 기다리는 설계 항목은 다음과 같다.
+
+1. DSP와 Jetson 출력을 합산하는지, 각각 별도 스피커를 쓰는지와 실제 제어 스피커 수.
+2. DSP 실험이 현재 덕트·동일 REF/ERR에서 이루어졌는지, 사용 음원·조건·감쇠 대역.
+3. Jetson의 첫 검증 범위를 1–1.6 kHz로 둘지, 그 이상의 대역도 먼저 다룰지.
+
+확정 전에는 듀얼 제어기 합산·대역 분할·출력 라우팅·공유 ERR 적응 규칙과 런타임 배선을
+구현하거나 임의로 바꾸지 않는다. 기존 `HybridEngine`은 한 Jetson 내부의 DNN+FxNLMS
+비교용이며 외부 DSP 결합을 구현한 것이 아니다. 대기 중에도 PC의 데이터 정책·합성 회귀는 진행한다.
+Jetson 경로의 **35.854 ms**, REF 기하선행 **2.915 ms**, S 신뢰대역 **150–600 Hz**라는
+기존 기록은 그대로다. DSP 보고나 역할 분담만으로 Jetson 지연·고역 S 검증이 해결됐다고 하지 않는다.
+
+MIMII train-only 정책을 준비 도구·strict 로더에 반영했다. 공식 train/test·domain/section 기록을
+ANC 학습 분할과 구분해 보존하며, section을 독립 장치/원녹음 ID로 취급하지 않는다.
+원 팬·배경음 재사용의 독립성은 여전히 미확인이다. 가짜 그룹/평가 분할을 만들거나
+사용자 승인만으로 `data_ready`·실제 학습 완료를 선언하지 않는다.
+
+- 준비 CSV의 공식 split/group/원녹음 ID 원문은 metadata에 보존한다. machine 원녹음 ID가
+  비어 있으면 unknown이며 가짜 ID를 채우지 않는다. 출력 ANC split은 모두 train이고
+  `machine:mimii-dg-unresolved`는 독립 녹음이 아닌 **보수적 전체 묶음**의 이름이다.
+- machine `source_index_meta.json`은 `usage_policy: train_only_auxiliary`가 필수다.
+  QA와 설정에 `train_only_source_families: [machine]`, 행에 평가 금지 metadata를 남기고
+  누락·변경·val/test 행을 strict 로더에서 거부한다. 기존 QA를 수작업 수정해 재사용하지 않는다.
+- 학습 mix의 machine 0.10은 유지한다. val/test는 machine을 제외하고 다른 소스 상대 비율을
+  재정규화한다. 평가 풀 강제 접근과 machine 강제 선택은 합성 대체가 아니라 오류이며,
+  이 정책을 사용하는 train dataset을 `make_eval_batch`로 평가하는 것도 거부한다.
+- `evaluate_offline.py`의 소스별 평가는 실제 test mix의 양수 태그만 사용한다.
+  acoustic 전용 mix override도 함께 단일화하고, 제외 목록·평가 분포·미평가 사유를
+  Markdown와 NPZ의 `source_evaluation_policy_json`에 남긴다. 실패 소스를 0 dB/성공으로 세지 않는다.
+- 새 역할 결정만으로 기존 800–1600 Hz 생성 설정·S 신뢰대역·손실 대역을 변경하지 않았다.
+  이번에는 원본 재다운로드·Drive 변경·실제 corpus 학습·오디오 출력을 하지 않았다.
 
 ### 현재 환경과 실행
 
@@ -65,7 +108,17 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 - 이 단계는 **초기 비교용 API**다. DNN 계수 생성, 온라인 S/F 식별, F 보상, 실제 비선형 모델은 미구현이다.
 - 고정 REF 전용 가짜 신경망 수렴 테스트는 ERR를 사용하는 실제 DNN과의 폐루프 안정성 검증을 대체하지 않는다.
 
-### 이번 검증 결과
+### 최신 CPU 검증 결과 — 2026-09-17
+
+- Docker 전체 회귀 `.venv/bin/python -m pytest -q -o addopts= -ra`:
+  **1169 passed, 2 skipped (66.67초)**. skip은 현장 raw 진단 파일과 실측 `metrics.md` 부재다.
+- 개별 검사: corpus writer→strict loader 포함 **67 passed**, acoustic 준비·기존 dataset·lead
+  회귀 **120 passed**, 평가 artifact/제외 분포·미평가 보고 **27 passed**. 모두 합성 fixture다.
+- `pip check`, `git diff --check` 통과. 실제 corpus 준비 CLI는 로컬 strict manifest가 없어
+  예상대로 exit 1 / `data_ready=false`다. 정책 구현 통과와 공개 원본 학습 준비를 구분한다.
+- 실제 DSP·Jetson 통합, 새로운 오디오 측정·출력, GPU/실제 corpus 학습은 실행하지 않았다.
+
+### 기존 CPU 검증 결과 — 2026-09-15 기록
 
 - `deep-anc-dev` 내부에서 `.venv/bin/python -m pytest -q -o addopts= -ra`: **1109 passed, 2 skipped (59.95초)**.
 - 건너뛴 2개는 현장 raw 진단 파일과 실측 `metrics.md` 부재 때문이다. GPU/실기 검증으로 해석하지 않는다.
@@ -143,6 +196,7 @@ L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공�
 - `prepare_acoustic_corpus.py`: 5계열의 공식/검토 metadata·전체 PCM·SHA·그룹 split·정확한 중복 QA.
   실패 시 inventory/QA만, 성공 시 5계열 JSONL도 생성. 재사용은 원본까지 재검증하고 덮어쓰지 않는다.
   DEMAND/MIMII 완전성은 staging 작성자 선언이며 Libri chapter의 metadata+PCM 동시 누락은 외부 완전 목록 없이는 검출 못한다.
+  2026-09-17 machine train-only 예외를 반영했다. 다른 4계열은 train/val/test 필수 검사를 유지한다.
 - `configs/data_acoustic_prepared.yaml`: acoustic lead0, strict 원본/RIR 검증, legacy 설정 불변.
   source mix는 기존에서 DNS를 제외한 정규화 연구 출발점이다. 합성원에만 목표대역 분포를 opt-in으로 섞는다.
   `check_acoustic_training_data.py`는 기본 checkout에 strict 원본/manifest가 없어 exit1/data_ready=false다.
@@ -189,8 +243,9 @@ Drive의 새 public_archives/{source_id}에는 parts와 manifest.json만 보관�
   soft decoder 경고 영향은 추가 미확인이다. 실패 파일을 버리거나 manifest READY를 만들지 않았다.
   요약은 `results/drive_preparation/20260915_01/public_archive_audit_summary.json`에 있다.
 - MIMII 3개 attribute CSV와 3,600개 음원 이름을 대조했다. section은 물리적 fan ID가 아니며
-  원녹음·배경 재사용의 독립성 정보가 없다. 학습 보조 전용 제한 여부는 사용자에게 질문한 상태다.
-  답변 없이 가상 group을 만들거나 section holdout을 독립 평가로 승격하지 않는다.
+  원녹음·배경 재사용의 독립성 정보가 없다. **2026-09-17 학습 보조 전용 사용이 확정됐다.**
+  machine은 train-only·val/test 제외이며 공식 split 메타데이터는 보존한다.
+  이 선택으로 부모 녹음 독립성이 입증된 것은 아니며 section holdout을 독립 평가로 승격하지 않는다.
 - `split_staged_archive.py --restore-manifest ... --archive-out NEWPATH`는 전체 조각·결합·출력
   재읽기 검증을 수행하는 새 파일 전용 복원이다. 실패 출력 보존 규약과 명령은 docs/16을 따른다.
 - 추가 병렬 Range 시험은 Libri 연결 실패, FMA는 중복 전송을 줄이기 위해 중단했다.
@@ -218,7 +273,8 @@ Drive의 새 public_archives/{source_id}에는 parts와 manifest.json만 보관�
 약 1.6 kHz 평면파 차단을 ERR 한 점 감쇠의 절대 상한으로 해석하지 않는다.
 반복 정렬 후 일관성이 높다는 사실도 실시간 클록/위상 안정성을 증명하지 않는다.
 과거 clock-warp 해석을 하드웨어 원인으로 확정하지 말고 독립적인 타이밍 측정으로 확인한다.
-위 `--require-band 1000 1600`은 이전 검사 기록이다. 새 우선 개선 대역의 요구 검사는 **800 1600**을 사용한다.
+위 `--require-band 1000 1600`은 이전 검사 기록이며, **800 1600**은 2026-09-15 연구 설정의 범위다.
+2026-09-17 Jetson 고역 역할에 맞는 첫 검증 범위는 사용자 응답 후 확정하며 설정을 먼저 바꾸지 않는다.
 하드웨어는 고정이다. 약 35.9ms 경로 기록과 약 2.9ms 기하선행의 시간 기준/지터를 실제 장치에서
 재검증하고 사용자 공간에서 줄일 수 있는 지연을 구분한다. 사전 S 측정이나 FxNLMS 결합만으로
 이 시간차가 해소된다고 가정하지 않는다. 주기음 개선을 불규칙한 음성·음악 전체의 성공으로 확대하지 않는다.
@@ -229,13 +285,15 @@ Drive의 새 public_archives/{source_id}에는 parts와 manifest.json만 보관�
 연구/설계 근거는 [docs/13](docs/13_acoustic_hybrid.md)를 따른다.
 
 1. **이 PC에서 계속**: 목표 대역 지표·ESS 반복 진단·계수 전달 연구 API·다중 seed 필터 뱅크와
-   과거 REF 특징 선택 기준선은 구현했다. 다음은 DEMAND/MIMII 출처 그룹 검토, FMA 디코더 경고의
+   과거 REF 특징 선택 기준선과 MIMII train-only 정책은 구현했다. 다음은
+   DEMAND 출처 그룹 검토와 MIMII provenance를 보존하는 실제 staging, FMA 디코더 경고의
    트랙별 검증, 승인된 임시 staging에서 strict 그룹 manifest QA와 실제 음성·음악 독립 평가다.
    이후 실제 스레드 전달/라이브 연결 전의 소유권·마감·안전 리뷰를 수행한다.
    실측 원자료가 오면 PCM→IR 재추출 정합·SNR/지연/대역 검증과 기록 기반 재현을 연결한다.
    현재 `calibrate_wideband.py` ESS 산출물은 `consistency_band_hz`가 없어 readiness에 가진 대역을 대신 넣으면 안 된다.
    새 ESS 진단도 모델 승격 도구가 아니다. 고정 하드웨어 지연이 해결됐다고 가정하지 않는다.
    설계에 영향을 주는 측정/계수 교체 선택이 불명확하면 먼저 질문한다. 실제 자료가 필요한 항목만 별도 대기시킨다.
+   DSP/Jetson 출력 구성·동일 조건의 DSP 기준선·첫 고역 범위 답변을 받은 뒤에만 듀얼 제어기 연결 설계를 확정한다.
 2. **Jetson에서만**: 실제 ARM64 이미지 빌드·CUDA/TensorRT·추론 마감 검증. 호스트 시스템 변경으로 실패를 우회하지 않는다.
 3. **Jetson 현장**: 장치 접근을 별도로 준비하고 입력-only 점검 후, 사용자 입회·최저 볼륨에서 광대역 S와 별도 F를 측정한다.
 4. **자료 회수 후 이 PC**: 원자료 QA, 신뢰대역·지연·클록 안정성·밴드별 감쇠 분석. 설정의 S 지연이나 신뢰대역 숫자를 임의로 바꾸지 않는다.

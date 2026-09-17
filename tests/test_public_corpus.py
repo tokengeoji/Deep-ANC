@@ -13,7 +13,10 @@ import pytest
 import soundfile as sf
 
 from deep_anc.data.manifest import read_manifest
-from deep_anc.data.public_corpus import FAMILIES, inspect_audio, prepare_public_corpus, sha256_file
+from deep_anc.data.public_corpus import (
+    FAMILIES, MACHINE_GROUP_ID, MACHINE_GROUPING_BASIS, MACHINE_USAGE_POLICY,
+    inspect_audio, prepare_public_corpus, sha256_file,
+)
 
 
 def _write_csv(path: Path, fields: list[str], rows: list[dict]) -> None:
@@ -69,14 +72,19 @@ def corpus(tmp_path: Path) -> tuple[Path, Path]:
         for index in range(3):
             relative = f"environment_{index}/ch01.wav"
             _audio(root / relative, index + offset, channels=2 if family == "demand" else 1)
-            rows.append({"path": relative, "group_id": f"group-{index}", "official_split": "",
-                         "license": "fixture-license", "source_recording_id": f"original-{index}"})
+            rows.append({"path": relative, "group_id": f"group-{index}",
+                         "official_split": ("train", "val", "test")[index] if family == "machine" else "",
+                         "license": "fixture-license",
+                         "source_recording_id": "" if family == "machine" else f"original-{index}"})
         _write_csv(root / "source_index.csv", list(rows[0]), rows)
-        (root / "source_index_meta.json").write_text(json.dumps({
+        metadata = {
             "source_family": family, "expected_inventory_complete": True,
             "inventory_origin": "synthetic fixture expected file inventory",
             "grouping_basis": "synthetic fixture groups, not real device/section evidence",
-        }))
+        }
+        if family == "machine":
+            metadata["usage_policy"] = MACHINE_USAGE_POLICY
+        (root / "source_index_meta.json").write_text(json.dumps(metadata))
     return raw, tmp_path / "manifests"
 
 
@@ -90,11 +98,13 @@ def test_complete_corpus_writes_compatible_group_manifests(corpus):
     assert report["data_ready"] is True
     assert report["performance_claim_allowed"] is False
     assert report["network_or_download_performed"] is False
+    assert report["train_only_source_families"] == ["machine"]
     assert set(path.name for path in out.iterdir()) == {"qa.json", "inventory.jsonl", *(f"{family}.jsonl" for family in FAMILIES)}
     inventory = [json.loads(line) for line in (out / "inventory.jsonl").read_text().splitlines()]
     assert len(inventory) == 15
     for family in FAMILIES:
-        assert report["split_counts"][family] == {"train": 1, "val": 1, "test": 1}
+        expected_counts = {"train": 3, "val": 0, "test": 0} if family == "machine" else {"train": 1, "val": 1, "test": 1}
+        assert report["split_counts"][family] == expected_counts
         path = out / f"{family}.jsonl"
         assert sha256_file(path) == report["manifest_sha256"][path.name]
         entries = read_manifest(path)
@@ -107,10 +117,157 @@ def test_complete_corpus_writes_compatible_group_manifests(corpus):
             assert entry["band_power"]["nyquist_hz"] == 8000
             assert entry["band_power"]["snr_and_trusted_band"] == "unknown"
             assert entry["metadata"]["license"]
+            if family == "machine":
+                assert entry["group_id"] == MACHINE_GROUP_ID
+                assert entry["split"] == "train"
+                assert entry["metadata"]["usage_policy"] == MACHINE_USAGE_POLICY
+                assert entry["metadata"]["independent_evaluation_allowed"] is False
+                assert entry["metadata"]["source_recording_id_status"] == "unknown"
+                assert entry["metadata"]["official"]["source_recording_id"] == ""
     speech = read_manifest(out / "speech.jsonl")
     assert {entry["metadata"]["official_subset"]: entry["split"] for entry in speech} == {"train-clean-100": "train", "dev-clean": "val", "test-clean": "test"}
     for relative, digest in report["source_metadata_sha256"].items():
         assert sha256_file(raw / relative) == digest
+
+
+def test_machine_official_splits_and_declared_groups_are_metadata_only(corpus):
+    raw, out = corpus
+    source_index = raw / "machine/source_index.csv"
+    with source_index.open() as stream:
+        original_rows = list(csv.DictReader(stream))
+    original_rows[0]["official_split"] = ""
+    original_rows[0]["group_id"] = ""
+    original_rows[1]["source_recording_id"] = "caller-declared-recording"
+    _write_csv(source_index, list(original_rows[0]), original_rows)
+    report = prepare_public_corpus(raw, out, seed=912, split_ratios={"train": .2, "val": .3, "test": .5})
+    assert report["data_ready"]
+    assert report["split_counts"]["machine"] == {"train": 3, "val": 0, "test": 0}
+    assert report["train_only_source_families"] == ["machine"]
+    provenance = report["source_provenance"]["machine"]
+    assert provenance["usage_policy"] == MACHINE_USAGE_POLICY
+    assert provenance["independent_evaluation_allowed"] is False
+    assert provenance["external_authenticity_verified"] is False
+    assert provenance["group_id"] == MACHINE_GROUP_ID
+    assert provenance["grouping_basis"] == MACHINE_GROUPING_BASIS
+    assert provenance["source_recording_independence"] == "unknown"
+    original_by_path = {row["path"]: row for row in original_rows}
+    for entry in read_manifest(out / "machine.jsonl"):
+        metadata = entry["metadata"]
+        assert entry["split"] == "train" and entry["group_id"] == MACHINE_GROUP_ID
+        assert metadata["official"] == original_by_path[metadata["official"]["path"]]
+        assert metadata["grouping_basis"] == MACHINE_GROUPING_BASIS
+        assert metadata["declared_grouping_basis"] == provenance["declared_grouping_basis"]
+        assert metadata["independent_evaluation_allowed"] is False
+        assert metadata["source_recording_independence"] == "unknown"
+        expected = "declared_unverified" if metadata["official"]["source_recording_id"] else "unknown"
+        assert metadata["source_recording_id_status"] == expected
+    for family in set(FAMILIES) - {"machine"}:
+        assert all(report["split_counts"][family].values())
+
+
+@pytest.mark.parametrize("policy", [None, "", "independent_evaluation", "train_only", True])
+def test_machine_requires_explicit_train_only_auxiliary_metadata(corpus, policy):
+    raw, out = corpus
+    path = raw / "machine/source_index_meta.json"
+    metadata = json.loads(path.read_text())
+    if policy is None:
+        metadata.pop("usage_policy")
+    else:
+        metadata["usage_policy"] = policy
+    path.write_text(json.dumps(metadata))
+    report = prepare_public_corpus(raw, out)
+    assert not report["data_ready"]
+    assert any("usage_policy=train_only_auxiliary" in issue["detail"] for issue in report["issues"])
+    assert not (out / "machine.jsonl").exists()
+    entries = [json.loads(line) for line in (out / "inventory.jsonl").read_text().splitlines()]
+    machine = [entry for entry in entries if entry["source_family"] == "machine"]
+    assert len(machine) == 3  # 잘못된 정책도 PCM QA/오류 기록을 생략하지 않는다.
+    assert all(entry["qa_valid"] for entry in machine)
+    assert all(entry["split"] == "train" and entry["group_id"] == MACHINE_GROUP_ID for entry in machine)
+    assert all(entry["metadata"]["independent_evaluation_allowed"] is False for entry in machine)
+
+
+@pytest.mark.parametrize("value", [True, "false", 0, None])
+def test_machine_explicit_independent_evaluation_claim_is_rejected(corpus, value):
+    raw, out = corpus
+    path = raw / "machine/source_index_meta.json"
+    metadata = json.loads(path.read_text())
+    metadata["independent_evaluation_allowed"] = value
+    path.write_text(json.dumps(metadata))
+    report = prepare_public_corpus(raw, out)
+    assert not report["data_ready"]
+    assert any("independent_evaluation_allowed" in issue["detail"] for issue in report["issues"])
+
+
+def test_machine_unknown_recording_id_does_not_allow_missing_required_column(corpus):
+    raw, out = corpus
+    path = raw / "machine/source_index.csv"
+    with path.open() as stream:
+        rows = list(csv.DictReader(stream))
+    for row in rows:
+        row.pop("source_recording_id")
+    _write_csv(path, list(rows[0]), rows)
+    report = prepare_public_corpus(raw, out)
+    assert not report["data_ready"]
+    assert "source_metadata_invalid" in _issues(report)
+
+
+def test_machine_unlisted_audio_is_preserved_train_only_but_fails_inventory_qa(corpus):
+    raw, out = corpus
+    _audio(raw / "machine/unlisted.wav", 7918)
+    report = prepare_public_corpus(raw, out)
+    assert not report["data_ready"]
+    assert "audio_missing_from_metadata" in _issues(report)
+    entries = [json.loads(line) for line in (out / "inventory.jsonl").read_text().splitlines()]
+    machine = [entry for entry in entries if entry["source_family"] == "machine"]
+    assert len(machine) == 4
+    assert all(entry["split"] == "train" and entry["group_id"] == MACHINE_GROUP_ID for entry in machine)
+    unknown = next(entry for entry in machine if entry["metadata"].get("unindexed"))
+    assert unknown["metadata"]["source_recording_id_status"] == "unknown"
+
+
+def test_machine_train_requires_at_least_one_valid_audio(corpus):
+    raw, out = corpus
+    for path in (raw / "machine").rglob("*.wav"):
+        sf.write(path, np.zeros(4096), 16000)
+    report = prepare_public_corpus(raw, out)
+    assert not report["data_ready"]
+    assert report["split_counts"]["machine"] == {"train": 0, "val": 0, "test": 0}
+    assert [issue["detail"] for issue in report["issues"] if issue["source_family"] == "machine" and issue["code"] == "empty_split"] == ["train"]
+
+
+def test_machine_duplicate_audio_still_fails_without_selection(corpus):
+    raw, out = corpus
+    first, second, _ = sorted((raw / "machine").rglob("*.wav"))
+    shutil.copyfile(first, second)
+    report = prepare_public_corpus(raw, out)
+    assert not report["data_ready"] and "duplicate_sha256" in _issues(report)
+    assert not (out / "machine.jsonl").exists()
+
+
+def test_other_indexed_family_still_requires_all_three_splits(corpus):
+    raw, out = corpus
+    path = raw / "demand/source_index.csv"
+    with path.open() as stream:
+        rows = list(csv.DictReader(stream))
+    for row in rows:
+        row["official_split"] = "train"
+    _write_csv(path, list(rows[0]), rows)
+    report = prepare_public_corpus(raw, out)
+    assert not report["data_ready"]
+    assert {issue["detail"] for issue in report["issues"] if issue["source_family"] == "demand" and issue["code"] == "empty_split"} == {"val", "test"}
+
+
+def test_machine_declared_group_changes_cannot_reuse_old_provenance(corpus):
+    raw, out = corpus
+    prepare_public_corpus(raw, out)
+    path = raw / "machine/source_index.csv"
+    with path.open() as stream:
+        rows = list(csv.DictReader(stream))
+    rows[0]["group_id"] = "changed-caller-declaration"
+    _write_csv(path, list(rows[0]), rows)
+    with pytest.raises(ValueError, match="재사용"):
+        prepare_public_corpus(raw, out, reuse=True)
 
 
 def test_writer_output_is_accepted_by_strict_prepared_loader(corpus, tmp_path):
@@ -133,6 +290,8 @@ def test_writer_output_is_accepted_by_strict_prepared_loader(corpus, tmp_path):
     assert metadata["split_counts"] == writer_report["split_counts"]
     assert metadata["manifest_sha256"] == writer_report["manifest_sha256"]
     assert metadata["source_metadata_sha256"] == writer_report["source_metadata_sha256"]
+    assert writer_report["train_only_source_families"] == ["machine"]
+    assert metadata["train_only_source_families"] == ["machine"]
     for key in rirs:
         np.testing.assert_array_equal(validated_rirs[key], rirs[key])
     # 실제 writer 산출물 이후 원본 변경은 strict loader에서도 거부된다.
@@ -213,10 +372,11 @@ def test_existing_output_rejected_before_audio_read(corpus, monkeypatch):
     assert (out / "keep").read_text() == "untouched"
 
 
+@pytest.mark.parametrize("family", ["esc50", "machine"])
 @pytest.mark.parametrize("damage", ["missing", "corrupt", "silent", "nan", "inf", "low_sample_rate"])
-def test_bad_audio_preserved_and_no_training_manifests(corpus, damage):
+def test_bad_audio_preserved_and_no_training_manifests(corpus, damage, family):
     raw, out = corpus
-    path = next((raw / "esc50").rglob("*.wav"))
+    path = next((raw / family).rglob("*.wav"))
     if damage == "missing":
         path.unlink()
     elif damage == "corrupt":
@@ -330,10 +490,11 @@ def test_source_group_not_file_split(corpus):
     assert len({entry["split"] for entry in sibling_group}) == 1
 
 
-@pytest.mark.parametrize("problem", ["missing_csv", "missing_inventory_attestation", "unknown_completeness", "unexpected_audio", "missing_family", "dns", "missing_license", "unsafe_path", "recording_cross_group", "partial_split", "group_cross_split"])
+@pytest.mark.parametrize("problem", ["missing_csv", "missing_inventory_attestation", "unknown_completeness", "unexpected_audio", "missing_family", "dns", "missing_license", "missing_recording_id", "unsafe_path", "recording_cross_group", "partial_split", "group_cross_split"])
 def test_metadata_and_inventory_errors_fail_closed(corpus, problem):
     raw, out = corpus
-    path = raw / "machine" / "source_index.csv"
+    family = "demand" if problem in {"missing_recording_id", "recording_cross_group", "partial_split", "group_cross_split"} else "machine"
+    path = raw / family / "source_index.csv"
     rows = list(csv.DictReader(path.open()))
     if problem == "missing_csv":
         path.unlink()
@@ -353,6 +514,8 @@ def test_metadata_and_inventory_errors_fail_closed(corpus, problem):
     else:
         if problem == "missing_license":
             rows[0]["license"] = ""
+        elif problem == "missing_recording_id":
+            rows[0]["source_recording_id"] = ""
         elif problem == "unsafe_path":
             rows[0]["path"] = "../escape.wav"
         elif problem == "recording_cross_group":
@@ -412,8 +575,10 @@ def test_cli_success_failure_and_help(corpus):
     help_run = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True)
     assert help_run.returncode == 0
     assert "--reuse" in help_run.stdout
+    assert "train-only" in help_run.stdout
     run = subprocess.run([sys.executable, str(script), "--raw-root", str(raw), "--out", str(out)], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
+    assert "machine=train-only" in run.stdout
     duplicate = subprocess.run([sys.executable, str(script), "--raw-root", str(raw), "--out", str(out)], capture_output=True, text=True)
     assert duplicate.returncode == 1
 

@@ -37,7 +37,8 @@ def prepared(tmp_path):
     families = [name for name in cfg["data"]["source_mix_ratio"] if name != "synthetic"]
     for family_index, family in enumerate(families):
         rows = []
-        for index, split in enumerate(("train", "val", "test")):
+        splits = ("train",) if family == "machine" else ("train", "val", "test")
+        for index, split in enumerate(splits):
             path = raw / f"{family}_{split}.wav"
             time = np.arange(4096) / 8000
             tone = 0.08 * np.sin(2 * np.pi * (300 + 170 * family_index + 20 * index) * time)
@@ -48,16 +49,21 @@ def prepared(tmp_path):
                 "group_id": f"{family}-{split}", "source_family": family, "split": split,
                 "tag": family, "qa_valid": True,
             })
+            if family == "machine":
+                rows[-1].update(group_id="machine:mimii-dg-unresolved", metadata={
+                    "usage_policy": "train_only_auxiliary", "independent_evaluation_allowed": False,
+                })
         manifest_path = manifests / f"{family}.jsonl"
         _write_rows(manifest_path, rows)
         all_rows.extend(rows)
         manifest_hashes[manifest_path.name] = _hash(manifest_path)
-        counts[family] = {split: 1 for split in ("train", "val", "test")}
+        counts[family] = {split: int(split in splits) for split in ("train", "val", "test")}
     _write_rows(manifests / "inventory.jsonl", all_rows)
     (raw / "sources.json").write_text("{}", encoding="utf-8")
     qa = {
         "schema_version": 1, "data_ready": True, "diagnostic_only": True,
         "performance_claim_allowed": False, "raw_root": str(raw), "families": families,
+        "train_only_source_families": ["machine"],
         "manifest_sha256": manifest_hashes, "inventory_sha256": _hash(manifests / "inventory.jsonl"),
         "source_metadata_sha256": {"sources.json": _hash(raw / "sources.json")}, "split_counts": counts,
     }
@@ -111,6 +117,100 @@ def test_strict_family_split_smoke_and_rir_isolation(prepared):
         assert ds.prepared_data_metadata["data_ready"] is True
         assert ds.prepared_data_metadata["performance_claim_allowed"] is False
     assert all(not indices[i] & indices[j] for i in range(3) for j in range(i))
+
+
+@pytest.mark.parametrize("split", ["val", "test"])
+def test_train_only_machine_is_excluded_and_remaining_mix_renormalized(prepared, split):
+    from deep_anc.data.synth_dataset import source_mix_for_split
+
+    original = dict(prepared["data"]["source_mix_ratio"])
+    train = _dataset(prepared)
+    evaluated = _dataset(prepared, split)
+    assert train.mix_ratio == original
+    assert train.prepared_data_metadata == evaluated.prepared_data_metadata
+    assert "machine" in train.pools and "machine" not in evaluated.pools
+    assert "machine" not in evaluated.mix_ratio
+    assert sum(evaluated.mix_ratio.values()) == pytest.approx(1.0)
+    for family, weight in evaluated.mix_ratio.items():
+        assert weight == pytest.approx(original[family] / (1 - original["machine"]))
+    assert prepared["data"]["source_mix_ratio"] == original
+    assert source_mix_for_split(prepared["data"], split) == evaluated.mix_ratio
+
+
+@pytest.mark.parametrize("split", ["val", "test"])
+def test_forced_machine_eval_is_rejected_even_if_pool_cached_or_fallback_available(prepared, split):
+    ds = _dataset(prepared, split)
+    ds._pool_objs["machine"] = object()  # cached pool도 policy를 우회하지 못한다.
+    with pytest.raises(ValueError, match="학습 보조 전용"):
+        ds._pool("machine", np.random.default_rng(2))
+    ds.mix_ratio = {"machine": 1.0}
+    with pytest.raises(ValueError, match="학습 보조 전용"):
+        make_eval_batch(ds, 1)
+
+
+def test_training_dataset_cannot_be_used_as_independent_eval(prepared):
+    with pytest.raises(ValueError, match="val/test dataset"):
+        make_eval_batch(_dataset(prepared), 1)
+
+
+@pytest.mark.parametrize("policy", [None, [], "machine", ["machine", "machine"], ["speech"], [True]])
+def test_prepared_policy_cannot_be_removed_or_reassigned(prepared, policy):
+    prepared["data"]["train_only_source_families"] = policy
+    with pytest.raises(ValueError, match="train_only_source_families"):
+        _dataset(prepared)
+
+
+@pytest.mark.parametrize("policy", [None, [], ["speech"], ["machine", "machine"]])
+def test_qa_train_only_policy_must_match_config(prepared, policy):
+    path = Path(prepared["data"]["noise_manifest_dir"]) / "qa.json"
+    qa = json.loads(path.read_text())
+    qa["train_only_source_families"] = policy
+    path.write_text(json.dumps(qa))
+    with pytest.raises(ValueError, match="train_only_source_families"):
+        _dataset(prepared)
+
+
+@pytest.mark.parametrize("fault", ["val", "test", "group", "role", "evaluation_allowed", "metadata_missing", "empty"])
+def test_machine_manifest_cannot_claim_independent_eval_with_fresh_hashes(prepared, fault):
+    def change(rows):
+        if fault in ("val", "test"):
+            rows[0]["split"] = fault
+        elif fault == "group":
+            rows[0]["group_id"] = "machine:section_00"
+        elif fault == "role":
+            rows[0]["metadata"]["usage_policy"] = "evaluation"
+        elif fault == "evaluation_allowed":
+            rows[0]["metadata"]["independent_evaluation_allowed"] = True
+        elif fault == "metadata_missing":
+            rows[0].pop("metadata")
+        else:
+            rows.clear()
+    _rewrite_manifest(prepared, "machine", change)
+    with pytest.raises(ValueError, match="학습"):
+        _dataset(prepared)
+
+
+def test_train_only_mix_without_evaluation_sources_fails(prepared):
+    prepared["data"]["source_mix_ratio"] = {"machine": 1.0}
+    with pytest.raises(ValueError, match="평가 가능한 source"):
+        _dataset(prepared)
+
+
+def test_split_policy_respects_acoustic_mix_override(prepared):
+    from deep_anc.data.synth_dataset import source_mix_for_split
+
+    prepared["data"]["source_mix_ratio_acoustic"] = {"machine": 0.25, "speech": 0.75}
+    assert source_mix_for_split(prepared["data"], "train") == {"machine": 0.25, "speech": 0.75}
+    assert source_mix_for_split(prepared["data"], "val") == {"speech": 1.0}
+    assert source_mix_for_split(prepared["data"], "test") == {"speech": 1.0}
+
+
+def test_legacy_without_policy_retains_machine_eval_mix(prepared):
+    from deep_anc.data.synth_dataset import source_mix_for_split
+
+    prepared["data"]["require_prepared_data"] = False
+    prepared["data"].pop("train_only_source_families")
+    assert source_mix_for_split(prepared["data"], "test") == prepared["data"]["source_mix_ratio"]
 
 
 @pytest.mark.parametrize("relative", ["qa.json", "speech.jsonl", "inventory.jsonl"])
@@ -435,7 +535,8 @@ def test_eval_uses_same_opt_in_generator_as_training(prepared):
 def test_checker_smoke_is_local_only_and_not_training(prepared):
     namespace = runpy.run_path(str(REPO_ROOT / "scripts/bench/check_acoustic_training_data.py"))
     report = namespace["check_acoustic_training_data"](prepared)
-    assert len(report["smoke"]) == 18 and len(report["synthetic_coverage"]) == 5
+    assert len(report["smoke"]) == 16 and len(report["synthetic_coverage"]) == 5
+    assert [row["split"] for row in report["smoke"] if row["source_family"] == "machine"] == ["train"]
     assert report["drive_inventory_ready"] is None and report["training_launched"] is False
     assert report["performance_claim_allowed"] is False
     assert report["loss_plant_delay_samples"] == 263
@@ -495,6 +596,9 @@ def test_cpu_tiny_fixture_trainer_two_steps_preserves_acoustic_metadata(prepared
     snapshot = saved["cfg"]["data"]["source_metadata"]["prepared_data_snapshot"]
     assert snapshot == prepared["data"]["source_metadata"]["prepared_data_snapshot"]
     assert snapshot["data_ready"] is True
+    assert snapshot["train_only_source_families"] == ["machine"]
+    assert "machine" not in snapshot["effective_source_mix_by_split"]["val"]
+    assert "machine" not in snapshot["effective_source_mix_by_split"]["test"]
     assert saved["cfg"]["trusted_band_hz"] == [150, 600]
     if trainer.writer:
         trainer.writer.close()

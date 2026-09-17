@@ -1,8 +1,16 @@
 # 16. Drive 중심 acoustic 데이터·bootstrap 준비
 
-> 비상업 학업 실험, acoustic REF, ERR 한 점, 저역과 800–1600 Hz 및 음성·음악이 목표다.
+> 2026-09-17: 비상업 학업 실험, acoustic REF, ERR 한 점. 시스템 전체는 저역·고역과 음성·음악 모두가 목표다.
+> Jetson은 1 kHz 이상 고역 보완에 집중한다. 기존 800–1600 Hz 연구 설정은 보존하며 첫 1–1.6 kHz 검증 범위는 미확정이다.
+> **MIMII DG fan은 학습 보조 전용: machine train-only, validation/test 제외가 확정됐다.**
 > 최신 사용자 지시: **PC Docker에 임시 다운로드 → 검증 → Drive 업로드 확인 → 해당 PC 원본 삭제**.
 > 기존 Drive 백업은 보존한다. 코드·검증 기록과 실제 원본 확보·학습·실기 성능은 별개다.
+
+사용자가 보고한 `omap138` DSP FxNLMS의 **10 dB 이상 감쇠 및 1 kHz 이상 취약**은
+대역·소리·조건·동일 덕트/REF/ERR 여부가 아직 확인되지 않은 보고다. Jetson/DSP 출력 합산 여부와
+스피커 수, 첫 고역 범위는 사용자 응답을 기다리며 듀얼 제어기 런타임 배선은 아직 구현하지 않았다.
+기존 Jetson 경로 35.854 ms·기하선행 추정 2.915 ms·S 신뢰대역 150–600 Hz의 제약을
+이 보고나 데이터 정책 변경으로 해소했다고 주장하지 않는다. 자세한 최신 결정은 [HANDOFF](../HANDOFF.md)를 따른다.
 
 ## 1. 완료 범위를 구분하는 기준
 
@@ -102,12 +110,14 @@ RIR은 덕트 기하 시뮬레이션이며 실측 절대 gain/실제 F/장치 �
 | 음악 | [FMA small 및 metadata](https://github.com/mdeff/fma) | artist 단위. metadata CC BY 4.0, 음원은 `track.license`별 조건 |
 | 환경음 | [ESC-50](https://github.com/karolpiczak/ESC-50) 기존 원본/공식 CSV | `src_file` 단위. ESC-50 CC BY-NC 3.0, ESC-10 예외 별도 |
 | 실제 환경 잡음 | [DEMAND 48 kHz](https://zenodo.org/records/1227121), CC BY-SA 3.0 | 동시 녹음 16채널을 같은 recording/group으로 유지 |
-| 기계음 | [MIMII DG fan](https://zenodo.org/records/6529888), CC BY-NC-SA 4.0 | section/기계 개체/원녹음 관계를 검토한 목록 필요 |
+| 기계음 | [MIMII DG fan](https://zenodo.org/records/6529888), CC BY-NC-SA 4.0 | 학습 보조 train-only·val/test 제외. 공식 split/section 메타 보존, 부모 녹음 독립성 미확인 |
 
 비상업 연구 승인은 저작자 표시·개별 라이선스 조건을 생략하는 허가가 아니다.
 기존 DNS 원본의 출처 그룹 매핑을 모르는 상태에서 파일명만으로 새 split을 만들지 않는다.
 새 strict 기본 설정은 DNS를 필수 계열에서 제외하되 기존 DNS/구형 설정은 변경하지 않는다.
 MIMII의 domain/공식 train-test 디렉터리를 우리의 ANC train/val/test로 무조건 복사하지 않는다.
+2026-09-17 승인한 train-only 정책은 **ANC의 사용 역할**이며 공식 출처 메타를 덮어쓰는 지시가 아니다.
+공식 split·domain·section·파일 목록과 원래 라이선스를 보존한다. Drive 원본/보관 정책은 바뀌지 않는다.
 
 PC 임시 다운로드 명령은 아래와 같다. `NEW_STAGING`은 이번 작업의 새 임시 하위 폴더다.
 
@@ -196,10 +206,37 @@ RAW_ROOT/
 
 DEMAND/machine CSV 필수 열은 `path,group_id,official_split,license,source_recording_id`다.
 `path`는 계열 루트 기준 상대 경로, 같은 동시녹음·원녹음은 같은 group이다.
-`official_split`은 검토된 `train/val/test` 또는 공백(그룹 분할 도구에 위임)이다.
+DEMAND의 `official_split`은 검토된 `train/val/test` 또는 공백(그룹 분할 도구에 위임)이다.
+MIMII의 공식 train/test 메타와 ANC train-only 역할은 구분한다. 공식 split을 모두 `train`으로
+고쳐 쓰거나 가상의 val/test·독립 group을 만들지 않는다. 준비 도구는 공식 CSV 행을
+`metadata.official`에 보존하고 출력 manifest의 **ANC split만 train으로 고정**한다.
+machine의 입력 `group_id`는 독립성 근거로 쓰지 않으며 출력은 모두
+`machine:mimii-dg-unresolved`라는 보수적 전체 묶음이다. 이 값은 실제 원녹음 ID가 아니다.
+machine의 `source_recording_id`는 빈값을 허용하고 unknown을 기록한다. 값이 있어도
+declared_unverified로 남기며 원녹음 독립성은 unknown이다. DEMAND의 빈 원녹음 ID는 계속 거부한다.
 메타 JSON은 `source_family`, `expected_inventory_complete:true`, `inventory_origin`,
 `grouping_basis`가 필요하다. 이 true는 staging 작성자의 책임 있는 선언이지 외부 완전성 인증이 아니다.
 실제 archive 목록과 대조하지 않고 자동으로 true를 채우지 않는다.
+machine 메타에는 다음 역할 선언도 필수이며 평가 허용 true는 거부한다.
+
+```json
+{"usage_policy": "train_only_auxiliary", "independent_evaluation_allowed": false}
+```
+
+위 두 필드만으로 완전한 메타 파일이 되는 것은 아니다. 원본 출처·목록·라이선스 선언은 여전히 필요하다.
+strict 설정과 새 QA는 `train_only_source_families: [machine]`을 공유하며 불일치를 거부한다.
+행의 train-only 역할·평가 금지·보수적 그룹과 `train>0, val=test=0`을 검사하고,
+다른 4계열은 기존의 train/val/test 비어 있음·그룹 누수·중복 hash 검사를 유지한다.
+정책 없는 옛 QA를 수작업으로 고쳐 READY로 만들지 말고 검토된 staging에서 새 출력 경로로 다시 준비한다.
+
+학습 source mix는 유지한다(machine 0.10). val/test에는 machine이 들어가지 않으며 남은
+0.90의 상대 비율을 1로 재정규화한다. 평가 풀 접근·강제 machine 선택은 합성 fallback 없이
+오류로 중단한다. QA smoke는 이 설정에서 train 6종, val/test 각 5종으로 총 16개 조합이다.
+이는 합성 fixture로 확인한 코드 계약이며 실제 원본 staging/학습 완료를 의미하지 않는다.
+`evaluate_offline.py`도 실제 test mix의 활성 소스만 평가하며, 소스별 설정의 기본 mix와
+acoustic override를 함께 단일화한다. 보고서/NPZ에 제외 목록·평가 분포·남은 가중치 합과
+소스별 요청/성공/미평가 사유를 기록한다. 전체 점수는 이 분포에서 뽑은 아이템의 NMSE(dB)
+산술평균이며, 소스별 8개 표본 결과를 다시 전체 평균의 분모에 추가하지 않는다.
 
 ```bash
 # RAW_ROOT에는 실제 승인된 staging 경로를 넣는다. 이 CLI는 다운로드하지 않는다.
@@ -282,9 +319,14 @@ JSON/CSV에 남긴다. 집계 중앙값만으로 최악 소스의 실패를 덮�
   실제 attributes CSV 3개와 대조했다. 각각 데이터 1,200행, `file_name,d1p,d1v` 3열이며
   3,600개 파일 목록과 CSV hash는 기존 archive QA inventory와 일치했다. 원 팬 녹음 및
   혼합 배경음의 부모 녹음·시간 구간 ID는 없으므로 section 간 부모 녹음 독립성은 여전히 미확인이다.
-- 현 strict 기본 계약은 5계열 각각 train/val/test 존재를 요구한다. MIMII에 임의 group ID를
-  발급해 READY 검사를 우회하지 않는다. 학습 보조 전용 사용 또는 보류에 대한 사용자 결정은
-  대기 중이며 아직 채택하지 않았다. 출처 그룹·평가 정책 확정 후 실제 음성·음악도 독립 평가한다.
+- **2026-09-17 사용자 결정: MIMII는 machine 학습 보조 전용으로 사용하며 val/test에서 제외한다.**
+  기존의 5계열 각각 train/val/test 필수 계약에 이 명시적 예외를 반영하고, 다른 계열의 독립 평가
+  요구는 유지한다. 공식 split metadata와 미확인 부모 녹음 관계를 보존하며 가짜 group으로 검사를 우회하지 않는다.
+  준비 도구·strict 로더의 코드 계약은 반영했다. 실제 strict staging QA, 음성·음악의 독립 평가와
+  학습 완료는 여전히 별도다. 합성 fixture 통과를 실제 corpus READY로 표시하지 않는다.
+- DSP의 사용자 보고를 동일 조건의 기준선으로 재현할 수 있는지와 출력 합산/스피커 구성을 확인한다.
+  Jetson 고역 전담 목표가 저역을 포함한 시스템 전체 do-no-harm·quiet zone 검증을 대체하지 않는다.
+  첫 1–1.6 kHz 범위와 듀얼 제어기 연결은 사용자 응답 전 확정하거나 런타임에 반영하지 않는다.
 - 학습된 선택기/계수 생성기, 온라인 S/F 식별, F 보상, 오디오 스레드 통합은 후속 구현이다.
 - Jetson 이미지·CUDA/TensorRT·장치/경로/THD·실제 지연·ERR OFF–ON–OFF는 [docs/14](14_pc_jetson_workplan.md)를 따른다.
 

@@ -59,10 +59,41 @@ def _check_hash(path: Path, expected) -> str:
     return actual
 
 
-def _source_mix(data_cfg: dict) -> dict:
+def _train_only_families(data_cfg: dict) -> tuple[str, ...]:
+    values = data_cfg.get("train_only_source_families", [])
+    if (not isinstance(values, list) or any(not isinstance(value, str) for value in values)
+            or len(values) != len(set(values))):
+        raise ValueError("train_only_source_families는 중복 없는 family 문자열 목록이어야 합니다")
+    for value in values:
+        validate_source_family(value)
+        if value == "synthetic":
+            raise ValueError("synthetic은 train_only_source_families로 제한하지 않습니다")
+    # 현재 strict machine 원본은 MIMII다. 설정 누락/해제로 독립 평가에 섞지 않는다.
+    # 구형 non-prepared 경로는 opt-in하지 않으면 기존 동작을 유지한다.
+    if data_cfg.get("require_prepared_data") is True and values != ["machine"]:
+        raise ValueError("prepared train_only_source_families는 ['machine']이어야 합니다")
+    return tuple(values)
+
+
+def source_mix_for_split(data_cfg: dict, split: str = "train") -> dict:
+    """학습 전용 원본은 val/test에서 제외하고 나머지 상대 비율만 보존한다."""
+    if split not in ("train", "val", "test"):
+        raise ValueError("source mix split은 train/val/test여야 합니다")
+    train_only = _train_only_families(data_cfg)
     if data_cfg.get("reference_mode") == "acoustic" and data_cfg.get("source_mix_ratio_acoustic"):
-        return dict(data_cfg["source_mix_ratio_acoustic"])
-    return dict(data_cfg.get("source_mix_ratio", {"synthetic": 1.0}))
+        mix = dict(data_cfg["source_mix_ratio_acoustic"])
+    else:
+        mix = dict(data_cfg.get("source_mix_ratio", {"synthetic": 1.0}))
+    if split == "train" or not train_only:
+        return mix
+    if any(isinstance(value, (bool, str)) or not np.isfinite(value) or value < 0
+           for value in mix.values()):
+        raise ValueError("source mix 비율은 유한한 비음수여야 합니다")
+    allowed = {tag: value for tag, value in mix.items() if tag not in train_only and value > 0}
+    total = sum(allowed.values())
+    if not allowed or not np.isfinite(total) or total <= 0:
+        raise ValueError("학습 보조 전용 원본 제외 후 평가 가능한 source가 없습니다")
+    return {tag: value / total for tag, value in allowed.items()}
 
 
 def validate_prepared_handoff(duct_cfg: dict) -> int:
@@ -83,10 +114,12 @@ def validate_prepared_data(data_cfg: dict) -> tuple[dict, dict[str, np.ndarray]]
 
     if data_cfg.get("reference_mode") != "acoustic" or data_cfg.get("digital_reference_lead_samples") != 0:
         raise ValueError("prepared 데이터는 acoustic reference/lead=0만 지원합니다")
-    mix = _source_mix(data_cfg)
+    mix = source_mix_for_split(data_cfg)
     if (not mix or any(isinstance(v, (bool, str)) or not np.isfinite(v) or v < 0 for v in mix.values())
             or not np.isclose(sum(mix.values()), 1.0, rtol=0, atol=1e-12)):
         raise ValueError("prepared source_mix_ratio는 유한한 비음수이며 합이 1이어야 합니다")
+    train_only = _train_only_families(data_cfg)
+    split_mixes = {split: source_mix_for_split(data_cfg, split) for split in ("train", "val", "test")}
     families = sorted(tag for tag, ratio in mix.items() if tag != "synthetic" and ratio > 0)
     for family in families:
         validate_source_family(family)
@@ -104,6 +137,8 @@ def validate_prepared_data(data_cfg: dict) -> tuple[dict, dict[str, np.ndarray]]
         raise ValueError("로컬 prepared QA data_ready/schema/진단 범위를 확인할 수 없습니다")
     if not set(families).issubset(qa.get("families", [])):
         raise ValueError("prepared QA에 요청한 모든 source family가 필요합니다")
+    if qa.get("train_only_source_families") != list(train_only):
+        raise ValueError("prepared QA train_only_source_families 정책 누락/불일치")
     if not isinstance(qa.get("manifest_sha256"), dict) or not isinstance(qa.get("split_counts"), dict):
         raise ValueError("prepared QA manifest_sha256/split_counts가 필요합니다")
     raw_root = Path(qa["raw_root"])
@@ -134,6 +169,13 @@ def validate_prepared_data(data_cfg: dict) -> tuple[dict, dict[str, np.ndarray]]
                     or row.get("qa_valid") is not True
                     or row.get("split") not in counts[family]):
                 raise ValueError(f"prepared manifest family/group/split/path 메타 오류: {manifest_path}")
+            if family in train_only:
+                role = row.get("metadata")
+                if (row["split"] != "train" or row["group_id"] != "machine:mimii-dg-unresolved"
+                        or not isinstance(role, dict)
+                        or role.get("usage_policy") != "train_only_auxiliary"
+                        or role.get("independent_evaluation_allowed") is not False):
+                    raise ValueError("MIMII 학습 보조 전용: train split/보수적 그룹/평가 제외 metadata가 필요합니다")
             raw_path = Path(row["path"]).resolve()
             if not raw_path.is_relative_to(raw_root):
                 raise ValueError("음원 경로가 staged raw_root 밖입니다")
@@ -149,7 +191,10 @@ def validate_prepared_data(data_cfg: dict) -> tuple[dict, dict[str, np.ndarray]]
                     or abs(row["duration_s"] - info.frames / info.samplerate) > 1 / info.samplerate):
                 raise ValueError(f"prepared 원본 오디오 header 불일치: {raw_path}")
             counts[family][row["split"]] += 1
-        if any(count == 0 for count in counts[family].values()):
+        if family in train_only:
+            if counts[family]["train"] == 0 or counts[family]["val"] or counts[family]["test"]:
+                raise ValueError(f"prepared {family}: 학습 전용 train>0, val=test=0이어야 합니다")
+        elif any(count == 0 for count in counts[family].values()):
             raise ValueError(f"prepared {family}: 비어 있는 train/val/test split")
         if qa.get("split_counts", {}).get(family) != counts[family]:
             raise ValueError(f"prepared QA split_counts 불일치: {family}")
@@ -189,6 +234,7 @@ def validate_prepared_data(data_cfg: dict) -> tuple[dict, dict[str, np.ndarray]]
         "raw_root": str(raw_root), "qa_sha256": qa_hash,
         "inventory_sha256": inventory_hash, "manifest_sha256": hashes,
         "source_metadata_sha256": metadata, "split_counts": counts,
+        "train_only_source_families": list(train_only), "effective_source_mix_by_split": split_mixes,
         "rir_sha256": rir_hash, "rir_path": str(bank_path), "rir_variants": len(variant_hashes),
     }, rirs
 
@@ -220,6 +266,7 @@ class SynthANCDataset(IterableDataset):
         self.require_prepared_data = data_cfg.get("require_prepared_data", False)
         if type(self.require_prepared_data) is not bool:
             raise ValueError("require_prepared_data는 bool이어야 합니다")
+        self.train_only_source_families = _train_only_families(data_cfg)
         self.prepared_data_metadata = None
         if self.require_prepared_data:
             validate_prepared_handoff(duct_cfg)
@@ -280,7 +327,7 @@ class SynthANCDataset(IterableDataset):
         # manifest(data/manifests/<tag>.jsonl)가 없는 태그는 합성원으로 자동 폴백하므로,
         # 데이터셋을 나중에 추가해도 설정 변경 없이 활성화된다 (speech/music 등).
         # acoustic-ref 는 전용 소스 구성을 사용 (주기성↑ + 예측불가 성분 무해화 학습) [로드맵 A2]
-        self.mix_ratio = _source_mix(data_cfg)
+        self.mix_ratio = source_mix_for_split(data_cfg, split)
         manifest_dir = _resolve_path(data_cfg.get("noise_manifest_dir", "data/manifests"))
         self.pools: dict[str, list] = {
             tag: [str(manifest_dir / f"{tag}.jsonl")]
@@ -330,6 +377,8 @@ class SynthANCDataset(IterableDataset):
     # ---------- 내부 ----------
 
     def _pool(self, tag: str, rng: np.random.Generator) -> NoisePool | None:
+        if self.split != "train" and tag in self.train_only_source_families:
+            raise ValueError(f"학습 보조 전용 원본은 평가/합성 대체에 사용할 수 없습니다: {tag}")
         if tag not in self.pools:
             return None
         if tag not in self._pool_objs:
@@ -465,6 +514,8 @@ def make_eval_batch(
     dataset: SynthANCDataset, n_items: int, seed: int = 12345
 ) -> dict[str, torch.Tensor]:
     """고정 시드 검증 배치 — 학습 중 val NMSE 추적용 (매번 동일 데이터)."""
+    if dataset.train_only_source_families and dataset.split not in ("val", "test"):
+        raise ValueError("학습 전용 source 정책의 평가 배치는 val/test dataset이 필요합니다")
     rng = np.random.default_rng(seed)
     synth = dataset.synthetic_generator(seed=seed)
     items = [dataset._make_item(rng, synth) for _ in range(n_items)]

@@ -5,6 +5,9 @@ segment_seconds: 0.5
 reference_mode: acoustic
 digital_reference_lead_samples: 0
 require_prepared_data: true
+# MIMII 원녹음·배경 재사용 독립성 미확인: ANC val/test에서 제외한다.
+# 학습 비율은 아래 그대로, 평가 시 machine을 빼고 남은 비율을 정규화한다.
+train_only_source_families: [machine]
 noise_manifest_dir: data/acoustic/manifests
 rir_bank: data/acoustic/rir_bank/duct_rirs_v1.npz
 
@@ -55,3 +58,5 @@ source_metadata:
   drive_inventory_is_data_ready: false
   raw_download_by_this_config: false
   use_scope: noncommercial_academic_research_subject_to_each_source_license
+  mimii_usage_policy: train_only_auxiliary
+  mimii_independent_evaluation_allowed: false

@@ -8,17 +8,21 @@
 
 import argparse
 import copy
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.config import REPO_ROOT, load_yaml                     # noqa: E402
-from deep_anc.data.synth_dataset import SynthANCDataset, make_eval_batch  # noqa: E402
+from deep_anc.data.synth_dataset import (                            # noqa: E402
+    SynthANCDataset,
+    make_eval_batch,
+    source_mix_for_split,
+)
 from deep_anc.dsp.secondary_path import (                            # noqa: E402
     DifferentiableSecondaryPath,
     load_secondary_path,
@@ -51,6 +55,47 @@ def resolve_checkpoint_config(
         file=sys.stderr,
     )
     return load_yaml(legacy_default)
+
+
+def source_evaluation_policy(data_cfg: dict, active_mix: dict) -> dict:
+    """test 데이터셋의 실제 표집 분포와 제외된 학습 보조 소스를 기록한다."""
+    train_mix = source_mix_for_split(data_cfg, "train")
+    allowed = {tag: float(weight) for tag, weight in active_mix.items() if weight > 0}
+    total = float(sum(allowed.values()))
+    if not allowed or not np.isfinite(total) or total <= 0:
+        raise ValueError("평가에 허용된 source mix가 비어 있거나 유효하지 않습니다")
+    train_only = list(data_cfg.get("train_only_source_families", []))
+    if set(allowed).intersection(train_only):
+        raise ValueError("train-only 소스는 독립 평가에 포함할 수 없습니다")
+    return {
+        "schema_version": 1,
+        "split": "test",
+        "diagnostic_only": True,
+        "performance_claim_allowed": False,
+        "evaluation_domain": "simulated_secondary_path_not_physical_measurement",
+        "configured_training_source_mix": {tag: float(w) for tag, w in train_mix.items()},
+        "excluded_train_only_source_families": train_only,
+        "retained_training_weight_sum": float(sum(train_mix.get(tag, 0) for tag in allowed)),
+        "training_weight_sum": float(sum(train_mix.values())),
+        "effective_evaluation_source_mix": {tag: weight / total for tag, weight in allowed.items()},
+        "overall_aggregation": "arithmetic_mean_of_item_nmse_db_from_effective_evaluation_mix",
+        "per_source_aggregation": "8_items_per_source_separate_from_overall_mean",
+        "per_source_requested": list(allowed),
+        "per_source_evaluated": [],
+        "per_source_skipped": [],
+    }
+
+
+def per_source_config(data_cfg: dict, tag: str, active_mix: dict) -> dict:
+    """허용 소스 하나로 고정한다. acoustic override가 혼합을 되살리면 안 된다."""
+    if (active_mix.get(tag, 0) <= 0
+            or tag in data_cfg.get("train_only_source_families", [])):
+        raise ValueError(f"독립 평가에서 허용하지 않는 소스: {tag}")
+    cfg = copy.deepcopy(data_cfg)
+    cfg["source_mix_ratio"] = {tag: 1.0}
+    if cfg.get("reference_mode", "digital") == "acoustic":
+        cfg["source_mix_ratio_acoustic"] = {tag: 1.0}
+    return cfg
 
 
 def main() -> int:
@@ -107,6 +152,7 @@ def main() -> int:
     ).to(device)
 
     ds = SynthANCDataset(data_cfg, duct_cfg, split="test", seed=999)
+    source_policy = source_evaluation_policy(data_cfg, ds.mix_ratio)
     batch = make_eval_batch(ds, n_items=args.n_items, seed=999)
 
     with torch.no_grad():
@@ -149,28 +195,41 @@ def main() -> int:
 
     # [기능2] 소스 종류별 감쇠 — "모든 소리 제거" 목표의 분리 점수 (소음/음성/음악/기계음…)
     per_source: list[tuple[str, float]] = []
-    for tag in ["synthetic"] + [t for t in data_cfg.get("source_mix_ratio", {}) if t != "synthetic"]:
-        tag_cfg = dict(data_cfg)
-        tag_cfg["source_mix_ratio"] = {tag: 1.0}
+    for tag in source_policy["per_source_requested"]:
+        tag_cfg = per_source_config(data_cfg, tag, ds.mix_ratio)
         try:
             tag_ds = SynthANCDataset(tag_cfg, duct_cfg, split="test", seed=555)
             if tag != "synthetic":
                 pool_paths = tag_ds.pools.get(tag, [])
                 if not pool_paths or not Path(pool_paths[0]).exists():
-                    continue                  # manifest 없음 — 합성 폴백 값은 무의미하므로 제외
+                    raise ValueError("manifest 없음: 합성 폴백은 해당 소스의 평가가 아닙니다")
             tb = make_eval_batch(tag_ds, n_items=8, seed=555)
             with torch.no_grad():
                 ty = model(tb["x"].to(device))
                 te = tb["d"].to(device) + plant(ty.float(), {"jitter": 0})
             td, te_np = tb["d"].squeeze(1).numpy(), te.squeeze(1).cpu().numpy()
             per_source.append((tag, float(np.mean([nmse_db(td[i], te_np[i]) for i in range(td.shape[0])]))))
+            source_policy["per_source_evaluated"].append(tag)
         except Exception as exc:
+            source_policy["per_source_skipped"].append({"source_family": tag, "reason": str(exc)})
             print(f"[skip] 소스별 평가 {tag}: {exc}")
 
     lines = [
         f"# 오프라인 평가 — {Path(args.ckpt).name}",
         "",
+        "- 합성 플랜트 진단이며 실기 감쇠 또는 모든 소스의 독립 일반화 입증이 아닙니다.",
         f"- 테스트 아이템: {len(per_item_fullband)}개 (reference_mode={data_cfg.get('reference_mode')})",
+        "- 독립 평가 제외(train-only): "
+        + (", ".join(source_policy["excluded_train_only_source_families"]) or "없음"),
+        f"- 평가 분포 정규화 분모: 남은 학습 가중치 합 "
+        f"{source_policy['retained_training_weight_sum']:.6g} "
+        f"(전체 학습 가중치 합 {source_policy['training_weight_sum']:.6g}); "
+        "허용 소스만 재정규화한 분포로 표집합니다.",
+        "- 실제 test 표집 분포: " + json.dumps(
+            source_policy["effective_evaluation_source_mix"], ensure_ascii=False, sort_keys=True
+        ),
+        "- 전체 점수는 표집 아이템별 NMSE(dB)의 산술평균입니다. "
+        "소스별 8개 점수는 별도 진단이며 전체 평균의 추가 분모가 아닙니다.",
         f"- Trusted 대역: **{trusted[0]:.0f}–{trusted[1]:.0f} Hz** "
         f"(S(z) {sp.trusted_band_hz()[0]:.0f}–{sp.trusted_band_hz()[1]:.0f} Hz ∩ "
         f"덕트 목표 {duct_cfg['acoustics']['realistic_target_band_hz'][0]:.0f}–"
@@ -204,6 +263,11 @@ def main() -> int:
     ]
     for tag, v in per_source:
         lines.append(f"| {tag} | {v:+.2f} | {-v:+.2f} |")
+    for skipped in source_policy["per_source_skipped"]:
+        lines.append(f"| {skipped['source_family']} | 미평가 | 미평가 |")
+    if source_policy["per_source_skipped"]:
+        lines += ["", "소스별 미평가 사유(성공 또는 0 dB로 집계하지 않음):", ""]
+        lines += [f"- {row['source_family']}: {row['reason']}" for row in source_policy["per_source_skipped"]]
     (out_dir / "metrics.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     np.savez_compressed(
         out_dir / "metrics.npz",
@@ -215,6 +279,7 @@ def main() -> int:
         nmse_heldout_fullband_db=nmse_heldout_fullband,
         per_item_trusted_db=np.asarray(per_item_trusted, dtype=np.float64),
         per_item_fullband_db=np.asarray(per_item_fullband, dtype=np.float64),
+        source_evaluation_policy_json=json.dumps(source_policy, ensure_ascii=False, allow_nan=False),
     )
 
     spectrogram_pair(d_np[0], e_np[0], fs, out_dir / "spec_item0.png", "ANC OFF vs ON (시뮬)")
