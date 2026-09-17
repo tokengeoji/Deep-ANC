@@ -80,7 +80,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = _Parser(description=__doc__)
     parser.add_argument("--raw-npz", required=True, help="calibrate_wideband raw_measurement.npz")
     parser.add_argument("--out", required=True, help="아직 존재하지 않는 진단 디렉터리")
-    parser.add_argument("--band", type=float, nargs=2, default=[800.0, 1600.0])
+    parser.add_argument("--band", type=float, nargs=2, default=[1000.0, 1600.0],
+                        help="진단 대역 Hz (기본 1000 1600; 과거 800 1600은 명시 지정)")
     args = parser.parse_args(argv)
     created = False
     out = None

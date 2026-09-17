@@ -137,7 +137,7 @@ def _ratio_db(numerator: float, denominator: float, floor: float) -> float | Non
 def _frequency_bands(fs: int, secondary: dict) -> list[dict]:
     nyquist = fs / 2
     if nyquist < 1600:
-        raise ValueError("800–1600 Hz 전체 우선대역 진단에는 sample_rate >= 3200이 필요합니다")
+        raise ValueError("1600 Hz 상한까지의 목표/과거대역 진단에는 sample_rate >= 3200이 필요합니다")
     trusted = secondary["consistency_band_hz"]
     quality = secondary["repeat_consistency"]
     validated = trusted is not None and quality is not None and quality >= MIN_PATH_CONSISTENCY
@@ -323,6 +323,9 @@ def analyze_acoustic_session(
                       "on_warmup_samples": warmup, "edge_guard_samples": edge, "secondary_tail_samples": tail,
                       "handoff_added_to_recorded_output": False, "power_floor": floor},
         "method": {"power": "one_sided_parseval_per_fixed_window",
+                   "primary_metric_band": "target_1000_1600",
+                   "guard_metric_bands": ["low_0_1000", "target_800_1000", "full"],
+                   "historical_target_band": "target_800_1600",
                    "frequency_edges": "[low, high); target_*는 Nyquist여도 high 제외, 기존 대역은 Nyquist 포함; low에는 DC 포함",
                    "baseline": "min(mean(pre_OFF_window_power), mean(post_OFF_window_power))",
                    "worst10": "작은 관측 감소량 ceil(N*0.1)개 평균; p10과 별도",

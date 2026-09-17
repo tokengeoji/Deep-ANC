@@ -556,7 +556,10 @@ def _band_powers(values, sample_rate):
     return {"fullband": float(np.mean(values * values)),
             "below_800": float(spectrum[frequencies < 800].sum()),
             "target_800_1600": float(spectrum[(frequencies >= 800) & (frequencies < 1600)].sum()),
-            "above_1600": float(spectrum[frequencies >= 1600].sum())}
+            "above_1600": float(spectrum[frequencies >= 1600].sum()),
+            # 기존 지표를 보존하고 Jetson 우선 고역/그 아래 보조 대역을 분리한다.
+            "target_1000_1600": float(spectrum[(frequencies >= 1000) & (frequencies < 1600)].sum()),
+            "guard_800_1000": float(spectrum[(frequencies >= 800) & (frequencies < 1000)].sum())}
 
 
 def _metric_rows(config, description, disturbance, result, *, failure=None):
@@ -668,7 +671,12 @@ def prepare_and_evaluate(config: BankConfig):
                      "same_candidate": "hold_without_reinstall", "rejected_proposal": "reevaluate_at_next_interval",
                      "fixed_baseline": "first mixed candidate in train order, never score-selected"},
         "metric_definition": {"power_floor": POWER_FLOOR, "power": "rectangular-window FFT/mean-square",
-                              "target_band_hz": [800, 1600], "target_high_endpoint_included": False,
+                              "primary_metric_band": "target_1000_1600",
+                              "target_band_hz": [1000, 1600],
+                              "historical_target_band_hz": [800, 1600],
+                              "guard_band_hz": [800, 1000],
+                              "target_high_endpoint_included": False,
+                              "frequency_edges": "target/guard [low, high); above_1600 includes 1600 and Nyquist",
                               "aggregate_pooling": "steady rows, by scenario/split/variant/band; pools seeds/families/levels/saturation; statistics use available dB only, emergent/failed counted separately"},
         "training": training, "runs": runs, "metrics": rows, "aggregate": _aggregate(rows),
         "warnings": [

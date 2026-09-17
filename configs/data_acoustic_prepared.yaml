@@ -23,7 +23,8 @@ source_mix_ratio:
 
 # 기존 저역 분포와 목표 기본주파수 분포의 혼합. legacy 기본 생성기는 불변이다.
 # 비율 0.5는 검증용 출발점이며 신뢰대역/성공률을 의미하지 않는다.
-synthetic_target_band_hz: [800, 1600]
+# 2026-09-17 Jetson 우선 목표. DSP와의 출력 합산/크로스오버 설정이 아니다.
+synthetic_target_band_hz: [1000, 1600]
 synthetic_target_probability: 0.5
 
 level_dbfs: [-45, -20]
@@ -44,6 +45,7 @@ closed_loop:
   unroll_group_frames: 4
 
 source_metadata:
+  jetson_role: high_band_research_not_deployed_crossover
   preparation_scope: staged_drive_audio_and_synthetic_acoustic_rir
   checkpoint_physics_status: acoustic_rir_training
   primary_path: synthetic_1d_p_ref_and_p_err

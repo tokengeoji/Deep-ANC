@@ -527,7 +527,7 @@ def test_invalid_target_generation_settings_fail(changes):
 def test_eval_uses_same_opt_in_generator_as_training(prepared):
     ds = _dataset(prepared, "val")
     generator = ds.synthetic_generator(12)
-    assert generator.target_band == (800, 1600) and generator.target_probability == 0.5
+    assert generator.target_band == (1000, 1600) and generator.target_probability == 0.5
     batch = make_eval_batch(ds, 2, seed=12)
     assert batch["x"].shape == (2, 2, 2048)
 
@@ -541,7 +541,45 @@ def test_checker_smoke_is_local_only_and_not_training(prepared):
     assert report["performance_claim_allowed"] is False
     assert report["loss_plant_delay_samples"] == 263
     assert report["secondary_consistency_band_hz"] == (150, 600)
+    assert report["target_band_hz"] == [1000, 1600]
+    assert report["target_high_endpoint_included"] is False
+    assert report["historical_target_band_hz"] == [800, 1600]
+    assert all(row["mean_below_target_power_fraction"] >= row["mean_below_800_power_fraction"]
+               for row in report["synthetic_coverage"])
     json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize("frequency,expected", [(800, 0), (900, 0), (1000, 1), (1599, 1), (1600, 0)])
+def test_training_qa_1k_target_edges_are_explicit(frequency, expected):
+    namespace = runpy.run_path(str(REPO_ROOT / "scripts/bench/check_acoustic_training_data.py"))
+    fraction = namespace["_band_fraction"]
+    values = np.sin(2 * np.pi * frequency * np.arange(8000) / 8000)
+    assert fraction(values, 8000, 1000, 1600) == pytest.approx(expected, abs=1e-12)
+
+
+def test_training_qa_explicit_historical_target_is_not_relabelled(prepared):
+    namespace = runpy.run_path(str(REPO_ROOT / "scripts/bench/check_acoustic_training_data.py"))
+    prepared["data"]["synthetic_target_band_hz"] = [800, 1600]
+    report = namespace["check_acoustic_training_data"](prepared)
+    assert report["target_band_hz"] == [800, 1600]
+    assert report["secondary_consistency_band_hz"] == (150, 600)
+    assert report["performance_claim_allowed"] is False
+
+
+def test_prepared_1k_generation_retains_low_band(prepared):
+    generator = _dataset(prepared).synthetic_generator(10)
+    frequencies = np.array([generator._pick_f0() for _ in range(1000)])
+    assert generator.target_band == (1000, 1600)
+    assert np.count_nonzero(frequencies < 800) > 200
+    assert np.count_nonzero((frequencies >= 1000) & (frequencies < 1600)) > 300
+
+
+def test_training_qa_missing_target_cannot_report_default_band(prepared):
+    namespace = runpy.run_path(str(REPO_ROOT / "scripts/bench/check_acoustic_training_data.py"))
+    prepared["data"].pop("synthetic_target_band_hz")
+    prepared["data"]["synthetic_target_probability"] = 0
+    with pytest.raises(ValueError, match="명시적인 synthetic_target_band_hz"):
+        namespace["check_acoustic_training_data"](prepared)
 
 
 def test_checker_rejects_different_valid_snapshots_between_splits(prepared, monkeypatch):

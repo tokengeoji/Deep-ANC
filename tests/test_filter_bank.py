@@ -75,6 +75,17 @@ def test_condition_specific_training_and_source_sha(experiment, config):
     assert not report["physical_claim_allowed"] and not report["performance_claim_allowed"]
     assert not report["split_protocol"]["validation_tuning_used"]
     assert len(report["runs"]) == 2 * 4 * 7 * 4
+    assert len(report["metrics"]) == len(report["runs"]) * 3 * 6
+    assert len(report["aggregate"]) == 2 * 2 * 4 * 6
+    assert {row["band"] for row in report["metrics"]} == {
+        "fullband", "below_800", "target_800_1600", "above_1600",
+        "target_1000_1600", "guard_800_1000",
+    }
+    assert report["metric_definition"]["primary_metric_band"] == "target_1000_1600"
+    assert report["metric_definition"]["target_band_hz"] == [1000, 1600]
+    assert report["metric_definition"]["historical_target_band_hz"] == [800, 1600]
+    assert report["metric_definition"]["guard_band_hz"] == [800, 1000]
+    assert report["metric_definition"]["target_high_endpoint_included"] is False
     assert all(event["observed_until_sample"] <= event["apply_at_sample"]
                for run in report["runs"] for event in run["events"])
     assert all(row["adapted_blocks"] == 0 for row in report["runs"] if row["variant"] == "fixed_fir")
@@ -225,6 +236,68 @@ def test_missing_and_amplified_bands_are_not_removed(experiment):
             assert row["reduction_db"] == 0.0
 
 
+@pytest.mark.parametrize("frequency,expected_band", [
+    (799, "below_800"), (800, "guard_800_1000"), (999, "guard_800_1000"),
+    (1000, "target_1000_1600"), (1599, "target_1000_1600"),
+    (1600, "above_1600"), (1601, "above_1600"),
+])
+def test_fft_bands_use_half_open_target_and_guard(frequency, expected_band):
+    # 정수 Hz와 1초 창으로 bin 누설을 제거한 경계 계약이다. 실기 성능 검사가 아니다.
+    fs = 8000
+    values = np.sin(2 * np.pi * frequency * np.arange(fs) / fs)
+    powers = fb._band_powers(values, fs)
+    assert powers[expected_band] == pytest.approx(0.5, abs=1e-12)
+    for band in ("below_800", "guard_800_1000", "target_1000_1600", "above_1600"):
+        if band != expected_band:
+            assert powers[band] < 1e-20
+    expected_historical = 0.5 if 800 <= frequency < 1600 else 0.0
+    assert powers["target_800_1600"] == pytest.approx(expected_historical, abs=1e-12)
+
+
+@pytest.mark.parametrize("count", [128, 129, 8000, 7999])
+def test_target_subbands_are_additive_and_preserve_fullband_power(count):
+    values = np.random.default_rng(91).normal(size=count)
+    powers = fb._band_powers(values, 8000)
+    assert powers["guard_800_1000"] + powers["target_1000_1600"] == pytest.approx(
+        powers["target_800_1600"], rel=1e-12, abs=1e-14,
+    )
+    assert sum(powers[band] for band in (
+        "below_800", "guard_800_1000", "target_1000_1600", "above_1600",
+    )) == pytest.approx(powers["fullband"], rel=1e-12, abs=1e-14)
+
+
+def test_fft_1600_nyquist_stays_outside_target():
+    # BankConfig의 기존 fs>3200 조건은 유지하되 FFT helper 자체의 Nyquist 경계를 고정한다.
+    powers = fb._band_powers((-1.0) ** np.arange(3200), 3200)
+    assert powers["fullband"] == 1.0
+    assert powers["above_1600"] == pytest.approx(1.0)
+    assert powers["target_800_1600"] < 1e-20
+    assert powers["target_1000_1600"] < 1e-20
+
+
+def test_guard_improvement_does_not_mask_primary_band_amplification(config):
+    # 각 128-sample 평가 창의 FFT bin에 맞춘 서로 독립된 합성 톤이다.
+    time = np.arange(config.eval_blocks * config.hop) / config.sample_rate
+    guard = np.sin(2 * np.pi * 875 * time)
+    target = np.sin(2 * np.pi * 1250 * time)
+    disturbance = 0.1 * (guard + target)
+    error = 0.05 * guard + 0.2 * target
+    rows = fb._metric_rows(
+        config, dict(scenario="causal_toy", split="test", variant="selected_fxnlms"),
+        disturbance, {"error": error, "control": np.zeros_like(error)},
+    )
+    assert len(rows) == 3 * 6
+    for period in ("early", "after_gain_change", "steady"):
+        bands = {row["band"]: row for row in rows if row["period"] == period}
+        assert bands["guard_800_1000"]["reduction_db"] == pytest.approx(20 * np.log10(2))
+        assert bands["target_1000_1600"]["reduction_db"] == pytest.approx(-20 * np.log10(2))
+        assert bands["target_1000_1600"]["amplified"] is True
+        for key in ("baseline_power", "error_power"):
+            assert bands["guard_800_1000"][key] + bands["target_1000_1600"][key] == pytest.approx(
+                bands["target_800_1600"][key], abs=1e-12,
+            )
+
+
 def test_aggregate_distinguishes_failure_silence_emergence_and_finite_amplification(config):
     """정의할 수 없는 dB를 0으로 바꾸지 않고 실패/신규 에너지를 별도 센다."""
     description = dict(scenario="causal_toy", split="test", variant="selected_fxnlms")
@@ -318,9 +391,13 @@ runpy.run_path(script, run_name='__main__')
     assert result.returncode == 0, result.stderr
     report = json.loads((tmp_path / "new" / "report.json").read_text())
     assert len(report["artifacts"]) == 2
+    assert report["metric_definition"]["primary_metric_band"] == "target_1000_1600"
+    assert report["metric_definition"]["historical_target_band_hz"] == [800, 1600]
     with (tmp_path / "new" / "metrics.csv").open(newline="") as handle:
         csv_rows = list(csv.DictReader(handle))
     assert len(csv_rows) == len(report["metrics"])
+    assert len(csv_rows) == len(report["runs"]) * 3 * 6
+    assert {row["band"] for row in csv_rows} >= {"target_1000_1600", "guard_800_1000"}
     for row, original_row in zip(csv_rows, report["metrics"]):
         assert row["reduction_db"] == ("null" if original_row["reduction_db"] is None else str(original_row["reduction_db"]))
     assert "physical_claim_allowed=false" in (tmp_path / "new" / "summary.md").read_text()

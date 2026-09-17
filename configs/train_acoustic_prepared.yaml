@@ -20,7 +20,7 @@ run_until_step: 2
 amp: null
 grad_clip: 5.0
 loss:
-  # 측정 S의 기존 검증 대역을 유지한다. 800–1600 Hz 가중/신뢰 승격을 하지 않는다.
+  # 측정 S의 기존 검증 대역을 유지한다. 새 1000–1600 Hz 목표를 가중/신뢰 승격하지 않는다.
   nmse_objective: trusted_band
   mrstft_ffts: [256, 512, 1024, 2048]
   lambda_mrstft: 1.0

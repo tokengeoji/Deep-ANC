@@ -18,11 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from deep_anc.config import _resolve_path, load_train_config  # noqa: E402
 from deep_anc.data.synth_dataset import SynthANCDataset, validate_prepared_handoff  # noqa: E402
-from deep_anc.data.synthetic_signals import KINDS  # noqa: E402
+from deep_anc.data.synthetic_signals import KINDS, SyntheticNoise  # noqa: E402
 from deep_anc.dsp.secondary_path import load_secondary_path  # noqa: E402
 
 
-def _band_fraction(values: np.ndarray, fs: int, low=800, high=1600) -> float | None:
+def _band_fraction(values: np.ndarray, fs: int, low: float, high: float) -> float | None:
     power = np.abs(np.fft.rfft(values.astype(np.float64))) ** 2
     weights = np.full(power.size, 2.0)
     weights[0] = 1
@@ -38,6 +38,14 @@ def check_acoustic_training_data(cfg: dict) -> dict:
     if cfg["data"].get("require_prepared_data") is not True:
         raise ValueError("이 QA는 require_prepared_data=true 설정만 검사합니다")
     handoff = validate_prepared_handoff(cfg["duct"])
+    # 별도 하드코딩 대역으로 새 생성 설정을 잘못 진단하지 않는다.
+    target = SyntheticNoise(
+        cfg["data"]["sample_rate"], seed=0,
+        target_band_hz=cfg["data"].get("synthetic_target_band_hz"),
+        target_probability=cfg["data"].get("synthetic_target_probability", 0.0),
+    ).target_band
+    if target is None:
+        raise ValueError("이 QA는 명시적인 synthetic_target_band_hz가 필요합니다")
     rows, metadata, synthetic = [], None, []
     for split_index, split in enumerate(("train", "val", "test")):
         dataset = SynthANCDataset(cfg["data"], cfg["duct"], split=split, seed=20260915)
@@ -59,8 +67,8 @@ def check_acoustic_training_data(cfg: dict) -> dict:
             rows.append({
                 "split": split, "source_family": family, "samples": dataset.segment,
                 "rir_indices": dataset.rir_indices.tolist(),
-                "input_ref_target_power_fraction": _band_fraction(x[0], dataset.fs),
-                "disturbance_target_power_fraction": _band_fraction(disturbance[0], dataset.fs),
+                "input_ref_target_power_fraction": _band_fraction(x[0], dataset.fs, *target),
+                "disturbance_target_power_fraction": _band_fraction(disturbance[0], dataset.fs, *target),
                 "finite": True,
             })
         if split == "train":
@@ -70,7 +78,10 @@ def check_acoustic_training_data(cfg: dict) -> dict:
                 synthetic.append({
                     "kind": kind, "examples": len(values),
                     "mean_target_power_fraction": float(np.mean([
-                        _band_fraction(value, dataset.fs) for value in values
+                        _band_fraction(value, dataset.fs, *target) for value in values
+                    ])),
+                    "mean_below_target_power_fraction": float(np.mean([
+                        _band_fraction(value, dataset.fs, 0, target[0]) for value in values
                     ])),
                     "mean_below_800_power_fraction": float(np.mean([
                         _band_fraction(value, dataset.fs, 0, 800) for value in values
@@ -82,6 +93,8 @@ def check_acoustic_training_data(cfg: dict) -> dict:
         "real_time_claim_allowed": False, "training_launched": False,
         "drive_inventory_ready": None, "scope": "explicitly_staged_local_data_only",
         "reference_mode": "acoustic", "digital_reference_lead_samples": 0,
+        "target_band_hz": list(target), "target_high_endpoint_included": False,
+        "historical_target_band_hz": [800, 1600],
         "source_metadata": cfg["data"].get("source_metadata", {}),
         "prepared_data": metadata, "smoke": rows, "synthetic_coverage": synthetic,
         "secondary_delay_samples": secondary.delay_samples, "handoff_extra_samples": handoff,

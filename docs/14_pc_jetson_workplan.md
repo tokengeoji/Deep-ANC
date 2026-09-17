@@ -1,9 +1,15 @@
 # 14. 현재 PC와 Jetson의 작업 분담·현장 실행표
 
-> 기준일: 2026-09-15. 목표는 기존 Jetson AGX Orin·덕트에서 acoustic REF를 사용하여
+> 기준일: 2026-09-17. 목표는 기존 Jetson AGX Orin·덕트에서 acoustic REF를 사용하여
 > ERR 한 점의 저역과 1 kHz 이상 소리, 음성·음악까지 감쇠시키는 것이다.
-> **우선 개선 대역은 800–1600Hz. 현재 마이크·USB DAC를 포함한 하드웨어를 모두 유지한다.**
+> **Jetson 우선 개선 대역은 1000–1600Hz. 시스템 전체의 저역·고역 목표는 유지한다.**
+> Jetson의 현재 마이크·USB DAC 유지 지시는 그대로다. DSP 실험의 마이크 교체 보고를 Jetson 교체 지시로 해석하지 않는다.
 > 모든 코드 작업·분석·Python 실행은 Docker 안에서 한다. 호스트 `.venv`는 사용하지 않는다.
+
+DSP FxNLMS의 10dB 이상 감쇠는 같은 덕트 구조·스피커에 다른 마이크를 사용한 사용자 보고다.
+음원·시험 대역·REF/ERR 역할·제품·측정 조건을 사용자가 모르는 상태이므로 직접 비교 기준선이나
+마이크 교체 효과로 단정하지 않는다. DSP/Jetson 합산 위치·스피커 구성은 미정이며 아래 명령은
+기존 Jetson 단독 준비/진단용이다. 외부 DSP 결합·크로스오버를 자동 설정하지 않는다.
 
 ## 1. 어디에서 무엇을 할 것인가
 
@@ -34,7 +40,7 @@ bash scripts/docker/dev.sh status
 bash scripts/docker/dev.sh exec .venv/bin/python -m pip check
 bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q
 bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --json
-bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --require-band 800 1600 --require-broadband
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_readiness.py --require-band 1000 1600 --require-broadband
 ```
 
 기본 readiness는 보고용이다. exit 0을 준비 완료로 해석하지 않는다.
@@ -229,6 +235,9 @@ S를 다시 적용하지 않는다. REF 변화는 진단값이며 감쇠를 보�
 1600Hz는 target에서 제외한다. 전체 범위를 볼 수 없는 `fs < 3200`은 거부한다.
 fs=3200에서도 target 상한은 제외하지만 기존 full/high 대역의 Nyquist 포함은 유지한다.
 기존 전체 고역 값을 1–1.6kHz 값으로 표기하지 않는다.
+현재 우선 지표는 `target_1000_1600`이다. `low_0_1000`과 `target_800_1000` 및 전체 대역을
+악화 여부 확인용으로 함께 보고, 과거 `target_800_1600` 결과를 새 목표 결과로 고쳐 쓰지 않는다.
+목표 선정만으로 `trusted`가 true가 되지 않는다. 기존 S의 150–600Hz 신뢰 한계는 유지한다.
 
 기본 1초 창, 초기 OFF 1초·ON 워밍업 2초·경계 0.5초 제외를 사용한다.
 각 구간 앞에서는 `max(해당 guard, S.delay + FIR 길이 − 1)`을 제외한다.
@@ -255,7 +264,7 @@ exit 2는 비교 불가·불완전 사이클이며 진단 산출물은 보존한
 # 실제 회수 원자료가 있을 때만. RAW_SESSION을 실제 진단 세션 디렉터리로 바꾼다.
 bash scripts/docker/dev.sh exec .venv/bin/python scripts/eval/analyze_path_bands.py \
   --raw-npz results/acoustic_SESSION_ID/calibration/RAW_SESSION/raw_measurement.npz \
-  --band 800 1600 --out results/acoustic_SESSION_ID/path_band_trial_01
+  --band 1000 1600 --out results/acoustic_SESSION_ID/path_band_trial_01
 
 # 실제 원자료가 없어도 독립 합성 데이터로 실행 가능
 bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/benchmark_prepared_fir.py \

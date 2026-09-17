@@ -71,6 +71,10 @@ def test_half_amplitude_unequal_durations_are_observations_not_physical_pass(tmp
     assert report["performance_claim_allowed"] is False
     assert report["comparison_available"] is True
     assert report["all_cycles_complete"] is True
+    assert report["method"]["primary_metric_band"] == "target_1000_1600"
+    assert report["method"]["guard_metric_bands"] == ["low_0_1000", "target_800_1000", "full"]
+    assert report["method"]["historical_target_band"] == "target_800_1600"
+    assert _row(report, "target_1000_1600")["trusted"] is False
     for band in ("full", "low_0_1000", "high_1000_nyquist", "trusted"):
         row = _row(report, band)
         assert row["observed_err_reduction_db"] == pytest.approx(6.0206, abs=0.03)
@@ -340,7 +344,7 @@ def test_target_excludes_1600_at_nyquist_without_changing_existing_bands(tmp_pat
 @pytest.mark.parametrize("fs", [2400, 3199])
 def test_incomplete_target_frequency_range_is_rejected(tmp_path, session_config, fs):
     _set_session_sample_rate(session_config, fs)
-    with pytest.raises(ValueError, match="800–1600.*sample_rate >= 3200"):
+    with pytest.raises(ValueError, match="1600 Hz.*sample_rate >= 3200"):
         _analyze(tmp_path, session_config, _session(fs=fs, frequency=800))
 
 

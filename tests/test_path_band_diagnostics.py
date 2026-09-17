@@ -228,6 +228,7 @@ def test_cli_writes_three_diagnostic_files_and_refuses_overwrite(raw_fixture, tm
     assert {path.name for path in out.iterdir()} == {"report.json", "metrics.csv", "summary.md"}
     report = json.loads((out / "report.json").read_text())
     assert report["promote_secondary_allowed"] is False
+    assert (_target(report)["low_hz"], _target(report)["high_hz"]) == (1000, 1600)
     assert "coherence_median" in (out / "metrics.csv").read_text()
     assert "S 모델을 승격하지 않는다" in (out / "summary.md").read_text()
     contents = {path.name: path.read_bytes() for path in out.iterdir()}
