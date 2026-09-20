@@ -1,189 +1,104 @@
 # 03. 데이터 파이프라인
 
-## 1. 신호 모델 (Deep ANC 방식)
+최우선 준비 경로는 실제 REF 마이크를 사용하는 **acoustic-ref**다. 저역·고역과 음성·음악을
+함께 평가하며 Jetson의 우선 개선 대역은 1000–1600 Hz다. 데이터 준비·보관 절차는
+[docs/16](16_drive_acoustic_preparation.md), 현재 확보 상태는 [HANDOFF](../HANDOFF.md)를 따른다.
+아래 도구는 모두 Docker 안에서 실행한다.
 
-학습 샘플 하나는 (모델 입력 x, 1차경로 소음 d) 쌍이다. 타깃 상쇄 파형은 없다 —
-손실이 미분가능 2차경로 플랜트로 에러를 직접 계산한다 (docs/04 §5).
-현재 digital Stage-1의 정렬은 다음과 같다.
+## 1. 신호와 지연 계약
 
-```
-x[0] = x_ref   (digital: 연속 source n의 109샘플 선행분, acoustic: P_ref·n)
-x[1] = err_in  (에러 피드백 근사: d 를 512~1024샘플 랜덤 지연 — 캡처+블록 지연 모사)
-playback[t] = n[t]
-x_ref[t]    = n[t+109]
-d           = S_FIR·playback 을 D_noise=1489만큼 지연  # secondary surrogate
-y           = model(x)
-e           = d + S_total·y,  S_total delay=1342+256=1598
-```
+학습 샘플은 입력 `x=(x_ref, err_in)`과 제어 전 ERR 신호 `d`다. 별도의 정답 상쇄 파형 대신
+모델 출력 `y`에 미분 가능한 S 플랜트를 적용하여 **`e = d + S·y`**를 최소화한다.
+극성은 측정 FIR에 포함되므로 추가 반전을 하지 않는다. open-loop의 지연된 `err_in` 근사는
+실제 폐루프 응답과 구분한다.
 
-학습은 source를 `segment+109`샘플 연속으로 뽑으므로 tail zero-padding이나 파일 경계의
-가짜 패턴이 없다. 런타임도 모델 입력에서 미래 샘플을 읽는 대신 실제 noise playback을
-109샘플 FIFO로 늦춰 같은 관계를 만든다. 지연 물리는 docs/01 §3이 단일 근거다.
-
-### digital 1차경로 모드
-
-| `digital_primary_path_mode` | d 생성 | 용도 |
+| 모드 | REF와 d의 구성 | 선행 정보 |
 |---|---|---|
-| `secondary_surrogate` **(현재)** | 측정 S의 compact FIR/gain + `D_noise=1489` | P/S 스케일을 맞춘 표현 사전학습. 물리 성능 주장 금지 |
-| `measured` | `duct.digital_reference.primary_path_npz`의 FIR/gain/delay | 같은 gain·볼륨으로 P/S를 실측한 뒤 실제 파인튜닝 |
-| `rir_surrogate` | 1D `p_err` RIR + 음향 onset을 뺀 추가지연 | 과거 호환·진단 전용. 측정 S와 단위가 달라 본 학습에 사용 금지 |
+| acoustic-ref | 합성에서는 `P_ref·n`과 `P_err·n`, 실측에서는 실제 REF/ERR 채널 | 마이크 기하·실측 경로의 선행 시간; digital lead=0 |
+| digital-ref | 자기생성 소스의 연속 조각을 REF로 공급하고 재생은 FIFO로 지연 | artifact·학습·런타임에서 같은 digital lead 사용 |
 
-`measured` 모드는 NPZ sample rate와 설정 delay가 다르면 즉시 실패한다. compact FIR과
-순수지연은 각각 정확히 한 번만 적용하며, RIR onset과 `D_noise`를 이중 계상하지 않는다.
+현재 `configs/data_sim.yaml`의 digital lead 실행값은 **113**이다. 선택된 측정 NPZ의 S 지연은
+**1465**, P 지연은 **1608** 샘플이며 `configs/duct.yaml`의 handoff는 **256**이다.
+따라서 digital 정렬은 `K=(1465+256)-1608=113`, 총 S 지연은 1721샘플이다.
+이는 설정·저장 자산의 계약이며 현재 장치의 재측정 결과를 뜻하지 않는다.
 
-## 2. 소음원 구성 (`data_sim.yaml source_mix_ratio`)
+과거 surrogate artifact의 **S=1342, D_noise=1489, K=109**는 별도 이력이다. YAML에 남은
+과거 주석보다 실행값과 artifact의 resolved 설정을 확인한다. 기존 checkpoint/ONNX의 메타데이터를
+113으로 고쳐 재사용하지 않는다. digital 학습은 source를 `segment+K`만큼 연속 추출하여
+`x_ref[t]=source[t+K]`를 구성하고, 런타임은 실제 재생을 K샘플 늦춘다.
+acoustic 입력에 이 digital 선행 정보를 공급하지 않는다.
 
-| 소스 | 비율 | 이유 |
+| `digital_primary_path_mode` | d 생성 | 해석 |
 |---|---|---|
-| 합성원 (`synthetic_signals.py`) | 25% | 톤+고조파, AM/FM 기계음, 협대역, 처프, 멀티톤과 덕트 공진 가중 |
-| DNS-Challenge noise_fullband | 30% | 48kHz 네이티브 실환경 소음 대량 확보 |
-| DNS-Challenge clean_fullband speech | 15% | 대화(음성) 제거 목표 |
-| FMA-small music | 10% | 음악 제거 목표 |
-| DEMAND | 8% | 48kHz 지속 환경음 |
-| MIMII fan | 7% | 팬·회전 기계음(16kHz, 저역 전용) |
-| ESC-50 | 5% | 비정상 이벤트음 다양성 — 강건화용 소량 |
+| `secondary_surrogate` | S의 FIR/gain과 설정된 `D_noise` 지연 | 표현 사전학습; 실제 P 응답을 검증한 것이 아님 |
+| `measured` | 설정된 P NPZ의 FIR/gain/delay | 측정 조건·메타데이터가 일치해야 사용 |
+| `rir_surrogate` | `p_err` RIR과 음향 onset을 제외한 추가지연 | 과거 호환·진단 경로 |
 
-acoustic-ref는 예측 가능한 주기성 비중을 높인 전용 비율
-`synthetic/machine/dns_fullband/demand/speech/esc50 = 45/15/20/10/5/5%`를 사용한다.
-전체 공개 데이터 구성은 Elice의 `scripts/elice/bootstrap_all.sh`가 준비한다. manifest가 없는
-태그는 합성원으로 폴백하지만 학습 시작 전 Trainer가 누락 태그와 비율을 경고한다.
+`data_sim.yaml`은 digital/surrogate 기본 설정이고, acoustic 준비 설정은
+`configs/data_acoustic_prepared.yaml`이다. compact FIR·순수지연은 각각 한 번만 적용하며
+RIR의 음향 onset을 추가지연과 중복 계산하지 않는다. 세부 물리는 [docs/01](01_physics_limits.md)을 따른다.
 
-## 3. 덕트 음향 시뮬 (RIR 뱅크)
+## 2. 소스 구성과 acoustic 준비
 
-- `dsp/duct_sim.py` — 1D 영상법, closed(폐단)–open(개방단) 경계. `duct.yaml` 기하 사용.
-  검증: 이론 공진 70/210/350Hz 재현 (tests/test_duct_sim.py).
-- 한계: 평면파 모델 — 컷오프(1633Hz) 이상 고차 모드는 미모델링(저역통과 근사만).
-- **RIR 뱅크**: 반사계수/감쇠/위치 ±1cm/저역통과 컷오프를 바꾼 변형 300개.
-  RIR 변형도 train/val/test로 분리한다.
-- 현재 digital `secondary_surrogate`의 d는 `p_err` RIR을 쓰지 않는다. 이 RIR은
-  acoustic-ref의 `P_ref/P_err`와 legacy `rir_surrogate`에 사용된다. 따라서 Stage-1
-  surrogate 결과를 덕트 RIR 도메인 랜덤화 성능으로 해석하지 않는다.
+음성·음악·환경·기계·합성 신호를 포함하되 혼합 비율은 선택한 설정 파일이 단일 출처다.
+기존 `data_sim.yaml`의 digital/acoustic 혼합과 strict acoustic 준비 설정을 섞어서 해석하지 않는다.
+현재 준비 설정은 음성·음악을 포함하고, 저역 기본 합성과 1000–1600 Hz 목표 합성을 0.5 비율로
+혼합한다. 이 비율은 연구 출발점이며 최적 비율·S 신뢰대역·감쇠 성공률이 아니다.
 
-```bash
-.venv/bin/python scripts/data/build_rir_bank.py --n 300     # duct.yaml 변경 시 재실행 필수
-```
+MIMII DG fan은 **train-only 학습 보조**다. `train_only_source_families: [machine]`와
+소스 metadata의 `usage_policy: train_only_auxiliary`를 보존하고 val/test에서 제외한다.
+평가는 나머지 소스 비율을 재정규화한다. 공식 split/domain/section은 보존하지만 section을
+독립 장치나 원녹음 ID로 취급하지 않는다. 독립성을 모르는 녹음에 가짜 그룹 ID를 만들지 않는다.
 
-## 4. 현재 Stage-1 커리큘럼과 이후 증강
+`require_prepared_data: true` 경로는 필요한 원본·manifest·QA의 결손을 오류로 처리한다.
+기존 범용 로더의 합성 폴백이나 파일 수만 확인한 목록을 실제 corpus 준비 완료로 간주하지 않는다.
+정확한 staging 구조, PCM 전수 검사와 재사용 조건은 [docs/16 §4](16_drive_acoustic_preparation.md)를 따른다.
 
-| 항목 | Stage-1 현재값 | 이유 / 이후 단계 |
-|---|---|---|
-| 레벨 | **−45 ~ −20dBFS** | limiter ±0.2 안에서 먼저 선형 역매핑 확립 |
-| 스피커 비선형 | SEF η=10, drive=1, hardclip=0 | 사실상 선형. THD/IMD와 실측 P/S 확보 뒤 점진적으로 강화 |
-| S 플랜트 섭동 | delay `[0,0]`, gain/tilt 0, all-pass off | 모델이 관측하지 못하는 독립 위상 랜덤화가 gradient를 상쇄하지 않도록 공칭 plant 고정 |
-| 마이크 자기잡음 | SNR 5~30dB | INMP441 잡음 바닥 모사 |
-| DC hum | 20% | 50/60Hz와 2차 고조파 모사 |
-| 채널 dropout | ref 15% / err 15%, 동시 금지 | ref-only / err-only 운용 폴백 학습 |
-| 피드백 지연 | err_in에 512~1024샘플 | open-loop 피드백 근사 및 이후 closed-loop 캡처 지연 |
+음성이나 음악을 acoustic-ref에서 일괄적으로 불가능하다고 분류하지 않는다. 필요한 예측 지평은
+실제 REF 선행 시간과 전체 제어 지연으로 결정된다. 그 지평보다 상관시간이 짧은 예측 불가능한
+성분은 미래 입력 없이 상쇄할 수 없으며, 주기·준정상 성분의 가능성은 따로 평가한다.
+소스 명칭만으로 감쇠 성공을 가정하지 않고 대역·시간 구조·실측 잔차와 증폭 여부를 함께 본다.
 
-과거 실행은 대규모 delay/all-pass와 비선형을 처음부터 매 batch에 독립 적용했다.
-모델에 plant 조건을 주지 않은 상태에서는 상충하는 위상 gradient가 평균되어
-영출력으로 수렴한다. 다중 plant·비선형 증강은 실측 조건 라벨이나 적응층을 마련한 뒤
-Stage-2 커리큘럼으로 한 축씩 켠다.
+## 3. RIR과 증강
 
-## 5. 실측 수집 → 파인튜닝
+`dsp/duct_sim.py`의 1D RIR은 덕트 기하와 반사·감쇠 변형을 사용한다. RIR 변형은 split을
+분리하며, 평면파 모델이 고차 모드나 실제 장치 gain을 보증하지 않는다. acoustic 합성의
+`P_ref/P_err`와 measured S를 함께 썼다는 사실만으로 절대 P/S 단위가 실측 검증된 것도 아니다.
 
-```bash
-# 출력 장치를 열지 않는 선행 게이트. recorded 세션은 ERR+REF 모두 PASS해야 한다.
-.venv/bin/python scripts/bench/check_audio_input.py --require-both
-# 세션 수집 (ANC OFF, ch1 상쇄 스피커 무음 유지)
-.venv/bin/python scripts/data/record_duct.py --program tone --frequency 300 --seconds 60 \
-  --source-family synthetic --group-id tone300_setup_a
-.venv/bin/python scripts/data/record_duct.py --program file --file speech.wav --seconds 120 \
-  --source-family speech --group-id speaker_book_001
-.venv/bin/python scripts/data/record_duct.py --program file --file music.wav --seconds 120 \
-  --source-family music --group-id artist_track_001
-# 같은 화자·곡·원본·환경의 반복 세션은 반드시 같은 group-id를 사용한다.
-# manifest 생성: group 원자성 + source_family 층화 8:1:1
-.venv/bin/python scripts/data/make_recorded_manifest.py
-# 전체 파일/메타/클리핑/무음/분할 누수 QA — PASS 전에는 학습 금지
-.venv/bin/python scripts/data/validate_recorded_sessions.py
-# 파인튜닝 (실측:합성 = 7:3 혼합, digital lead=109 유지)
-.venv/bin/python scripts/train/train.py --config configs/train_finetune.yaml \
-  --set data.digital_primary_path_mode=measured
-# 학습에 쓰지 않은 test split의 독립 반사실 평가
-.venv/bin/python scripts/eval/evaluate_recorded.py \
-  --ckpt runs/finetune_tiny/ckpt/best.pt --split test
-```
+레벨·마이크 잡음·hum·채널 dropout·피드백 지연은 선택한 설정에 따라 적용한다.
+모델이 관측하지 못하는 독립 지연·all-pass·비선형 증강은 손실의 위상 정보를 상쇄할 수 있다.
+물리 조건과 평가 근거 없이 증강 범위를 임의 확대하지 않는다. closed-loop 워밍업은
+플랜트 적용 후 절단하며 plant/loss 계산은 FP32를 유지한다.
 
-2026-08-03 빠져 있던 pin17(REF L/R)을 재연결한 뒤 ERR/REF는 −46dBFS대, clip 0%로
-두 채널 probe를 통과했다. 유효 수집이 가능해졌지만 매 세션 직전 probe를 반복하고,
-사용자 입회·볼륨 최저 조건에서만 `record_duct.py`를 실행한다. sudo/pinmux/I²S/오디오 데몬 등
-Jetson 시스템 설정은 바꾸지 않는다.
+## 4. 실측 녹음과 분할
 
-세션 구조: `data/recorded/<시각_프로그램>/{mics.wav(2ch PCM_32), source.wav, session.json}`.
-ANC OFF 녹음이므로 **에러 마이크 신호가 곧 d(t)** 다. digital-ref 파인튜닝은 같은 세션의
-연속 `source.wav`에서 109샘플 앞선 조각을 x_ref로 쓰고, acoustic-ref는 ref 마이크 채널을
-쓴다 (`recorded_dataset.py`). 실제 수집 전에는 noise→ERR P와 cancel→ERR S를 같은 출력
-gain·볼륨으로 측정하고, checkpoint의 lead=109와 배포 runtime lead=109를 유지한다.
+실제 수집은 [docs/14](14_pc_jetson_workplan.md)의 장치·입력·경로 확인 순서를 따른다.
+스피커 출력은 사용자 입회·볼륨 최소에서만 수행하며 ANC OFF로 시작한다. 기본 Docker에는
+오디오 장치를 노출하지 않는다. 과거 입력 probe 결과를 새 세션의 입력 상태로 재사용하지 않는다.
 
-## 6. manifest 스키마와 분할 규칙
+세션은 `mics.wav`, 필요할 때 `source.wav`, `session.json`으로 구성한다. ANC OFF 녹음의 ERR가
+해당 세션의 d이고, acoustic-ref는 실제 REF 채널을 쓴다. digital-ref는 artifact의 K를 적용한
+연속 source 조각을 사용한다. 화자·곡·원본·환경·기계 조건이 같은 반복 녹음은 같은 그룹에 둔다.
 
-JSONL 한 줄 = 파일/세션 하나:
-
-```json
-{"path":"../recorded/20260803_190000_file","path_base":"manifest","duration_s":120.0,"sample_rate":48000,"channels":2,"tag":"recorded","session_id":"20260803_190000_file","group_id":"speaker_book_001","source_family":"speech","split":"test"}
-```
-
-`path_base: manifest`가 명시된 상대경로만 manifest 파일의 부모 기준으로 해석한다. 따라서
-`data/` 묶음을 Jetson에서 Elice로 그대로 옮겨도 경로를 다시 만들 필요가 없다. marker가 없는
-기존 절대·상대경로는 호환성을 위해 의미를 바꾸지 않는다.
-
-현재 분리 게이트 (tests/test_dataset.py가 검사):
-
-1. 노이즈 풀은 **원본 파일 단위** 90/5/5 분할 (세그먼트 단위 금지)
-2. RIR 뱅크는 **변형 단위** 분할
-3. 실측 데이터는 **group_id 원자 단위 + source_family 층화** 80/10/10 분할
-
-실측 manifest는 같은 `group_id`가 여러 split에 나타나면 쓰기·읽기·QA 단계에서 모두
-fail-fast한다. 각 family에 충분한 그룹이 있으면 양수 비율의 train/val/test에 최소 한 그룹씩
-배치한다. 구형 세션은 디렉터리명을 임시 group으로 추론하고 `metadata_inferred=true`를 남기므로,
-최종 수집에서는 화자/책·곡/원본·환경/기계조건을 직접 지정해야 한다. 공개 노이즈 풀의 기존
-파일 단위 split은 별도 source×band held-out 재평가 전까지 상관 누수 한계가 남는다.
-
-`validate_recorded_sessions.py`는 저장된 파일만 블록 단위로 읽어 2채널/SR/길이/finite/RMS/
-clipping, `session.json`, source 필요 여부, group 누수, family×required-split 커버리지를 검사하고
-`recorded_qa.md`+`recorded_qa.json`을 남긴다. 기본 게이트를 완화하는
-`--allow-incomplete-family-coverage`는 진단용이며 최종 G2 판정에는 쓰지 않는다.
-`evaluate_recorded.py`도 오디오 장치를 열지 않으며 checkpoint의 resolved model/data/duct와
-measured P/S/lead만 사용한다. surrogate는 `--allow-surrogate`를 명시한 진단 외에는 거부한다.
-
-## 7. 데이터셋 적합성 — 학습 × 실시간 추론 정합 분석
-
-배포된 모델이 보는 신호는 "덕트 마이크가 들은 소리"다. 학습 분포가 이것과 정합해야 한다.
-
-### 소스별 적합성 매트릭스
-
-| 소스 | 원 SR | 학습 적합성 | 추론(배포) 정합성 | 비고 |
-|---|---|---|---|---|
-| DNS noise_fullband | **48k 네이티브** | ◎ 실환경 소음 대량 | ◎ 팬/기계/환경 소음 = 덕트 실전 분포 | 주력 |
-| DNS clean_fullband(speech) | **48k 네이티브** | ◎ 대화 제거 목표의 핵심 | ◎ digital-ref 데모(음성 재생→상쇄)와 직결 | ⚠ acoustic-ref 에선 비주기라 불가(물리) |
-| ESC-50 | 44.1k→48k 리샘플 | ○ 다양성 (5%) | △ 비정상 이벤트음 — 강건화용 | 22.05k 이상 무성분(문제 없음 — 나이퀴스트 밖) |
-| 합성원 | 48k 생성 | ◎ 주기성/공진 정조준 | ◎ 덕트 공진(70~629Hz) 가중 생성 | 무한 |
-| FMA-small music | 44.1k→48k 리샘플 | ○ 음악 제거 목표(10%) | ○ digital-ref 데모용 | MP3 8,000개 중 soundfile 디코딩 가능한 파일을 manifest에 포함 |
-| DEMAND | **48k 네이티브** | ○ 지속 환경음(8%) | ◎ 주방·세탁기·사무실·교통 환경 정합 | 6환경×16채널 |
-| MIMII fan | 16k→48k 리샘플 | ○ 회전 기계음(7%) | ◎ 저역 팬/기계 소음 | 8kHz 이상 성분 없음 — 저역 전용 |
-
-### 파이프라인의 정합 장치 (코드 근거)
-
-| 배포 현실 | 학습 쪽 대응 |
+| 데이터 | 분할 단위 |
 |---|---|
-| INMP441 레벨 편차 | 소스 RMS 정규화 후 Stage-1 레벨 −45~−20dBFS (`synth_dataset`) |
-| 마이크 자기잡음 | SNR 5~30dB 가우시안 부가 |
-| DC/저역 험 (런타임은 DCBlocker) | dc_hum 증강 20% + 손실 W(f)<40Hz ×0.1 |
-| 44.1k 소스 | 로더에서 resample_poly 48k (`NoisePool`) |
-| 5초 미만 클립 | 타일링 반복 (`NoisePool.sample_segment`) |
-| 스피커/앰프 비선형 | Stage-1은 사실상 선형, 실측 THD/IMD 뒤 커리큘럼으로 활성화 |
-| 1차/2차경로 | 현재 P=S scale surrogate + 공칭 측정 S; 실제 물리 성능은 measured P/S 파인튜닝 뒤 평가 |
+| 기존 공개 노이즈 풀 | 원본 파일 단위; segment별 분할 금지, 상관 누수는 추가 검토 |
+| RIR bank | 변형 단위 |
+| 실측 녹음 | `group_id` 원자 단위 + `source_family` 층화 |
+| strict acoustic corpus | 소스별 공식 metadata·보수적 그룹과 train-only 정책 |
 
-### 자동 QA 게이트
+실측 manifest의 `path_base: manifest` 상대경로는 manifest 부모 기준이다. 전송 시 디렉터리
+관계를 보존하며, marker가 없는 legacy 경로의 의미를 임의 변경하지 않는다.
+`make_recorded_manifest.py`와 `validate_recorded_sessions.py`로 채널·SR·길이·finite·클립·무음·
+메타데이터·그룹 누수·family별 평가 coverage를 검사한다. 진단용 게이트 완화는 최종 통과가 아니다.
+`evaluate_recorded.py`의 저장 녹음 평가는 소리를 내지 않으며 독립 test와 실제 checkpoint 조건을 사용한다.
 
-다운로드 직후 `.venv/bin/python scripts/data/validate_noise_pool.py` (부트스트랩 [4/6]에 포함)가
-태그별 표본 150개를 실검사한다: 샘플레이트 분포/읽기 실패율/클리핑/무음 비율/
-**덕트 제어대역(<1.6kHz) 에너지 비율**. 결과는 `data/manifests/dataset_qa.md` 리포트로 남고,
-치명(태그 전체 읽기 불가)이면 학습 시작 전에 중단된다.
+## 5. 보관과 이동
 
-## 8. 저장 정책
+**데이터 원본의 최종 보관소는 Google Drive**다. 기존 자료를 우선 재사용하고 공식 checksum과
+라이선스를 보존한다. PC Docker에 임시 다운로드·검증할 수 있으며 **Drive 업로드 파일 ID·크기·
+완전성을 확인한 뒤 해당 PC 원본만 삭제**한다. 실패·미확인 파일은 남기고 정리 receipt를 기록한다.
 
-온더플라이 합성이므로 학습쌍을 디스크에 굳히지 않는다 — 원본 노이즈(30~50GB)만 저장.
-Elice 128GiB 스토리지에 여유 있게 들어가며, 업로드가 필요할 땐
-`.venv/bin/python scripts/data/pack_transfer.py` 로 2GB tar 샤드를 만든다.
+학습 환경으로 이동하는 사본과 최종 원본 보관을 구분한다. manifest·원본 식별 정보·QA를 함께
+전송하고 원본은 Git에 넣지 않는다. 온더플라이 합성은 학습쌍 저장을 줄이지만 archive·해제본·
+변환본이 동시에 필요할 수 있으므로 공간이 충분하다고 가정하지 않는다. 세부 절차는 [docs/16](16_drive_acoustic_preparation.md)에 있다.

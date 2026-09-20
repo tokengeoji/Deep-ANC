@@ -9,20 +9,24 @@
 
 한쪽 대역·한쪽 소스만 좋은 결과는 목표 미달로 판정한다. **2026-09-15 사용자 확정 기준은
 acoustic REF, ERR 한 점, 고역 1 kHz 이상**이다. 고역은 광대역 S(z) 반복 검증이 선행 게이트다.
-후속 확정한 **우선 개선 대역은 800–1600Hz**이며 기존 저역도 함께 평가한다.
+2026-09-17 확정한 **Jetson 우선 개선 대역은 1000–1600Hz**이며 시스템 전체 저역도 함께 평가한다.
+800–1000Hz 경계와 기존 800–1600Hz 연구 지표는 별도로 보존하며 새 우선대역의 결과로 바꿔 부르지 않는다.
 현재 마이크·USB DAC·Jetson·덕트는 모두 유지한다. 하드웨어 교체를 성공의 전제로 삼지 않는다.
 약 1633Hz의 평면파 모드 차단을 ERR 한 점 감쇠의 절대 상한으로 해석하지 않는다(docs/01).
 위 표의 기존 digital 시나리오와 아래 과거 실적은 acoustic 실기 검증을 대신하지 않는다.
 현재 acoustic 녹음의 무출력 분석은 **§8**을 따르며, 외부 소리 세션의 내부 소음은 OFF로 유지한다.
-현 Stage-1의 `secondary_surrogate` 결과는 표현 사전학습 검증일 뿐이다. 실측
+기존 digital Stage-1의 `secondary_surrogate` 결과는 표현 사전학습 검증일 뿐이다. 실측
 `P(z)`/`S(z)`와 독립 recorded test 전에는 어떤 NMSE도 덕트 물리 성능으로
 주장하지 않는다.
+
+아래 Python 명령은 Docker 컨테이너 내부에서 실행한다. 실행 호스트에 맞는 환경 선택은
+[docker/README](../docker/README.md), 최신 완료 상태와 산출물 위치는 [HANDOFF](../HANDOFF.md)를 따른다.
 
 ## 1. 지표
 
 | 지표 | 정의 | 좋은 방향 |
 |---|---|---|
-| trusted-band NMSE(dB) | 150–600Hz에서 10·log₁₀(Σ|E|²/Σ|D|²) | 음수 ↓ |
+| trusted-band NMSE(dB) | 지정한 신뢰대역에서 10·log₁₀(Σ|E|²/Σ|D|²); 기존 측정 S 기준 150–600Hz | 음수 ↓ |
 | fullband NMSE(dB) | 전 주파수에서 10·log₁₀(Σe²/Σd²) | 음수 ↓ |
 | NMSE gap(dB) | trusted − fullband; 대역 집중 이득/대역 밖 행동 차이 | 0과 함께 해석 |
 | 감쇠(attenuation, dB) | −NMSE = 10·log₁₀(P_d/P_e) | 양수 ↑ |
@@ -30,7 +34,7 @@ acoustic REF, ERR 한 점, 고역 1 kHz 이상**이다. 고역은 광대역 S(z)
 | 세그먼트 분포 | 1s 세그먼트 감쇠의 중앙값 / 최악 10% | — |
 | 실시간 건전성 | step P99(ms), deadline miss, xrun | ↓ |
 
-**신뢰 표기**: S(z) 보정 유효대역(현재 150–600Hz) 밖의 밴드 수치는 `trusted=False`(*)로
+**신뢰 표기**: S(z) 보정 유효대역(기존 측정 자산은 150–600Hz) 밖의 밴드 수치는 `trusted=False`(*)로
 표기한다 — 광대역 재보정(docs/02 §4) 후 유효대역을 갱신할 것 (설계 L2).
 
 **이중 판정 규칙**: corrected Trainer는 trusted NMSE와 fullband NMSE를 매 train/val
@@ -69,8 +73,11 @@ control limit 0.10 조건의 역사적 baseline이며 현재 하드웨어에서 
 - Trainer 로그·TensorBoard·checkpoint 선택은 trusted/fullband NMSE를 동시 출력한다.
   단, 현 val은 고정 합성 배치 최대 16개이며 recorded val/test를 소비하지 않는다.
 - `eval.metrics.intersect_frequency_bands`/`band_nmse_db`가 평가 공용 규약이다.
-  trusted 대역은 항상 **S(z) `excitation_band_hz` ∩ duct 목표대역**으로 산출하고,
-  빈 교집·샘플레이트 불일치는 fail-fast한다.
+  기존 offline/session 평가의 trusted 대역은 **S(z) `trusted_band_hz()` ∩ duct 목표대역 ∩ Nyquist**로
+  산출하고, 빈 교집·샘플레이트 불일치는 fail-fast한다. `trusted_band_hz()`는 `consistency_band_hz`를
+  우선하며 이 검증 대역 메타가 없는 legacy 자산에만 `excitation_band_hz`로 폴백한다. 이 호환 동작은 가진대역의
+  반복 검증을 뜻하지 않는다. acoustic readiness와 §8 녹음 진단은 폴백 없이 검증 대역 메타와
+  반복 일관성 기준을 요구한다.
 - `evaluate_offline.py`는 합성 test의 trusted/fullband/gap, 각 아이템 분포,
   held-out 비선형 trusted/fullband를 `metrics.md`+`metrics.npz`에 저장한다.
   기존 소스별 fullband NMSE와 옥타브 감쇠/`trusted` 표식도 유지한다.
@@ -229,7 +236,7 @@ G0의 고정-batch 수치는 의도적 과적합 진단이지 일반화 성능�
 ANC OFF/ON 스펙트로그램, PSD 오버레이(off/FxLMS/DL), 옥타브밴드 막대(신뢰 회색 표기).
 캡스톤 보고서에는 시나리오 표 + 밴드 막대 + 물리 한계 요약(docs/01 §5)을 함께 실을 것.
 
-## 8. Acoustic 런타임 녹음 진단 — 현재 PC, 무출력
+## 8. Acoustic 런타임 녹음 진단 — Docker 오프라인 분석, 무출력
 
 `scripts/eval/analyze_acoustic_session.py`는 장치·신경망을 열지 않고 런타임 NPZ를 분석한다.
 실행 명령, 현장 OFF→ON→OFF 확보와 회수 목록은 [docs/14 §4-E·§5](14_pc_jetson_workplan.md)를 따른다.
@@ -249,6 +256,7 @@ ANC OFF/ON 스펙트로그램, PSD 오버레이(off/FxLMS/DL), 옥타브밴드 �
   고역은 `[1000,Nyquist]`라 1 kHz 성분은 고역에만 속한다. DC는 저역/전체 대역에 포함한다.
   별도로 `target_800_1600=[800,1600)`, `target_800_1000=[800,1000)`,
   `target_1000_1600=[1000,1600)`을 보고한다. 1600Hz는 target에서 항상 제외한다.
+  우선 개선 판정에는 `target_1000_1600`을 사용하되 저역·고역 전체와 나머지 두 지표도 함께 남긴다.
   `fs<3200`은 전체 우선대역 관측 불가로 거부하고, fs=3200의 기존 full/high Nyquist 포함은 유지한다.
   옥타브 경계 `f/√2 ~ f√2`도 FFT bin 적분이며, §1의 기존 Butterworth 4차 출력과 동일 지표가 아니다.
   유한 창의 스펙트럼 누설·주파수 분해능 한계가 있고 실제 마이크 SNR을 측정한 것은 아니다.
@@ -292,4 +300,5 @@ exit 1은 입력·설정·I/O 실패다. exit 0이어도 신뢰대역 미달·�
 저역·우선대역·대역 밖, 초기/조건 변화/후기와 모든 대조군을 보존하되 실측 감쇠·실시간성은 주장하지 않는다.
 S 모델 반복 진단의 `|mean(H)|²/mean(|H|²)`는 기존 전체 IR Pearson 일관성과 다른 값이다.
 그 값이 0.9를 넘더라도 `consistency_band_hz` 승격·클록 안정성·SNR·비선형 모델 검증으로 쓰지 않는다.
-경로 진단 target은 끝점 확인을 위해 [800,1600]을 사용하며, §8 ERR 에너지 분할의 [800,1600)와 구분한다.
+경로 진단 CLI의 기본 target은 끝점을 포함한 [1000,1600]이며, §8 ERR 에너지 분할의
+[1000,1600)와 구분한다. Python API의 호환 기본 [800,1600]과 과거 보고서를 새 대역 결과로 고쳐 쓰지 않는다.

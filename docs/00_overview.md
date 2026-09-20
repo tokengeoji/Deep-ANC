@@ -1,89 +1,73 @@
 # 00. 프로젝트 개요
 
-## 무엇을 만드는가
+## 목표와 현재 방향
 
-덕트(사각 아크릴, 1.2m) 안의 소음을 **딥러닝 모델이 실시간으로 상쇄**하는 시스템.
-소음 스피커(NS)가 좌측 폐단에서 소음을 방사하면, 레퍼런스 신호를 입력받은 모델이
-상쇄 신호 y(n)을 만들어 상쇄 스피커(CS)로 출력하고, 에러 마이크(ERR)가 잔여 소음을 감시한다.
+기존 Jetson AGX Orin·사각 아크릴 덕트·마이크·USB DAC를 사용해
+ERR 마이크 한 점의 소리를 실시간으로 상쇄하는 시스템이다. 성공 조건은
+저역과 고역을 모두 감쇠하고, 소음뿐 아니라 음성·음악까지 다루는 것이다.
+한 점의 감쇠를 덕트 단면 전체의 quiet zone으로 확대해 해석하지 않는다.
 
-```
-            X=0        X=0.1m                X=1.05m   X≈1.1m   X=1.2m
-        ┌────┃──────────┃─────────────────────┃─────────┃─────────┐
-  [NS]──┨    │        [REF]                 [CS]      [ERR]       ┃ → 개방단
-        └────┃──────────┃─────────────────────┃─────────┃─────────┘
-   소음 스피커      레퍼런스 마이크        상쇄 스피커   에러 마이크
+현재 우선순위는 외부 소리를 실제 REF 마이크로 받는 **acoustic-ref**이며,
+Jetson의 우선 개선 대역은 **1000–1600Hz**다. 시스템 전체의 저역 목표도 유지한다.
+자기생성 소음의 원본을 미리 아는 digital-ref는 별도의 비교·학습 경로다.
 
-  Jetson AGX Orin: 마이크 2ch 입력(hw:APE,1) · 스피커 2ch 출력(AB13X USB)
-```
+제어는 FxNLMS 기준선에서 출발해 인과 신경망과의 결합을 검증한다.
+기존 하드웨어를 유지하며, 장치 교체나 시스템 설정 변경을 해결책으로 삼지 않는다.
+외부 DSP와 Jetson의 출력 합산·스피커 공유 방식은 미정이다. 저장소의
+`HybridEngine`은 한 Jetson 안의 DNN+FxNLMS 결합이며 외부 DSP 통합 구현이 아니다.
 
-기존 FxLMS(적응 필터) 시스템과 동일 하드웨어를 쓰되, 시간영역 인과 모델로
-복잡한 소리의 상쇄 파형을 직접 회귀한다. 최종 목표는 ① 저주파와 고주파를 함께
-제거하고 ② 소음뿐 아니라 대화·음악까지 포함한 quiet zone을 만드는 것이다.
+## 하드웨어와 신호 경로
 
-현재 단계는 이 최종 성능을 주장하는 단계가 아니다. noise 출력→ERR 1차경로
-`P(z)`의 실측 파일이 아직 없으므로, Stage-1은 측정 `S(z)`의 FIR/gain을
-`P(z)` 대용으로 재사용하는 **secondary-surrogate 표현 사전학습**이다. 이 선택은
-`P/S` 단위 불일치로 학습이 영출력에 고정되는 것을 막지만, surrogate 체크포인트의
-dB를 실제 덕트 감쇠 성능으로 해석해서는 안 된다.
+덕트는 길이 약 1.2m, 내측 단면 0.105×0.105m다. 좌표와 측정 경로는
+[configs/duct.yaml](../configs/duct.yaml)이 단일 출처이며 ERR 위치 1.100m는 잠정값이다.
 
-## 시스템 전체 그림
+| 요소 | 역할 |
+|---|---|
+| REF 마이크 | 외부 소리를 먼저 관측하는 제어 입력 |
+| 상쇄 스피커 CS | 제어기 출력 `y`를 재생 |
+| ERR 마이크 | 잔류음 `e = d + S·y`를 관측 |
+| 소음 스피커 NS | digital-ref 또는 명시적인 측정에서 내부 소음을 재생 |
+| Jetson | 2채널 입력·출력과 3스레드 제어 런타임 실행 |
 
-```
-[학습 — Elice Cloud 2×A100, 서로 독립된 base/tiny 프로세스]
-  공개 노이즈·음성·음악 + 합성원 → 연속 source n
-                    ├→ ref를 실제 playback보다 109샘플 먼저 공급
-                    └→ P_surrogate=S의 FIR/gain, D_noise=1489 → d
-  HybridANCNet → y → 공칭 선형 S(z), 총지연 1342+256=1598 → e=d+S·y
-                    └→ trusted NMSE(150–600Hz) 최적화 + fullband NMSE 감시
-  결과: physics_status=secondary_surrogate_representation_pretrain 체크포인트
-[배포 — Jetson AGX Orin]
-  실측 파인튜닝을 통과한 best.pt → ONNX(정적 스트리밍 그래프) → [ORT CPU | TensorRT FP16]
-  3-스레드 런타임: 콜백(5.33ms) ↔ 링버퍼 ↔ 추론 스레드, 안전장치 8종
-[검증]
-  P/S 실측 → 덕트 녹음·파인튜닝 → OFF/ON/OFF 평가 → 밴드별 감쇠 리포트
-```
+acoustic 기준선은 내부 소음 OFF, ANC OFF로 시작한다. 소리가 나는 측정과 실행은
+사용자 입회·볼륨 최소 상태에서만 한다.
 
-## 3단계 로드맵 (Stage-1 내부 게이트 분리 — docs/01 참조)
+## 구현과 남은 검증
 
-| 단계 | 모드 | 목표 | 성능 주장 범위 |
-|---|---|---|---|
-| **Stage-1A (현재)** | digital-ref, secondary surrogate | `P/S` 스케일을 맞춘 공칭 선형 플랜트에서 상쇄 역매핑과 학습 건전성 확립 | **표현 사전학습만**. 실제 덕트 감쇠·FxLMS 우위 주장 금지 |
-| **Stage-1B** | digital-ref, measured P/S | noise→ERR `P(z)`와 cancel→ERR `S(z)`를 같은 출력 gain/볼륨으로 실측하고 recorded 데이터로 파인튜닝 | 독립 실측 val/test를 통과한 대역만 주장 |
-| **Stage-2** | digital-ref 강건화 + acoustic-ref | 실측 다중 plant·비선형 커리큘럼, 외부 주기/준정상 소음 상쇄 | THD/IMD 및 다중 조건 실측 게이트 통과 후 주장 |
-| **Stage-3** | acoustic-ref 광대역 | I/O 지연 단축 후 고역 확장 | 지연과 평면파 한계를 실측으로 검증한 범위만 주장 |
+| 경로 | 저장소의 상태와 필요한 증거 |
+|---|---|
+| acoustic FxNLMS | `configs/runtime_acoustic.yaml`. 실측 S를 고정하고 제어 FIR만 적응하는 기준선 |
+| acoustic DNN+FxNLMS | `configs/runtime_acoustic_hybrid.yaml`. 결합 API는 있지만 acoustic 모델 경로는 placeholder |
+| 계수 선택·생성 연구 | 준비 FIR+FxNLMS의 오프라인 API. 학습된 생성기·실시간 배선은 미완성 |
+| acoustic 학습 준비 | `configs/data_acoustic_prepared.yaml`. 실제 원본·manifest·QA가 필요하며 누락 데이터를 합성원으로 대체하지 않음 |
+| digital 비교 | 실측 P/S와 surrogate 모드를 별도로 지원. 기존 digital 모델을 acoustic 모델로 사용하지 않음 |
 
-같은 코드베이스를 사용하지만 단계 전환에는 config 변경만으로 충분하지 않다.
-Stage-1B에는 같은 장치 조건의 `P/S` 실측이, Stage-2 이후에는 비선형·다중 plant 측정과
-독립 검증이 필요하다. 지연 규약은 docs/01, 판정 기준은 docs/07 §0을 따른다.
+현재 채택한 S의 검증 대역은 **150–600Hz**다. 고역 목표를 설정한 것만으로
+1000–1600Hz 경로가 검증되거나 해당 대역의 학습·감쇠가 완료된 것은 아니다.
+측정 S 지연과 핸드오프를 합친 35.854ms는 기하 기반 REF→ERR 선행 2.915ms보다 길다.
+예측 가능한 성분의 성과를 임의의 음성·음악·광대역음 전체로 일반화하지 않는다.
+
+다음 판단은 S/F 경로와 실제 선행 시간 확인, acoustic 기준선의 독립 녹음,
+동일 조건의 하이브리드 비교 순서로 한다. 최신 환경·완료 결과·다음 작업은
+[HANDOFF.md](../HANDOFF.md), 실행 위치별 조건은 [docs/14](14_pc_jetson_workplan.md)에만 유지한다.
+과거 Elice 학습이나 Jetson 벤치마크를 현재 실행 상태로 간주하지 않는다.
 
 ## 저장소 지도
 
-```
-Deep_ANC/
-├─ configs/          # duct(덕트 실측), model, train, runtime, eval — 모든 파라미터의 단일 출처
-├─ src/deep_anc/
-│  ├─ dsp/           # 미분가능 S(z), 덕트 시뮬(영상법), 비선형, 필터
-│  ├─ models/        # HybridANCNet (TCN/GLSTM/MHSA), 스트리밍/Export 래퍼
-│  ├─ losses/        # ANCLoss (NMSE + MR-STFT×W(f))
-│  ├─ data/          # 온더플라이 합성, 노이즈풀, 실측 데이터셋, manifest
-│  ├─ train/         # Trainer(open/closed-loop, DDP), 체크포인트, 재현성
-│  ├─ eval/          # 지표, 플롯, FxLMS 베이스라인
-│  ├─ realtime/      # 3-스레드 런타임, 엔진 4종, 링버퍼, 안전장치
-│  └─ baselines/     # anc_project fxlms_core.py 사본 (출처 명기)
-├─ scripts/          # data / train / eval / elice / jetson / export / bench / demo
-├─ tests/            # 자동 검증 (인과성, 등가성, 물리 재현, 누수, 복구 안전성)
-├─ assets/measured/  # 측정 2차경로 npz (저장소에 포함)
-└─ docs/             # 이 문서들
-```
+| 위치 | 내용 |
+|---|---|
+| `configs/` | 물리·모델·데이터·학습·실행·평가 설정 |
+| `src/deep_anc/dsp/`, `losses/` | 측정 S, 합성 덕트, 비선형과 잔류음 손실 |
+| `src/deep_anc/models/`, `train/` | HybridANCNet, 스트리밍 상태, 학습·체크포인트 |
+| `src/deep_anc/data/`, `eval/` | 원본/manifest 로더, 합성·실측 데이터, 오프라인 진단 |
+| `src/deep_anc/realtime/` | 엔진, SPSC 링버퍼, 녹음과 안전장치 |
+| `assets/measured/` | 채택한 P/S 측정 NPZ |
+| `scripts/`, `tests/` | 준비·측정·학습·분석 도구와 회귀 검사 |
+| `docker/` | Docker 환경과 컨테이너 실행 안내 |
 
-## 검증 상태
+코드 읽기·수정·Python·테스트는 Docker 안에서 한다.
+데이터 원본의 최종 보관소는 Google Drive이며, 임시 다운로드는 업로드 확인 후 정리한다.
+자세한 규칙은 [AGENTS.md](../AGENTS.md), 실행법은 [docker/README.md](../docker/README.md)를 따른다.
 
-- 전체 pytest 통과: 인과성(미래 무의존), 스트리밍=오프라인 등가(실측 ~3e-8, 테스트 허용 1e-5), GLSTM 이중 경로 등가,
-  덕트 시뮬 공진 70/210/350Hz 재현, 데이터 분할 무누수, S(z) torch=scipy 등가
-- 학습 스모크: open/closed-loop 각각 Jetson GPU에서 정상 (bf16 AMP, 손실은 FP32)
-- ONNX export → ORT 등가성 max err 2.4e-8
-- 추론 지연: tiny+ORT CPU P99 **1.50ms** (블록 예산 5.33ms 통과), base+ORT 6.8ms
-- 현재 Stage-1 설정: 공칭 선형 plant, `D_noise=1489`, `S_total=1598`, 실제 playback
-  FIFO lead 109, trusted NMSE 150–600Hz + fullband 모니터
-- 과거 `rir_surrogate` + 미관측 plant 위상 랜덤화 + fullband NMSE로 수행한 0dB 정체
-  체크포인트는 학습 목적이 잘못된 실행으로 판정했다. 새 Stage-1에 resume하지 않는다.
+설계 변경 전에는 [지연 규약](01_physics_limits.md), [모델 계약](04_model_architecture.md),
+[평가 기준](07_evaluation_protocol.md), [acoustic 실행 계획](13_acoustic_hybrid.md)을 확인한다.

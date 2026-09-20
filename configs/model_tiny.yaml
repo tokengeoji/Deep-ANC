@@ -1,5 +1,5 @@
-# HybridANCNet-tiny — 현행 실시간 기본 모델 (≈1.2M params, 0.43 GMAC/s)
-# 실측: ORT CPU P99 1.50ms — TensorRT 없이 실시간 게이트(P99<3ms) 통과.
+# HybridANCNet-tiny — 경량 인과 모델 (≈1.2M params)
+# 실제 배포 적합성·P99는 선택한 artifact와 현재 Jetson 환경에서 다시 검증한다.
 
 name: hybrid_anc_tiny
 hop: 128

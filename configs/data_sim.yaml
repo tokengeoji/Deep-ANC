@@ -5,20 +5,20 @@ segment_seconds: 1.5
 
 # 레퍼런스 모드 [교차검증 C2 — 두 모드의 지연 물리가 다르다]
 #   digital : 소음원을 Jetson이 생성 → 출력버퍼 지연이 소음/상쇄 양경로에 공통 → 광대역 상쇄 가능
-#   acoustic: 외부 소음을 레퍼런스 마이크로 수음 → P≈30ms 예측 필요 → 주기성/협대역 한정
+#   acoustic: 외부 소음을 REF로 수음. 선행 시간과 제어 지연의 차이만큼 예측 필요(docs/01).
 reference_mode: digital
 
 # digital-ref의 noise 출력→error mic 1차경로 P(z) 선택.
-#   secondary_surrogate: 실측 P가 없는 현재 사전학습에서 S(z)의 gain/FIR을 대용해
+#   secondary_surrogate: 표현 사전학습에서 S(z)의 gain/FIR을 P 대신 사용해
 #                        P/S 단위 불일치를 피한다. D_noise 지연은 아래 duct 설정 사용.
 #   measured           : duct.digital_reference.primary_path_npz의 실측 P(z) 사용.
 #   rir_surrogate      : 기존 1D p_err RIR 경로(호환/비교 실험 전용).
 digital_primary_path_mode: secondary_surrogate
 
 # 자기생성 digital-ref를 실제 소음 출력보다 앞서 공급하는 샘플 수.
-# 현재 P/S 지연차: (S 1342 + runtime handoff 256) - D_noise 추정 1489 = 109.
-# 새 surrogate 사전학습은 이 실제 선행 공급을 포함한다. 배포 runtime 값도 반드시
-# 109로 맞춰야 하며, checkpoint/ONNX 메타와 다르면 런타임이 시작 전 거부한다.
+# 현재 측정 경로 정렬: (S 1465 + runtime handoff 256) - D_noise 1608 = 113.
+# 배포 runtime 값은 선택한 checkpoint/ONNX 메타와 일치해야 한다.
+# 과거 lead=109 artifact를 이 설정으로 임의 재해석하지 않는다.
 # acoustic 모드에서는 반드시 0으로 override해야 한다.
 digital_reference_lead_samples: 113
 
@@ -35,14 +35,15 @@ source_mix_ratio:
   esc50: 0.05                   # ESC-50 (비정상 환경음 — 강건화용 소량) [교차검증 L1]
 
 # acoustic-ref 모드 전용 구성 [로드맵 A2] — reference_mode: acoustic 일 때 위 표를 대체.
-# 주기성/공진(P≈30ms 에서 유일하게 예측 가능) 비중을 키우되, 예측 불가 광대역도 명시 포함
+# 과거 acoustic 연구 분포다. 현재 strict 준비 분포는 data_acoustic_prepared.yaml을 따른다.
+# 주기성/공진 비중을 키우되, 예측 불가 광대역도 명시 포함
 # (do-no-harm — "출력 0" 이 최적인 성분을 분포에 넣어야 증폭 안 하는 법을 배운다).
 source_mix_ratio_acoustic:
   synthetic: 0.45               # 공진(210/350/489/629Hz) 가중 생성기 — 주기·협대역 중심
   machine: 0.15                 # 팬/회전기계 (준주기)
   dns_fullband: 0.20            # 예측 불가 광대역 — 무해화(0dB) 학습용
   demand: 0.10
-  speech: 0.05                  # 비주기 — 무해화 학습용
+  speech: 0.05                  # 예측 가능한 성분과 예측 불가 성분을 구분해 평가
   esc50: 0.05
 
 noise_manifest_dir: data/manifests

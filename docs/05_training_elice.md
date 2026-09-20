@@ -1,207 +1,104 @@
-# 05. Elice Cloud 학습 가이드 (2×A100)
+# 05. Elice Cloud 학습 가이드
 
-현재 Elice 작업은 하나의 모델을 2-GPU DDP로 돌리는 방식이 아니다. **GPU0은 base,
-GPU1은 tiny를 각각 독립 프로세스로 동시에 학습**한다. 두 실행은 데이터·optimizer·checkpoint를
-공유하지 않으며, 한 모델의 step 속도를 다른 GPU가 직접 높여주지는 않는다.
+실행 중인 학습·접속 정보·회수 산출물은 [HANDOFF](../HANDOFF.md)에서 확인한다. 이 문서는
+학습 절차와 계약을 설명하며 특정 GPU 수·PID·step·ETA를 현재 상태로 고정하지 않는다.
+모든 코드·Python·테스트는 승인된 **Docker 컨테이너 내부**에서 실행한다.
 
-> **물리 유효성 경계**
->
-> 현재 Stage-1은 실측 P가 없는 상태에서 `P=S`로 장치 스케일을 맞춘
-> `secondary_surrogate` 표현 사전학습이다. 체크포인트의 surrogate val dB를 실제 덕트
-> 감쇠로 보고하지 않는다. 과거 RIR-P/미관측 plant 위상 랜덤화/fullband 목적의 0dB
-> 체크포인트는 목적함수가 잘못된 실행이며 새 학습에 resume하지 않는다.
+## 1. 환경과 데이터 준비
 
-## 1. 인스턴스 구성 (확정)
+Elice 학습 의존성은 `requirements-train.txt`의 torch **2.5.1+cu121**을 기준으로 한다.
+Jetson의 NVIDIA wheel을 학습 환경에 그대로 복사하지 않는다. 기존 학습이 실행 중인지,
+선택한 GPU와 실행 경로에 충돌이 없는지 확인한 뒤 컨테이너의 전용 venv를 준비한다.
 
-| 항목 | 값 |
+아래 명령은 Elice Docker 내부의 저장소 루트에서 실행한다. 이미 검증된 환경에 설치를 반복하지 않는다.
+
+```bash
+bash scripts/elice/setup_env.sh
+.venv/bin/python -m pip check
+.venv/bin/python -c 'import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())'
+```
+
+학습 데이터는 [docs/03](03_data_pipeline.md)과 [docs/16](16_drive_acoustic_preparation.md)의
+Drive 보관·staging·QA 절차를 따른다. 원본을 Git으로 전송하지 않는다. PC의 임시 원본은
+Drive 업로드를 확인한 뒤 정리하며, 실패·미확인 업로드와 기존 불완전 백업은 보존한다.
+원본 확보와 manifest 생성, 실제 PCM 검사, 학습 준비 완료는 각각 별도 상태다.
+
+`bootstrap_all.sh`는 과거 다운로드·환경 준비·학습 시작을 묶은 도구이며 현재 데이터 정책의
+자동 진입점으로 사용하지 않는다. `--no-train`도 다운로드·데이터 변경까지 막는 옵션은 아니다.
+부족한 소스를 합성으로 대체해 실제 corpus 학습으로 보고하지 않는다.
+
+## 2. 학습 목적과 정렬
+
+최우선은 acoustic-ref이며 준비 설정은 `train_acoustic_prepared.yaml`과
+`data_acoustic_prepared.yaml`이다. 현재 이 학습 설정의 `run_until_step: 2`는 준비 확인용
+한도다. 설정 파일의 존재나 2-step 실행을 완전한 corpus 학습·물리 검증으로 보고하지 않는다.
+MIMII DG fan은 train-only이며 평가에서는 제외한다. Jetson 우선 목표 1000–1600 Hz를
+S의 기존 신뢰대역이나 손실 검증 범위가 확대됐다는 뜻으로 해석하지 않는다.
+
+digital 사전학습·파인튜닝 경로는 별도 비교·검증용으로 남아 있다. 현재 실행 설정은
+S 지연 **1465** + handoff **256**, P 지연 **1608**, digital lead **113**이다.
+과거 **1342/1489/109** surrogate artifact는 당시 resolved 설정으로 해석하며 숫자만
+최신값으로 바꾸지 않는다. `secondary_surrogate`는 P의 FIR/gain을 S로 대용하는 표현 학습이고,
+`measured`는 실제 P NPZ와 측정 조건을 요구한다. 파일의 존재와 경로 품질 게이트 통과도 구분한다.
+
+정렬·데이터·물리 조건은 해결된 config와 checkpoint metadata로 대조한다. `e=d+S·y` 극성,
+인과성, FP32 plant/loss, 플랜트 적용 후 워밍업 절단을 유지한다. trusted/fullband 지표를
+함께 기록하고 0 dB 정체·NaN·발산이 보이면 지연·gradient·입력·데이터를 먼저 진단한다.
+
+## 3. 실행과 재개
+
+새 실험은 목적·GPU·설정·출력 경로·데이터 QA를 확정한 뒤 명시적으로 시작한다.
+로그와 checkpoint 디렉터리를 재사용해 기존 결과를 덮어쓰지 않는다.
+
+| 도구 | 동작·사용 조건 |
 |---|---|
-| 인스턴스 | **G-NAHP-160** — 2× A100 80GB PCIe, 32 vCore, 384GiB RAM (₩3,980/시간) |
-| 실행 환경 | **VSCode (CUDA 12.8)** — torch cu121 wheel 과 호환 (드라이버 하위호환) |
-| 스토리지 | **128 GiB** (₩19.2/시간) — 온더플라이 합성 설계라 충분. 업그레이드만 가능하므로 작게 시작 |
+| `scripts/train/train.py` | 선택한 설정의 단일 실행; GPU/출력 경로를 명시적으로 관리 |
+| `scripts/elice/run_parallel_models.sh` | GPU0 base, GPU1 tiny의 독립 실행; 1 GPU에서는 base만 시작 |
+| `scripts/elice/run_pretrain.sh` | 여러 GPU를 감지하면 한 모델의 DDP 실행; 모델별 병렬과 다른 방식 |
+| `scripts/train/run_finetune_pipeline.py` | readiness → 명시된 파인튜닝 → recorded 평가·완료 검사 |
 
-**비용 팁**
-- 스토리지·인스턴스 모두 시간당 과금 — **켜둔 채 방치 금지**.
-- 코드 디버깅/소규모 실험은 **G-NAHPM-10 (MIG 1g-10GB, ₩340/시간)** 으로:
-  `--set batch_size=4` 만 바꾸면 같은 코드가 그대로 돈다.
-- 본 학습은 2×A100에서 base/tiny를 병렬 실행한다. 완료 시간은 로그의 실제 it/s로
-  `남은 step ÷ it/s`를 계산한다. 인스턴스는 SSH 연결 여부와 무관하게 켜진 시간만큼 과금된다.
+병렬 스크립트의 과거 base/tiny 설정을 최신 acoustic 학습 설정으로 간주하지 않는다.
+전체 batch·worker 수·학습 예산은 실제 GPU/CPU와 연구 설계에 맞춰 검토한다.
+GPU 사용량만 보고 정상 학습을 재시작하거나 batch를 임의 변경하지 않는다.
 
-## 2. 초기 셋업 (웹 VS Code 터미널)
+`--resume`은 동일 목적·모델·정렬·데이터 정책의 checkpoint에서 optimizer·scheduler·step·RNG를
+이어서 실행할 때 사용한다. 다른 lead/P mode/물리 상태의 checkpoint를 같은 실행의 재개로 취급하지 않는다.
+사전학습 가중치를 파인튜닝의 초기값으로 쓰는 `init_ckpt`와 완전 재개는 구분한다.
+실측 경로에 맞춘 초기 checkpoint의 제한된 lead 차이는 명시된 readiness 허용 범위에서만 판단한다.
 
-```bash
-# 원샷 (권장): 환경+데이터+QA+테스트+2-GPU 병렬 학습까지 자동
-git clone https://github.com/Roka-jsj/Deep-ANC.git && bash Deep-ANC/scripts/elice/bootstrap_all.sh
-```
+## 4. 실측 파인튜닝 게이트
 
-수동 단계 (부트스트랩 내부 동작과 동일):
-
-```bash
-git clone https://github.com/Roka-jsj/Deep-ANC.git && cd Deep-ANC
-bash scripts/elice/setup_env.sh          # venv + requirements-train.txt + pip -e .
-bash scripts/data/download_noise.sh 2    # DNS 2샤드(각 5.4GB) + ESC-50 — Azure 는 느리면 scripts/elice/pget.py 사용
-.venv/bin/python scripts/data/prepare_noise_pool.py
-.venv/bin/python scripts/data/build_rir_bank.py --n 300
-.venv/bin/python scripts/data/validate_noise_pool.py   # 데이터셋 QA 리포트
-.venv/bin/python -m pytest -q                         # 전체 테스트로 환경 검증
-```
-
-인터넷이 막힌 인스턴스라면: Jetson 에서 `.venv/bin/python scripts/data/pack_transfer.py` 로 만든
-tar 샤드를 VS Code 탐색기로 업로드 → `for f in transfer/*.tar; do tar -xf "$f"; done`.
-
-## 3. 학습 실행
+다음은 **digital measured 파인튜닝** 준비 검사와 실행 예시다. 최신 acoustic 준비 절차와
+혼동하지 않는다. 필요한 실측 자료와 init checkpoint가 준비됐을 때 컨테이너 내부에서 실행한다.
 
 ```bash
-# Stage-1 사전학습: GPU0=base, GPU1=tiny 독립 실행
-# bootstrap_all.sh는 마지막 단계에서 이 스크립트를 자동 호출한다.
-bash scripts/elice/run_parallel_models.sh
-# 모니터링
-tail -f runs/train_base_corrected.log runs/train_tiny_corrected.log
-nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
-.venv/bin/tensorboard --logdir runs --port 6006  # VS Code 포트포워딩
-```
-
-`run_parallel_models.sh`는 기존 산출물이나 실행 중인 `train.py`가 있으면 덮어쓰지 않고
-실패한다. 두 프로세스 중 하나가 시작 직후 실패하면 이번 호출이 시작한 둘을 함께 종료하고
-산출물을 `runs/failed_start_*`에 보존한다. SSH가 끊겨도 `setsid nohup` 프로세스는 계속 돈다.
-
-### 현재 Stage-1 실행값
-
-| 항목 | base / GPU0 | tiny / GPU1 |
-|---|---:|---:|
-| 모델 파라미터 | 5,994,512 | 1,164,809 |
-| batch size | **96** | **128** |
-| total steps | **100,000** | **100,000** |
-| warmup | **1,250 step** | **1,250 step** |
-| DataLoader workers | **14** | **14** |
-| prefetch factor | 4 | 4 |
-| eval 간격 / 조기종료 | 500 / 끔 | 500 / 끔 |
-| checkpoint | `runs/pretrain_base_corrected` | `runs/pretrain_tiny_corrected` |
-
-공통값은 AdamW lr 1e-3, weight decay 1e-4, warmup→cosine, bf16 model forward,
-FP32 plant/loss, grad clip 5.0이다. base는 96×100k=9.6M, tiny는
-128×100k=12.8M sample update를 사용한다. 32 vCore 중 worker 28개를 데이터 생성에 배정해
-GPU 공급 병목을 줄인다. batch를 더 크게 만드는 것은 메모리 활용률은 올릴 수 있어도
-optimizer update 수와 일반화가 바뀌므로 별도 검증 없이 적용하지 않는다.
-
-Tiny 100k 완료 뒤 GPU1의 유휴 시간을 쓰는 구조 탐색 watcher:
-
-```bash
-setsid nohup bash scripts/elice/run_structure_search.sh \
-  > runs/structure_search.log 2>&1 < /dev/null &
-```
-
-watcher는 tiny `last.pt`가 실제 step 100,000인지 확인한 뒤 tiny-long/tiny-attn/
-tiny-long-attn을 순서대로 실행한다. 세 후보 모두 100k cosine 스케줄은 유지하고
-`run_until_step=20000`에서 멈춰 동일 초반 학습곡선을 비교하며, 기존 파일이 하나라도 있으면
-시작하지 않는다. 각 후보 best/last에 독립 합성 평가까지 저장하고 오류 시 다음 후보를 막는다.
-
-### 라이브 스냅샷 (2026-08-03 19:11 KST)
-
-| 실행 | PID | 현재 step / 최신 val | 속도 | 단순 ETA |
-|---|---:|---|---:|---|
-| base / GPU0 | 22554 | 36,600 / step36,500 trusted −17.23dB, full −16.48dB | 1.8–1.84it/s | 8월4일 04:45–05:30 KST |
-| tiny / GPU1 | 21433 | 79,700 / step79,500 trusted −19.48dB, full −18.25dB | 4.0–4.1it/s | 8월3일 20:35–21:00 KST |
-| 구조 watcher | 24271 | tiny 완료 대기 | — | 후보 3종 완료 8월4일 02:30–04:30 KST 예상 |
-
-두 production 로그에서 NaN/OOM/traceback은 없고 step이 계속 증가한다. 일부 FMA 손상 MP3의
-mpg123 decode 경고는 데이터 로더가 다른 항목으로 재시도하는 recoverable 경고다. ETA는
-`남은 step ÷ 최근 it/s`와 eval/checkpoint 여유를 합친 범위이며 인스턴스 상태에 따라 변한다.
-가장 최신 상태는 `HANDOFF.md`의 SSH 명령으로 다시 확인한다. 정상 프로세스를 GPU 메모리
-사용량만 보고 재시작하거나 batch를 올리지 않는다.
-
-### 학습 목적과 정상 판정
-
-- `digital_primary_path_mode=secondary_surrogate`: P에 S의 FIR/gain을 재사용하고
-  `D_noise=1489` 적용
-- `digital_reference_lead_samples=109`: 학습의 연속 source 정렬과 실제 playback FIFO가 동일
-- S 총지연 `1342+256=1598`, delay/gain/tilt jitter 0, all-pass off
-- η=10, drive=1, hardclip off의 공칭 선형 커리큘럼
-- best 기준은 trusted NMSE **150–600Hz**; fullband NMSE도 매 log/eval에 함께 기록
-
-로그는 `nmse_t`(trusted)와 `nmse_f`(fullband)를 분리해 표시한다. corrected Stage-1에서도
-trusted NMSE가 과적합 게이트와 초기 검증 구간 내에서 계속 0dB에 고정되면 정상으로 기다리지
-말고 학습을 중단해 정렬·gradient·데이터를 점검한다. loss≈2/NMSE≈0dB였던 과거 실행은
-이미 무효로 판정했다.
-
-### 재개 규칙
-
-동일한 corrected 설정에서 중단된 `last.pt`만 같은 GPU별 명령으로 재개한다. 과거 invalid
-checkpoint나 lead/P mode가 다른 checkpoint를 재개하지 않는다. 예:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train/train.py \
-  --config configs/train_pretrain.yaml \
-  --resume runs/pretrain_base_corrected/ckpt/last.pt
-
-CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/train/train.py \
-  --config configs/train_pretrain.yaml \
-  --set model_config=configs/model_tiny.yaml \
-  --set batch_size=128 --set ckpt_dir=runs/pretrain_tiny_corrected \
-  --resume runs/pretrain_tiny_corrected/ckpt/last.pt
-```
-
-`scripts/elice/run_pretrain.sh`는 한 모델을 여러 GPU에 DDP로 분산하는 별도 도구다.
-현재 base/tiny 동시 운용의 기본 경로는 `run_parallel_models.sh`다.
-
-### Stage-2 폐루프 파인튜닝 (선택 — 시뮬 피드백 동역학 학습)
-
-```bash
-.venv/bin/python scripts/train/train.py --config configs/train_finetune.yaml \
-    --set data.digital_primary_path_mode=measured \
-    --set stage=closed_loop --set "schedule.total_steps=30000"
-```
-
-프레임 순차 unroll 이라 step 당 수 배 느리다 — 20k~50k step 권장 (설계 H1).
-
-### 실측 파인튜닝 (덕트 녹음 후)
-
-Jetson 에서 수집한 `data/recorded/` + manifest 를 git/zip 으로 올린 뒤:
-
-```bash
-# 준비 상태만 검사(오디오 출력 없음, 미준비 시 nonzero 종료)
 .venv/bin/python scripts/train/check_finetune.py \
-    --config configs/train_finetune.yaml \
-    --set data.digital_primary_path_mode=measured
+  --config configs/train_finetune.yaml \
+  --set data.digital_primary_path_mode=measured
 
-# READY 뒤 원샷 실행: 자동 resume → 학습 → recorded val/test → 완료 검증
+# 위 검사가 READY이고 이 실험의 실행이 정해진 경우에만 시작
 .venv/bin/python scripts/train/run_finetune_pipeline.py \
-    --config configs/train_finetune.yaml \
-    --set data.digital_primary_path_mode=measured
+  --config configs/train_finetune.yaml \
+  --set data.digital_primary_path_mode=measured
 ```
 
-파이프라인과 직접 `train.py` 실행은 모두 GPU 초기화 전에 같은 readiness 게이트를 강제한다.
-`duct.digital_reference.primary_path_npz`가 실제 측정 파일을 가리키는지만 보는 것이 아니라,
-P/S 각각의 official ESS 출력 채널·80–1600Hz·3회 이상·일관성 0.9·xrun 0과 동일
-amplitude/block/latency, P/S 지연에서 계산한 lead까지 검사한다.
-`require_measured_primary_path: true`가 surrogate 파인튜닝을,
-`require_init_checkpoint: true`가 누락된 사전학습 checkpoint를,
-`require_recorded_manifest: true`가 녹음 없이 합성-only로 진행되는 실수를 fail-fast한다.
-manifest는 `path_base: manifest` 상대경로를 사용하므로 `data/` 묶음을 같은 구조로 전송하면
-Jetson 절대경로를 다시 쓰지 않는다. readiness는 `validate_recorded_sessions.py`와 같은 파일·group
-누수·family×split 전수 QA에 더해 최소 80세션/90분과 speech/music/environment/machine을 요구한다.
-완료는 같은 checkpoint/manifest SHA-256으로 생성한 독립 recorded val/test가 G4 trusted/fullband를
-동시에 통과해야만 인정한다. Jetson 입력은 pin17 복구 뒤 두 채널 probe를 통과했지만 아직 official
-P/S와 recorded 세션이 없으므로 현재 검사는 의도대로 FAIL이며, 이 게이트를 우회하지 않는다.
+진입 게이트는 P/S의 출처·출력 채널·반복 품질·일치하는 측정 조건, `S+handoff−P` 정렬,
+완료된 init checkpoint, 실측 manifest와 파일·그룹·소스 coverage QA를 검사한다.
+정확한 요구값은 `configs/train_finetune.yaml`의 `readiness`가 단일 출처다.
+현재 요구 경로 대역 **150–600 Hz** 통과는 1000–1600 Hz나 전체 quiet-zone 목표 통과가 아니다.
+자료 부족이나 조건 불일치를 플래그 완화·메타데이터 수정으로 우회하지 않는다.
 
-## 4. 결과 회수 → Jetson
+학습 내부의 고정 합성 val만으로 파인튜닝 완료를 판정하지 않는다. 같은 checkpoint와 manifest
+식별 정보로 생성한 독립 recorded val/test에서 trusted/fullband·소스별·최악 구간 지표를 확인한다.
+closed-loop 단계는 추가 피드백 동역학 실험이며 데이터나 실기 안정성 검증을 대신하지 않는다.
 
-```bash
-.venv/bin/python scripts/train/export_onnx.py --ckpt runs/pretrain_base_corrected/ckpt/best.pt --out runs/export/model.onnx
-# runs/export/{model.onnx, model.json} + ckpt/best.pt 를 zip 으로 다운로드
-# (수십 MB — VS Code 탐색기 우클릭 Download, 또는 GitHub Release 자산으로 업로드)
-```
+## 5. 회수와 배포
 
-surrogate checkpoint의 ONNX export는 추론 지연·스트리밍 통합 검증용이다. 실제 ANC 성능
-배포 전에는 같은 gain/볼륨에서 noise→ERR P와 cancel→ERR S를 측정하고, measured P 및
-recorded 데이터 파인튜닝과 독립 평가를 통과해야 한다. Jetson 절차는 docs/06 참조.
+회수 묶음에는 checkpoint, 해결된 설정, Git revision, 의존성 목록, 로그·평가 결과,
+데이터·경로 식별 정보와 해시를 포함한다. 원본 데이터의 최종 보관은 Drive를 따른다.
+파일 전송 성공과 독립 평가 통과를 구분하고 공개 저장소에 비밀정보·원본을 넣지 않는다.
 
-## 5. 자주 겪는 문제
-
-| 증상 | 조치 |
-|---|---|
-| CUDA OOM | 해당 모델 batch를 한 단계 낮추고 sample budget/스케줄도 함께 재산정 |
-| DataLoader 병목 (GPU util 낮음) | 두 프로세스 합 worker 수가 32 vCore를 넘지 않는지 확인; 현재 14+14 |
-| corrected val trusted NMSE가 0dB 정체 | 정상으로 간주하지 말고 P mode·lead·경로 지연·gradient부터 점검 |
-| torch 버전 충돌 | requirements-train.txt 는 2.5.1+cu121 고정 — Jetson(2.5.0a0)과 정렬 |
-| SSH 세션 종료 | 학습은 `setsid nohup`으로 유지됨. 재접속 후 PID/step을 먼저 확인 |
-| 한 GPU만 바쁨 | `train_base_corrected.pid`/`train_tiny_corrected.pid`, 각 로그와 `nvidia-smi`를 함께 확인 |
+ONNX export는 실제 사용할 checkpoint를 대상으로 수행하고 동반 JSON의 reference mode·lead·
+상태 규약을 함께 보존한다. surrogate 모델 export는 추론 구현 진단용이며 실제 감쇠를 보증하지 않는다.
+Jetson Docker의 라이브러리 검사, 프로젝트 모델 등가성·지연, 현장 OFF→ON→OFF 평가는
+[docs/06](06_deployment_jetson.md)과 [docs/14](14_pc_jetson_workplan.md) 순서로 검증한다.

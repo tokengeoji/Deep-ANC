@@ -1,239 +1,110 @@
-# 10. 저장소 구조 전체 지도 (Structure Map)
+# 10. 코드·설정 지도
 
-> 근거: 2026-08-03 3종 감사(데이터흐름·문서 사실성·운영/HANDOFF) 통합 + 코드 직접 재검증.
-> 이 문서는 "어떤 설정 키를 어느 코드가 소비하는가"의 단일 참조점이다.
+이 문서는 작업할 코드와 설정을 찾기 위한 지도다. 현재 실행 환경·시험 결과는
+[HANDOFF.md](../HANDOFF.md), 우선 실행 순서는 [docs/14](14_pc_jetson_workplan.md)에 둔다.
+모든 파일 작업과 Python 실행은 Docker 안에서 한다.
 
-## 1. 전체 데이터흐름
+## 1. 현재 진입점
 
-### 1.1 학습 (Elice, open-loop / Stage-1)
-
-```
-configs/train_*.yaml ──load_train_config(config.py:73)──▶ cfg{model,data,duct 병합}
-                                                             │
-소음원 ──────────────────────────────────────────────────────┤
-  SyntheticNoise(synthetic_signals.py, 덕트공진 가중)   25%    │
-  NoisePool(noise_pool.py ← data/manifests/<tag>.jsonl)      │  dns_fullband 30% + speech 15%
-       ├ music(FMA-small) 10% + demand(DEMAND 48k) 8%        │  + machine(MIMII fan 16k) 7%
-       └ esc50 5%; 48kHz 리샘플(resample_poly), RMS=1 정규화 │
-  (acoustic-ref 선택 시 전용 비율: synthetic/machine/dns_fullband/demand/speech/esc50
-   = 45/15/20/10/5/5%; 주기성 비중 상향 + 예측 불가 성분 do-no-harm 학습)
-                                                             ▼
-  SynthANCDataset(data/synth_dataset.py)              n(t) [T=1.5s→71,936샘플(256 배수 내림)]
-  ├ RIR 뱅크: data/rir_bank/duct_rirs_v1.npz (build_rir_bank.py 300변형; 분할 5/5/90% 하드코딩)
-  │   duct.yaml positions_m/reflection/duct.* ──dsp/duct_sim.py 영상법──▶ p_ref / p_err / f_fb
-  ├ digital-ref: x_ref=n[t+K], K=109(현 corrected Stage-1)
-  │   └ d=P(z)*n[t]; primary_path.resolve_digital_primary_path 선택
-  │      ├ secondary_surrogate(현 Stage-1): P FIR/gain=S FIR/gain, 지연 D_noise
-  │      ├ measured(파인튜닝): primary_path_npz FIR+실측 순수지연을 각 1회
-  │      └ rir_surrogate(legacy/비교): p_err RIR + D_noise−t_ac(NS→ERR) [이중계상 방지]
-  │   D_noise = duct.digital_reference.d_noise_delay_samples(null → 기하추정 1489 = 1342−7+154)
-  ├ err_in = delay(d, fb∈[512,1024]) + 마이크잡음(snr_mic_noise_db)
-  │          + 전원 험(dc_hum_prob=0.2; 50/60Hz+2차) + 채널드롭아웃(0.15/0.15 하드코딩)
-  ▼
-x=[B,2,T] ──HybridANCNet(models/hybrid_anc.py: /io_scale(model_*.yaml에 0.02 명시) → enc(win384,hop128)
-            → TCN/GLSTM/(base만 MHSA; tiny 비활성) → dec → ×io_scale
-            → 0.2·tanh 소프트리미터)──▶ y=[B,1,T]
-  ▼
-ANCLoss(losses/anc_loss.py, FP32 강제)
-  y → RandomNonlinear(현 Stage-1: drive=1, SEF η=10, hardclip=0 → 사실상 선형)
-    → DifferentiableSecondaryPath(현 Stage-1: 지연 1342+핸드오프256,
-       jitter/gain/tilt=0, allpass=false → 관측 가능한 공칭 plant 고정)
-  e = d + S(G(y))
-    ├ 최적화/체크포인트: trusted NMSE(S 실측 150–600 ∩ 목표 80–800 = 150–600Hz)
-    ├ 동시 관측: fullband NMSE(do-no-harm)
-    └ + λ·MRSTFT×W(f)[curriculum_a: 80–800Hz ×3, >1633Hz ×0.25]
-       + λ_pow·|y|² + λ_clip·relu(|y|−0.18)²
-  ▼
-Trainer(train/trainer.py): AdamW+cosine, bf16 autocast(손실 FP32), val trusted/fullband 동시 로깅
-  → trusted val로 best.pt 선택; resolved cfg + physics_status + lead + trusted band 저장
-  → 현 Elice 실행은 GPU0=base, GPU1=tiny의 독립 프로세스(가중치 공유/DDP 아님)
-
-[Stage-2 closed-loop] 단일 GPU 전용(DDP 금지). chunk = hop×unroll_group = 512샘플
-  순차 unroll, e 프리픽스를 fb_delay(≥chunk) 지연 후 err 채널로 되먹임.
-  손실 절단(warmup 0.25s)은 플랜트 적용 후(anc_loss.py loss_start_sample).
-```
-
-`secondary_surrogate` Stage-1 checkpoint의 `physics_status`는
-`secondary_surrogate_representation_pretrain`이다. 고정-batch overfit과 학습 안정성은
-검증할 수 있지만 실제 noise→ERR 경로가 아니므로, measured `P(z)`와 독립
-recorded test 전에는 물리 감쇠 주장에 쓰지 않는다.
-
-### 1.2 배포 (Jetson)
-
-```
-best.pt(resolved cfg/physics_status/lead 포함) ──export_onnx.py(블록256, 상태 명시 I/O, ORT 등가 검증)
-        ──▶ model.onnx + model.json(lead 메타; 런타임 mismatch fail-fast, legacy=0)
-        ──scripts/export/build_trt.sh──▶ model_fp16.plan (+메타 json 복사)
-runtime.yaml ──load_runtime_config(config.py:91)──▶ RealtimeANC(realtime/run_realtime.py, 3-스레드)
-  [콜백]  int32 입력 → DCBlocker → in_ring / NoiseProgram(noise.*)
-          생성 신호+소음 게이트 → DigitalReferenceBuffer → 109샘플 늦은 ch0
-          생성 신호는 즉시 ref_digital(`ref[t]=source[t+K]`, K=109 artifact)
-          out_ring.pop_latest → SafetySupervisor.limit(0.2) → FadeGate → ch1(int16)
-  [추론]  ref(digital=소스|mic) + err → engine.step(hop=256, ==block_size 강제) → out_ring
-          (1 hop 핸드오프 = 학습 handoff_extra_samples=256 과 정합 [C1])
-  [엔진]  engines.py: torch(ckpt 내장 cfg 재구성)|ort|trt|fxlms(duct.secondary_path.npz+fxlms.*)
-  [안전]  safety.*: 클립스트릭/발산/데드라인 워치독 → 자동 mute
-```
-
-`configs/runtime.yaml`은 배포 템플릿 호환성을 위해 lead=0이다. 109로 학습한
-artifact를 사용할 때는 런타임도 109로 명시하며, Torch/ORT/TRT 엔진이
-메타 불일치를 오디오 시작 전에 거부한다. 키가 없는 legacy artifact는 0이다.
-
-### 1.3 실측·보정 루프 / 평가
-
-```
-record_duct.py(hardware.yaml) → data/recorded/<세션> → make_recorded_manifest.py
-  → group_id 원자성 + source_family 층화 + manifest-relative path
-  → validate_recorded_sessions.py(채널/SR/길이/finite/RMS/clip/family×split QA)
-  → RecordedANCDataset(d=err mic, x_ref=digital:source.wav / acoustic:ref mic)
-  → MixedIterator(recorded_ratio; 현 Trainer는 recorded train만 소비, val은 합성 최대16개)
-calibrate_wideband.py(ESS) → --output-channel cancel: S(z) 재보정 npz
-                           → --output-channel noise: P(z) FIR+순수지연 npz
-                              → duct.digital_reference.{primary_path_npz,d_noise_delay_samples}
-measure_duct_transfer_map.py(단일 stream/time-division ESS 또는 multitone)
-  → NS→REF/ERR + CS→REF/ERR 반복 IR·magnitude/phase/coherence/group delay
-  → 같은 I2S ERR-REF TDOA / PortAudio ADC-DAC timestamp / 절대지연을 분리 저장
-  → 안정 지연일 때만 acoustic/digital 인과성 예산을 유효화; NPZ+JSON+Markdown(+PNG)
-run_realtime --calibrate: 3-스레드 실효지연 측정 vs (1342+256) 대조
-
-Trainer: trusted/fullband NMSE 동시 집계, trusted로 best 선택
-eval/metrics.py: S(z) excitation∩duct target 교집합 + 공용 band NMSE 규약
-evaluate_offline.py: trusted/fullband/간극을 Markdown+NPZ에 저장; 소스별·옥타브·held-out 유지
-evaluate_recorded.py: resolved measured P/S/lead + 독립 val/test + source family/최악10%/G4
-compare_fxlms.py(동일 S(z)) / evaluate_session.py(실기 OFF→ON→OFF;
-  trusted/fullband/간극 Markdown+세션 NPZ, 옥타브·miss·xrun 유지)
-```
-
-recorded 도구의 group/source 층화·이식 경로·독립 evaluator는 구현됐다. 다만 실제 measured
-P/S와 독립 세션을 수집해 QA/G4를 통과하기 전에는 물리 성능 게이트가 완료된 것이 아니다.
-
-## 2. 설정 소비 지도
-
-범례: ✅=코드 소비, ☠=죽은 키(어떤 코드도 읽지 않음 — grep 재확인 완료), ⚠=주의.
-
-### duct.yaml
-| 키 | 상태 | 소비 지점 |
+| 작업 | 진입점 | 해석 |
 |---|---|---|
-| duct.interior_length_m / cross_section_m / end_correction_factor / speed_of_sound_mps | ✅ | dsp/duct_sim.py, config.duct_distance_samples |
-| duct.shape / wall_thickness_m / total_length_m / boundary, positions_m.opening, acoustics.axial_resonances_hz | ☠ | 문서용(테스트도 하드코딩값 사용) |
-| positions_m.{noise_speaker,reference_mic,cancel_speaker,error_mic} | ✅ | duct_sim.duct_paths, duct_distance_samples, validate_duct |
-| acoustics.plane_wave_cutoff_hz / realistic_target_band_hz | ✅ | Trainer가 trusted 교집합과 ANCLoss 주파수 가중에 주입 |
-| reflection.* | ✅ | duct_sim(단, build_rir_bank 는 자체 랜덤값으로 대체) |
-| secondary_path.npz | ✅ | Trainer, SynthANCDataset, offline/FxLMS 평가, realtime FxLMS 엔진이 공유 |
-| secondary_path.handoff_extra_samples | ✅ | duct.yaml에 256 명시. 키 부재 시도 `DEFAULT_HANDOFF_SAMPLES=256`을 학습·평가·런타임이 공유 |
-| digital_reference.primary_path_npz | ⚠ | `digital_primary_path_mode=measured`에서 primary_path.py가 로드; null이면 measured 모드 fail-fast |
-| digital_reference.d_noise_delay_samples | ⚠ | primary_path.py/synth_dataset.py, compare_fxlms.py, config.validate_duct. null은 기하추정; measured NPZ delay와 다르면 fail-fast |
+| acoustic 준비 진단 | `scripts/bench/check_acoustic_readiness.py` | 설정·S·기하선행을 읽는 무출력 검사. 기본 exit 0은 보고 성공 |
+| acoustic 데이터 QA | `scripts/bench/check_acoustic_training_data.py` | 실제 manifest·RIR·QA와 train-only 정책 검사 |
+| Jetson 설치 진단 | `scripts/bench/check_jetson_stack.py` | CUDA·cuDNN·ORT·TensorRT의 무오디오 검사. ANC 성능 시험 아님 |
+| acoustic FxNLMS 기준선 | `deep_anc.realtime.run_realtime` + `configs/runtime_acoustic.yaml` | 외부 REF, 내부 소음 OFF, ANC OFF 시작 |
+| acoustic 하이브리드 | 같은 런타임 + `configs/runtime_acoustic_hybrid.yaml` | DNN+FxNLMS API. acoustic artifact 경로는 placeholder |
+| 녹음 분석 | `scripts/eval/analyze_acoustic_session.py` | OFF→ON→OFF 관측 감소량·대역·health 분석 |
+| 경로 진단 | `scripts/eval/analyze_path_bands.py` | 저장된 경로 자료의 대역·위상·일관성 분석 |
+| 준비 FIR 연구 | `scripts/bench/prepare_filter_bank.py`, `benchmark_prepared_fir.py` | 오프라인 후보·잔차 적응 비교. live 배선과 별개 |
 
-`secondary_path.delay_jitter_range`와 `calibration.input_ref_rms`는 현재 duct.yaml에 없다.
-지연 지터는 `data_sim.plant_perturbation.delay_jitter_range`, 입출력 스케일은
-`model_*.yaml io_scale`이 각각 단일 출처다.
+출력이 가능한 측정·런타임은 사용자 입회·볼륨 최소 조건에서만 실행한다.
+Docker 기본 컨테이너는 오디오 장치를 노출하지 않는다.
 
-### data_sim.yaml
-| 키 | 상태 | 소비 지점 |
+## 2. 설정에서 실행까지
+
+`src/deep_anc/config.py`가 YAML과 CLI override를 읽고 참조 설정을 병합한다.
+학습은 `model_config/data_config/duct_config`, 런타임은
+`hardware_config/duct_config`를 병합한다. 참조 파일을 읽은 뒤 하위 override도 적용한다.
+상대 경로는 현재 작업 디렉터리의 실제 경로를 먼저 확인하고 저장소 루트로 대체하므로,
+재현할 때는 저장소 루트에서 실행하고 resolved 설정을 기록한다.
+
+| 설정·키 | 주요 소비 코드 | 유지할 계약 |
 |---|---|---|
-| sample_rate / segment_seconds / reference_mode | ✅ | synth·recorded_dataset, trainer.fs (세그먼트는 256 배수 내림) |
-| digital_primary_path_mode | ⚠ | primary_path.py→synth_dataset.py. 현 YAML은 `secondary_surrogate`; `measured`는 primary NPZ 필수, `rir_surrogate`는 legacy/비교 전용 |
-| digital_reference_lead_samples | ⚠ | synth·recorded_dataset에서 x_ref=n[t+K], run_realtime에서 생성 신호/실재생 FIFO 정렬. 현 학습 YAML은 109, runtime 템플릿은 0; artifact 메타와 런타임 값은 동일해야 하며 acoustic 모드는 K>0 거부 |
-| source_mix_ratio.* / source_mix_ratio_acoustic.* | ⚠ | SynthANCDataset이 reference_mode에 따라 비율표 선택, 키=manifest 태그. manifest 부재는 Trainer 배너와 dataset 메시지 후 synthetic 폴백 |
-| noise_manifest_dir / rir_bank | ⚠ | SynthANCDataset이 `_resolve_path`로 해석(CWD에 실제 경로가 있으면 우선, 없으면 REPO_ROOT 폴백). RIR 부재 시 경고 후 32개 즉석 생성 |
-| level_dbfs / snr_mic_noise_db | ✅ | synth_dataset. 현 Stage-1 레벨값은 −45∼−20dBFS |
-| dc_hum_prob | ✅ | SynthANCDataset이 확률 0.2로 x_ref/err_in에 50/60Hz + 2차 고조파 험 추가 |
-| nonlinear.* / plant_perturbation.* | ⚠ | trainer→RandomNonlinear/DifferentiableSecondaryPath. 현 Stage-1은 η=10·drive=1·hardclip=0, jitter/gain/tilt=0·allpass=false; 미관측 랜덤 plant를 공칭학습에 임의 투입하지 않음 |
-| closed_loop.{feedback_delay_samples,warmup_seconds,unroll_group_frames} | ✅ | Trainer closed-loop와 synth/recorded dataset |
+| `duct.yaml: secondary_path.npz` | `dsp/secondary_path.py`, Trainer, 평가, 런타임 엔진 | S 파일을 학습·평가·실행에서 공유 |
+| `secondary_path.handoff_extra_samples` | 미분가능 S, FxNLMS, readiness·평가 | NPZ 순수지연에 실제 핸드오프를 한 번만 추가 |
+| `digital_reference.primary_path_npz/d_noise_delay_samples` | `data/primary_path.py` | measured P 지연과 설정이 일치해야 함 |
+| `positions_m`, 덕트 기하 | `dsp/duct_sim.py`, readiness | 기하 추정을 실측 선행 시간으로 취급하지 않음 |
+| `acoustics.realistic_target_band_hz` | Trainer와 손실·평가 | 기존 학습 가중 대역이며 프로젝트 전체 성공 대역과 구분 |
+| `data_*.yaml: reference_mode/digital_reference_lead_samples` | 합성·실측 dataset, Trainer | acoustic은 lead=0. digital 메타와 런타임 정렬 일치 |
+| `require_prepared_data/train_only_source_families` | `data/synth_dataset.py`, 준비 QA | strict 데이터 누락 거부, machine은 ANC train-only |
+| `source_mix_ratio*`, `synthetic_target_band_hz` | 소스 선택·합성 생성기 | 데이터 분포와 S 검증 대역을 구분 |
+| `model_*.yaml` | `models/hybrid_anc.py` | hop·상태 shape·io_scale·리미터는 artifact 계약 |
+| `train_*.yaml` | `train/trainer.py` | 손실 FP32, resolved 설정·물리 상태·lead 보존 |
+| `runtime_*.yaml` | `realtime/run_realtime.py`, `engines.py` | reference/controller/artifact 선택, ANC OFF 시작 |
+| `hardware_jetson.yaml: audio.*` | `audio_io.py`, 런타임·측정 도구 | 장치별 소비 키를 코드에서 확인하고 S 측정 조건과 대조 |
 
-`closed_loop.chunk_seconds`와 `split.*`은 현재 data_sim.yaml에 없다. chunk는
-hop×unroll_group=512샘플, 분할은 RIR 90/5/5,
-소음 manifest 90/5/5, 실측 manifest 80/10/10으로
-코드에 고정되어 있다.
+acoustic 준비의 현재 데이터 설정은 `configs/data_acoustic_prepared.yaml`이다.
+범용 `data_sim.yaml`의 합성 fallback 동작을 strict 준비 경로에 적용하지 않는다.
+측정 지연·legacy digital 정렬은 [docs/01](01_physics_limits.md)에 정리되어 있다.
 
-### model_base/tiny.yaml
-hop/win/in_channels/**io_scale**/encoder/tcn/glstm/attention/limiter.limit → HybridANCNet ✅.
-`io_scale: 0.02`는 base/tiny 두 YAML에 명시되며 코드에는 키 부재 호환용
-기본값 0.02가 있다. name → ONNX 메타. (`sample_rate`는 현재 model YAML에 없음.)
+## 3. 학습·데이터 경로
 
-### train_pretrain/finetune.yaml
-model/data/duct_config → config.load_train_config ✅. batch_size/num_workers/prefetch → Trainer ✅.
-optimizer.{name,lr,weight_decay,betas} → Trainer ✅
-(`name`은 adamw만 허용하고 다른 값은 예외 처리).
-schedule/amp/grad_clip/loss.*/eval_every/early_stop/ckpt_dir/resume/seed ✅.
-init_ckpt/recorded_manifest/recorded_ratio/freeze_encoder(파인튜닝) → Trainer ✅.
-`require_measured_primary_path: true`는 digital 파인튜닝에서 surrogate P(z)를 시작 전에 거부한다.
-`require_init_checkpoint: true`는 초기 checkpoint 누락을 거부하고, Trainer는 저장 lead와
-파인튜닝 lead가 다르면 가중치를 적용한 직후 즉시 실패한다.
-`loss.nmse_objective=trusted_band`는 S 실측 대역∩덕트 목표대역(현 150–600Hz)을
-최적화하고 fullband NMSE를 동시 로깅한다. `best.pt`는 trusted val 기준이다.
-체크포인트 스냅샷에는 `physics_status`와 lead/trusted band alias가 남는다.
+| 모듈 | 역할 |
+|---|---|
+| `data/public_corpus.py` 등 준비 모듈 | 공개 음원 index·metadata·manifest·QA |
+| `data/archive_*.py`, `drive_*.py` | 원본 확보·무결성·Drive 전송 기록 |
+| `data/synth_dataset.py` | REF/d 합성, strict 준비 검사, split별 소스 정책 |
+| `data/primary_path.py` | digital measured/secondary_surrogate/rir_surrogate 선택 |
+| `data/recorded_dataset.py`, `recorded_qa.py` | 녹음 입력과 독립 분할·세션 QA |
+| `dsp/duct_sim.py` | 합성 P_ref/P_err/F 경로. 실제 경로 측정을 대체하지 않음 |
+| `models/hybrid_anc.py`, `models/streaming.py` | 파형 모델·상태·정적 export 래퍼 |
+| `losses/anc_loss.py` | `e=d+S·G(y)`, trusted/fullband 손실·과출력 벌점 |
+| `train/trainer.py` | open/closed-loop 학습, 검증·체크포인트 |
 
-### runtime.yaml
-hop(==block_size 강제), reference, digital_reference_lead_samples, controller,
-engine.{type,ckpt,onnx,plan,cpu_affinity},
-fxlms.*, safety.*, noise.*, record/run_seconds ✅. `start_on`은 false만 허용하며 true는
-RealtimeANC 생성 즉시 안전 오류로 거부된다(항상 ANC OFF 시작).
-TorchEngine은 ckpt 내장 `state["cfg"]["model"]`을 사용하며,
-체크포인트 lead를 읽는다. ORT/TRT는 ONNX/plan 옆 JSON의 lead를 읽고,
-세 엔진 모두 런타임 lead 불일치를 fail-fast한다. 메타 키가 없는 legacy
-artifact는 0으로만 해석한다.
-과거의 `engine.model_config`는 현재 YAML에 없다. 최상위 `secondary_path`도 없으며,
-FxLMS 엔진과 `--calibrate`는 runtime 병합 결과의 `duct.secondary_path.npz`를
-`secondary_path_npz()`로 공유한다.
+공개 원본의 최종 보관소는 Google Drive다. 준비·무결성·업로드 확인·임시 원본 정리 규약은
+[docs/16](16_drive_acoustic_preparation.md)를 따른다. Drive 목록만으로
+로컬 strict 학습 준비 완료를 선언하지 않는다.
 
-### hardware_jetson.yaml
-sample_rate/block_size, input/output.card+pcm, channels.*, dc_blocker_r ✅.
-**audio.latency, input/output.{channels,dtype} ☠** — 런타임·record_duct 등이
-("int32","int16"), (2,2), ("low","low") 하드코딩.
+acoustic 학습 설정 `train_acoustic_prepared.yaml`은 최대 2 step의 준비 확인용이다.
+Elice 관련 스크립트의 존재는 현재 원격 학습이 실행 중이라는 뜻이 아니다.
+학습 플랜트·상태·손실의 상세 계약은 [docs/04](04_model_architecture.md)를 따른다.
 
-### eval.yaml
-octave_bands_hz/scenarios/protocol/heldout_sef_eta ✅.
-`trusted_band_hz` ☠ — trusted aggregate와 옥타브 신뢰 표식은 모두
-S(z) `excitation_band_hz`∩duct `realistic_target_band_hz`로 계산한다.
-`report_dir` → evaluate_session.py ✅: REPO_ROOT 기준 세션 NPZ 디렉토리와
-`--out` 미지정 시 기본 Markdown 리포트 경로에 쓴다.
-`evaluate_offline.py`와 `evaluate_session.py`는 공용 `eval.metrics`로 trusted/fullband/간극을
-계산해 Markdown+NPZ에 저장한다. 오프라인의 소스별·옥타브·held-out 지표와 실기의
-옥타브·miss·xrun 지표도 유지한다.
+## 4. 실시간·배포 경로
 
-## 3. 모듈 의존 관계 (src/deep_anc)
+`realtime/run_realtime.py`는 입력 callback, 추론 작업, UI를 분리하고
+`ring_buffer.py`의 SPSC 버퍼로 블록을 전달한다.
+생산자는 write 위치만, 소비자는 read 위치만 소유한다.
 
-```
-config.py (REPO_ROOT, load/merge/validate)  ←─ 모든 스크립트의 진입 관문
-   ▲
-data/    synth_dataset ─▶ primary_path, synthetic_signals, noise_pool(─▶manifest), dsp/{duct_sim,filters,secondary_path}, config
-         recorded_dataset ─▶ manifest
-dsp/     duct_sim, filters, nonlinear, secondary_path (독립적 하위층)
-models/  hybrid_anc ─▶ tcn_blocks, glstm, attention, streaming
-losses/  anc_loss ─▶ dsp/{nonlinear,secondary_path}
-train/   trainer ─▶ data/*, dsp/*, losses, models, checkpoint, reproducibility, config
-realtime/ run_realtime ─▶ engines(─▶models, baselines/fxlms_core), ring_buffer, safety, noise_gen, ui, audio_io, config
-eval/    metrics(대역 교집합·band NMSE), plots, fxlms_baseline  ←─ scripts/eval·demo 가 사용
-baselines/ fxlms_core (레거시 FxLMS — anc_project 유산)
-```
-상향 의존 없음(dsp/data → train → scripts 단방향). `config._resolve_path`는 상대경로의
-존재하는 CWD 후보를 먼저 쓰고, 없으면 REPO_ROOT로 폴백한다(config.py:24-30).
-SynthANCDataset은 RIR·manifest·S(z) 경로에 이 함수를 적용하고 NoisePool에는 해석된 manifest
-경로를 넘기므로, 과거의 원시 CWD 상대경로 사용은 해소되었다.
+`realtime/engines.py`는 Torch/ORT/TensorRT/FxNLMS와 초기 HybridEngine을 제공한다.
+mic DL/hybrid는 acoustic reference 메타가 있는 모델만 허용한다.
+FxNLMS는 사전 측정한 S를 고정하고 제어 FIR을 적응한다.
+HybridEngine은 한 Jetson의 파형 DNN+FxNLMS 결합이며 외부 DSP와의 합산 구현이 아니다.
 
-## 4. 실행 경로별 진입점
+`safety.py`와 런타임은 합산 출력 제한·페이드·발산·클리핑·출력 누락을 감시한다.
+손상 구간과 지연된 ERR 이력이 적응에 섞이지 않게 보류하고,
+mic 신경망 입력 손상은 초기화와 ANC OFF로 처리한다.
+`recording.py`는 원시 배열과 S 해시·설정·health 메타를 저장하며 기존 파일을 덮어쓰지 않는다.
 
-| 경로 | 진입점 | 소비 설정 |
-|---|---|---|
-| 학습(사전) | `scripts/train/train.py --config configs/train_pretrain.yaml` (DDP: torchrun) | train_pretrain → model/data/duct 병합 |
-| 학습(원샷, Elice) | `scripts/elice/bootstrap_all.sh` → `run_parallel_models.sh`(GPU0=base, GPU1=tiny, `mkdir -p runs` 포함) | 〃 |
-| 파인튜닝 | `train.py --config configs/train_finetune.yaml` (+recorded_manifest) | train_finetune |
-| 데이터 준비 | `scripts/data/{download_noise.sh, prepare_noise_pool.py, build_rir_bank.py}` | data_sim, duct |
-| 실측/보정 | `scripts/data/{record_duct.py, make_recorded_manifest.py, calibrate_wideband.py}` | hardware, duct |
-| 내보내기 | `scripts/train/export_onnx.py` → `scripts/export/build_trt.sh` | (ckpt 내장 cfg) |
-| 실시간 | `.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml` (--calibrate/--list-devices) | runtime → hardware/duct 병합 |
-| 벤치 | `scripts/bench/measure_{inference,io}_latency.py` | runtime, hardware |
-| 평가 | `scripts/eval/{evaluate_offline,compare_fxlms}.py --ckpt …`, `scripts/demo/evaluate_session.py` | eval, duct, data_sim |
+`scripts/train/export_onnx.py`는 checkpoint를 정적 ONNX와 메타로 내보낸다.
+`scripts/export/build_trt.sh`는 제공된 `trtexec`를 사용하는 별도 엔진 변환 경로다.
+TensorRT import 성공, 작은 진단 모델 실행, 실제 ANC 모델 export·지연·감쇠는
+각각 별도로 검증한다. 도구 설치 여부를 이 문서에서 고정된 사실로 복제하지 않는다.
 
----
+`baselines/prepared_fir.py`와 `filter_bank.py`의 오프라인 계수 연구는
+live engine factory와 연결되지 않았다. 구조와 제한은 [docs/15](15_prepared_fir_research.md)를 따른다.
 
-## 부록: 감사 이슈 반영 상태 (2026-08-03)
+## 5. 측정·평가 경로
 
-위 지도를 만든 3종 감사에서 확정된 이슈 35건(HIGH 2/MED 12/LOW 21)은 같은 날 커밋에서
-일괄 반영되었다 — 죽은 키 정리/주석화, S(z)·핸드오프·목표대역 단일 출처화, CWD 상대경로 제거,
-manifest 부재 배너, dc_hum 구현, HANDOFF 재작성 등. 상세 내역은 해당 커밋 메시지 참조.
-현재 표는 반영 후 코드를 재검증한 결과다. 특히 DEMAND·MIMII 포함 소스 비율,
-SEF η, YAML `io_scale`, 공유 핸드오프 기본값, 경로 해석, dc_hum, S(z) 단일 출처,
-`eval.report_dir` 소비 상태는 위 본문에 현재 상태로 갱신했다. 설정을 바꿀 때는 이 지도로
-소비 지점을 찾은 뒤 코드로 재확인할 것.
+`scripts/data/record_duct.py`, `calibrate_wideband.py`, `measure_paths_interleaved.py`와
+`scripts/bench/measure_duct_transfer_map.py`는 실제 장치를 사용하는 측정 도구다.
+P/S/F, 블록·latency, 지연·클록 기준과 원시 녹음을 함께 보존한다.
+
+`scripts/eval/evaluate_offline.py`, `evaluate_recorded.py`, `compare_fxlms.py`는
+합성·녹음·기준선 비교를 맡는다. 실기 세션과 acoustic 관측 분석은
+`scripts/demo/evaluate_session.py`, `eval/acoustic_session.py`로 구분된다.
+독립 세션·소스 분할을 지키고 low/high·소스별·최악 구간을 함께 보고한다.
+
+측정 NPZ의 `consistency_band_hz`와 `excitation_band_hz`는 서로 다른 증거다.
+공용 S 로더는 consistency 메타를 우선 사용하고 구형 파일에는 fallback이 있으나,
+acoustic 준비 진단의 고역 검증은 명시적인 신뢰대역·반복 일관성을 확인한다.
+최종 판정과 관측 감소량의 한계는 [docs/07](07_evaluation_protocol.md)가 기준이다.

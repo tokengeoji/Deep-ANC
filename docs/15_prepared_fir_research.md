@@ -1,6 +1,6 @@
 # 15. 논문 반영: 사전 FIR + FxNLMS 연구 준비와 PC 검증
 
-> acoustic-ref 우선, ERR 한 점, 우선 개선 대역 800–1600Hz, 저역·음성·음악도 목표에 포함한다.
+> acoustic-ref 우선, ERR 한 점, Jetson 우선 개선 대역 1000–1600Hz, 저역·음성·음악도 목표에 포함한다.
 > Jetson·덕트·마이크·USB DAC는 그대로다. 모든 개발/시험은 Docker 안에서만 한다.
 > 아래 제어기는 **오프라인 연구용**이며 실제 오디오 런타임에 연결하지 않았다.
 
@@ -9,7 +9,7 @@
 [사용자 논문 §3–4](https://arxiv.org/html/2601.06981v1)는 프레임 단위 CNN 필터 선택과
 샘플 단위 FIR 출력을 분리하고, FxLMS로 준비한 필터 집합을 사용한다. 실험은 4REF/1CS/1ERR의
 선형 RIR 시뮬레이션이며 광대역 감쇠 비교는 100–700Hz다. 필터 준비 대역 20–2020Hz와
-감쇠 검증 대역을 혼동하지 않는다. 현재 구성의 800–1600Hz 실기·비선형·Jetson 성능 증거가 아니다.
+감쇠 검증 대역을 혼동하지 않는다. 현재 구성의 1000–1600Hz 실기·비선형·Jetson 성능 증거가 아니다.
 
 [Hybrid SFANC–FxNLMS §II-D](https://arxiv.org/html/2208.08082v1)는 느린 필터 선택과 빠른
 FxNLMS 적응을 결합한다. 이 저장소는 두 연구의 **선택/준비 계산과 출력 계산 분리**를 적용한다.
@@ -109,7 +109,9 @@ tanh 옵션 역시 실측 비선형 모델이 아니라 스트레스 조건이�
 양수는 감소·음수는 증폭이다. 준비한 계수의 초기 이득과 적응의 보정 효과를 이 toy에서는 확인했다.
 긴 지연 스트레스는 거의 무감쇠이며 준비 구조가 인과성 한계를 없애지 않음을 함께 보여준다.
 단일 seed·고정 합성 S·후보 하나의 결과이므로 일반적 우월성·최적성으로 확대하지 않는다.
-세부 대역/소스/모든 run은 다음 PC 로컬 산출물에 있고 `results/`는 Git에 올리지 않는다.
+세부 대역/소스/모든 run은 당시 x86 PC Docker에서 다음 경로에 생성했다. `results/`는 Git에 올리지 않는다.
+2026-09-20 확인한 Jetson checkout에는 이 두 실행 폴더가 미회수 상태다. 위 표는 당시 기록이며,
+해당 산출물을 확보하기 전에는 이 checkout에서 재검증한 결과로 보고하지 않는다.
 
 - `results/prepared_fir/pc_20260915_linear_01/{report.json,metrics.csv,summary.md}`
 - `results/prepared_fir/pc_20260915_tanh_01/{report.json,metrics.csv,summary.md}`
@@ -125,7 +127,7 @@ Jetson 현장 측정에서 회수한 `raw_measurement.npz`가 있을 때만 실�
 ```bash
 bash scripts/docker/dev.sh exec .venv/bin/python scripts/eval/analyze_path_bands.py \
   --raw-npz results/acoustic_SESSION_ID/calibration/RAW_SESSION/raw_measurement.npz \
-  --band 800 1600 --out results/acoustic_SESSION_ID/path_band_trial_01
+  --band 1000 1600 --out results/acoustic_SESSION_ID/path_band_trial_01
 ```
 
 `repeat_irs`, scalar JSON 메타, 모든 반복의 저장 지연이 필요하다. cancel/ch1 ESS만 지원하며
@@ -139,9 +141,10 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/eval/analyze_path_bands
 0.9는 **참고선**이며 기존 `coherence_median` 전체 Pearson 상관과 동일한 검증량이 아니다.
 SNR·실시간 위상/클록 안정성은 이 도구로 증명하지 않는다.
 
-경로 끝점도 확인하기 위해 이 도구의 기본 target은 **[800,1600]**이다.
-하위 대역은 [800,1000), [1000,1600]으로 1kHz를 중복하지 않는다.
-이는 ERR 에너지 분할 보고의 [800,1600)와 목적이 다르며 출력에 끝점 포함 여부를 표시한다.
+CLI의 현재 기본 target은 **[1000,1600]**이다. Python API의 호환용 기본은 [800,1600]이며
+과거 범위 재현은 CLI에 `--band 800 1600`을 명시한다. 하위 대역 [800,1000), [1000,1600]은
+1kHz를 중복하지 않는다. 경로 진단은 상한 끝점을 포함하므로 ERR 에너지 분할의 [1000,1600)와
+목적이 다르며 출력에 끝점 포함 여부를 표시한다.
 가진 범위 밖·FFT bin 없음·무전력은 계산 불가이며 숫자나 신뢰대역으로 대체하지 않는다.
 
 새 폴더에 JSON·CSV·Markdown만 저장하며 **S NPZ 생성·기존 자산 수정·신뢰대역 자동 승격은 하지 않는다**.

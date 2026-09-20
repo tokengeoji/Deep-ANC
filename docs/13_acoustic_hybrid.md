@@ -1,9 +1,9 @@
 # 13. Acoustic REF 기반 하이브리드 ANC 실행 계획
 
 > 기준일: 2026-09-17. 이 문서는 사용자가 확정한 다음 개발 방향과 구현 범위를 기록한다.
-> 개발·분석·테스트는 Docker 안에서만 수행한다. 현재는 x86_64 CPU 컨테이너이며 추론 타깃은 기존 Jetson AGX Orin이다.
+> 개발·분석·테스트는 Docker 안에서만 수행한다. x86_64 PC는 CPU 이미지, ARM64 Jetson은 Jetson 환경을 사용한다.
 > 이 변경의 소프트웨어 검증을 Jetson 지연 측정이나 덕트 감쇠 실험으로 해석하지 않는다.
-> 위치별 실행 체크리스트는 [docs/14](14_pc_jetson_workplan.md). 이 PC에서 가능한 코드·합성 시험·분석은 현장 작업과 병행한다.
+> 위치별 실행 체크리스트는 [docs/14](14_pc_jetson_workplan.md). 코드·합성 시험·분석은 실행 가능한 Docker 환경에서 현장 작업과 병행한다.
 
 ## 1. 확정된 목표와 실행 범위
 
@@ -14,7 +14,7 @@
 - 환경소음·기계음뿐 아니라 음성·음악도 상쇄한다. 음성 보존 손실을 사용하지 않는다.
 - 목표 범위는 ERR 한 점이다. 한 점의 감쇠를 덕트 단면 전체의 quiet zone으로 확대하지 않는다.
 - **현재 마이크와 USB DAC까지 모두 유지한다.** 하드웨어 교체·구매·공통 클록 장치 통합은 이번 범위에서 제외한다.
-- `~/anc_project`는 읽기 전용이다. Jetson 시스템 변경, sudo 실행, 전원 모드 변경은 금지다.
+- `~/anc_project`는 읽기 전용이다. Jetson 시스템 설정·전원 모드 등 sudo가 필요한 시스템 변경은 금지다.
 - 소리가 나는 측정·실행은 사용자 입회와 볼륨 최소 상태에서만 하며 항상 ANC OFF로 시작한다.
 
 `digital-ref`의 재생 선행 정보는 acoustic REF의 대체물이 아니다.
@@ -92,7 +92,8 @@ readiness PASS도 장치 출력 허가나 감쇠 성능 판정이 아니다. 별
 
 ### A. Docker 개발 환경과 준비 상태 검사
 
-다음 명령은 저장소 루트에서 Docker 환경을 관리하며, Python 실행과 파일 작업은 컨테이너에서 수행한다.
+다음은 x86_64 PC용 예시다. 실제 ARM64 Jetson은 [Docker 안내](../docker/README.md)의 Jetson 절차를 따른다.
+호스트에서는 Docker 환경만 관리하며, Python 실행과 파일 작업은 컨테이너에서 수행한다.
 
 ```bash
 bash scripts/docker/dev.sh build cpu
@@ -105,7 +106,8 @@ bash scripts/docker/dev.sh shell
 `.venv`는 Docker volume으로 덮어 마운트한다. 기존 호스트 Python 환경은 보존하고 사용하지 않는다.
 x86 CPU 컨테이너는 개발 공간이며 Jetson 에뮬레이션이나 GPU·오디오 실기 검증 환경이 아니다.
 Jetson용 `build jetson`·`up jetson`은 실제 ARM64 Jetson에서만 실행한다.
-Jetson 이미지는 `nvcr.io/nvidia/l4t-jetpack:r36.4.0`과 NVIDIA PyTorch 2.5.0a0 wheel을 사용하며 GPU 검증도 그곳에서 한다.
+기본 Jetson 이미지는 `nvcr.io/nvidia/l4t-jetpack:r36.4.0`과 NVIDIA PyTorch 2.5.0a0 wheel을 사용한다.
+별도 경량 검증 환경과 기본 이미지의 완료 상태는 Docker 안내와 HANDOFF에서 구분한다.
 
 기본 기준선 `configs/runtime_acoustic.yaml`과 S NPZ의 샘플레이트·지연·검증 대역을 대조한다.
 
@@ -128,7 +130,7 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_audio_input
 ```
 
 오디오 장치가 연결된 Jetson 컨테이너에서만 수행하며 출력 장치는 열지 않는다. ERR와 REF 모두 반복해서 유효해야 한다.
-입력 FAIL을 소리 출력으로 우회 진단하지 않는다. 현재 x86 CPU 컨테이너에서는 이 실측을 수행하지 않는다.
+입력 FAIL을 소리 출력으로 우회 진단하지 않는다. 이 실측은 오디오 장치를 연결한 실제 Jetson Docker에서 수행한다.
 장치·배선·게인·볼륨·블록 크기·샘플레이트·측정 시각을 함께 기록한다.
 
 ### C. S를 먼저 측정하고 F를 별도로 확인
@@ -153,7 +155,7 @@ mic DL/하이브리드는 손상 블록을 신경망에 넣지 않고 초기화�
 초기화와 적응 상태 변경은 계수를 소유한 작업 스레드에서 수행한다.
 산출물은 OFF→ON→OFF 원시 녹음과 밴드별 감쇠이며, 기존 실기 결과와 섞지 않는다.
 runtime 녹음에는 S 해시·주요 설정과 전체 실행 누적 health 메타를 붙이며 기존 파일은 덮어쓰지 않는다.
-회수 후 PC Docker에서 `scripts/eval/analyze_acoustic_session.py`로 사이클별 앞뒤 OFF와 비교한다.
+회수한 녹음은 PC 또는 Jetson의 Docker에서 `scripts/eval/analyze_acoustic_session.py`로 사이클별 앞뒤 OFF와 비교한다.
 긴 ON의 후반 악화와 1 kHz 이상 에너지 증가를 함께 보고한다. 이 수치는 관측 감소량이며
 시간이 다른 외부 음원의 변화나 REF의 F 유입을 제거한 인과 효과가 아니다.
 명령은 [docs/14 §5](14_pc_jetson_workplan.md), 통계·메타·한계는 [docs/07 §8](07_evaluation_protocol.md)를 따른다.

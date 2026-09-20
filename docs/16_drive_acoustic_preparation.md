@@ -56,6 +56,10 @@ ID/이름/크기/부모와 최종 폴더 목록을 확인했다. PC의 원본·�
 `results/drive_preparation/20260915_01/final_drive_archive_audit.json`,
 `final_local_cleanup_audit.json`이다. 다운로드 receipt와 parts manifest의 false 상태는
 각 작성 시점의 이력이므로 고쳐 쓰지 않고, 최신 상태는 이 최종 전송/정리 기록으로 판단한다.
+이 경로들은 2026-09-15 PC에서 생성한 기록이다. 2026-09-20 확인한 Jetson checkout에는 위 두
+상위 결과 폴더가 미회수 상태다. Jetson의 다른 `runs/`·`results/`는 존재하므로 산출물 전체가
+없다고 표현하지 않는다. 당시 전송 완료 기록은 유지하되 receipt 회수 전에는 원격 상태나
+완전 복원을 현재 checkout에서 재확인했다고 보고하지 않는다.
 `acoustic_preparation_20260915_pc_bundle.zip`은 최신 bootstrap·합성 필터 뱅크·QA·이 기록과
 복원/Jetson 문서를 묶는 파일명이다. 생성·업로드 성공 여부와 Drive ID는 별도
 `bundle_upload_receipt.json`을 확인한다. 기존 원본 archive나 코드 전체를 중복 백업하지 않는다.
@@ -84,7 +88,7 @@ DEMAND 96, DNS 15,553, ESC 1,006, machine 3,600, music 6,308, speech 7,969 파�
 - 빈 폴더·중복처럼 보여도 기존 백업은 자동 삭제하지 않는다. 이번 최적화는 중복 방지·정리·추적성이다.
 - 원본 음원/개인 인증은 Git에 올리지 않는다. 출처·저작자·트랙별 라이선스 표시는 보존한다.
 
-## 3. 이 PC에서 가능한 bootstrap
+## 3. PC·Jetson Docker에서 가능한 bootstrap
 
 아래 명령은 원본 다운로드나 학습을 하지 않는다. 매번 **새 출력 경로**를 사용한다.
 
@@ -183,13 +187,13 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/data/split_staged_archi
 로컬 생성 archive checksum을 구분한다. Git 출처 선언도 서명된 원격 증명은 아니다.
 
 선택적 `stage_public_archive_parallel.py`는 최대 4개 HTTPS Range와 공식 전체 checksum을
-검사하는 도구다. 현재 실전 시도에서는 Libri 연결 실패가 있었고 FMA는 기존 전송과 중복되어
+검사하는 도구다. 2026-09-15 PC 시도에서는 Libri 연결 실패가 있었고 FMA는 기존 전송과 중복되어
 중단했다. 속도 개선/완주를 주장하지 않는다. 실패 부분 파일은 정식 원본 전송 확인 전 보존한다.
 이번 FMA/Libri의 실패 부분 파일은 정식 원본 전송 확인 후 삭제했고 별도 cleanup receipt를 남겼다.
 
 인증된 별도 환경용 `stream_public_to_drive.py`도 준비돼 있다. 기본은 계획만 출력하고,
-실행은 운영자가 승인된 원격 환경으로 표시했을 때만 가능하다. 현재 PC는 연결 Drive의
-파일 업로드를 사용한다. Google 인증을 플러그인에서 추출하지 않는다. 스트리밍 도구의
+실행은 운영자가 승인된 원격 환경으로 표시했을 때만 가능하다. 2026-09-15 PC 전송은 연결 Drive의
+파일 업로드를 사용했다. Google 인증을 플러그인에서 추출하지 않는다. 스트리밍 도구의
 공식 checksum/청크 ACK/최종 Drive MD5 검사는 mock 회귀만 수행했으며 실서비스 인증 전송은 미검증이다.
 중단된 resumable session을 자동 재개·삭제하지 않는다.
 

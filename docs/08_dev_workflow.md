@@ -1,112 +1,77 @@
 # 08. 개발 워크플로와 프로젝트 정책
 
-## 1. 저장소 정책
+작업을 이어받으면 [HANDOFF](../HANDOFF.md)를 먼저 읽고 [AGENTS](../AGENTS.md)의 규칙을 따른다.
+진행 상태는 HANDOFF에 남기며 이 문서에 날짜별 완료표·학습 PID·과거 성능을 중복하지 않는다.
+설계의 기준은 ERR 한 점에서 **저역·고역과 음성·음악을 모두 감쇠**하는 목표다.
+acoustic-ref가 최우선이고 Jetson의 우선 개선 대역은 1000–1600 Hz다.
 
-| 정책 | 내용 |
-|---|---|
-| **anc_project 읽기전용** | `~/anc_project`(기존 FxLMS)는 절대 수정 금지. 검증된 코드(fxlms_core)와 측정 자산(npz)의 **복사만** 허용 — 출처를 주석으로 명기 |
-| **Jetson 시스템 불가침** | 핀 설정(pinmux/I2S)·RT 커널·전원모드·오디오 데몬·apt 설치 등 **시스템 변경 금지** (의도된 실험 구성). 모든 도구는 venv/유저 공간에서만 |
-| 대용량 산출물 | `data/`, `runs/`, `*.pt`, `*.onnx`, `*.plan` 은 .gitignore — 가중치는 GitHub Release 자산으로 |
-| 커밋 자산 예외 | `assets/measured/*.npz` (수십 KB 측정 자산)는 저장소에 포함 |
+## 1. 작업 경계
 
-legacy `main_realtime_anc.py`는 정상 종료 때도 기본 `control_filter_last.npy`를 저장한다.
-따라서 과거 300Hz/약 2dB baseline 명령을 원본 디렉터리에서 그대로 실행하면 읽기전용 정책을
-위반한다. 재현이 필요할 때만 `--weights-output /home/capston/Deep_ANC/results/legacy_fxlms/control_filter_last.npy`
-처럼 저장소의 ignored 경로를 명시하고, `python3 -B`로 `__pycache__` 쓰기도 막는다.
-그 외 원본 파일은 읽기만 한다.
+- 코드 읽기·수정·Git·Python·테스트는 **Docker 안에서만** 수행한다. 호스트는 Docker 환경 관리만 한다.
+- `~/anc_project`는 읽기 전용이며 필요한 검증 자산의 복사만 허용한다. 원본 스크립트를 실행하지 않는다.
+- Jetson의 RT 커널·30W·핀/I²S·클록·오디오 서비스·시스템 권한·호스트 패키지를 변경하지 않는다.
+- 기본 컨테이너에는 오디오 장치를 노출하지 않는다. 스피커 출력은 사용자 입회·볼륨 최소·ANC OFF 시작 조건을 지킨다.
+- 기존 변경·측정 파일·녹음·checkpoint를 보존한다. 설계를 바꾸는 미확정 조건은 사용자에게 확인한다.
 
-## 2. Jetson ↔ Elice 동기화 (git 허브 모델)
+현재 시스템 설정·장치를 유지한 채 가능한 코드·합성 회귀·오프라인 분석을 진행한다.
+실제 ARM64/CUDA/TensorRT·I/O·덕트 측정만 Jetson 현장에서 수행하며, x86 CPU 결과를
+그 실측으로 보고하지 않는다. 환경 구성은 [Docker 문서](../docker/README.md), 역할과
+현장 선행조건은 [docs/14](14_pc_jetson_workplan.md)를 따른다.
 
-```
-[Jetson]  코드 개발·실기 검증 → git push
-                                   ↓
-[GitHub]  단일 동기화 지점 (원격 저장소)
-                                   ↓ git pull/clone
-[Elice]   학습 실행 → 작은 산출물(설정, metrics, 로그 요약)만 커밋
-          가중치/onnx 는 zip 다운로드 또는 GitHub Release 업로드
-```
+## 2. 평소 작업 순서
 
-- 브랜치: `main` 은 항상 실행 가능 상태 유지. 실험은 `exp/<이름>` 브랜치.
-- 실측 녹음(data/recorded)은 크기가 작으면 zip 으로 Elice 에 직접 업로드,
-  크면 `pack_transfer.py` 샤드.
-
-## 3. 재현성
-
-- 모든 실행은 config yaml 이 단일 출처 — CLI 는 `--set key=value` 오버라이드만.
-- `train/reproducibility.py` 가 run 디렉토리에 config 스냅샷·git rev·pip freeze 자동 기록.
-- 체크포인트는 모델+옵티마이저+스케줄러+step+RNG 를 포함해 `--resume` 완전 재개.
-- corrected checkpoint는 resolved model/data/duct 전체와 `physics_status`,
-  `trusted_band_hz`, `digital_reference_lead_samples`를 보존한다. ONNX 동반
-  JSON에도 lead를 복사하며, 런타임 불일치는 오디오 시작 전에 거부한다.
-  해당 키가 없는 legacy artifact는 lead=0으로만 해석한다.
-- 시드: 학습 `seed`(+rank), 데이터 분할 고정 시드, val 배치 고정 시드(1234/999).
-- 버전 고정: Elice torch 2.5.1+cu121 ↔ Jetson 2.5.0a0(JP6.1) 정렬, ORT 1.18.1(Jetson).
-
-## 4. 코드 품질 게이트
+호스트에서는 Docker 환경을 확인·접속한다. 없으면 Docker 문서에서 실제 아키텍처에 맞는
+이미지를 선택하고, 기존 컨테이너가 중지됐으면 `start`로 재사용한다.
 
 ```bash
-.venv/bin/python -m pytest -q  # 커밋 전 전체 통과 필수
+bash scripts/docker/dev.sh status
+bash scripts/docker/dev.sh shell
 ```
 
-핵심 불변식 (테스트가 강제):
-1. 모델 인과성 — 미래 입력 무의존 (비트 단위)
-2. 스트리밍 = 오프라인 등가 (≤1e-5), GLSTM nn.LSTM = 수동 셀 등가
-3. S(z) torch = scipy 등가, 극성 규약(e = d + S·y, 추가 반전 금지)
-4. 덕트 시뮬이 이론 공진(70/210/350Hz) 재현
-5. 데이터 분할 무누수 (파일/세션/RIR 변형 단위)
-6. digital-ref 연속 source와 런타임 FIFO의 +109 정렬, acoustic-ref의 nonzero lead 거부
-7. checkpoint/ONNX lead 메타·legacy0 호환·런타임 mismatch fail-fast
-8. trusted-band 목적함수와 fullband 관측 지표 동시 산출, 평가 시 trusted−fullband 간극 저장
+접속한 컨테이너 안에서 변경 상태를 확인하고 관련 문서·설정·테스트를 읽는다.
+다음은 읽기 전용 확인과 검증 명령이며 테스트는 변경 영향에 맞춰 수행한다.
 
-## 5. 단계별 진행 체크리스트
+```bash
+git status --short
+git diff --check
+.venv/bin/python -m pip check
+.venv/bin/python -m pytest -q
+```
 
-### 5.1 corrected Stage-1 — 표현 사전학습
+문서에는 실행값·결과·제한을 구분해 적는다. Docker 설치 성공, 합성 시험, corpus QA,
+실제 모델 추론, 물리 감쇠를 각각의 근거로 판정한다. 실패·미평가를 통과로 바꾸지 않는다.
+검증 후 diff와 산출물을 점검하고 완료 내용·남은 조건·재현 명령을 HANDOFF에 반영한다.
 
-- [x] `P(z)=S(z)` scale-matched surrogate, +109 lead FIFO, 공칭 선형 plant로 영출력 해의 원인 제거
-- [x] trusted 150–600Hz NMSE를 학습/체크포인트 선택에 쓰고 fullband NMSE를 동시 로깅
-- [x] +109 학습↔실시간 FIFO 정렬, artifact 메타, mismatch fail-fast 자동 테스트
-- [ ] base/tiny 완주 후 `best.pt`·`last.pt`·resolved config·로그 회수
+## 3. 재현성과 불변식
 
-> 이 단계의 `secondary_surrogate` 체크포인트는 표현 학습 결과이다.
-> 실제 덕트 감쇠, 고역 성능, 음성·음악 quiet-zone 성능으로 표기하지 않는다.
+설정 YAML과 CLI override로 해결된 실행 설정을 보존한다. run에는 Git revision·의존성 목록·
+seed·입력 데이터 및 측정 경로 식별 정보를 함께 남긴다. checkpoint의 모델·optimizer·scheduler·
+step·RNG를 사용하는 완전 재개와 다른 실험의 초기 가중치 사용을 구분한다.
 
-### 5.2 파인튜닝 준비 — 사용자 입회 실측
+- 극성은 `e=d+S·y`이며 S의 지연·핸드오프·RIR onset을 중복 적용하지 않는다.
+- 인과적 모델과 오프라인↔스트리밍 수치 등가성을 유지한다.
+- digital lead는 설정·checkpoint·ONNX·런타임이 일치해야 한다. acoustic-ref는 lead=0이다.
+  현재 digital 설정의 113과 과거 artifact의 109를 혼동하지 않는다([docs/03](03_data_pipeline.md)).
+- 손실은 FP32이며 closed-loop 워밍업은 플랜트 적용 후 절단한다.
+- ONNX는 opset 17·정적 shape·명시적 상태 입출력, 세그먼트는 256의 배수다.
+- SPSC 링버퍼는 생산자가 write_pos만, 소비자가 read_pos만 소유한다.
+- 데이터는 원본·그룹 단위로 분리하고 MIMII train-only 정책을 평가에 유지한다.
 
-- [x] APE `hw:1,1`·AB13X `hw:2,0` 장치 인식과 48kHz/2채널 스트림 설정 확인
-- [x] `.venv/bin/python scripts/bench/check_audio_input.py`로 ERR ch0 무출력 probe PASS
-- [x] `--require-both`로 ERR/REF 모두 PASS(pin17 REF L/R 복구)
-- [x] ERR/REF 과클리핑 원인이던 빠진 pin17을 재연결; Jetson pinmux/I²S는 변경하지 않음
-- [ ] 동일 앰프·볼륨·오디오 설정에서 `P(z)`(noise→ERR)와 `S(z)`(cancel→ERR) 반복 실측
-- [ ] 각 ESS 반복 일관성 ≥0.9, `S(z)` 80–1600Hz 신뢰대역, 스피커 THD/IMD 확인
-- [ ] 실측 순수지연으로 `K=(S delay+256)-P delay`를 재계산; 109가 바뀌면
-  학습 설정·런타임·artifact 메타를 함께 바꿈
-- [ ] 소음·음성·음악·환경·기계음을 source family×대역으로 나눈 독립 세션 수집
-- [ ] 화자·곡·환경·기계 조건 그룹을 가로지 않는 8:1:1 train/val/test 생성
+라이브러리 import나 테스트 개수만으로 실제 고역 경로·모델 성능을 선언하지 않는다.
+목표별 판정 기준은 [docs/07](07_evaluation_protocol.md), 학습 계약은 [docs/05](05_training_elice.md)를 따른다.
 
-`make_recorded_manifest.py`는 같은 화자·곡·원본·환경의 `group_id`를 원자 단위로
-보존하고 `source_family`별 8:1:1 층화를 수행한다. `path_base: manifest` 상대경로라
-Jetson→Elice 전송 뒤에도 재생성하지 않는다. `validate_recorded_sessions.py`의 파일·클립·
-무음·family×split QA가 PASS해야 최종 split로 간주한다. 스피커 출력을 내는 모든 항목은
-사용자 입회·볼륨 최저·ANC OFF 상태에서만 실행한다.
+## 4. 데이터와 Git 반영
 
-2026-08-03 빠져 있던 pin17(REF L/R)을 재연결한 뒤 ERR/REF는 −46dBFS대, clip 0%로
-두 채널 probe를 통과했다. 이 PASS는 입력 생존 확인이지 성능 결과가 아니다. legacy FxLMS,
-`record_duct`, P/S 보정, `evaluate_session` 직전에 probe를 반복하고 사용자 입회·볼륨 최저를
-확인한다. sudo, Jetson-IO, pinmux/device-tree, RT 커널, 전원모드, 오디오 데몬은 변경하지 않는다.
+데이터 원본의 최종 보관소는 **Google Drive**다. PC Docker의 임시 다운로드는 공식 checksum·
+라이선스 검증과 Drive 업로드 확인을 거친 뒤 해당 PC 원본만 정리한다. Drive 파일 ID·크기·
+정리 receipt를 남기며 실패·미확인 파일과 불완전한 기존 백업은 보존한다.
+정확한 staging·중복 방지·정리 절차는 [docs/16](16_drive_acoustic_preparation.md)을 따른다.
 
-### 5.3 실측 파인튜닝·배포 게이트
+공개 GitHub에는 코드와 검토한 작은 메타데이터만 반영한다. 원본 데이터·대용량 가중치와
+API 키·토큰·환경 파일·개인키를 커밋하지 않는다. `.gitignore`의 `/data/` 같은 앵커 패턴을
+비앵커로 바꾸지 않는다. 측정 자산을 갱신할 때도 출처·메타데이터와 변경 근거를 확인한다.
 
-- [x] 합성 offline·실기 session 평가에서 S(z) 실측대역∩덕트 목표대역을 trusted로
-  산출하고 trusted/fullband/간극을 Markdown+NPZ에 저장(소스별·옥타브 지표 유지)
-- [ ] `duct.digital_reference.primary_path_npz`와 실측 `d_noise_delay_samples`를 지정하고
-  `digital_primary_path_mode: measured`로 open-loop 파인튜닝
-- [ ] 실측 70%+합성 30% 후 closed-loop 20k–50k를 별도 ablation으로 검증
-- [x] Trainer의 고정 합성 val 16개와 분리된 recorded val/test 평가기 구현
-- [ ] 실제 독립 test를 수집해 trusted/fullband, 소스×대역, 최악 10% G4 PASS
-- [ ] ONNX export → lead 메타 정합 → tiny ORT P99<3ms → FxLMS와 동일
-  OFF 10s→ON 30s→OFF 5s 세션 실기 비교
-- [ ] 덕트 문서 미확정 항목(ERR 위치 등) 확정 시 duct.yaml 갱신 + RIR 뱅크 재생성
-- [ ] `trtexec`가 사전 제공된 별도 환경에서만 base TRT를 검증
-
-실측 `P(z)`로 파인튜닝하고 학습에 쓰지 않은 recorded test를 통과하기
-전에는 체크포인트와 실기 리포트를 물리 성능 결과로 공개하지 않는다.
+Git 작성자는 승인된 저장소 로컬 설정을 쓰고 전역 설정을 바꾸지 않는다.
+커밋 메시지에 AI 표기나 AI Co-Authored-By를 넣지 않는다. 현재 원격은
+`tokengeoji/Deep-ANC`이며 이전 `Roka-jsj` 주소는 계정명 변경 전 이력이다.
+승인된 push는 origin·현재 브랜치·검증한 diff를 확인하여 수행하고 force push하지 않는다.

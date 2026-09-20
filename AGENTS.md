@@ -38,9 +38,9 @@
 | 위치 | 내용 |
 |---|---|
 | 추론 타깃 | Jetson AGX Orin (JetPack 6/R36.4.4). 현재 접속 호스트의 아키텍처와 구분할 것 |
-| 개발 환경 | Docker 전용. x86 호스트는 `cpu`, 실제 ARM64 Jetson은 `jetson` 이미지 사용 |
+| 개발 환경 | Docker 전용. x86 호스트는 `cpu`, 실제 ARM64 Jetson은 `jetson` 또는 저장공간 절약형 `jetson-local`. 현재 상태는 HANDOFF 참조 |
 | venv | 컨테이너 `/workspace/Deep-ANC/.venv`, 이미지별 Docker 볼륨. **onnxruntime==1.18.1 고정**(1.19+는 Tegra 크래시). Jetson 이미지는 NVIDIA PyTorch wheel과 lib preload 훅을 설치하며 실기 CUDA 검증은 별도 |
-| 학습 | Elice Cloud A100 (SSH 접속 — HANDOFF.md 참조), torch 2.5.1+cu121 |
+| 학습 | Elice A100용 설정을 보유. 현재 원격 자원·접속·학습 실행 여부는 별도 확인하며 과거 서버/PID를 재사용하지 않는다 |
 | GitHub | https://github.com/tokengeoji/Deep-ANC (공개, 이전 Roka-jsj 주소도 같은 저장소로 연결). 현재 checkout의 origin/작성자/인증은 별도 확인하고 사용자 승인 대상으로만 push한다. 과거 Jetson 키 경로를 현재 PC에 있다고 가정하지 않는다 |
 | 실행 | `bash scripts/docker/dev.sh exec .venv/bin/python ...`. 테스트: `bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q` (전부 통과 유지) |
 
@@ -55,7 +55,8 @@
 
 ## 건드릴 때 조심해야 하는 불변식 (테스트가 강제하지만, 의미를 알고 고칠 것)
 
-- 지연 규약: 학습 플랜트 총지연 = S(z) npz delay(1342) + 스레드 핸드오프(256).
+- 지연 규약: 학습 플랜트 총지연 = 선택한 S(z) NPZ의 delay + 스레드 핸드오프(256).
+  현재 interleaved S는 1465로 총 1721샘플이며, 과거 S의 1342를 현재 고정값으로 사용하지 않는다.
   digital-ref d 경로는 핸드오프 없음. **RIR에는 음향 온셋이 이미 포함 — D_noise 결합 시 t_ac(NS→ERR)를 빼는 이유** (synth_dataset.py 주석)
 - 극성: `e = d + S·y` — 어디에서도 추가 부호 반전 금지 (측정 FIR에 극성 포함)
 - 인과성: 모델은 미래 입력 참조 금지. 스트리밍=오프라인 수치 등가 유지

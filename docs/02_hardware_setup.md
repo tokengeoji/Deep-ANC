@@ -1,159 +1,113 @@
 # 02. 하드웨어 구성과 점검 절차
 
-## 1. 장치·채널 맵 (anc_project 에서 실기 검증된 구성)
+기존 Jetson AGX Orin·덕트·마이크·USB DAC를 유지한다.
+이 문서의 배선·초기 진단 기록은 현재 연결·입력 정상 여부를 보장하지 않는다.
+실행 환경과 최근 검증은 [HANDOFF.md](../HANDOFF.md),
+위치별 작업 조건은 [docs/14](14_pc_jetson_workplan.md)를 따른다.
 
-```
-[Jetson AGX Orin]
-  입력  hw:APE,1 (ADMAIF2) · S32_LE · 48kHz · 스테레오     sounddevice 예시 idx 5
-    ch0 = 에러 마이크   (INMP441, L/R핀 → GND)   덕트 X≈1.10m 벽면
-    ch1 = 레퍼런스 마이크(INMP441, L/R핀 → 3.3V)  덕트 X=0.10m 벽면
-  출력  AB13X USB Audio (hw:2,0) · S16_LE · 48kHz · 스테레오  idx 24
-    ch0 = 소음 스피커   (좌)  덕트 X=0 폐단, 축방향
-    ch1 = 상쇄 스피커   (우)  덕트 X=1.05m 상면, side-branch
-  앰프  TPA3116D2 (12~24V) — 시작 전 볼륨 최소로!
-```
+## 1. 장치·채널과 배선
 
-### J30 40핀 헤더 물리 배선 (2026-08-03 사용자 확정)
+[configs/hardware_jetson.yaml](../configs/hardware_jetson.yaml)의 논리 맵은 다음과 같다.
 
-두 INMP441은 `VDD/GND/SCK/WS/SD`를 공유하고, `L/R`만 서로 다른 전원 레벨에 연결해
-하나의 스테레오 I²S 프레임을 만든다.
+| 구분 | 구성 | 채널 |
+|---|---|---|
+| 입력 | APE ADMAIF2, `hw:APE,1`, 48kHz 스테레오 S32_LE | ch0=ERR, ch1=REF |
+| 출력 | AB13X USB Audio, 카드 ID `Audio`, 48kHz 스테레오 S16_LE | ch0=NS, ch1=CS |
+| 앰프 | TPA3116D2 | 출력 시험 전 볼륨 최소 확인 |
 
-| INMP441 신호 | 선 색 | Jetson J30 물리 핀 | 역할 |
+2026-08-03에는 APE가 `hw:1,1`, USB 출력이 `hw:2,0`으로 열거됐다.
+이 숫자와 당시 PortAudio index를 현재 장치 번호로 복사하지 않는다.
+`deep_anc.audio_io.resolve_alsa_portaudio_device`는 ALSA 카드의 짧은 ID를 사용하며,
+USB 연결 상태와 현재 목록을 매 세션 확인한다.
+
+### 사용자 확인 배선 — 2026-08-03 기록
+
+두 INMP441은 VDD/GND/SCK/WS/SD를 공유하고 L/R 선택을 달리하는 구성이다.
+아래는 당시 사용자 확인값이며 이번 문서 정리에서 실물 배선을 재검사한 것은 아니다.
+
+| 신호 | 선 색 | Jetson J30 물리 핀 | 역할 |
 |---|---|---:|---|
-| 두 마이크 `VDD` | 빨강 | **1** | 3.3V 전원 |
-| 두 마이크 `GND` | 검정 | **6** | GND |
-| 두 마이크 `SCK` | 주황 | **12** | I²S2 SCLK |
-| 두 마이크 `WS` | 노랑 | **35** | I²S2 FS/word-select |
-| 두 마이크 `SD` | 갈색 | **38** | I²S2 DIN, 두 마이크의 SD를 같은 선에 연결 |
-| 레퍼런스 마이크 `L/R` | 초록 | **17** | 3.3V(high) → 오른쪽 프레임 → 입력 ch1 |
-| 에러 마이크 `L/R` | 파랑 | **39** | GND(low) → 왼쪽 프레임 → 입력 ch0 |
+| 공통 VDD | 빨강 | 1 | 3.3V |
+| 공통 GND | 검정 | 6 | GND |
+| 공통 SCK | 주황 | 12 | I²S2 SCLK |
+| 공통 WS | 노랑 | 35 | I²S2 FS |
+| 공통 SD | 갈색 | 38 | I²S2 DIN |
+| REF L/R | 초록 | 17 | high → 오른쪽 프레임 → ch1 |
+| ERR L/R | 파랑 | 39 | low → 왼쪽 프레임 → ch0 |
 
-> [!CAUTION]
-> 전원을 끈 상태에서 배선하고, PCB의 흰색 삼각형으로 J30 pin 1 방향을 먼저 확인한다.
-> pin 2/4는 5V이므로 INMP441 전원이나 `L/R`에 사용하지 않는다. INMP441 허용 전원은
-> 1.8–3.3V다. 두 마이크의 SD 출력은 공통선으로 묶는 구성이며, 데이터시트는 공통 SD에
-> 100kΩ pull-down을 권장한다. 사용 중인 breakout에 저항이 이미 있는지 먼저 확인한다.
+물리 접촉을 점검할 때는 전원을 끄고 J30 pin 1 방향부터 확인한다.
+pin 2/4의 5V를 마이크 전원이나 L/R에 연결하지 않는다.
+배선 기록의 근거는 [NVIDIA carrier-board specification](https://developer.nvidia.com/assets/embedded/secure/jetson/agx_orin/jetson_agx_orin_devkit_carrier_board_specification_sp)과
+[INMP441 datasheet](https://product.tdk.com/system/files/dam/doc/product/sw_piezo/mic/mems-mic/data_sheet/inmp441.pdf)다.
+덕트 좌표·장착 미확정값은 [docs/09](09_duct_structure.md)를 따른다.
 
-이 매핑은 NVIDIA의 J30 표와 I²S2 표(`SCLK=12`, `FS=35`, `DIN=38`) 및 INMP441의
-`L/R low=left`, `high=right` 규약을 따른다. 근거:
-[NVIDIA carrier-board specification](https://developer.nvidia.com/assets/embedded/secure/jetson/agx_orin/jetson_agx_orin_devkit_carrier_board_specification_sp),
-[NVIDIA audio guide](https://docs.nvidia.com/jetson/archives/r38.2.1/DeveloperGuide/SD/Communications/AudioSetupAndDevelopment.html#board-interfaces),
-[TDK INMP441 datasheet](https://product.tdk.com/system/files/dam/doc/product/sw_piezo/mic/mems-mic/data_sheet/inmp441.pdf).
+## 2. 시스템과 실행 범위
 
-- 장치 해석은 `deep_anc.audio_io.resolve_alsa_portaudio_device` (fxlms_core 이식)가
-  `/proc/asound/cards` 의 짧은 ID(`APE`, `Audio`)로 자동 매핑한다.
-- 장치 목록 확인: `.venv/bin/python -m deep_anc.realtime.run_realtime --list-devices`
-- **USB 오디오(AB13X)가 꽂혀 있어야 카드 `Audio` 가 보인다.** 2026-08-03 현재
-  APE 입력 `hw:1,1`과 AB13X 출력 `hw:2,0`은 인식되며 48kHz/2채널 설정도 수락된다.
+Jetson의 pinmux/I²S, device tree, RT 커널, 전원모드,
+`nvpmodel`/`jetson_clocks`, 오디오 데몬과 priority limit을 변경하지 않는다.
+호스트 apt 설치도 하지 않는다. Docker 환경 관리는 [docker/README.md](../docker/README.md)를 따른다.
+코드·Python·테스트·장치 점검 도구는 컨테이너 안에서 실행한다.
 
-## 2. 시스템 정책 (중요)
+기본 개발 컨테이너에는 오디오 장치가 노출되지 않는다.
+실제 장치 점검은 해당 장치 접근을 준비한 Jetson 컨테이너에서 수행하며,
+장치가 보이지 않는 문제를 호스트 시스템 설정 변경으로 우회하지 않는다.
 
-Jetson 의 **핀 설정(pinmux/I2S)과 RT 커널 구성은 의도된 것이므로 절대 변경하지 않는다.**
-전원모드(30W), pulseaudio/pipewire, RT priority limit 등 시스템 상태도 건드리지 않는다.
-이 저장소의 모든 도구는 유저 공간(venv)에서만 동작하도록 만들어졌다.
-(성능 튜닝 여지가 있는 항목들은 docs/06 §5 에 "참고"로만 기록)
+## 3. 현재 세션의 입력 점검
 
-NVIDIA 일반 문서상 J30 I²S2는 pinmux가 필요한 인터페이스지만, 이 Jetson의 현재 APE/I²S
-구성은 이미 의도적으로 설정된 실험 환경이다. `Jetson-IO`나 device tree를 다시 적용하지 말고,
-아래의 장치 목록과 무음 녹음으로 기존 구성을 읽기 전용 검증한다.
-
-이 정책은 입력 문제를 진단할 때도 예외가 없다. `sudo`, Jetson-IO, pinmux/device-tree,
-RT 커널, `nvpmodel`/`jetson_clocks`, pulseaudio/pipewire, apt 설치를 변경하지 않는다.
-
-## 3. 하드웨어 점검 순서 (USB 오디오 연결 후)
-
-### 현재 정상 입력 상태 (2026-08-03 19:29 KST)
-
-19:11의 무출력 캡처에서는 ERR/REF raw sample이 전부 `-1`이었다. 19:25 재배선 뒤 두 채널에
-동적 데이터는 들어오지만, 손을 뗀 상태의 5초 캡처가 ERR −9.19dBFS/6.79% clip,
-REF −8.77dBFS/7.60% clip, 양쪽 peak 1.0으로 실패했다. 0.1초별 clip이 최대 약 38%로
-튀었다. 원인은 빠져 있던 pin17(REF L/R→3.3V)이었다.
-
-pin17 재연결 뒤 5초 검사는 ERR −46.33dBFS/peak 0.0609/clip 0%,
-REF −46.64dBFS/peak 0.0572/clip 0%로 모두 PASS했다. 현재 배선을 유지하고, 매 출력 실험 전에
-probe를 다시 실행한다. 이 결과를 이유로 Jetson 시스템 설정을 바꾸지 않는다.
-
-### 안전한 점검 순서
+다음은 장치 목록과 입력만 읽는 점검이다.
 
 ```bash
-# 1) 장치 인식
-.venv/bin/python -m deep_anc.realtime.run_realtime --list-devices     # APE(hw:1,1), Audio(hw:2,0) 확인
-# 2) 출력 장치를 열지 않는 입력 probe — FxLMS/digital-ref는 ERR ch0가 필수
-.venv/bin/python scripts/bench/check_audio_input.py
-# recorded/acoustic-ref는 두 채널 모두 필수
-.venv/bin/python scripts/bench/check_audio_input.py --require-both
-# 3) 위 probe PASS 후 세션 도구 자체 점검 (noise/cancel 스피커는 무음)
-.venv/bin/python scripts/data/record_duct.py --program silence --seconds 10
-# 4) 무음 전체 루프 (스피커 소리 없음, 3-스레드 검증)
-.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml \
-    --set noise.type=silence --set engine.type=ort --run-seconds 10
-# 5) 실효 지연 측정 (처프 재생 — 사용자 입회·볼륨 최저!)
-.venv/bin/python -m deep_anc.realtime.run_realtime --config configs/runtime.yaml --calibrate
-# 6) I/O 지연 스윕 (선택)
-.venv/bin/python scripts/bench/measure_io_latency.py
+bash scripts/docker/dev.sh exec .venv/bin/python -m deep_anc.realtime.run_realtime --list-devices
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_audio_input.py --require-both --max-clip-ratio 0
 ```
 
-probe는 raw code 다양성, float 변환 RMS, peak, clipping을 함께 검사한다. 19:29 기준 두 채널
-모두 PASS했지만 출력 직전마다 다시 확인하고, 실패 시 `--force`나 재생으로 우회하지 않는다.
+acoustic-ref에는 ERR/REF 두 채널이 모두 필요하다. raw code 다양성, RMS, peak,
+clipping을 확인하고 clip 0의 반복 PASS를 확보한다.
+입력이 실패하면 강제 진행이나 스피커 재생으로 우회하지 않는다.
+`record_duct --program silence`나 무음 런타임도 출력 장치를 여는 도구이므로
+입력 전용 probe와 구분한다.
 
-입력 복구 전에도 noise speaker ch0의 출력 채널·누설·주관적 공진만 확인하려면, 사용자 입회와
-앰프 볼륨 최저를 실제로 확인한 뒤 다음 정성 진단을 사용할 수 있다.
+### 과거 입력 진단 — 현재 상태로 사용하지 않음
 
-```bash
-.venv/bin/python scripts/bench/playback_duct_probe.py --confirm-volume-minimum
-```
+| 시점 | 관측과 범위 |
+|---|---|
+| 2026-08-01 | REF ch1 무신호 기록 |
+| 2026-08-03 19:11 | ERR/REF raw sample이 −1에 고착 |
+| 2026-08-03 19:25 | 재배선 후 동적 입력은 있으나 ERR/REF clip 약 6.79%/7.60% |
+| 2026-08-03 19:29 | pin17 재연결 뒤 5초 검사에서 ERR/REF 약 −46.33/−46.64dBFS, clip 0% |
+| 2026년 8월 초의 22:39 이후 기록 | 간헐 과클리핑 재발. 2초 검사 ERR/REF clip 약 2.47%/5.03%, 재검사도 실패하여 출력 측정 중단 |
 
-이 도구는 설정의 축방향 공진과 300Hz를 peak 0.002 단계 톤으로 재생하고 cancel ch1은 항상
-무음으로 둔다. 마이크 데이터가 없으므로 생성되는 JSON은 자극 로그일 뿐 P(z), S(z), 지연,
-감쇠 dB 또는 `duct.yaml` 갱신 근거가 아니다.
+잠깐의 PASS 이후에도 실패가 재발한 이력이다.
+이 표만으로 현재 정상·고장을 판단하거나 pin17만이 모든 실패의 원인이라고 단정하지 않는다.
+현재 세션의 무출력 진단과 실물 접촉 확인이 필요하다.
 
-### 레퍼런스 마이크(ch1) 이력
+## 4. 채택한 경로와 재측정
 
-2026-08-01 진단에서 ch1은 사실상 무신호였고 2026-08-03 19:11에는 ch0까지 raw −1로
-고착됐다. 빠져 있던 pin17을 복구한 뒤 둘 다 정상 PASS했다. acoustic-ref와 recorded 수집도
-각 세션 직전 두 채널 probe가 계속 PASS할 때만 진행한다.
+현재 `duct.yaml`이 참조하는 자산은 다음과 같다.
+파일 채택과 현재 장치 조건에서의 재검증 완료는 다른 판단이다.
 
-## 4. 2차경로 S(z) 보정
+| 파일 | 순수지연 | 반복 일관성 | 검증 대역 |
+|---|---:|---:|---|
+| `primary_path_il.npz` | 1608샘플 | 약 0.973 | 150–600Hz |
+| `secondary_path_il.npz` | 1465샘플 | 약 0.956 | 150–600Hz |
 
-### 현재 자산 (assets/measured/)
+두 파일은 같은 capture의 interleaved P/S다.
+자극 대역은 P 64–1648Hz, S 72–1640Hz이지만 검증 대역은 양쪽 모두 150–600Hz다.
+Jetson 목표 1000–1600Hz는 별도 반복 검증이 필요하다.
+총지연·digital/acoustic 정렬은 [docs/01](01_physics_limits.md)이 기준이다.
 
-| 파일 | delay | 일관성 (150–600Hz) | 전대역 | 방식 | 비고 |
-|---|---|---|---|---|---|
-| `primary_path_il.npz` | 1608 | **0.973** | 0.920 | interleaved | **채택 P(z)** |
-| `secondary_path_il.npz` | 1465 | **0.956** | 0.781 | interleaved | **채택 S(z)** — P 와 같은 capture |
-| `secondary_path_4s.npz` | 1342 | 0.40 | — | 순차 ESS | 폐기 (2026-08-05) |
-| `secondary_path_legacy_512high.npz` | 2613 | 0.27 | — | 순차 ESS | 구버전 기록용 (block 512/high) |
+`secondary_path_4s.npz`(1342샘플)와
+`secondary_path_legacy_512high.npz`(2613샘플)는 과거 비교 자료다.
+채택 S를 대신하지 않으며, 당시 품질·설정 불일치는
+[legacy 부록](appendix_legacy_fxlms.md)에 한정해 기록한다.
 
-채택본 두 개는 **한 번의 재생으로 동시에** 측정했고 `capture_id` 가 일치한다. 순차 ESS 는
-두 측정 사이의 클록 wander 가 P/S 상대 지연에 실려 lead 를 틀리게 만든다.
+재측정에서는 블록·latency·샘플레이트·채널·게인·볼륨을 기록하고 기존 S의 조건과 대조한다.
+CS→ERR의 S, CS→REF의 F, 외부 소리의 REF→ERR 선행 시간을 구분한다.
+측정 도구는 `measure_paths_interleaved.py`, `calibrate_wideband.py`,
+`measure_duct_transfer_map.py`이며 구체적 순서는 [docs/14](14_pc_jetson_workplan.md)를 따른다.
+새 측정은 새 산출물로 남기고, 반복 일관성·지연 안정성·대역 검증 전에 채택 NPZ를 교체하지 않는다.
 
-`excitation_band_hz`(구동 64–1648Hz)와 `consistency_band_hz`(검증 150–600Hz)는 다른 값이다.
-학습 손실과 평가는 **검증 대역**을 쓴다 — 재현되지 않는 대역까지 최적화하면 그 잘못된 위상이
-gradient 를 지배해 신뢰 구간 성능까지 잃는다.
-
-주의: 기존 anc_project 는 512/high 로 측정된 모델을 256/low 런타임에 쓰고 있었다
-(지연 26ms 어긋남 — appendix 참조). 측정 latency 는 런타임과 반드시 같아야 한다.
-
-### 광대역 재보정 (풀밴드 학습의 선행 게이트)
-
-```bash
-# S(z) 재보정: 상쇄 스피커(ch1) → 에러 마이크, 80–8000Hz ESS 스윕
-.venv/bin/python scripts/data/calibrate_wideband.py --output-channel cancel \
-    --out assets/measured/secondary_path_wb.npz
-# 반복 일관성 ≥0.9 확인 후 duct.yaml secondary_path.npz 교체 → 파인튜닝
-# digital-ref 1차경로 지연 실측: 소음 스피커(ch0) → 에러 마이크
-.venv/bin/python scripts/data/calibrate_wideband.py --output-channel noise \
-    --out assets/measured/primary_path_wb.npz
-# → duct.yaml digital_reference.primary_path_npz에 위 NPZ 경로,
-#   d_noise_delay_samples에 출력된 delay를 함께 기입
-```
-
-## 5. 안전 수칙
-
-1. 모든 실행은 **ANC OFF 로 시작**한다 (A 키로 수동 ON).
-2. TPA3116D2 볼륨은 최소에서 시작해 점진적으로 올린다.
-3. 런타임 안전장치: 출력 리미터(0.2) / 클립 스트릭 자동 mute / 발산 워치독(+6dB·0.5s)
-   / 추론 데드라인 워치독 — 이상 시 자동으로 상쇄 채널이 꺼진다.
-4. 스피커에 소리를 내는 스크립트(`record_duct.py`, `calibrate_wideband.py`,
-   `measure_io_latency.py`, `evaluate_session.py`, `run_realtime.py`)는 반드시 사람이
-   현장에 있을 때 실행한다.
+소리가 나는 측정과 실행은 사용자 입회·볼륨 최소 상태에서만 한다.
+런타임은 항상 ANC OFF로 시작한다. 출력 제한은 선택한 설정을 따른다
+(acoustic 기준선은 `control_limit=0.10`). 페이드·클리핑·발산·출력 누락 보호가
+측정 조건 확인이나 사용자 입회를 대체하지 않는다.

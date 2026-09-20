@@ -1,5 +1,5 @@
-# HybridANCNet-base — TRT FP16 배포 목표 모델 (≈6.0M params, 2.25 GMAC/s @48kHz)
-# 실측: ORT CPU P99 6.8ms(예산 초과) → TensorRT 필요. 현행 실시간은 tiny 사용.
+# HybridANCNet-base — 구조 비교용 인과 모델 (≈6.0M params)
+# 배포 엔진은 실제 artifact의 등가성·Jetson P99 검증 후 선택한다.
 # 시간영역 인과 회귀: Conv-TasNet 인코더/디코더 + WaveNet dilated causal TCN
 #                    + GCRN GLU/GLSTM + windowed causal MHSA 1층
 

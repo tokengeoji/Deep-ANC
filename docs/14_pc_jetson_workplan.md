@@ -1,6 +1,6 @@
-# 14. 현재 PC와 Jetson의 작업 분담·현장 실행표
+# 14. 개발 Docker와 Jetson 현장의 작업 분담·실행표
 
-> 기준일: 2026-09-17. 목표는 기존 Jetson AGX Orin·덕트에서 acoustic REF를 사용하여
+> 목표는 기존 Jetson AGX Orin·덕트에서 acoustic REF를 사용하여
 > ERR 한 점의 저역과 1 kHz 이상 소리, 음성·음악까지 감쇠시키는 것이다.
 > **Jetson 우선 개선 대역은 1000–1600Hz. 시스템 전체의 저역·고역 목표는 유지한다.**
 > Jetson의 현재 마이크·USB DAC 유지 지시는 그대로다. DSP 실험의 마이크 교체 보고를 Jetson 교체 지시로 해석하지 않는다.
@@ -13,27 +13,31 @@ DSP FxNLMS의 10dB 이상 감쇠는 같은 덕트 구조·스피커에 다른 �
 
 ## 1. 어디에서 무엇을 할 것인가
 
+이 문서의 PC/Jetson은 **작업 유형별 실행 위치**다. 실제 접속 호스트·컨테이너·검증 결과는
+[HANDOFF](../HANDOFF.md)를 확인한다. Jetson Docker에서도 코드·합성 회귀·오프라인 분석이 가능하다.
+
 | 작업 | 수행 위치 | 필요한 입력·산출물 |
 |---|---|---|
-| 코드 수정, 설정 검증, 전체 CPU 테스트 | **현재 PC, CPU Docker** | 저장소 → 테스트 결과·코드 변경 |
-| 지연 예산·S 신뢰대역 진단 | **현재 PC, CPU Docker** | 설정·기존 NPZ → 부족한 조건 보고 |
-| 합성 플랜트의 FxNLMS/하이브리드 회귀 | **현재 PC, CPU Docker** | 합성 신호 → 극성·지연·적응·장애 처리 검증 |
+| 코드 수정, 설정 검증, 전체 회귀 | **접속 호스트의 개발 Docker** | 저장소 → 테스트 결과·코드 변경 |
+| 지연 예산·S 신뢰대역 진단 | **개발 Docker** | 설정·기존 NPZ → 부족한 조건 보고 |
+| 합성 플랜트의 FxNLMS/하이브리드 회귀 | **개발 Docker** | 합성 신호 → 극성·지연·적응·장애 처리 검증 |
 | Jetson 이미지·CUDA·TensorRT 호환성 | **실제 Jetson, Jetson Docker** | 기존 JetPack/L4T → 라이브러리 검사 결과 |
 | 실제 추론 시간·콜백 마감·클록 변동 | **실제 Jetson** | 실제 장치·실행 조건 → 지연 분포·xrun 기록 |
 | REF/ERR 입력, S·F 전달경로·THD/IMD | **Jetson과 덕트 현장** | 연결된 장치 → 원시 녹음·반복 측정·메타데이터 |
 | 외부 소리의 OFF→ON→OFF 감쇠 | **Jetson과 덕트 현장** | 사전 측정 S → acoustic FxNLMS 기준선 |
 | 회수 자료의 품질·대역·왜곡 분석 | **자료 회수 후 현재 PC** | 현장 원자료 → 독립 분석·다음 측정 항목 |
 | acoustic 데이터 처리·학습·계수 생성 개발 | **현재 PC에서 가능한 규모부터** | Drive 보관 자료 → 코드·소규모 검증·학습 산출물 |
-| 공개 원본의 임시 다운로드·검증·Drive 전송 | **현재 PC, CPU Docker + 연결 Drive** | 공식 checksum → Drive 파일 확인 → 해당 PC 원본 삭제·receipt 보존 |
+| 공개 원본의 임시 다운로드·검증·Drive 전송 | **저장공간이 확보된 개발 Docker + 연결 Drive** | 공식 checksum → Drive 파일 확인 → 해당 임시 원본 삭제·receipt 보존 |
 
 Jetson 현장이 준비되지 않아도 현재 PC의 테스트·경로 진단·합성 회귀·후처리 개발은 계속한다.
 현재 PC 결과를 Jetson 실시간 성능이나 덕트 감쇠 성능으로 표기하지 않는다.
 설계 배경은 [docs/13](13_acoustic_hybrid.md), 환경 관리는 [docker/README](../docker/README.md)를 따른다.
 
-## 2. 현재 PC에서 바로 수행할 작업
+## 2. 개발 Docker에서 바로 수행할 작업
 
-실행 중인 CPU 개발 컨테이너에서 다음을 확인한다. 환경이 없으면 Docker 문서의 `build cpu`와
-`up cpu`, 중지 상태면 `start`를 사용한다. Python 패키지를 호스트에 설치하지 않는다.
+실행 중인 개발 컨테이너에서 다음을 확인한다. 환경이 없으면 Docker 문서에서 호스트에 맞는
+대상(`cpu`/`jetson-local`/`jetson`)을 선택하고, 중지 상태면 `start`를 사용한다.
+Python 패키지를 호스트에 설치하지 않는다.
 
 ```bash
 bash scripts/docker/dev.sh status
@@ -72,7 +76,7 @@ acoustic 녹음 후처리와 runtime 저장 메타데이터 연결은 구현했�
 - [ ] 실제 ARM64 Jetson AGX Orin이며 기존 JetPack/L4T와 Docker가 준비되어 있다.
 - [ ] 현재 마이크·USB DAC·Jetson·덕트를 유지한다. 장치 교체/구매를 선행조건으로 삼지 않는다.
 - [ ] 호스트 RT 커널·NVIDIA 드라이버·전원 모드·핀 설정·오디오 서비스를 변경하지 않는다.
-- [ ] **기본 `dev.sh up jetson`은 오디오 장치를 노출하지 않는다.** 장치 연결을 확정하고
+- [ ] **기본 `jetson`/`jetson-local`은 오디오 장치를 노출하지 않는다.** 장치 연결을 확정하고
       해당 장치에 접근하는 컨테이너 구성을 마련하기 전까지 아래 오디오 작업은 보류한다.
 - [ ] `/dev/snd` 접근, ALSA 카드/PCM, ERR/REF 채널, 출력 채널, UID/GID를 실제 장치와 대조한다.
       현재 관리 스크립트에 없는 오디오 연결 옵션을 가정하지 않는다.
@@ -89,30 +93,17 @@ acoustic 녹음 후처리와 runtime 저장 메타데이터 연결은 구현했�
 
 ### A. 이미지·라이브러리 검증 — 오디오 불필요
 
+최초 설치는 [Docker 안내](../docker/README.md)를 따른다. 기존 환경을 다시 만들지 않는다.
+
 ```bash
-bash scripts/docker/dev.sh build jetson
-bash scripts/docker/dev.sh up jetson
-bash scripts/docker/dev.sh exec .venv/bin/python -c 'import torch; print(torch.__version__); print(torch.cuda.is_available())'
-bash scripts/docker/dev.sh exec .venv/bin/python -c 'import tensorrt; print(tensorrt.__version__)'
+bash scripts/docker/dev.sh status
+bash scripts/docker/dev.sh exec .venv/bin/python -m pip check
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_jetson_stack.py
 ```
 
-**산출물:** 이미지 ID, Jetson/L4T 정보, PyTorch·CUDA·TensorRT 검사 출력.
-현재 x86 CPU 검증은 이 단계를 대체하지 않는다.
-
-**2026-09-20 실제 Jetson 부분 결과:** 오디오 미노출 `l4t-cuda:12.6.11-runtime`에서
-`--runtime nvidia --network none`으로 aarch64, L4T R36.4.4, CUDA 12.6.11,
-`/dev/nvhost-gpu`, `libcudart.so.12`를 확인했다. 프로젝트 기본 이미지가 아니라 NVIDIA 런타임의
-최소 확인이다. 같은 Ubuntu 22.04 L4T CUDA 컨테이너에 호스트 TensorRT Python·동적 라이브러리
-경로를 읽기 전용으로 수동 연결한 진단에서는 `tensorrt==10.3.0` import가 성공했다. 이 bind 구성은
-`dev.sh` 기본 환경이나 프로젝트 이미지 검증을 대체하지 않는다.
-기본 `l4t-jetpack:r36.4.0` 빌드는 57GB 루트 파일시스템 공간 부족으로 완료하지
-못했다. `l4t-cuda` build arg probe는 의존성 설치·이미지 등록까지 진행했지만 실행 스냅샷 unpack에서
-여유 공간이 1.9GB로 내려가 중단·삭제했다. 당시 임시 ID
-`sha256:76bf18ecb9ef2111c3128d7f30d305710747b7318c016d91ed17729d13ec039b`는
-실행 검증 산출물이 아니며 현재 존재하지 않는다. 컨테이너·태스크·이미지 참조가 없는 고아
-containerd lease도 공식 lease 삭제와 GC로 정리했으며, 최종 루트 여유 공간은 12GB다.
-따라서 프로젝트 이미지의 PyTorch CUDA·ONNX Runtime·TensorRT 검증은 계속 미완료이며,
-추가 저장공간 확보 후 기본 이미지로 이 절 전체를 다시 수행한다.
+**산출물:** 이미지 ID·venv 패키지 목록·Jetson/L4T 정보·stack JSON.
+소형 합성 Conv1d로 CUDA/cuDNN/ORT/TensorRT 연산을 확인하며 실제 프로젝트 모델과는 구분한다.
+최신 실행 결과는 HANDOFF에만 기록한다. x86 CPU 검증은 이 단계를 대체하지 않는다.
 
 **중단 조건:** 이미지 호환성·GPU 접근 실패 시 GPU 배포를 보류한다. 호스트 시스템 변경으로 우회하지 않는다.
 라이브러리 import 성공과 실제 모델의 스트리밍 추론 검증도 별도 항목이다.
@@ -259,7 +250,7 @@ fs=3200에서도 target 상한은 제외하지만 기존 full/high 대역의 Nyq
 각 구간 앞에서는 `max(해당 guard, S.delay + FIR 길이 − 1)`을 제외한다.
 출력 callback에서 녹음한 control/gain이므로 handoff를 다시 더하지 않는다.
 ON이 OFF보다 길어도 ON 후반을 버리지 않으며, 사이클별 앞뒤 OFF 중 작은 평균 파워와 비교한다.
-분석 창 미만의 말미는 별도 discarded 샘플 수로 남긴다. 자세한 정의는 [docs/07 §8](07_evaluation_protocol.md#8-acoustic-런타임-녹음-진단--현재-pc-무출력)을 따른다.
+분석 창 미만의 말미는 별도 discarded 샘플 수로 남긴다. 자세한 정의는 [docs/07 §8](07_evaluation_protocol.md#8-acoustic-런타임-녹음-진단--docker-오프라인-분석-무출력)을 따른다.
 
 exit 0은 모든 사이클의 구간이 완전하고 **최소 한 사이클**의 전체 대역 비교가 계산 가능하다는 뜻이다.
 exit 2는 비교 불가·불완전 사이클이며 진단 산출물은 보존한다. exit 1은 입력·설정·I/O 오류다.
@@ -297,6 +288,6 @@ FIR 비교는 독립 train 후보 한 개의 초기 수렴·gain 변화·긴 지
 - 저역과 1 kHz 이상, 환경소음·기계음·음성·음악의 결과를 각각 남긴다. 전체 평균만으로 성공을 선언하지 않는다.
 - S의 검증 대역 밖 결과는 미검증으로 표시한다. `e = d + S·y` 극성과 실제 핸드오프를 유지한다.
 - CPU 테스트, Jetson 추론 벤치마크, 실제 acoustic 감쇠를 구분하고 원자료 경로·설정·코드 버전을 연결한다.
-- 과거 [docs/12](12_system_summary.md)의 수치를 이번 구조의 신규 실기 결과로 재사용하지 않는다.
+- 과거 digital-ref 수치나 합성 결과를 이번 acoustic 구조의 신규 실기 결과로 재사용하지 않는다.
 - 현재 마이크·USB DAC를 포함한 하드웨어 유지가 최신 조건이다. 이전의 교체 허용 문구는 적용하지 않는다.
   기존 장치 지연·지터를 재검증하고 Docker·사용자 공간 개선만 검토한다. 호스트 시스템은 변경하지 않는다.
