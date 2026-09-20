@@ -19,13 +19,17 @@ FxNLMS 적응을 결합한다. 이 저장소는 두 연구의 **선택/준비 �
 이번 구현의 **기준 FIR + 별도 FxNLMS 잔차 유지 + 선형 crossfade**는 논문 그대로가 아닌
 이 프로젝트의 실험 정책이다. 아래 §2–3은 준비한 후보 한 개를 시험한 첫 단계 기록이다.
 후속으로 조건별 bank와 과거 REF만 사용하는 PSD 선택기를 구현했다([docs/16 §6](16_drive_acoustic_preparation.md#6-논문-구조를-확장한-합성-필터-뱅크)).
-학습된 CNN/계수 생성기·live 선택기는 아직 없다.
+이와 별도로 **OMAP 16 kHz 실측 S 원본 500탭 + 합성 P + 소스 음원**을 사용하는
+FP64 인과 FIR 계산과 REF-only CNN 선택기 사전학습을 추가했다([docs/18](18_sfanc_pretraining.md)).
+CNN은 미리 계산한 후보를 선택하며 FIR 계수를 생성하는 모델이 아니다.
+기존 PSD bank·준비 FIR API·48 kHz 런타임은 변경하지 않았고 두 선택기 모두 live에 연결하지 않았다.
 선형 FIR만으로 비선형 왜곡이 해결됐다고 주장하지 않는다.
 
 ## 2. 구현된 연구용 API
 
-소스는 `src/deep_anc/baselines/prepared_fir.py`다. 기존 `HybridEngine`의 신경망 파형 결합과 별도다.
+이 절의 소스는 `src/deep_anc/baselines/prepared_fir.py`다. 기존 `HybridEngine`의 신경망 파형 결합과 별도다.
 `build_engine`에 새 controller를 등록하지 않았고 runtime 설정·오디오 callback은 변경하지 않았다.
+아래 표는 이 API의 범위이며, 별도 CNN 사전학습의 구현 여부를 뜻하지 않는다.
 
 | 구성 | 이번 구현 | 아직 하지 않는 것 |
 |---|---|---|
@@ -153,10 +157,12 @@ CLI의 현재 기본 target은 **[1000,1600]**이다. Python API의 호환용 �
 ## 5. 다음 연결과 Jetson에 남은 일
 
 다양한 조건의 합성 bank와 비학습 REF-only 선택기, 독립 seed/레벨/주파수 스트레스는
-[docs/16](16_drive_acoustic_preparation.md)에 추가했다. 실제 회수 자료 재현·음성/음악 검증과
-과거 REF 특징만 쓰는 선택기의 학습은 아직 남아 있다.
-훈련/검증/test의 녹음 그룹 분리와 후보의 S/조건 메타를 먼저 갖춘다.
-현재 한 후보 시험을 완성된 SFANC/CNN으로 부르거나 데이터 없는 모델 학습을 성공으로 기록하지 않는다.
+[docs/16](16_drive_acoustic_preparation.md)에 추가했다. 현재는 사용자 지시에 따라 하드웨어 연결을
+보류하고 [docs/18](18_sfanc_pretraining.md)의 수치 검증·SFANC 사전학습을 우선한다.
+새 경로는 완료된 REF 창으로 다음 창의 후보를 선택하고, 소스 그룹별 train/validation/test와
+S 원본 SHA를 분리·기록한다. 합성 음원과 선택적 LibriSpeech 음성은 실측 REF/ERR 녹음이 아니다.
+OMAP 동기 ANC-OFF 자료를 사용한 미세조정, 실제 회수 자료 재현·음성/음악 실측 검증은 남아 있다.
+독립 창별 선택 평가를 연속 필터 전환 검증이나 SFANC 실감쇠로 해석하지 않는다.
 
 실제 Jetson에서만 확인할 것은 I/O·콜백 마감·지터, 사용자 입회 하의 S/F와 레벨별 비선형 측정,
 독립 acoustic OFF→ON→OFF 세션이다. 라이브 FIR 경로 연결과 스레드 전달은 그 전에 별도 리뷰가 필요하다.

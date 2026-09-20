@@ -1,0 +1,23 @@
+{
+  "sample_rate": 16000,
+  "control_length": 64,
+  "bank_train_samples": 16384,
+  "window_samples": 4096,
+  "n_fft": 512,
+  "secondary_kind": "synthetic",
+  "secondary_delay_samples": 8,
+  "primary_delay_samples": 32,
+  "regularization": 1e-7,
+  "effort_penalty": 0.002,
+  "target_band_weight": 3.0,
+  "control_limit": 0.2,
+  "epochs": 40,
+  "batch_size": 64,
+  "learning_rate": 0.001,
+  "temperature": 0.05,
+  "risk_weight": 1.0,
+  "seed": 20260920,
+  "train_groups": 32,
+  "validation_groups": 8,
+  "test_groups": 8
+}

@@ -11,6 +11,8 @@
 - ERR 한 점의 감쇠가 기준이며 고역은 1 kHz 이상이다. **Jetson 우선 대역은 1000–1600 Hz**다.
 - 최신 검토 구상은 **1 kHz를 경계로 저역은 OMAP FxNLMS, 고역은 Jetson Orin**이 맡는 구조다.
   정확한 전이대역·출력 합산·입력 공유·장치 간 전송은 미정이다. 1600 Hz를 전체 목표의 상한으로 정하지 않는다.
+- 최신 작업 지시는 **연결은 나중에 하고 SFANC 필터 계산·학습부터 진행**하는 것이다.
+  사전학습의 S는 사용자가 확정한 **OMAP 16 kHz 원본 실측 500탭**이다. 48 kHz 경로와 섞지 않는다.
 - 시스템 전체의 저역·고역 동시 감쇠와 음성·음악까지 제거하는 quiet zone 목표를 유지한다.
 - 현재 Jetson AGX Orin·덕트·마이크·USB DAC를 유지한다. 교체·구매를 해결책으로 가정하지 않는다.
 - Docker 내부에서만 코드·문서·Git·Python·테스트 작업을 한다. 호스트 `.venv`는 사용하지 않는다.
@@ -31,9 +33,9 @@
 통합 자체는 x86 CPU Docker에서 수행됐고 당시 결과는 1282 passed, 2 skipped,
 5 subtests passed였다. 아래 Jetson 검증은 그 이후 통합 코드를 실제 장치에서 실행한 결과다.
 
-최종 통합 Jetson 회귀: **1303 passed, 7 subtests passed, 실패·skip 없음 (185.57초)**.
-`pytest -q -o addopts= -ra`로 두 Python 경로와 새 CUDA·원본 보호 회귀를 함께 실행했다.
-로그는 `results/pytest_jetson_merged_20260920_03.log`다. 스피커 출력은 하지 않았다.
+최종 통합 Jetson 회귀: **1452 passed, 7 subtests passed, 실패·skip 없음 (195.07초)**.
+`pytest -q -o addopts= -ra`로 두 Python 경로와 새 SFANC·CUDA·원본 보호 회귀를 함께 실행했다.
+로그는 `results/pytest_sfanc_full_20260920_01.log`다. 스피커 출력은 하지 않았다.
 
 ### 통합 OMAP 16 kHz 경로
 
@@ -53,6 +55,24 @@
   어떤 파일도 쓰기 전에 거부한다. 준비 진단의 Python 최소 버전도 저장소와 같은 3.10으로 맞췄다.
 - 준비 시 여유 공간은 약 4.49 GiB로 5 GiB 미만 경고가 있다. 대용량 데이터 복원 전 공간을 확인한다.
   컨테이너에 `nvidia-jetpack` 메타패키지는 없지만 L4T 파일과 실제 CUDA 연산을 확인했다.
+
+### SFANC 필터 계산·선택기 사전학습
+
+- [SFANC 안내](docs/18_sfanc_pretraining.md)의 FP64 인과 FIR 계산과 REF-only CNN 학습을 추가했다.
+  독립 컨볼루션·부호·지연·gradient·미래 입력 차단·분할/복원 등 신규 회귀 **149개 통과**.
+- `runs/sfanc/omap_20260920_02/`: 실제 Orin CUDA에서 **60 epoch**, 검증 비용으로 선택한 epoch 52 모델.
+  `bank.npz`는 128탭 FIR 8개+무제어 후보이며 S의 원본 500탭과 SHA·gain·극성·선행 탭을 보존했다.
+  `selector.pt`, `report.json`, `speech_manifest.json`을 저장하고 복원 수치 등가를 확인했다.
+- train/validation/test는 600/160/160창이다. LibriSpeech 음성 120/40/40창은 화자·책 연결요소로
+  분리하고 나머지는 독립 합성 음원·무음이다. 원천 음성은 동기 REF/ERR 실측 녹음이 아니다.
+- **P는 명시적 합성 경로**다. 추가 S 지연 0은 오프라인 조건이지 Jetson 전송 지연 실측값이 아니다.
+  고역 가중 잔차·출력 에너지·한도 초과 벌점을 합친 독립 test 비용은 고정 FIR 0.574615,
+  학습 선택기 0.554180이다. dB 감쇠나 실제 덕트 성공으로 해석하지 않는다.
+- test 1/160창에서 선택 출력이 0.2 한도를 넘는다. 평가에는 실제 limiter를 적용하지 않았고
+  초과·증폭 결과를 보고서에 보존했다. **실기 배포 불가**, 연속 필터 교체/전송도 미연결이다.
+- 로그는 `results/sfanc_omap_20260920_02.log`. 첫 CE-only 학습 `_01`도 보존했다.
+  두 번째 학습은 validation에서 발견한 비용 불일치를 기대 regret 손실로 보완한 것이며,
+  최종 test를 본 뒤 모델/임계값을 다시 고르지 않았다. 음악 학습·실측 fine-tuning은 미실행이다.
 
 ### 재사용한 Jetson Docker 구성
 
@@ -99,8 +119,8 @@ bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q -o addopts= -ra
   acoustic 배포 artifact는 미확정이며 기존 digital/모드미상 모델을 대신 쓰지 않는다.
 - REF/ERR 오류, 클리핑·xrun·출력 누락 후 적응 보류/초기화/ANC OFF 규약과 합성 회귀가 있다.
 - 녹음 schema v1은 설정·S SHA·누적 health를 기록한다. 분석 CLI는 새 경로에 진단 보고를 저장한다.
-- 사전 FIR·REF-only 선택기·필터 뱅크·strict acoustic 데이터 준비는 구현했다.
-  **학습된 선택기·온라인 S/F 식별·F 보상·실측 비선형 모델·사전 FIR live 연결은 미완료**다.
+- 사전 FIR·필터 뱅크·strict acoustic 데이터 준비와 별도 OMAP S 기반 **오프라인 학습형 REF-only 선택기**를 구현했다.
+  **실측 fine-tuning·온라인 S/F 식별·F 보상·실측 비선형 모델·사전 FIR live 연결은 미완료**다.
 
 현재 설정/저장 S 기준의 상쇄 경로는 `1465 + handoff 256 = 1721`샘플(35.854 ms)이고,
 REF 기하 선행은 약 2.915 ms다. S의 기존 반복 검증 대역은 **150–600 Hz**다.
@@ -132,7 +152,7 @@ OMAP 계약의 manifest·`capture.json`·`preparation.json`도 발견되지 않�
 각 82행의 48 kHz legacy 자료이며 현재 참조 세션 경로는 각 0/82개 존재한다.
 이 자료를 리샘플링하거나 ANC-OFF라고 추정해 OMAP 학습에 사용하지 않는다.
 현재 상태는 **로컬 미수집 / 기존 자료가 없으면 실측 예정**이다(사용자 확정).
-다음 단계는 OMAP raw ADC 두 채널의 동기·손실 없는 수집 경로와 gain·배선 조건을 확인하고,
+실측 단계에서는 OMAP raw ADC 두 채널의 동기·손실 없는 수집 경로와 gain·배선 조건을 확인하고,
 사용자 입회·볼륨 최소 상태에서 ANC OFF 녹음을 확보하는 것이다.
 기존 `rir.txt`는 이미 실측된 2차경로이며, 없다고 보고한 것은 학습용 REF/ERR 동기 녹음이다.
 실측 계획은 즉시 오디오 실행·펌웨어 변경을 승인한 것으로 해석하지 않는다.
@@ -142,8 +162,8 @@ OMAP 계약의 manifest·`capture.json`·`preparation.json`도 발견되지 않�
 프로세서는 OMAP-L138이며, 실제 보드 모델/revision·현재 CCS 버전·가용 RAM/링커 배치는 미확인이다.
 저장된 프로젝트는 LCDKOMAPL138/CCS 9.3.0 설정이다. raw REF/ERR 모니터는 256샘플(16 ms)
 순환 버퍼뿐이며 연속 녹음·누락 검출·WAV 회수 경로는 미구현이다.
-다음은 기존 CCS `.ccxml`의 `Board or Device` 또는 실물 사진 확인과 수집 방식 결정이다.
-원본 FxNLMS를 보존하는 별도 녹음 전용 프로젝트 준비 여부를 사용자에게 질문했으며 아직 미승인이다.
+사용자는 연결 작업을 뒤로 미루고 SFANC 학습을 먼저 진행하도록 지시했다. 보드 식별·수집 방식은
+실측 단계에서 확인한다. 별도 녹음 전용 프로젝트는 아직 승인·구현하지 않았으며 현재 보류한다.
 Windows에서 확보한 파일을 Jetson Docker에서 처리할 수 있지만, JTAG 접속 자체를 녹음 완료나
 실시간 Jetson–DSP 통신으로 간주하지 않는다. [수집 준비 안내](docs/DATASET.md)를 따른다.
 
@@ -175,17 +195,20 @@ Drive 보관 완료와 로컬 strict 데이터 준비·실제 학습 완료는 �
 ## 5. 다음 순서
 
 1. 기존 Docker를 재사용한다. 코드 변경 시 관련 회귀와 전체 검사를 수행한다.
-2. **OMAP 후속:** 기존 동기 녹음이 없으면 사용자 계획대로 실측한다.
+2. **우선 SFANC:** OMAP 원본 S를 보존한 오프라인 필터·선택기 학습을 발전시킨다.
+   출력 한도 초과·전이 구간·고역/저역 증폭을 확인하고 독립 자료로 재검증한다.
+   마지막 test를 다시 튜닝 자료로 쓰지 않는다. 연결 질문이나 녹음 부재로 가능한 오프라인 작업을 멈추지 않는다.
+3. **실측 후속:** 기존 동기 녹음이 없으면 사용자 계획대로 실측한다.
    먼저 OMAP 수집 경로·gain·배선·공통 clock을 확인하고, 사용자 입회·볼륨 최소 상태에서
    [DATASET.md](docs/DATASET.md)의 16 kHz raw REF/ANC-OFF 녹음을 확보한다.
    독립 train/valid 세션과 raw 단위를 검증한 뒤 CUDA 1 epoch부터 진행한다.
    합성 결과를 실제 데이터 학습으로 대체하거나 녹음 경로를 임의로 정하지 않는다.
-3. **별도 48 kHz 후속:** interleaved 저장모델의 pre-roll 회귀를 수정·재검증하고,
+4. **별도 48 kHz 후속:** interleaved 저장모델의 pre-roll 회귀를 수정·재검증하고,
    실제 acoustic artifact의 출처·독립 학습/평가 자격, Drive receipt/자료 회수 상태와
    strict 데이터 QA를 확인한다. 승인된 train-only 정책을 유지한다.
-4. 현장 준비가 되면 [docs/14](docs/14_pc_jetson_workplan.md)에 따라 장치·REF/ERR 입력,
+5. 현장 준비가 되면 [docs/14](docs/14_pc_jetson_workplan.md)에 따라 장치·REF/ERR 입력,
    고역 S·F·선행 시간과 반복 OFF/ON/OFF를 순서대로 측정한다. 현장 승인 전 오디오는 열지 않는다.
-5. 외부 DSP 출력 구성이 정해져야 하는 설계는 사용자 확인 뒤 진행한다.
+6. 외부 DSP 출력 구성이 정해져야 하는 설계는 사용자 확인 뒤 진행한다.
 
 ## 6. DeepANC에서 통합한 OMAP 경로
 
