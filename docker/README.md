@@ -15,7 +15,8 @@
 
 CPU 이미지는 Jetson 에뮬레이터가 아니다. CPU 테스트가 통과해도 Jetson의 CUDA,
 TensorRT, 처리 지연, 실제 오디오 경로가 검증된 것은 아니다.
-Jetson Dockerfile은 준비된 빌드 정의이며 **현재 실제 Jetson에서의 이미지 빌드·CUDA·TensorRT 검증은 미완료**다.
+Jetson Dockerfile은 준비된 빌드 정의다. 2026-09-20 실제 Jetson에서 NVIDIA CUDA 최소 런타임은
+확인했지만, 저장공간 부족으로 **프로젝트 이미지의 PyTorch CUDA·TensorRT 검증은 미완료**다.
 2026-09-15 CPU 컨테이너의 전체 테스트는 1109개 통과, 현장 자료 부재 2개 건너뜀이며 `pip check`도 통과했다.
 
 환경 정의는 [Dockerfile.cpu](Dockerfile.cpu), [Dockerfile.jetson](Dockerfile.jetson),
@@ -107,10 +108,27 @@ bash scripts/docker/dev.sh exec .venv/bin/python -c 'import tensorrt; print(tens
 ```
 
 기본 베이스는 `nvcr.io/nvidia/l4t-jetpack:r36.4.0`이며 `up jetson`은 `--runtime nvidia`를 사용한다.
+Jetson의 `build`와 `up`에는 `--network host`도 적용한다. 현재 RT 커널에서 Docker 기본 bridge가
+iptables `raw` 규칙을 만들지 못하는 문제를 호스트 방화벽·커널 변경 없이 피하기 위한 범위다.
+CPU 대상의 네트워크 방식은 바꾸지 않는다.
 Jetson 가상환경은 이미지의 시스템 Python 패키지를 함께 볼 수 있고,
 NVIDIA PyTorch wheel과 컨테이너 가상환경 내부의 라이브러리 preload 훅을 설치한다.
+nv24.08 ARM64 공식 스택과 L4T CUDA 12.6 Update 1에 맞춰 CUPTI는 `12.6.68`,
+cuSPARSELt는 `0.6.2`로 고정한다. 최신 버전 자동 선택으로 CUDA 계열이 바뀌지 않게 한다.
+[NVIDIA PyTorch 24.08 릴리스 노트](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-08.html),
+[cuSPARSELt 릴리스 노트](https://docs.nvidia.com/cuda/cusparselt/release_notes.html),
+[CUDA 12.6.1 릴리스 노트](https://docs.nvidia.com/cuda/archive/12.6.1/pdf/CUDA_Toolkit_Release_Notes.pdf)를 근거로 한다.
 이 구성의 실제 호환성은 위 현장 검사와 후속 추론 검사로 확인해야 한다.
 라이브러리 import 성공만으로 스트리밍 등가성이나 실시간 마감 충족을 판정하지 않는다.
+
+2026-09-20 실제 Jetson의 `l4t-cuda:12.6.11-runtime` 최소 컨테이너에서는 aarch64,
+L4T R36.4.4, CUDA 12.6.11, `/dev/nvhost-gpu`, `libcudart.so.12`를 확인했다.
+동일 계열 컨테이너에 호스트 TensorRT 경로를 읽기 전용으로 수동 연결한 별도 진단에서는
+`tensorrt==10.3.0` import가 성공했지만, 이 bind 구성은 `dev.sh` 기본 환경이 아니다.
+기본보다 작은 베이스를 일시적인 build arg로 사용한 probe는 의존성 설치·이미지 등록까지 갔지만,
+실행 스냅샷 unpack 시 디스크 보호 임계치에 도달해 중단하고 삭제했다. 기본 베이스를 작은 이미지로
+변경한 것이 아니며 PyTorch·ONNX Runtime·TensorRT·모델 추론 검증 결과로 인용하지 않는다.
+추가 저장공간을 확보한 뒤 기본 이미지로 이 절의 명령을 다시 완료해야 한다.
 
 컨테이너는 **호스트의 NVIDIA L4T 커널과 드라이버를 공유**한다.
 기존 RT 커널·핀 설정·전원 모드·오디오 서비스를 그대로 유지한다.

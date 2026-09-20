@@ -1,10 +1,10 @@
 # HANDOFF — 세션 인수인계 (다음 AI 에이전트/개발자용)
 
-> **"이어서 진행해줘"를 받았다면**: 먼저 아래 **2026-09-17 현재 작업**을 읽어라.
+> **"이어서 진행해줘"를 받았다면**: 먼저 아래 **2026-09-20 현재 작업**을 읽어라.
 > 규칙은 [AGENTS.md](AGENTS.md)가 단일 출처. 이 파일은 작업 상태가 바뀔 때마다 갱신할 것.
-> 최종 갱신: 2026-09-17. 아래 과거 §0 이후의 서버/PID/실험 현황은 역사 기록이며 현재 상태가 아니다.
+> 최종 갱신: 2026-09-20. 아래 과거 §0 이후의 서버/PID/실험 현황은 역사 기록이며 현재 상태가 아니다.
 
-## 현재 작업 — 2026-09-17 MIMII 학습 보조 확정·Jetson 고역 역할
+## 현재 작업 — 2026-09-20 Jetson Docker 부분 검증·Jetson 고역 역할
 
 ### 사용자 확정 사항
 
@@ -20,7 +20,7 @@
 - **최신 지시: Docker 환경을 만들고 그 안에서만 작업한다.** 호스트에서는 Docker 환경 관리만 한다.
 - 커밋·push는 승인됐다. **이 PC에서 가능한 작업은 이 PC에서 진행하고**, Jetson 필수 작업은 [docs/14](docs/14_pc_jetson_workplan.md)의 현장 체크리스트로 분리한다.
 - `Roka-jsj/Deep-ANC`와 `tokengeoji/Deep-ANC`는 **계정명 변경 전후의 같은 저장소**라고 사용자가 확인했다.
-  현재 `origin=https://github.com/tokengeoji/Deep-ANC.git`을 유지한다. push 대상 재질문은 불필요하다.
+  2026-09-20 현재 `origin=git@github.com:tokengeoji/Deep-ANC.git`이다. push 대상 재질문은 불필요하다.
 - 커밋 작성자는 최근 커밋과 동일하게 사용하도록 승인됐다. 작성자 확정 때 확인한 `fe80121`의 작성자는
   `SEUNG JOON JEONG <155646237+tokengeoji@users.noreply.github.com>`이다(과거 이름은 Roka-jsj).
   이 저장소의 local Git 작성자 설정만 맞췄으며 전역 설정은 변경하지 않았다.
@@ -87,13 +87,38 @@ ANC 학습 분할과 구분해 보존하며, section을 독립 장치/원녹음 
 - bootstrap RIR은 대역 독립 기하 합성이므로 목표 변경만으로 재생성하지 않았다.
   과거 Drive ZIP·QA·합성 bank 보고서를 새 대역 결과로 수정하거나 중복 업로드하지 않았다.
 
-### 현재 환경과 실행
+### 현재 환경과 실행 — 2026-09-20 실제 Jetson
 
-실제 접속 호스트는 x86_64다. 과거 문서의 "이 PC=Jetson"을 현재 호스트 사실로 간주하지 않는다.
-CPU 이미지 `deep-anc-cpu:dev`와 개발 컨테이너 `deep-anc-dev`를 빌드·시작했다.
-컨테이너 Python은 `/workspace/Deep-ANC/.venv/bin/python`, torch `2.5.1+cpu`, ORT `1.18.1`이다.
-호스트 저장소를 바인드하고 `.venv`는 이미지 ID별 Docker 볼륨으로 가린다. 기존 호스트 `.venv`는 보존했지만 사용하지 않는다.
-기본 환경은 비특권 사용자이며 오디오 장치를 노출하지 않는다.
+실제 접속 호스트는 **ARM64 Jetson AGX Orin**이며 L4T는 R36.4.4다. 이전 2026-09-17의
+x86_64 CPU 컨테이너 기록은 과거 검증 이력이고 현재 실행 환경이 아니다. 현재 `deep-anc-dev`
+개발 컨테이너는 없으며 프로젝트 Jetson 이미지는 아직 실행 검증을 완료하지 못했다.
+
+오디오 장치를 노출하지 않은 `nvcr.io/nvidia/l4t-cuda:12.6.11-runtime` 최소 컨테이너에서
+`--runtime nvidia --network none`으로 aarch64, L4T R36.4.4, CUDA 12.6.11 banner,
+`/dev/nvhost-gpu`, `libcudart.so.12`를 확인했다. 이는 NVIDIA 런타임의 최소 확인일 뿐,
+프로젝트 PyTorch·ONNX Runtime·TensorRT·모델 추론 성공을 뜻하지 않는다.
+같은 Ubuntu 22.04 L4T CUDA 컨테이너에 Python을 임시 설치하고 호스트의 TensorRT Python·동적
+라이브러리 경로를 읽기 전용으로 연결한 별도 진단에서는 `tensorrt==10.3.0` import가 성공했다.
+이 수동 bind 구성은 `dev.sh`나 프로젝트 이미지의 구성·검증 결과가 아니다.
+
+기본 `l4t-jetpack:r36.4.0` 이미지는 현재 57GB 루트 파일시스템의 공간 부족으로 완성하지 못했다.
+더 작은 `l4t-cuda`를 일시적인 build arg로 쓴 probe는 의존성 설치와 이미지 등록까지 진행했지만,
+실행 스냅샷 unpack 중 여유 공간이 1.9GB로 내려가 중단했다. 임시 probe 이미지와 캐시는 삭제해
+5.8GB 여유 공간을 복구했고, 저장소의 기본 베이스는 바꾸지 않았다. 임시 이미지 ID는
+`sha256:76bf18ecb9ef2111c3128d7f30d305710747b7318c016d91ed17729d13ec039b`였으나
+실행 검증에 성공한 산출물이 아니며 현재 존재하지 않는다.
+
+probe 당시 무핀 패키지는 `nvidia-cuda-cupti-cu12==12.9.79`,
+`nvidia-cusparselt-cu12==0.8.1`을 선택했다. 공식 nv24.08 ARM64 스택과 CUDA 12.6 Update 1을
+대조해 Dockerfile을 각각 `12.6.68`, `0.6.2`로 고정했다. 특히 cuSPARSELt 0.8 계열은
+CUDA 12.9/13 계열이므로 그대로 채택하지 않았다. 핀의 근거는 확보했지만 새 프로젝트 이미지를
+실행할 공간이 없어 PyTorch import·CUDA 텐서 연산으로 재검증하지는 못했다.
+
+이 과정에서 BuildKit에는 `/.dockerenv`가 없어 preload 설치가 실패하는 문제와, 최종 `chown`이
+전체 venv를 다음 레이어로 copy-up하는 문제를 수정했다. Jetson 대상의 빌드·실행만
+`--network host`를 사용해 현재 RT 커널의 Docker bridge/iptables raw 오류를 우회한다.
+호스트 커널·방화벽 설정은 변경하지 않았고 CPU 경로와 기본 오디오 미노출 규칙은 유지한다.
+전용 계약 테스트 6개와 `dev.sh` 셸 문법 검사는 Docker 안에서 통과했다.
 
 ```bash
 bash scripts/docker/dev.sh status
@@ -103,8 +128,8 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_re
 bash scripts/docker/dev.sh shell
 ```
 
-Jetson용 `docker/Dockerfile.jetson`도 준비했지만 **실제 ARM64 Jetson 빌드·CUDA/TensorRT·실시간 오디오 검증은 아직 하지 않았다**.
-L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공유한다. x86 CPU Docker가 이를 에뮬레이션하지 않는다.
+Jetson용 `docker/Dockerfile.jetson`은 준비했지만 **프로젝트 이미지의 PyTorch CUDA·TensorRT·실시간 오디오 검증은 아직 완료하지 않았다**.
+L4T R36.4.0 기반 사용자 공간은 호스트 RT 커널/드라이버를 공유한다. 위 최소 CUDA 런타임 확인이 프로젝트 이미지를 대체하지 않는다.
 명령·재시작·볼륨 규약은 [docker/README.md](docker/README.md)를 따른다.
 현재 체크아웃에는 과거 `runs/`, 현장 `results/`, strict 학습용으로 배치된 원본/manifest와
 배포용 acoustic 학습 artifact가 없다. 새 공개 원본 아카이브는 임시 확보해 Drive로 보관한다.

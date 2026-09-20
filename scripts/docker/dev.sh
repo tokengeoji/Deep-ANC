@@ -28,8 +28,15 @@ case "$task_action" in
       exit 1
     fi
     task_image="deep-anc-${task_target}:dev"
+    task_build_extra=()
+    if [[ "$task_target" == jetson ]]; then
+      # Jetson RT 커널에서는 Docker bridge의 iptables raw 규칙 생성이 실패할 수 있다.
+      # 호스트 네트워크를 사용해 시스템 방화벽/커널 설정 변경 없이 빌드한다.
+      task_build_extra+=(--network host)
+    fi
     if [[ "$task_action" == build ]]; then
-      docker build --build-arg "DEV_UID=$(id -u)" --build-arg "DEV_GID=$(id -g)" \
+      docker build "${task_build_extra[@]}" \
+        --build-arg "DEV_UID=$(id -u)" --build-arg "DEV_GID=$(id -g)" \
         -f "$task_repo/docker/Dockerfile.$task_target" -t "$task_image" "$task_repo"
       exit
     fi
@@ -46,7 +53,7 @@ case "$task_action" in
       task_extra+=(--mount "type=bind,src=$task_repo/../.git,dst=/workspace/.git,readonly")
     fi
     if [[ "$task_target" == jetson ]]; then
-      task_extra+=(--runtime nvidia)
+      task_extra+=(--runtime nvidia --network host)
     fi
     # 이미지 내부 .venv를 전용 볼륨으로 복사한다. 호스트 .venv는 가려지고 사용되지 않는다.
     # 기본 컨테이너에는 사운드 장치를 노출하지 않는다.

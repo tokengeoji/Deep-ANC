@@ -27,10 +27,14 @@ RUN python3 -m venv --system-site-packages .venv && .venv/bin/python -m pip inst
     .venv/bin/python -m pip install -r requirements-jetson.txt -r docker/requirements-dev.txt && \
     .venv/bin/python -m pip install \
     https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl && \
-    .venv/bin/python -m pip install 'nvidia-nvtx-cu12==12.6.77' nvidia-cuda-cupti-cu12 nvidia-cusparselt-cu12 && \
-    .venv/bin/python docker/preload_jetson.py
-COPY pyproject.toml README.md ./
-COPY src/ src/
-RUN .venv/bin/python -m pip install -e . && chown -R ${DEV_UID}:${DEV_GID} /workspace
+    .venv/bin/python -m pip install \
+    'nvidia-nvtx-cu12==12.6.77' \
+    'nvidia-cuda-cupti-cu12==12.6.68' \
+    'nvidia-cusparselt-cu12==0.6.2' && \
+    .venv/bin/python docker/preload_jetson.py && \
+    chown -R ${DEV_UID}:${DEV_GID} .venv
+COPY --chown=${DEV_UID}:${DEV_GID} pyproject.toml README.md ./
+COPY --chown=${DEV_UID}:${DEV_GID} src/ src/
 USER ancdev
+RUN .venv/bin/python -m pip install -e .
 CMD ["sleep", "infinity"]

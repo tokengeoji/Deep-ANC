@@ -97,7 +97,22 @@ bash scripts/docker/dev.sh exec .venv/bin/python -c 'import tensorrt; print(tens
 ```
 
 **산출물:** 이미지 ID, Jetson/L4T 정보, PyTorch·CUDA·TensorRT 검사 출력.
-현재 x86 CPU 검증은 이 단계를 대체하지 않는다. 실제 Jetson 이미지·CUDA·TensorRT 검증은 미완료다.
+현재 x86 CPU 검증은 이 단계를 대체하지 않는다.
+
+**2026-09-20 실제 Jetson 부분 결과:** 오디오 미노출 `l4t-cuda:12.6.11-runtime`에서
+`--runtime nvidia --network none`으로 aarch64, L4T R36.4.4, CUDA 12.6.11,
+`/dev/nvhost-gpu`, `libcudart.so.12`를 확인했다. 프로젝트 기본 이미지가 아니라 NVIDIA 런타임의
+최소 확인이다. 같은 Ubuntu 22.04 L4T CUDA 컨테이너에 호스트 TensorRT Python·동적 라이브러리
+경로를 읽기 전용으로 수동 연결한 진단에서는 `tensorrt==10.3.0` import가 성공했다. 이 bind 구성은
+`dev.sh` 기본 환경이나 프로젝트 이미지 검증을 대체하지 않는다.
+기본 `l4t-jetpack:r36.4.0` 빌드는 57GB 루트 파일시스템 공간 부족으로 완료하지
+못했다. `l4t-cuda` build arg probe는 의존성 설치·이미지 등록까지 진행했지만 실행 스냅샷 unpack에서
+여유 공간이 1.9GB로 내려가 중단·삭제했다. 당시 임시 ID
+`sha256:76bf18ecb9ef2111c3128d7f30d305710747b7318c016d91ed17729d13ec039b`는
+실행 검증 산출물이 아니며 현재 존재하지 않는다. 정리 후 여유 공간은 5.8GB다.
+따라서 프로젝트 이미지의 PyTorch CUDA·ONNX Runtime·TensorRT 검증은 계속 미완료이며,
+추가 저장공간 확보 후 기본 이미지로 이 절 전체를 다시 수행한다.
+
 **중단 조건:** 이미지 호환성·GPU 접근 실패 시 GPU 배포를 보류한다. 호스트 시스템 변경으로 우회하지 않는다.
 라이브러리 import 성공과 실제 모델의 스트리밍 추론 검증도 별도 항목이다.
 
