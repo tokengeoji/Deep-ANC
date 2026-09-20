@@ -15,10 +15,11 @@ def main() -> None:
     hook = '''import ctypes
 import os
 from pathlib import Path
-nv = Path(__file__).resolve().parent / "nvidia"
-for relative in ("nvtx/lib/libnvToolsExt.so.1", "cuda_cupti/lib/libcupti.so.12",
+# 고정한 cuSPARSELt 0.6.2 wheel은 nvidia/ 아래가 아닌 최상위 cusparselt/를 쓴다.
+site = Path(__file__).resolve().parent
+for relative in ("nvidia/nvtx/lib/libnvToolsExt.so.1", "nvidia/cuda_cupti/lib/libcupti.so.12",
                  "cusparselt/lib/libcusparseLt.so.0"):
-    library = nv / relative
+    library = site / relative
     if library.exists():
         ctypes.CDLL(str(library), mode=os.RTLD_GLOBAL)
 '''

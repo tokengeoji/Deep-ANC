@@ -27,6 +27,8 @@ def cfgs():
     data = dict(data)
     data["segment_seconds"] = 0.5                 # 테스트 고속화
     data["source_mix_ratio"] = {"synthetic": 1.0}
+    # 두 모드의 shape/인과성 검사는 사용자 로컬 음원·manifest와 독립적이어야 한다.
+    data["source_mix_ratio_acoustic"] = {"synthetic": 1.0}
     return data, duct
 
 

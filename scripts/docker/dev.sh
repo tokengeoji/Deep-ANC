@@ -5,21 +5,23 @@ task_repo=$(cd "$(dirname "$0")/../.." && pwd)
 task_action=${1:-help}
 task_target=${2:-cpu}
 task_container=deep-anc-dev
+task_uid=${SUDO_UID:-$(id -u)}
+task_gid=${SUDO_GID:-$(id -g)}
 
 usage() {
-  echo '사용: bash scripts/docker/dev.sh build [cpu|jetson]'
-  echo '      bash scripts/docker/dev.sh up [cpu|jetson]'
+  echo '사용: bash scripts/docker/dev.sh build [cpu|jetson|jetson-local]'
+  echo '      bash scripts/docker/dev.sh up [cpu|jetson|jetson-local]'
   echo '      bash scripts/docker/dev.sh exec COMMAND [ARG...]'
   echo '      bash scripts/docker/dev.sh shell | status | stop | start'
 }
 
 case "$task_action" in
   build|up)
-    if [[ "$task_target" != cpu && "$task_target" != jetson ]]; then
+    if [[ "$task_target" != cpu && "$task_target" != jetson && "$task_target" != jetson-local ]]; then
       usage >&2
       exit 2
     fi
-    if [[ "$task_target" == jetson && "$(uname -m)" != aarch64 ]]; then
+    if [[ "$task_target" == jetson* && "$(uname -m)" != aarch64 ]]; then
       echo 'Jetson 이미지는 ARM64 Jetson에서 빌드/실행하세요. x86에서는 cpu 검증 컨테이너를 사용합니다.' >&2
       exit 1
     fi
@@ -29,14 +31,14 @@ case "$task_action" in
     fi
     task_image="deep-anc-${task_target}:dev"
     task_build_extra=()
-    if [[ "$task_target" == jetson ]]; then
+    if [[ "$task_target" == jetson* ]]; then
       # Jetson RT 커널에서는 Docker bridge의 iptables raw 규칙 생성이 실패할 수 있다.
       # 호스트 네트워크를 사용해 시스템 방화벽/커널 설정 변경 없이 빌드한다.
       task_build_extra+=(--network host)
     fi
     if [[ "$task_action" == build ]]; then
       docker build "${task_build_extra[@]}" \
-        --build-arg "DEV_UID=$(id -u)" --build-arg "DEV_GID=$(id -g)" \
+        --build-arg "DEV_UID=$task_uid" --build-arg "DEV_GID=$task_gid" \
         -f "$task_repo/docker/Dockerfile.$task_target" -t "$task_image" "$task_repo"
       exit
     fi
@@ -52,8 +54,33 @@ case "$task_action" in
     if [[ ! -e "$task_repo/.git" && -d "$task_repo/../.git" ]]; then
       task_extra+=(--mount "type=bind,src=$task_repo/../.git,dst=/workspace/.git,readonly")
     fi
-    if [[ "$task_target" == jetson ]]; then
+    if [[ "$task_target" == jetson* ]]; then
       task_extra+=(--runtime nvidia --network host)
+    fi
+    if [[ "$task_target" == jetson-local ]]; then
+      # 같은 R36.4 호스트의 NVIDIA 라이브러리만 연결한다. libc 등은 이미지 것을 쓴다.
+      if [[ ! -r /etc/nv_tegra_release ]] || \
+         [[ "$(</etc/nv_tegra_release)" != '# R36 (release), REVISION: 4.'* ]]; then
+        echo 'jetson-local은 JetPack 6 / L4T R36.4 호스트가 필요합니다.' >&2
+        exit 1
+      fi
+      task_lib_root=/usr/lib/aarch64-linux-gnu
+      for task_required in libcudnn.so.9 libnvinfer.so.10 libnvonnxparser.so.10; do
+        [[ -r "$task_lib_root/$task_required" ]] || {
+          echo "필수 호스트 라이브러리 없음: $task_required" >&2
+          exit 1
+        }
+      done
+      task_trt=/usr/lib/python3.10/dist-packages/tensorrt
+      [[ -d "$task_trt" ]] || { echo '호스트 TensorRT Python 패키지가 없습니다.' >&2; exit 1; }
+      for task_lib in "$task_lib_root"/libcudnn*.so.9* \
+                      "$task_lib_root"/libnvinfer*.so.10* \
+                      "$task_lib_root"/libnvonnxparser*.so.10*; do
+        [[ -f "$task_lib" ]] || continue
+        task_extra+=(--mount "type=bind,src=$task_lib,dst=$task_lib,readonly")
+      done
+      task_extra+=(--mount "type=bind,src=$task_trt,dst=$task_trt,readonly")
+      # 빈 venv 디렉터리의 소유권만 이미지에서 복사된다. 패키지는 up 이후 한 번 설치한다.
     fi
     # 이미지 내부 .venv를 전용 볼륨으로 복사한다. 호스트 .venv는 가려지고 사용되지 않는다.
     # 기본 컨테이너에는 사운드 장치를 노출하지 않는다.
@@ -62,6 +89,9 @@ case "$task_action" in
       --mount "type=bind,src=$task_repo,dst=/workspace/Deep-ANC" \
       --mount "type=volume,src=$task_volume,dst=/workspace/Deep-ANC/.venv" \
       --workdir /workspace/Deep-ANC "${task_extra[@]}" "$task_image"
+    if [[ "$task_target" == jetson-local ]]; then
+      echo '다음: bash scripts/docker/dev.sh exec bash scripts/docker/bootstrap_jetson_local.sh'
+    fi
     ;;
   exec)
     shift

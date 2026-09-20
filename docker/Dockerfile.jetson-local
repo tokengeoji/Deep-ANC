@@ -1,0 +1,29 @@
+# 저장공간이 제한된 실제 Jetson용. Python 패키지는 실행 후 전용 venv 볼륨에 설치한다.
+# cuDNN/TensorRT는 같은 JetPack 호스트의 파일을 읽기 전용으로 연결한다.
+FROM nvcr.io/nvidia/l4t-cuda:12.6.11-runtime@sha256:49853e9fe2a0305efa51fcbb3426eea1bca658085f2d26bb40347711434849b1
+
+ARG DEV_UID=1000
+ARG DEV_GID=1000
+ENV DEEP_ANC_CONTAINER=jetson \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/workspace/Deep-ANC/src \
+    OMP_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=2 \
+    GIT_OPTIONAL_LOCKS=0
+
+RUN test "$(uname -m)" = aarch64 && apt-get update && \
+    apt-get install -y --no-install-recommends python3-venv git openssh-client \
+      ripgrep curl ca-certificates libportaudio2 libsndfile1 libopenblas0-pthread libgomp1 && \
+    apt-get clean && \
+    groupadd --gid ${DEV_GID} ancdev && \
+    useradd --uid ${DEV_UID} --gid ${DEV_GID} --create-home ancdev && \
+    install -d -o ${DEV_UID} -g ${DEV_GID} /workspace/Deep-ANC/.venv
+
+# 학습 작업 큐의 ZoneInfo("Asia/Seoul")에 필요하다. 호스트 시간대는 변경하지 않는다.
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata && apt-get clean
+
+WORKDIR /workspace/Deep-ANC
+USER ancdev
+CMD ["sleep", "infinity"]
