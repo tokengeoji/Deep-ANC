@@ -127,7 +127,11 @@ OMAP 계약의 manifest·`capture.json`·`preparation.json`도 발견되지 않�
 기존 WAV 103개는 44.1/48 kHz mono 음원이다. `recorded_train.jsonl`·`recorded_regrouped.jsonl`은
 각 82행의 48 kHz legacy 자료이며 현재 참조 세션 경로는 각 0/82개 존재한다.
 이 자료를 리샘플링하거나 ANC-OFF라고 추정해 OMAP 학습에 사용하지 않는다.
-별도 보관한 실측 녹음 위치와 수집 조건 확인이 실제 데이터 학습의 다음 선행조건이다.
+현재 상태는 **로컬 미수집 / 기존 자료가 없으면 실측 예정**이다(사용자 확정).
+다음 단계는 OMAP raw ADC 두 채널의 동기·손실 없는 수집 경로와 gain·배선 조건을 확인하고,
+사용자 입회·볼륨 최소 상태에서 ANC OFF 녹음을 확보하는 것이다.
+기존 `rir.txt`는 이미 실측된 2차경로이며, 없다고 보고한 것은 학습용 REF/ERR 동기 녹음이다.
+실측 계획은 즉시 오디오 실행·펌웨어 변경을 승인한 것으로 해석하지 않는다.
 
 통합 전 Jetson에서는 과거 `runs/export*/` ONNX와 `results/` 실측 디렉터리의 존재를 확인했다.
 Git 통합은 이 로컬 대용량 산출물을 PC나 다른 Jetson으로 복사하지 않는다.
@@ -157,9 +161,11 @@ Drive 보관 완료와 로컬 strict 데이터 준비·실제 학습 완료는 �
 ## 5. 다음 순서
 
 1. 기존 Docker를 재사용한다. 코드 변경 시 관련 회귀와 전체 검사를 수행한다.
-2. **OMAP 후속:** [DATASET.md](docs/DATASET.md)의 16 kHz 동기 raw REF/ANC-OFF 녹음 위치를 확인한다.
-   측정 gain·배선·clock 조건과 train/valid 세션 분리를 확인한 뒤 CUDA 1 epoch부터 진행한다.
-   자료가 없으면 이를 보고하고 합성 결과를 실제 데이터 학습으로 대체하지 않는다.
+2. **OMAP 후속:** 기존 동기 녹음이 없으면 사용자 계획대로 실측한다.
+   먼저 OMAP 수집 경로·gain·배선·공통 clock을 확인하고, 사용자 입회·볼륨 최소 상태에서
+   [DATASET.md](docs/DATASET.md)의 16 kHz raw REF/ANC-OFF 녹음을 확보한다.
+   독립 train/valid 세션과 raw 단위를 검증한 뒤 CUDA 1 epoch부터 진행한다.
+   합성 결과를 실제 데이터 학습으로 대체하거나 녹음 경로를 임의로 정하지 않는다.
 3. **별도 48 kHz 후속:** interleaved 저장모델의 pre-roll 회귀를 수정·재검증하고,
    실제 acoustic artifact의 출처·독립 학습/평가 자격, Drive receipt/자료 회수 상태와
    strict 데이터 QA를 확인한다. 승인된 train-only 정책을 유지한다.
