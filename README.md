@@ -1,5 +1,9 @@
 # Deep ANC
 
+통합 저장소는 **[tokengeoji/Deep-ANC](https://github.com/tokengeoji/Deep-ANC)**다.
+`tokengeoji/DeepANC`의 OMAP-L138 실측 자료와 오프라인 학습 도구를 이 저장소의 `main`에 통합했다.
+통합 내역과 16 kHz / 48 kHz 경로 구분은 [저장소 통합 안내](docs/17_repository_integration.md)를 따른다.
+
 덕트 안의 ERR 마이크 한 점에 quiet zone을 만드는 인과적 능동소음제어 연구다.
 Jetson AGX Orin에서 외부 소리를 REF 마이크로 받아 상쇄음을 생성한다.
 
@@ -67,6 +71,26 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_re
 일반 readiness 보고의 exit 0도 실제 감쇠 성공을 의미하지 않는다.
 기본 개발 컨테이너에는 오디오 장치를 노출하지 않는다.
 
+## OMAP-L138 실측 경로에서 이어서 학습
+
+사용자가 성공한 OMAP FxNLMS 소스는 `firmware/omap_l138/`, 원본 16 kHz·500탭 2차경로는
+`rir.txt`에 보존했다. 이 경로의 학습은 `deepanc/`와 `configs/anc_train.json`을 사용한다.
+기존 `src/deep_anc/`의 48 kHz Jetson 장치 경로·NPZ와는 샘플레이트, 지연 및 데이터 규약이 다르다.
+OMAP 경로를 선택했다고 Jetson USB 오디오 경로가 교정되는 것은 아니다.
+
+기존 개발 Docker를 시작한 뒤 오디오 출력 없이 준비한다.
+
+```bash
+bash scripts/docker/dev.sh exec bash tools/prepare_jetson.sh --allow-cpu  # x86 PC
+# 실제 Jetson Docker에서는 --allow-cpu를 빼고 CUDA를 검증한다.
+bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q
+```
+
+실제 16 kHz ANC-OFF 동기 녹음 준비와 학습/재개는 [OMAP 인수인계](docs/JETSON_HANDOFF.md),
+[데이터 준비](docs/DATASET.md), [학습 안내](docs/TRAINING.md)에 설명되어 있다.
+기존 GCRN 음성 향상 코드는 `scripts/train.py`와 `scripts/utils/`에 보존했다.
+이 코드는 `scripts/train/`의 기존 Jetson 학습 도구와 목적이 다르다.
+
 ## 저장소와 문서
 
 | 위치 | 내용 |
@@ -76,6 +100,8 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_re
 | `scripts/` | 데이터 준비·진단·학습·평가·Docker 관리 |
 | `tests/` | 인과성·지연·안전·데이터 계약 회귀 |
 | `assets/measured/` | 측정 경로, 메타데이터와 함께 해석 |
+| `rir.txt`, `calibration/`, `firmware/omap_l138/` | OMAP 실측 16 kHz / 500탭 원본·근거·성공한 DSP 코드 |
+| `deepanc/`, `tools/`, `configs/anc_train.json` | OMAP 경로의 저장소 루트 실행용 오프라인 학습·준비 |
 | `runs/`, `results/` | 로컬 모델·실험 산출물, Git 미포함 |
 
 읽는 순서:

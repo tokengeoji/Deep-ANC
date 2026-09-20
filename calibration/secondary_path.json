@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "source": "rir.txt",
+  "source_sha256": "9ece235a68a78a7f7c702d49d75525974df2ac2a8a9ca42ced155af901bcf9e3",
+  "sample_rate_hz": 16000,
+  "num_taps": 500,
+  "coefficient_order": "h[0] through h[499]; no reordering or leading-sample removal",
+  "input_domain": "actual DAC command pcm16 / 32768",
+  "output_domain": "raw error microphone ADC pcm16 / 32768",
+  "residual_equation": "e[n] = d[n] + sum_k h[k] * u[n-k]",
+  "measurement_dc_blocker": false,
+  "measurement_project": "firmware/omap_l138/NLMS0",
+  "validated_controller": "firmware/omap_l138/FxNLMS0/ISR.c",
+  "validated_array": "S_hat",
+  "sample_rate_evidence": "firmware/omap_l138/FxNLMS0/define.h and NLMS0/define.h: SAMPLING_FREQ_16000",
+  "preserve_gain_sign_and_delay": true,
+  "additional_jetson_delay_samples": null,
+  "hardware_measurement_date": null,
+  "amplifier_gain_at_measurement": null,
+  "scope": "OMAP-L138 measured DAC-to-error-microphone path; a different audio interface requires remeasurement",
+  "status": "User reports successful OMAP-L138 FxNLMS; RIR exactly matches its S_hat; no independent acoustic retest on this host"
+}

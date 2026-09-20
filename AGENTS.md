@@ -68,3 +68,32 @@
 
 스피커에 소리를 내는 스크립트(record_duct, calibrate_wideband, measure_io_latency,
 evaluate_session, run_realtime)는 **사용자 입회 + 볼륨 최소 상태에서만**. 런타임은 항상 ANC OFF로 시작.
+
+## 통합된 OMAP-L138 16 kHz 오프라인 경로
+
+현재 정식 원격은 `https://github.com/tokengeoji/Deep-ANC.git`, 통합 브랜치는 `main`이다.
+별도 저장소 `tokengeoji/DeepANC`에서 성공한 OMAP FxNLMS 기준선과 학습 도구를 가져왔다.
+두 저장소의 이력은 모두 보존하며 `dev`·`presentation`은 이번 통합 대상이 아니다.
+
+- `deepanc/`는 OMAP 16 kHz 오프라인 ANC이고, `src/deep_anc/`는 기존 48 kHz Jetson 경로다.
+  위 48 kHz NPZ 지연·handoff 규약을 OMAP 경로에 적용하지 않는다.
+- `rir.txt`는 권위 있는 실측 2차경로(16,000 Hz, 500탭)이며 성공한
+  `firmware/omap_l138/FxNLMS0/ISR.c`의 `S_hat`과 일치한다.
+  `calibration/secondary_path.json`의 원본 SHA와 함께 이득·부호·전체 탭·선행 지연을 보존한다.
+  정규화·자르기·피크 정렬·부호 반전·리샘플링·추측한 codec 지연 추가를 금지한다.
+- OMAP 신경망 출력은 정규화된 실제 DAC 명령 `u`, 잔차는 `e=d+S*u`다.
+  기존 DSP의 `u=-y`를 Python에서 다시 반전하지 않는다. 펌웨어는 변경·플래시하지 않는다.
+- OMAP 성공에는 Jetson이 관여하지 않았다. 기존 Jetson 48 kHz 검증 기록과 혼합하지 않는다.
+- OMAP 작업을 "이어서 해줘" 하면 `docs/JETSON_HANDOFF.md`, `docs/JETSON_SETUP.md`,
+  `docs/DATASET.md`를 읽고 Git 상태·실제 플랫폼·기존 데이터부터 확인한다.
+  Docker에서 `bash tools/prepare_jetson.sh`와 전체 pytest를 실행한다.
+  실제 Jetson에서는 CUDA 연산·역전파 성공이 필요하며 `--allow-cpu`로 대신하지 않는다.
+  `--install`은 호환 안내 옵션일 뿐 호스트 venv나 새 torch를 설치하지 않는다.
+- 학습에는 공통 디지털 스케일을 유지한 동기 16 kHz raw REF와 ANC-OFF disturbance가 필요하다.
+  train/valid는 녹음 세션을 분리한다. ANC-ON 잔차를 d로 사용하거나 독립 정규화·미래 정렬·
+  임의 합성 P를 실측 데이터로 사용하는 것을 금지한다. 데이터가 없으면 필요한 녹음을 보고한다.
+- 합성 smoke는 소프트웨어 검사다. 실제 데이터의 짧은 학습·유한 손실/gradient/output·checkpoint
+  저장을 확인한 뒤 확장한다. 실시간 출력 연결은 별도 승인·실측 지연·스케일·feedback 검증이 필요하다.
+- `scripts/train.py`와 `scripts/utils/`는 legacy GCRN 음성 향상이다. ANC 학습과 혼합하지 않는다.
+
+통합 상세와 패키지별 진입점: [docs/17_repository_integration.md](docs/17_repository_integration.md).

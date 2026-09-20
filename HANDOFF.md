@@ -16,12 +16,22 @@
 - 오디오 출력은 사용자 입회·볼륨 최소 상태에서만 한다. 이번 환경·문서 작업은 무오디오다.
 - 원본의 최종 보관소는 Drive. 임시 다운로드는 검증·업로드 확인 후 해당 임시 원본만 삭제한다.
 - MIMII DG fan은 **학습 보조 전용**이다. machine은 train에만 쓰고 val/test에서는 제외한다.
-- 커밋·push는 승인됐다. 원격은 `git@github.com:tokengeoji/Deep-ANC.git`이며 이전 Roka-jsj와 같은 저장소다.
+- 커밋·push는 승인됐다. 통합 대상은 `https://github.com/tokengeoji/Deep-ANC.git`의 `main`이다.
+  `tokengeoji/DeepANC`는 가져온 별도 원본 저장소이며 두 이름을 혼동하지 않는다.
   작성자는 `SEUNG JOON JEONG <155646237+tokengeoji@users.noreply.github.com>`을 사용한다. AI 표기는 넣지 않는다.
 
-## 2. 현재 접속 환경
+## 2. 통합 작업 환경과 기존 Jetson 검증
 
-현재 호스트는 **실제 ARM64 Jetson AGX Orin / L4T R36.4.4**다. x86 PC가 아니다.
+이번 저장소 통합은 **x86 PC의 CPU Docker**에서 수행했다. 이 작업에서 Jetson CUDA나
+실제 오디오를 실행하지 않았다. 아래는 통합 전 `Deep-ANC`에 기록된 실제 ARM64
+Jetson AGX Orin / L4T R36.4.4 검증 이력이며, 현재 접속 장치는 재개할 때 다시 확인한다.
+
+통합본 CPU Docker 검증: **1282 passed, 2 skipped, 5 subtests passed (79.50초)**.
+두 skip은 현장 raw 진단 파일 및 실측 `metrics.md`가 없는 조건이다. Python 3.10.21 /
+PyTorch 2.5.1+cpu에서 `pip check`, 원본 500탭 검증, 준비 스크립트의 합성 학습·checkpoint 저장을
+통과했다. CUDA는 검증하지 않았고 녹음·스피커 출력도 수행하지 않았다.
+
+### 기존 Jetson Docker 구성 기록
 
 - `deep-anc-jetson-local:dev` 이미지 빌드 및 `deep-anc-dev` 생성 완료.
 - CUDA 12.6 런타임 기반의 작은 이미지 + 전용 venv 볼륨에 의존성을 설치하는 방식이다.
@@ -40,11 +50,11 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_jetson_stac
 bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q -o addopts= -ra
 ```
 
-Docker 인증이 필요한 이 호스트에서는 위 관리 명령에 `sudo`를 붙인다.
+기존 Jetson처럼 Docker 인증이 필요한 호스트에서는 위 관리 명령에 `sudo`를 붙인다.
 중지 환경은 `start`로 재사용한다. 매번 이미지·컨테이너·볼륨을 삭제하지 않는다.
 새 환경의 최초 설치·버전·볼륨 규약은 Docker 문서를 따른다.
 
-### 검증 범위
+### 통합 전 Jetson 검증 범위 (기존 48 kHz 경로)
 
 - 최종 Jetson Docker 전체 회귀: **1228 passed, skip/실패 없음 (191.47초)**.
   명령은 `pytest -q -o addopts= -ra`, 로그는 `results/pytest_jetson_20260920_02.log`다.
@@ -85,11 +95,12 @@ REF 기하 선행은 약 2.915 ms다. S의 기존 반복 검증 대역은 **150�
 
 ## 4. 자료의 실제 위치와 보존 상태
 
-현재 Jetson에는 과거 `runs/export*/` ONNX와 `results/` 실측 디렉터리가 **존재한다**.
+통합 전 Jetson에서는 과거 `runs/export*/` ONNX와 `results/` 실측 디렉터리의 존재를 확인했다.
+Git 통합은 이 로컬 대용량 산출물을 PC나 다른 Jetson으로 복사하지 않는다.
 파일 존재만으로 현재 acoustic 모델이나 새 성능이 검증된 것은 아니다.
 반면 2026-09-15 x86 PC에서 생성한 `results/drive_preparation/20260915_01/`,
 `results/drive_transfer_receipts/20260915_01/`, `results/prepared_fir/pc_20260915_linear_01/`는
-현재 Jetson에 회수되지 않았다. 과거 PC 경로를 이 호스트에 있다고 가정하지 않는다.
+당시 Jetson에 회수되지 않았다. 과거 PC 경로를 현재 호스트에 있다고 가정하지 않는다.
 기존 `data/manifests`에는 호스트 절대경로를 담은 legacy 자료가 있다. Docker의 strict 준비
 완료로 간주하지 않는다. 합성 단위테스트는 이 로컬 자료에 의존하지 않도록 고립했다.
 
@@ -118,5 +129,16 @@ Drive 보관 완료와 로컬 strict 데이터 준비·실제 학습 완료는 �
    고역 S·F·선행 시간과 반복 OFF/ON/OFF를 순서대로 측정한다. 현장 승인 전 오디오는 열지 않는다.
 5. 외부 DSP 출력 구성이 정해져야 하는 설계는 사용자 확인 뒤 진행한다.
 
-이번 문서 정리는 오래된 상태·중복 실험 일지를 제거한 것이다.
-실측 원자료·모델·Drive 백업은 삭제하지 않는다. 삭제한 문장과 이전 수치는 Git 이력에 남는다.
+## 6. DeepANC에서 통합한 OMAP 경로
+
+사용자가 성공한 OMAP-L138 FxNLMS에는 Jetson이 관여하지 않았다. 성공한 펌웨어와
+`rir.txt`(16 kHz / 500탭)를 그대로 보존했다. 기존 48 kHz NPZ·설정·실시간 엔진은 변경하지 않았다.
+`deepanc/`는 새 오프라인 진입점이며 `src/deep_anc/`와는 별개다.
+두 경로의 샘플레이트·지연·스케일을 임의로 합치지 않는다.
+
+OMAP 기준선에서 딥러닝을 이어서 준비할 때는 [OMAP 인수인계](docs/JETSON_HANDOFF.md)를 따른다.
+Docker 안에서 준비 스크립트·전체 테스트를 수행하고, 실제 동기 ANC-OFF 녹음의 존재와 세션 분리를
+확인한다. 실제 녹음과 Jetson CUDA 확인 없이는 실제 데이터 학습 준비 완료나 감쇠 성공을 선언하지 않는다.
+통합 범위·검증 결과·사용법은 [통합 안내](docs/17_repository_integration.md)에 기록한다.
+
+실측 원자료·모델·Drive 백업과 원본 `DeepANC` 저장소는 삭제하지 않는다.

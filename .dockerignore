@@ -19,3 +19,14 @@ id_rsa*
 id_ecdsa*
 .env
 .env.*
+# 통합된 OMAP 경로의 로컬 녹음·보고서·CCS 빌드도 전송하지 않는다.
+/datasets/
+/artifacts/
+.venv-*/
+scripts/exp*/
+docs/references/*.pdf
+firmware/**/Debug/
+firmware/**/Release/
+firmware/**/.config/
+firmware/**/src/
+firmware/**/.launches/

@@ -1,0 +1,26 @@
+name: Combined ANC Docker checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start CPU development container
+        run: |
+          bash scripts/docker/dev.sh build cpu
+          bash scripts/docker/dev.sh up cpu
+      - name: Verify dependencies and original OMAP calibration
+        run: |
+          bash scripts/docker/dev.sh exec .venv/bin/python -m pip check
+          bash scripts/docker/dev.sh exec .venv/bin/python tools/prepare_secondary_path.py --verify-only
+      - name: Test both 48 kHz Jetson and 16 kHz OMAP paths
+        run: bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q -o addopts= -ra
+      - name: Offline OMAP preparation smoke
+        run: bash scripts/docker/dev.sh exec bash tools/prepare_jetson.sh --allow-cpu
+      - name: Stop development container
+        if: always()
+        run: docker stop deep-anc-dev || true

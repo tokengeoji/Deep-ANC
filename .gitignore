@@ -52,3 +52,23 @@ id_dsa*
 .env
 .env.*
 !.env.example
+
+# OMAP-L138 측정 기반 오프라인 학습: 원본 데이터와 재생성 산출물
+/datasets/
+/artifacts/
+.venv-*/
+scripts/exp*/
+docs/references/*.pdf
+firmware/**/Debug/
+firmware/**/Release/
+firmware/**/.config/
+firmware/**/src/
+firmware/**/.launches/
+firmware/**/*.obj
+firmware/**/*.out
+firmware/**/*.map
+firmware/**/*.d
+firmware/**/*.bak
+firmware/**/*.mak
+firmware/**/*.ae674
+firmware/**/makefile.defs
