@@ -109,7 +109,8 @@ bash scripts/docker/dev.sh exec .venv/bin/python -c 'import tensorrt; print(tens
 못했다. `l4t-cuda` build arg probe는 의존성 설치·이미지 등록까지 진행했지만 실행 스냅샷 unpack에서
 여유 공간이 1.9GB로 내려가 중단·삭제했다. 당시 임시 ID
 `sha256:76bf18ecb9ef2111c3128d7f30d305710747b7318c016d91ed17729d13ec039b`는
-실행 검증 산출물이 아니며 현재 존재하지 않는다. 정리 후 여유 공간은 5.8GB다.
+실행 검증 산출물이 아니며 현재 존재하지 않는다. 컨테이너·태스크·이미지 참조가 없는 고아
+containerd lease도 공식 lease 삭제와 GC로 정리했으며, 최종 루트 여유 공간은 12GB다.
 따라서 프로젝트 이미지의 PyTorch CUDA·ONNX Runtime·TensorRT 검증은 계속 미완료이며,
 추가 저장공간 확보 후 기본 이미지로 이 절 전체를 다시 수행한다.
 
