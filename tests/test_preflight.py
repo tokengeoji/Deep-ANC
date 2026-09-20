@@ -15,7 +15,7 @@ SPEC.loader.exec_module(PREFLIGHT)
 
 def healthy_report():
     return {
-        "python": {"version_info": [3, 8]},
+        "python": {"version_info": [3, 10]},
         "system": {"is_jetson": True, "jetpack_package_version": "test"},
         "dependencies": {"numpy": {"ok": True}},
         "torch": {"import_ok": True, "cuda_available": True, "cuda_compute_ok": True,
@@ -27,6 +27,14 @@ def healthy_report():
 
 
 class PreflightRequirementsTest(unittest.TestCase):
+    def test_python_below_repository_minimum_fails(self):
+        for version in ([3, 8, 18], [3, 9, 20]):
+            with self.subTest(version=version):
+                report = healthy_report()
+                report["python"]["version_info"] = version
+                errors, _ = PREFLIGHT.evaluate_report(report, require_cuda=True, require_jetson=True)
+                self.assertTrue(any("Python 3.10" in error for error in errors))
+
     def test_compatible_jetson_passes(self):
         errors, warnings = PREFLIGHT.evaluate_report(healthy_report(), require_cuda=True, require_jetson=True)
         self.assertEqual(errors, [])

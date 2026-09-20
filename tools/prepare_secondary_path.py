@@ -15,6 +15,15 @@ sys.path.insert(0, str(ROOT))
 from deepanc.calibration import DEFAULT_RIR, describe_secondary_path, load_secondary_path, read_coefficients
 
 
+def validate_output_paths(source, output_dir):
+    """Reject every source alias before creating or replacing any artifact."""
+    source = source.resolve()
+    for name in ("secondary_path.npy", "secondary_path.csv", "secondary_path.h", "report.json"):
+        target = output_dir / name
+        if target.resolve() == source or (target.exists() and target.samefile(source)):
+            raise ValueError(f"Output would overwrite measured source: {target}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DEFAULT_RIR)
@@ -31,6 +40,7 @@ def main():
             raise ValueError("rir.txt and successful FxNLMS S_hat disagree")
         report["matches_successful_dsp"] = True
     if not args.verify_only:
+        validate_output_paths(args.source, args.output_dir)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         np.save(args.output_dir / "secondary_path.npy", h.astype(np.float32), allow_pickle=False)
         np.savetxt(args.output_dir / "secondary_path.csv", np.column_stack((np.arange(len(h)), h)),

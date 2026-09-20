@@ -94,10 +94,14 @@ bash scripts/docker/dev.sh exec .venv/bin/python -m deepanc.train \
 
 체크포인트는 임시 파일에 저장한 뒤 교체한다. 새 학습에서 이미 결과가 있는 폴더를 지정하면 덮어쓰기를 거부하므로 새 `--output`을 사용하거나 위와 같이 같은 실행을 resume한다. 이어서 학습할 때 모델 구조, 학습 설정, 데이터 내용, RIR, sample rate와 추가 지연의 호환성을 검사한다. epoch 수를 늘리거나 worker 수·파일 위치를 바꾸는 것은 허용하지만, 학습 의미가 달라진 설정을 같은 실험으로 조용히 이어 가지 않는다. 변경 실험은 새 출력 폴더에서 시작한다.
 
+같은 출력 폴더에는 학습 프로세스를 하나만 실행한다. 동시 실행 잠금은 아직 없으며,
+재개는 위 예처럼 **동일 폴더의 `last.pt`**를 사용한다. 새 폴더로 resume하면 과거 `best.pt`는
+자동 복사되지 않으므로 이 절차에서는 사용하지 않는다.
+
 `--smoke-test`는 고정 seed의 합성 reference와 합성 disturbance만 사용하며, 기본적으로 짧은 chunk 512개 샘플로 1 epoch 실행한다. 실제 녹음 manifest를 함께 지정할 수 없다. 출력과 체크포인트에 합성 여부를 남긴다. 성공은 forward/backward, optimizer, 실측 FIR 적용, 검증과 저장 절차가 실행된다는 의미이며, 모델 학습 품질·실제 primary path·하드웨어 소음 감소량의 증거가 아니다.
 
 ## 현재 확인한 범위
 
 개발 환경에서 CPU 순전파·역전파와 실제 체크포인트 저장/복구를 실행했고, 모델의 인과성과 출력 범위, 녹음/채널 단위 보존, 세션·파일·동일 PCM 내용의 train/valid 누수 방지, chunk 문맥 일치 및 호환되지 않는 resume 거부를 테스트했다. 추가 지연과 FFT/DSP 계수의 수치 검증은 2차경로 테스트가 담당한다.
 
-이 OMAP 학습 경로의 실제 ANC-OFF 동기 녹음 학습, Jetson CUDA 실행, 장치의 추가 지연 및 실시간 음향 성능은 각 환경에서 별도로 확인해야 한다. 기존 `deep_anc`의 Jetson CUDA 설치·실행 검증 결과와 구분한다. OMAP 후속 순서는 [JETSON_HANDOFF.md](JETSON_HANDOFF.md), 통합 상태는 루트 HANDOFF에 정리한다.
+통합 후 실제 Jetson Docker에서도 이 OMAP 경로의 CUDA 합성 순전파·역전파·학습 및 체크포인트 저장을 확인했다. 장치·버전·로그와 최신 회귀 결과는 [루트 HANDOFF.md](../HANDOFF.md)가 단일 출처다. 실제 ANC-OFF 동기 녹음 학습, 장치의 추가 지연 및 실시간 음향 성능은 아직 미검증이며 합성 CUDA 결과와 구분한다. OMAP 후속 순서는 [JETSON_HANDOFF.md](JETSON_HANDOFF.md)를 따른다.

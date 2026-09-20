@@ -67,9 +67,12 @@ CUDA 연산·역전파까지 통과시켜야 한다. 이후 [OMAP 인수인계](
 
 ## 검증 범위
 
-이번 통합 검증은 x86 CPU Docker(Python 3.10.21 / PyTorch 2.5.1+cpu)에서 수행했다.
+최초 통합 검증은 x86 CPU Docker(Python 3.10.21 / PyTorch 2.5.1+cpu)에서 수행했다.
 전체 회귀는 **1282 passed, 2 skipped, 5 subtests passed (79.50초)**다. skip은 현장 raw 진단
 파일과 실측 `metrics.md` 부재 조건이다. `pip check`·원본 FIR 검증·오프라인 smoke 및
 checkpoint 저장도 통과했다. GitHub Actions도 같은 Docker 의존성으로 두 경로를 함께 검사한다.
-기존 `HANDOFF.md`의 Jetson 1228개 회귀 기록은 통합 전 환경의 이력이다.
-통합된 16 kHz 경로의 실제 Jetson CUDA 학습·실시간 지연·음향 감쇠 검증으로 승격하지 않는다.
+통합 전 Jetson 회귀 기록은 두 경로를 합친 이후의 검증을 대신하지 않는다.
+
+이후 통합 `main`을 실제 Jetson에 반영하고 기존 Docker에서 OMAP 16 kHz CUDA 합성 학습과
+체크포인트 저장까지 실행했다. 최신 Jetson 회귀·환경·산출물은 [HANDOFF.md §2](../HANDOFF.md)에
+기록한다. 실제 동기 ANC-OFF 녹음 학습·실시간 지연·음향 감쇠 검증으로 승격하지 않는다.

@@ -26,6 +26,11 @@ P/S는 같은 capture에서 얻은 내부 스피커 경로다. 이 P를 외부 �
 CS→REF 피드백 경로 F로 취급하지 않는다. acoustic 제어에서 S와 F의 역할은
 [docs/13](13_acoustic_hybrid.md)을 따른다.
 
+위 표는 기존 NPZ 메타데이터 기준이다. interleaved 측정 도구의 합성 round-trip에서
+pre-roll만큼 추가 지연되는 미해결 문제가 확인됐다([HANDOFF §3](../HANDOFF.md)).
+원시 capture와 저장 규약을 재검증하기 전까지 이 표를 새로 확정한 실측 지연으로 인용하거나,
+기존 NPZ에서 pre-roll을 임의로 빼서 보정하지 않는다. OMAP 16 kHz `rir.txt`는 별도 경로다.
+
 S 지연에는 측정 경로의 I/O·버퍼·음향 지연이 포함되어 있다. 같은 성분을 다시 더하지 않는다.
 CS→ERR의 기하상 전파 시간은 약 0.146ms로, S 전체 지연과 구분해야 한다.
 

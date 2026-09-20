@@ -20,18 +20,39 @@
   `tokengeoji/DeepANC`는 가져온 별도 원본 저장소이며 두 이름을 혼동하지 않는다.
   작성자는 `SEUNG JOON JEONG <155646237+tokengeoji@users.noreply.github.com>`을 사용한다. AI 표기는 넣지 않는다.
 
-## 2. 통합 작업 환경과 기존 Jetson 검증
+## 2. 현재 Jetson 환경과 통합 후 검증
 
-이번 저장소 통합은 **x86 PC의 CPU Docker**에서 수행했다. 이 작업에서 Jetson CUDA나
-실제 오디오를 실행하지 않았다. 아래는 통합 전 `Deep-ANC`에 기록된 실제 ARM64
-Jetson AGX Orin / L4T R36.4.4 검증 이력이며, 현재 접속 장치는 재개할 때 다시 확인한다.
+현재 checkout은 `tokengeoji/Deep-ANC/main`의 통합 커밋 `4c8d267`을 fast-forward로 반영했다.
+접속 장치는 **실제 ARM64 Jetson AGX Orin / L4T R36.4.4**다. 기존 Docker·NVIDIA PyTorch를
+그대로 재사용했으며 호스트 시스템·오디오 설정·측정 원본은 변경하지 않았다.
 
-통합본 CPU Docker 검증: **1282 passed, 2 skipped, 5 subtests passed (79.50초)**.
-두 skip은 현장 raw 진단 파일 및 실측 `metrics.md`가 없는 조건이다. Python 3.10.21 /
-PyTorch 2.5.1+cpu에서 `pip check`, 원본 500탭 검증, 준비 스크립트의 합성 학습·checkpoint 저장을
-통과했다. CUDA는 검증하지 않았고 녹음·스피커 출력도 수행하지 않았다.
+통합 자체는 x86 CPU Docker에서 수행됐고 당시 결과는 1282 passed, 2 skipped,
+5 subtests passed였다. 아래 Jetson 검증은 그 이후 통합 코드를 실제 장치에서 실행한 결과다.
 
-### 기존 Jetson Docker 구성 기록
+최종 통합 Jetson 회귀: **1303 passed, 7 subtests passed, 실패·skip 없음 (182.62초)**.
+`pytest -q -o addopts= -ra`로 두 Python 경로와 새 CUDA·원본 보호 회귀를 함께 실행했다.
+로그는 `results/pytest_jetson_merged_20260920_02.log`다. 스피커 출력은 하지 않았다.
+
+### 통합 OMAP 16 kHz 경로
+
+- `pip check` 및 `bash tools/prepare_jetson.sh` 통과. `--allow-cpu`를 사용하지 않았다.
+- `artifacts/jetson_preflight.json`: aarch64 / RT Tegra 커널 / L4T R36.4.4,
+  Orin CUDA 순전파·역전파와 유한값 확인 PASS. Python 3.10.12,
+  PyTorch `2.5.0a0+872d972e41.nv24.08`, CUDA 12.6, cuDNN 9.3을 유지한다.
+- `artifacts/secondary_path/report.json`: 원본 `rir.txt` 500탭·SHA와 성공한 DSP `S_hat` 일치.
+  탭·gain·부호·선행 지연은 변경하지 않았다.
+- `runs/smoke/run-AlOKhOVs/`: **CUDA 합성 학습 1 epoch** 및 검증, `last.pt`·`best.pt` 저장 완료.
+  유한 loss/gradient/output 검사 통과. 실행 로그는 `results/omap_prepare_jetson_20260920_01.log`다.
+  합성 데이터 검사이며 실제 ANC 감쇠나 실시간 지연 검증은 아니다.
+- `tests/test_omap_cuda.py`에 실제 CUDA의 FFT/direct FIR 출력·입력 gradient 등가,
+  청크 state와 경계를 넘는 gradient, 합성 학습 1→2 epoch 재개/Adam 상태 복원 회귀를 추가했다.
+  CUDA가 없으면 이 3개는 명시적으로 skip하며 CPU 검증으로 대체하지 않는다.
+- 파생 FIR 내보내기는 입력 원본과 출력 경로가 직접·심볼릭 링크·하드링크로 겹치면
+  어떤 파일도 쓰기 전에 거부한다. 준비 진단의 Python 최소 버전도 저장소와 같은 3.10으로 맞췄다.
+- 준비 시 여유 공간은 약 4.49 GiB로 5 GiB 미만 경고가 있다. 대용량 데이터 복원 전 공간을 확인한다.
+  컨테이너에 `nvidia-jetpack` 메타패키지는 없지만 L4T 파일과 실제 CUDA 연산을 확인했다.
+
+### 재사용한 Jetson Docker 구성
 
 - `deep-anc-jetson-local:dev` 이미지 빌드 및 `deep-anc-dev` 생성 완료.
 - CUDA 12.6 런타임 기반의 작은 이미지 + 전용 venv 볼륨에 의존성을 설치하는 방식이다.
@@ -54,11 +75,8 @@ bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q -o addopts= -ra
 중지 환경은 `start`로 재사용한다. 매번 이미지·컨테이너·볼륨을 삭제하지 않는다.
 새 환경의 최초 설치·버전·볼륨 규약은 Docker 문서를 따른다.
 
-### 통합 전 Jetson 검증 범위 (기존 48 kHz 경로)
+### 통합 전 별도 설치·legacy ONNX 검사 이력
 
-- 최종 Jetson Docker 전체 회귀: **1228 passed, skip/실패 없음 (191.47초)**.
-  명령은 `pytest -q -o addopts= -ra`, 로그는 `results/pytest_jetson_20260920_02.log`다.
-- `pip check`·Asia/Seoul 시간대 조회·셸 문법·diff 공백 검사 통과.
 - `stop`→`start` 후 venv 보존·CUDA 사용 가능·ORT/TensorRT import를 다시 확인했다.
 - `runs/jetson_stack_20260920_05.json`: 최종 이미지의 PyTorch CUDA 행렬곱·cuDNN·
   ONNX Runtime 1.18.1 CPU·TensorRT 10.3 FP32 전항목 PASS. 최대 TensorRT 오차 `5.96e-8`.
@@ -88,12 +106,28 @@ REF 기하 선행은 약 2.915 ms다. S의 기존 반복 검증 대역은 **150�
 `--require-band 1000 1600 --require-broadband` 결과를 숨기거나 게이트를 낮추지 않는다.
 자세한 digital/acoustic 구분은 [docs/01](docs/01_physics_limits.md)을 따른다.
 
+**48 kHz 측정 도구의 미해결 주의점:** `measure_paths_interleaved.py`의 저장모델을
+합성 순수지연 1400샘플로 재구성하면 `pre_roll=0/128/256`에서 각각 1400/1528/1656샘플이 된다.
+FIR 이동량을 별도 저장 delay에서 빼지 않아 pre-roll만큼 추가 지연되는 문제를 통합본에서도 재현했다.
+반복 consistency가 1이어도 시간 정렬을 보장하지 않는다. OMAP `rir.txt`와는 별도 문제이며,
+기존 실측 NPZ·1465/1608·handoff256은 자동 보정하지 않았다. 원시 capture와 저장 규약을 대조해
+수정·재검증하기 전에는 위 저장값 기반 예산을 확정 실측값으로 재해석하지 않는다.
+
 외부 DSP의 FxNLMS 10 dB 이상 감쇠는 사용자 보고다. 같은 덕트·스피커지만 마이크가 달랐고,
 음원·대역·REF/ERR 역할·구동 조건은 미확인이다. 현 Jetson과 직접 비교하지 않는다.
 **DSP/Jetson 출력 합산·스피커 공유·제어 스피커 수는 미정**이다.
 확정 전 듀얼 제어기·크로스오버·출력 라우팅을 임의 구현하지 않는다.
 
 ## 4. 자료의 실제 위치와 보존 상태
+
+통합 후 현재 Jetson의 `data/`, `datasets/`, `assets/`, `runs/`를 확인했으나
+**OMAP 16 kHz 동기 raw REF/ANC-OFF 실측 녹음은 없다.** `datasets/anc/` 자체가 없고,
+OMAP 계약의 manifest·`capture.json`·`preparation.json`도 발견되지 않았다.
+16 kHz 오디오 2,703개는 mono LibriSpeech FLAC이며 OMAP 녹음이 아니다.
+기존 WAV 103개는 44.1/48 kHz mono 음원이다. `recorded_train.jsonl`·`recorded_regrouped.jsonl`은
+각 82행의 48 kHz legacy 자료이며 현재 참조 세션 경로는 각 0/82개 존재한다.
+이 자료를 리샘플링하거나 ANC-OFF라고 추정해 OMAP 학습에 사용하지 않는다.
+별도 보관한 실측 녹음 위치와 수집 조건 확인이 실제 데이터 학습의 다음 선행조건이다.
 
 통합 전 Jetson에서는 과거 `runs/export*/` ONNX와 `results/` 실측 디렉터리의 존재를 확인했다.
 Git 통합은 이 로컬 대용량 산출물을 PC나 다른 Jetson으로 복사하지 않는다.
@@ -123,8 +157,12 @@ Drive 보관 완료와 로컬 strict 데이터 준비·실제 학습 완료는 �
 ## 5. 다음 순서
 
 1. 기존 Docker를 재사용한다. 코드 변경 시 관련 회귀와 전체 검사를 수행한다.
-2. 실제 acoustic artifact의 출처·독립 학습/평가 자격을 확인한다. 현재 legacy ONNX 검사와 구분한다.
-3. Drive receipt/자료 회수 상태와 strict 데이터 QA를 확인한다. 승인된 train-only 정책을 유지한다.
+2. **OMAP 후속:** [DATASET.md](docs/DATASET.md)의 16 kHz 동기 raw REF/ANC-OFF 녹음 위치를 확인한다.
+   측정 gain·배선·clock 조건과 train/valid 세션 분리를 확인한 뒤 CUDA 1 epoch부터 진행한다.
+   자료가 없으면 이를 보고하고 합성 결과를 실제 데이터 학습으로 대체하지 않는다.
+3. **별도 48 kHz 후속:** interleaved 저장모델의 pre-roll 회귀를 수정·재검증하고,
+   실제 acoustic artifact의 출처·독립 학습/평가 자격, Drive receipt/자료 회수 상태와
+   strict 데이터 QA를 확인한다. 승인된 train-only 정책을 유지한다.
 4. 현장 준비가 되면 [docs/14](docs/14_pc_jetson_workplan.md)에 따라 장치·REF/ERR 입력,
    고역 S·F·선행 시간과 반복 OFF/ON/OFF를 순서대로 측정한다. 현장 승인 전 오디오는 열지 않는다.
 5. 외부 DSP 출력 구성이 정해져야 하는 설계는 사용자 확인 뒤 진행한다.
@@ -137,8 +175,9 @@ Drive 보관 완료와 로컬 strict 데이터 준비·실제 학습 완료는 �
 두 경로의 샘플레이트·지연·스케일을 임의로 합치지 않는다.
 
 OMAP 기준선에서 딥러닝을 이어서 준비할 때는 [OMAP 인수인계](docs/JETSON_HANDOFF.md)를 따른다.
-Docker 안에서 준비 스크립트·전체 테스트를 수행하고, 실제 동기 ANC-OFF 녹음의 존재와 세션 분리를
-확인한다. 실제 녹음과 Jetson CUDA 확인 없이는 실제 데이터 학습 준비 완료나 감쇠 성공을 선언하지 않는다.
+현재 CUDA 합성 준비는 통과했지만 실제 동기 ANC-OFF 녹음이 없어 실측 데이터 학습은 미실행이다.
+자료 확보 후 세션 분리·단위·수집 조건을 검증한다. CUDA 준비 통과만으로 실제 데이터 학습 준비 완료나
+감쇠 성공을 선언하지 않는다.
 통합 범위·검증 결과·사용법은 [통합 안내](docs/17_repository_integration.md)에 기록한다.
 
 실측 원자료·모델·Drive 백업과 원본 `DeepANC` 저장소는 삭제하지 않는다.

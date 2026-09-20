@@ -141,8 +141,8 @@ def evaluate_report(report, require_cuda=False, require_jetson=False):
     """Return actionable failures and warnings separately."""
     errors = []
     warnings = []
-    if tuple(report["python"]["version_info"]) < (3, 8):
-        errors.append("Python 3.8 or newer is required.")
+    if tuple(report["python"]["version_info"]) < (3, 10):
+        errors.append("Python 3.10 or newer is required by this repository.")
     if require_jetson and not report["system"]["is_jetson"]:
         errors.append(
             "Jetson hardware was not detected. Run on the Orin host; for local "
