@@ -33,9 +33,10 @@
 통합 자체는 x86 CPU Docker에서 수행됐고 당시 결과는 1282 passed, 2 skipped,
 5 subtests passed였다. 아래 Jetson 검증은 그 이후 통합 코드를 실제 장치에서 실행한 결과다.
 
-최종 통합 Jetson 회귀: **1452 passed, 7 subtests passed, 실패·skip 없음 (195.07초)**.
-`pytest -q -o addopts= -ra`로 두 Python 경로와 새 SFANC·CUDA·원본 보호 회귀를 함께 실행했다.
-로그는 `results/pytest_sfanc_full_20260920_01.log`다. 스피커 출력은 하지 않았다.
+최종 통합 Jetson 회귀: **1640 passed, 7 subtests passed, 실패·skip 없음 (209.06초)**.
+`pytest -q -o addopts= -ra`로 두 Python 경로와 SFANC·CUDA·원본 보호 회귀를 함께 실행했다.
+이번 연속 FIR·지연·계산 벤치·직접 CLI/보존 검사 188개를 포함한다.
+로그는 `results/pytest_sfanc_continuous_full_20260920_01.log`다. 스피커 출력은 하지 않았다.
 
 ### 통합 OMAP 16 kHz 경로
 
@@ -73,6 +74,32 @@
 - 로그는 `results/sfanc_omap_20260920_02.log`. 첫 CE-only 학습 `_01`도 보존했다.
   두 번째 학습은 validation에서 발견한 비용 불일치를 기대 regret 손실로 보완한 것이며,
   최종 test를 본 뒤 모델/임계값을 다시 고르지 않았다. 음악 학습·실측 fine-tuning은 미실행이다.
+
+### SFANC 연속 처리·지연 민감도와 계산시간
+
+- 인과 FIR 이력·샘플별 계수 보간·평가용 hard clip과 연속 진단을 추가했다.
+  오프라인 수치 코어이며 실제 오디오 callback·비동기 worker·OMAP 전송은 아직 없다.
+- `results/sfanc_stress/omap_20260920_02/report.json`: 기존 CNN/bank와 OMAP 원본 S 동결,
+  합성 P 3/8 ms와 S 외 추가 제어 지연 0/0.5/1/2/4/8 ms를 평가했다.
+  새 절차 생성 음원 6개와 기존 heldout 음성 일부의 합성 접합 1개, 5개 방법으로
+  **420회 실행·16,800개 지표**를 기록했다. 음악·jitter·feedback은 미검증이다.
+- 같은 고역 잡음의 목표대역에서 SFANC는 P=8 ms/추가 지연 0일 때 3.556 dB,
+  추가 1 ms일 때 −1.758 dB(증폭)였다. 후자 조건으로 새로 계산한 FIR은 3.393 dB였다.
+  **합성 플랜트 결과**이며 동결 필터의 경로 불일치와 재설계를 구분한다.
+  이 고역 사례에서 SFANC와 기존 train-best 단일 FIR의 결과는 같았다.
+- FxNLMS는 같은 제한 명령을 플랜트에 적용하며 7회 clip/적응 보류를 보존했다.
+  정확한 S/추가 지연과 ERR를 제공하는 cold block 진단이며 성공한 펌웨어 재현이 아니다.
+  기존 test 음성 재사용은 고정 진단일 뿐 새 독립 test가 아니며 모델/임계값 재선택은 없었다.
+- `results/sfanc_compute/jetson_20260920_01/report.json`: Orin에서 warmup 30회+측정 200회.
+  CPU 32샘플 FIR P99 **0.0873 ms**, 매 블록 교체 **0.1299 ms**,
+  특징+선택기 CPU **1.2535 ms** / CUDA **8.9363 ms**였다.
+  미학습 HybridANCNet tiny PyTorch 구조는 CUDA 256샘플 P99 **11.6947 ms**였다.
+  I/O·동시 실행·최악 마감 보증·TensorRT 성능·감쇠 비교가 아닌 계산시간 측정이다.
+- legacy acoustic_pilot 파일은 있지만 OMAP 16 kHz 동조건 검증 HybridANCNet 학습본은
+  확인하지 못했다. **HybridANCNet 대비 감쇠 우위는 미판정**이다.
+- continuation에서도 `tools/prepare_jetson.sh`의 실제 CUDA 연산·역전파·합성 학습을 통과했다.
+  로그 `results/omap_prepare_20260920_continuation_01.log`, smoke `runs/smoke/run-1n9s40Ap/`.
+  원본·펌웨어·이전 모델·RT/30W/오디오는 보존했다. 해석은 [docs/18 §7–8](docs/18_sfanc_pretraining.md)을 따른다.
 
 ### 재사용한 Jetson Docker 구성
 
@@ -196,7 +223,9 @@ Drive 보관 완료와 로컬 strict 데이터 준비·실제 학습 완료는 �
 
 1. 기존 Docker를 재사용한다. 코드 변경 시 관련 회귀와 전체 검사를 수행한다.
 2. **우선 SFANC:** OMAP 원본 S를 보존한 오프라인 필터·선택기 학습을 발전시킨다.
-   출력 한도 초과·전이 구간·고역/저역 증폭을 확인하고 독립 자료로 재검증한다.
+   연속 진단에서 드러난 경로/지연 불일치를 반영한 bank 재설계·적응 결합을 검토하고,
+   출력 한도·전이 구간·고역/저역 증폭을 독립 자료로 재검증한다. 합성 P 3/8 ms를 실측값으로 쓰지 않는다.
+   HybridANCNet 감쇠 비교에는 동일 OMAP 경로·출력 제한·인과 지연의 별도 학습본이 필요하다.
    마지막 test를 다시 튜닝 자료로 쓰지 않는다. 연결 질문이나 녹음 부재로 가능한 오프라인 작업을 멈추지 않는다.
 3. **실측 후속:** 기존 동기 녹음이 없으면 사용자 계획대로 실측한다.
    먼저 OMAP 수집 경로·gain·배선·공통 clock을 확인하고, 사용자 입회·볼륨 최소 상태에서

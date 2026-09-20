@@ -13,7 +13,8 @@
 | 수치·소프트웨어 검증 | FIR/direct convolution, 인과 특징, 분할, CPU/CUDA 학습·저장/복원 회귀 | 실측 음향 감쇠·실시간 마감 |
 | 시뮬레이션 사전학습 | 합성 소음 + 로컬 음성 원천, 합성 P + 원본 실측 S | 실제 REF/ERR 학습·현재 Jetson 출력 경로 |
 | 실측 보정 학습 | 동기 raw REF/ANC-OFF ERR 확보 후 별도 준비 | 현재 미수집 자료의 성공 추정 |
-| 실시간 연결 | live binding·연속 교체·OMAP 전송 미구현, 연결 보류 | 연속 안정성·전송 지연·현장 quiet zone |
+| 연속 수치 진단 | FIR 상태·필터 교체·limiter·추가 지연 시뮬레이션(§7), 계산시간 진단(§8) | 실제 비동기 실행·장치 왕복 지연·음향 안정성 |
+| 실시간 연결 | live binding·OMAP 전송 미구현, 연결 보류 | 실시간 마감·현장 quiet zone |
 
 최신 실행 상태·검증 집계는 [HANDOFF](../HANDOFF.md), 실측 데이터 계약은
 [DATASET](DATASET.md), 시스템 안전은 [Docker 안내](../docker/README.md)를 따른다.
@@ -212,7 +213,143 @@ zero 평균에도 비용 0인 무음 12창이 포함되므로 평균이 1보다 
 추가했다. 002의 test 결과를 본 뒤 모델·threshold를 다시 조정하지 않았다.
 이 두 실험은 시뮬레이션 사전학습 기록이다. 최종 전체 회귀 집계는 [HANDOFF](../HANDOFF.md)에 별도로 기록한다.
 
-## 7. 코드 진입점과 남은 검증
+## 7. 연속 처리·추가 지연 진단
+
+§6의 모델·bank·원본 S를 동결한 채 연속 신호에서 출력 제한과 경로 불일치를 살핀다.
+기존 학습 결과를 덮어쓰거나 마지막 test로 모델·임계값을 다시 고르지 않는다.
+`StreamingFIRBank`는 REF 이력을 보존하며 필터를 즉시 교체하거나 샘플별 계수 보간으로
+전환한다. 같은 목표의 재요청은 전환을 다시 시작하지 않는다. 제한을 켜면 **최종 명령 u를
+hard clip한 뒤** 추가 지연·원본 S를 통과시켜 `e=d+S*delay(u)`를 계산한다.
+이는 Python/NumPy 오프라인 수치 코어이며 오디오 callback·비동기 worker는 아니다.
+
+[`configs/sfanc_delay_diagnostic.json`](../configs/sfanc_delay_diagnostic.json)의 조건은 다음과 같다.
+
+- 음원당 32,768샘플(2.048초), 제어 FIR 128탭, 처리 블록 32샘플, 출력 한도 0.2.
+- 합성 P의 첫 탭 지연은 48/128샘플(**3/8 ms**), 73샘플 뒤 −0.4배 echo.
+  3 ms는 민감도 진단점이지 OMAP 선행 시간 실측값이나 Jetson 기하의 전용값이 아니다.
+- S는 원본 500탭을 보존한다. **S 외의 추가 지연**은 0/8/16/32/64/128샘플
+  (0/0.5/1/2/4/8 ms)이다. 원본 S 내부 지연과 별개이며 실제 I/O 지연 측정값이 아니다.
+  블록 크기를 근거로 handoff를 숨겨 추가하거나 S의 선행 탭을 제거하지 않는다.
+- 선택기는 완료된 과거 4096샘플만 본다. 선택 결과는 **가상 4 ms 뒤** 적용하고
+  **8 ms 동안 계수 보간**한다. 두 값은 진단용 설정이며 실제 장치·스레드 정책으로
+  확정한 것이 아니다. 처음에는 zero 후보이며 최초 관측·선택 결과 도착 전에는 무제어다.
+- 신호는 새 seed의 백색잡음·저역/고역 잡음·급격한 대역 전환·다중 톤·무음과 선택적 음성이다.
+  다중 톤은 실제 음악이 아니며 `music_evaluated=false`를 유지한다.
+  음성은 기존 test crop을 정규화·리샘플링 없이 이어 붙인 **고정 진단 재사용**이다.
+  접합부는 합성이며 새로운 독립 test 집합이나 동기 REF/ERR 실측으로 주장하지 않는다.
+
+대조군 간 정보·초기 조건 차이를 숨기지 않는다.
+
+| 방법 | 조건과 해석 |
+|---|---|
+| `zero` | 무제어 |
+| `frozen_train_best_fir` | 기존 train에서 선택한 단일 FIR을 그대로 사용, 시작부터 출력 |
+| `frozen_sfanc` | 기존 모델·bank 동결, 첫 과거 창 관측 후 선택·전환 |
+| `scenario_fitted_fir_not_frozen` | 바뀐 합성 P/지연을 알고 별도 백색잡음으로 FIR 재계산. 동결 SFANC와 정보 조건이 다르며 최적 성능 상한도 아님 |
+| `cold_block_fxnlms` | 계수 0으로 시작, block=32·mu=0.05 고정. 진단 플랜트와 같은 S/추가 지연을 filtered-x에 제공하며 동결 SFANC와 정보 조건이 다름 |
+
+FxNLMS는 clipping 이후 S의 꼬리까지 적응을 보류하고 상태를 원천 간 공유하지 않는다.
+이는 성공한 OMAP 펌웨어의 동등 재현이나 최적화된 FxNLMS를 뜻하지 않는다.
+펌웨어의 DC blocker·noise gate·tap clamp·step cap까지 재현하지 않는다. 한 가지 고정
+step size와 짧은 cold-start 결과로 FxNLMS 전체의 성능 우열을 단정하지 않는다.
+
+전대역·1 kHz 미만·[1000,1600)·1600 Hz 이상의 결과를 전체 스트림, 공통 초기 구간 이후,
+각 4096샘플 창으로 남긴다. 공통 초기 구간 제외도 전체 플랜트 적용 **후** 수행한다.
+증폭·clip 횟수·무음 대역에 새로 생긴 에너지를 보존한다. 직사각 FFT 창의 대역 누설과
+미약한 분모에 주의하며 null dB를 성공으로 바꾸지 않는다.
+
+```bash
+bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/benchmark_sfanc_stress.py \
+  --run runs/sfanc/omap_20260920_02 \
+  --config configs/sfanc_delay_diagnostic.json \
+  --librispeech-root data/raw/speech/LibriSpeech \
+  --out results/sfanc_stress/NEW_DIAGNOSTIC
+```
+
+출력은 신규 디렉터리의 `report.json`이다. 같은 OMAP 16 kHz 조건으로 검증된 HybridANCNet
+학습본이 없어 **HybridANCNet 감쇠 비교는 수행하지 않는다.** legacy 48 kHz/digital artifact를
+대신 넣지 않는다. 연속 수치 진단 완료와 실측 감쇠·실시간 안전·배포 승인은 별개다.
+현재 jitter·feedback·비선형 실제 경로·장치 clock·음악은 검증 범위 밖이다.
+
+### 실행 결과: 2026-09-20 연속 진단 002
+
+`results/sfanc_stress/omap_20260920_02/report.json`에 12개 경로/지연 조건 × 7개 원천 ×
+5개 방법의 **420회 실행, 16,800개 지표**를 저장했다. 실행 로그는
+`results/sfanc_stress_20260920_02.log`다. 기존 CNN은 재학습하지 않았다.
+첫 CLI 시도는 패키지 경로 누락으로 출력 폴더 생성 전 실패했으며 로그를 보존하고,
+직접 실행 회귀를 추가한 뒤 002를 새 경로에서 실행했다.
+
+아래는 동일한 새 고역 잡음(`band_high`)의 **1000–1600 Hz, 공통 초기 구간 이후** 결과다.
+양수는 감쇠, 음수는 증폭이다. 모두 합성 P/오프라인 플랜트 수치이며 실측 dB가 아니다.
+
+| 합성 P 지연 | 추가 제어 지연 | 동결 SFANC dB | 해당 경로로 새로 계산한 FIR dB | cold block FxNLMS dB |
+|---|---|---:|---:|---:|
+| 8 ms | 0 ms | 3.556 | 3.493 | 3.768 |
+| 8 ms | 1 ms | −1.758 | 3.393 | 4.033 |
+| 8 ms | 8 ms | −1.555 | 0.363 | 0.350 |
+| 3 ms | 0 ms | −0.110 | 2.796 | 3.656 |
+| 3 ms | 1 ms | −1.460 | 0.426 | 1.170 |
+| 3 ms | 8 ms | −1.385 | 0.006 | −0.915 |
+
+이 고역 잡음의 동결 SFANC 결과는 기존 train-best 단일 FIR과 같았다. 즉, 이번 사례에서
+CNN 선택이 단일 필터보다 우수하다는 증거는 없다. 추가 지연으로 기존 필터의 위상 정합이
+깨지는 것과, 해당 조건에 맞춰 재계산/적응한 제어기의 한계를 구분해야 한다.
+SFANC 실패를 모든 재설계 필터의 불가능성으로, FxNLMS 일부 성공을 모든 소리의 성공으로
+확대 해석하지 않는다. 48샘플 P 조건도 실제 보드의 선행 시간으로 해석하지 않는다.
+
+420회 중 7회에서 FxNLMS의 제한 전 명령이 한도를 넘었다. 실제 명령에는 hard clip을
+적용하고 경고·적응 보류·증폭 결과를 보존했다. 모든 제한 명령의 peak는 0.2 이하였다.
+동결 SFANC는 이번 원천들에서 clip이 없었지만, §6의 기존 test 1/160창 실패를 지우거나
+해결한 것은 아니다. 이번 음성은 이전 test 중 일부를 재사용한 진단이며 새로운 안전 인증도 아니다.
+전체 스트림·저역·고역·음원별 실패는 원 보고서에 남기며 배포 허용은 계속 false다.
+
+## 8. Jetson 무오디오 계산시간 진단
+
+`results/sfanc_compute/jetson_20260920_01/report.json`은 실제 Orin Docker에서 구성요소를
+**순차 실행**한 wall-time 기록이다. 각 항목 warmup 30회 뒤 200회 측정했으며
+torch intra-op threads=1, `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`을 사용했다.
+기존 RT 커널·30W·시스템·오디오 설정은 변경하지 않았다.
+
+| 구성요소 | 장치·입력 | 중앙값 ms | p99 ms | 관측 최댓값 ms |
+|---|---|---:|---:|---:|
+| SFANC FIR 유지 | CPU, 32샘플 | 0.0695 | 0.0873 | 0.1082 |
+| SFANC FIR 매 블록 전환 | CPU, 32샘플 | 0.1010 | 0.1299 | 0.1465 |
+| Welch 특징 + 선택기 | CPU, 4096샘플 | 1.1532 | 1.2535 | 1.3392 |
+| Welch 특징 + 선택기 | CUDA, 4096샘플 | 3.7960 | 8.9363 | 9.0835 |
+| 미학습 HybridANCNet tiny | CPU, 256샘플 | 50.4101 | 51.2103 | 51.4532 |
+| 미학습 HybridANCNet tiny | CUDA, 256샘플 | 9.3255 | 11.6947 | 12.0119 |
+
+FIR은 16/32/64/128/256샘플 각각 유지·전환을 검사했으며 위 표는 32샘플의 발췌다.
+이 벤치의 전환 길이는 **해당 블록 길이**로, §7의 128샘플 전환 설정과 다르다.
+FIR 상태 갱신·내부 유한값 검사·0.2 limiter까지 포함하지만 production native 최적화본은 아니다.
+CUDA 항목은 CPU 입력에서 전송·추론·CPU 결과 회수와 전후 동기화를 포함한다.
+작은 선택기는 이 실행에서 CPU가 더 빨랐으므로 GPU 사용 자체를 저지연의 근거로 삼지 않는다.
+
+Hybrid는 기존 `model_tiny.yaml`의 **고정 seed 미학습 PyTorch eager FP32 구조**다.
+ERR 입력은 0이고 상태를 호출 간 유지한다. 해당 OMAP 16 kHz 학습본·ANC 성능 검증본이
+아니며 ONNX/TensorRT로 최적화한 모델의 속도도 아니다. 이를 근거로 SFANC의 고역 감쇠가
+Hybrid보다 우수하다고 주장하거나 기존 48 kHz 모델을 16 kHz 배포용으로 승격하지 않는다.
+
+32샘플은 16 kHz에서 2 ms, 256샘플은 16 kHz에서 16 ms/48 kHz에서 약 5.33 ms다.
+보고서의 두 표본률 예산은 산술 비교일 뿐 모델 표본률 변경이 아니다. **4096샘플 관측창은
+선택 반응시간이며 매 샘플 출력에 필수적인 256 ms 대기시간으로 더하지 않는다.**
+이 벤치에는 블록 수집·스레드 handoff·ADC/DAC·스피커·음향 전파가 없고 구성요소 간
+동시 실행 간섭도 측정하지 않았다. 유한 200회 p99/최댓값은 최악 실행시간 보증이 아니다.
+따라서 전체 인과 여유·장치 왕복 지연·실시간 마감 통과는 여전히 미검증이다.
+
+```bash
+bash scripts/docker/dev.sh exec env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python scripts/bench/benchmark_sfanc_compute.py \
+  --run runs/sfanc/omap_20260920_02 \
+  --out results/sfanc_compute/NEW_COMPUTE \
+  --devices cpu cuda --warmup 30 --trials 200 --torch-threads 1
+```
+
+신규 출력만 허용하며 `report.json`에 중앙값·p95·p99·최댓값·측정 원표본, 환경·스레드·TF32,
+모델/설정/구현 SHA를 기록한다. SFANC 로드는 bank/selector SHA와 원본 S 전체 탭 일치를
+검증한다. 계산시간 측정만으로 오디오를 열거나 배포 허용 플래그를 바꾸지 않는다.
+
+## 9. 코드 진입점과 남은 검증
 
 - [`sfanc_design.py`](../src/deep_anc/baselines/sfanc_design.py): `fit_control_fir()`, `score_control_filters()`.
 - [`sfanc_selector.py`](../src/deep_anc/train/sfanc_selector.py): `reference_features()`,
@@ -222,8 +359,13 @@ zero 평균에도 비용 0인 무음 12창이 포함되므로 평균이 1보다 
 - [`sfanc_experiment.py`](../src/deep_anc/train/sfanc_experiment.py): `ExperimentConfig`,
   `run_experiment(config, out, device=..., librispeech_root=...)`, `load_selector()`.
 - CLI: [`scripts/train/train_sfanc.py`](../scripts/train/train_sfanc.py).
+- 연속 FIR: [`sfanc_stream.py`](../src/deep_anc/baselines/sfanc_stream.py).
+- 연속·지연 진단: [`sfanc_stress.py`](../src/deep_anc/eval/sfanc_stress.py),
+  [`sfanc_fxnlms.py`](../src/deep_anc/eval/sfanc_fxnlms.py).
+- 계산시간 진단: [`sfanc_compute.py`](../src/deep_anc/eval/sfanc_compute.py).
 
-live callback 연결, 연속 스트림 FIR 교체/crossfade, OMAP 계수·샘플 전송은 아직 없다.
+연속 FIR 교체·보간·제한의 **오프라인 수치 코어**는 추가했지만,
+live callback·실제 비동기 선택기·OMAP 계수/샘플 전송은 아직 없다.
 실제 경로 변화·feedback·비선형성·클록·단위·전송 지연을 확인하기 전 실시간 배포하지 않는다.
 실측 보정 학습은 독립 세션의 동기 raw REF/ANC-OFF ERR와 실제 P/S 조건을 확보한 뒤 별도다.
 음악까지 포함한 독립 평가와 반복 OFF/ON/OFF 음향 검증도 남아 있다.
@@ -233,5 +375,8 @@ live callback 연결, 연속 스트림 FIR 교체/crossfade, OMAP 계수·샘플
 ```bash
 bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q \
   tests/test_sfanc_design.py tests/test_sfanc_selector.py \
-  tests/test_sfanc_sources.py tests/test_sfanc_experiment.py
+  tests/test_sfanc_sources.py tests/test_sfanc_experiment.py \
+  tests/test_sfanc_stream.py tests/test_sfanc_fxnlms.py \
+  tests/test_sfanc_stress.py tests/test_sfanc_stress_review.py \
+  tests/test_sfanc_compute_bench.py
 ```
