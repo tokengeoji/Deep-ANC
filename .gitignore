@@ -1,6 +1,6 @@
-# datasets
-datasets/
-data/
+# Local recordings and generated datasets
+/datasets/
+/data/
 *.tar.gz
 *.tar.bz2
 *.bz2
@@ -10,12 +10,39 @@ data/
 *.pt
 *.pth
 *.onnx
-models/
 checkpoints/
 exp*/
 **/exp*/
 **/models/
 **/*.npy
+
+# Reproducible outputs / local Python environments
+/artifacts/
+/runs/
+.venv/
+.venv-*/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# CCS generated files (kept on disk, not needed on Jetson)
+firmware/**/Debug/
+firmware/**/Release/
+firmware/**/.config/
+firmware/**/src/
+firmware/**/.launches/
+firmware/**/*.obj
+firmware/**/*.out
+firmware/**/*.map
+firmware/**/*.d
+firmware/**/*.bak
+firmware/**/*.mak
+firmware/**/*.ae674
+firmware/**/makefile.defs
+
+# Reference papers stay local; do not redistribute third-party PDFs.
+docs/references/*.pdf
 
 # logs/cache
 *.log

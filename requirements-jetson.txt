@@ -1,0 +1,6 @@
+# Keep NVIDIA's JetPack-matched torch installation. Do not add torch here.
+# NumPy 1.x supports the ABI used by older NVIDIA PyTorch builds.
+numpy>=1.21.6,<2.0
+scipy>=1.7.3,<1.14.0
+soundfile>=0.12.1,<1.0
+pytest>=7.0,<9.0

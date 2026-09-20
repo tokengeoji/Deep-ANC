@@ -1,385 +1,55 @@
-# DeepANC
+# DeepANC: OMAP-L138 실측 경로에서 Jetson Orin 학습까지
 
-GCRN(Complex-valued Gated Convolutional Recurrent Network) 기반 Speech Enhancement 및 향후 Deep ANC(Active Noise Cancellation) 연구를 위한 실험 저장소입니다.
+OMAP-L138에서 성공한 FxNLMS 코드와 실제 측정한 `rir.txt`를 기준으로, Jetson Orin에서 ANC 딥러닝을 준비하는 저장소다. 현재 GitHub 주소는 **https://github.com/tokengeoji/DeepANC**이다. 이전 `Roka-jsj/DeepANC` 주소는 같은 저장소로 연결된다.
 
-본 프로젝트는 Docker 환경에서 GCRN을 학습하고, LibriSpeech와 DNS-Challenge 데이터셋을 이용하여 noisy-clean speech pair를 생성한 뒤 Speech Enhancement 성능을 평가하는 것을 목표로 합니다.
+`rir.txt`는 16 kHz, 500-tap 2차경로이며 성공한 DSP `S_hat`와 모든 계수가 일치한다. 원본 gain·부호·선행 지연을 보존한다. 신경망은 실제 DAC command `u`를 출력하고 `e = d + S*u`의 잔차를 줄이도록 학습한다. FFT 선형 convolution으로 500탭을 그대로 계산한다.
 
----
-
-# Docker Image
-
-DockerHub
+## Jetson에서 시작
 
 ```bash
-docker pull jeongsj/deepanc:speech
+git remote set-url origin https://github.com/tokengeoji/DeepANC.git
+git pull --ff-only
+bash tools/prepare_jetson.sh --install
 ```
 
-DockerHub Repository
+준비 명령은 Jetson/JetPack/PyTorch CUDA 확인, 실측 계수 검증과 변환, 합성 데이터 1회 학습 점검을 수행한다. 설치된 NVIDIA PyTorch를 유지하며 일반 PyPI `torch`로 교체하지 않는다. CUDA PyTorch가 없거나 JetPack과 맞지 않으면 원인과 설치 문서가 출력된다. 이 경우 [Jetson 환경 준비](docs/JETSON_SETUP.md)를 따른다.
 
-```text
-jeongsj/deepanc:speech
-```
-
----
-
-# Repository Clone
+다른 PC에서는 다음으로 수치 검증을 할 수 있다.
 
 ```bash
-git clone https://github.com/Roka-jsj/DeepANC.git
-cd DeepANC
+bash tools/prepare_jetson.sh --allow-cpu
+python3 -m pytest -q
 ```
 
----
-
-# Run Docker
+실측 동기 녹음 데이터가 준비되면 [데이터 준비](docs/DATASET.md)에 따라 manifest를 만들고 학습한다.
+모델 구성·손실·체크포인트 재개 옵션은 [학습 안내](docs/TRAINING.md)에 정리되어 있다.
 
 ```bash
-docker run --gpus all -it \
-  --name deepanc \
-  -v $(pwd):/workspace/DeepANC \
-  -v ~/DeepANC/datasets:/workspace/datasets \
-  jeongsj/deepanc:speech bash
+source .venv/bin/activate  # --install로 가상환경을 만든 경우
+python -m deepanc.train --config configs/anc_train.json \
+  --manifest datasets/anc/prepared/manifest.jsonl \
+  --device cuda --output runs/anc
 ```
 
-GPU 확인
-
-```bash
-nvidia-smi
-
-python -c "import torch; print(torch.cuda.is_available())"
-```
-
-Expected:
+## 디렉터리
 
 ```text
-True
+rir.txt                       실측 2차경로 정본 (원본 바이트 유지)
+calibration/                  경로의 단위·샘플레이트·checksum·출처
+firmware/omap_l138/            성공한 FxNLMS0 및 NLMS0/NLMS1 CCS 소스
+deepanc/                      인과적 신경망, 데이터 로더, 2차경로, ANC 학습
+configs/                      Jetson용 소규모 학습 기본 설정
+tools/                        환경 점검, 계수 변환, 녹음 데이터 준비
+tests/                        물리 경로·인과성·데이터·학습 검증
+docs/                         하드웨어 근거, 데이터, Jetson 인수인계
+scripts/                      기존 GCRN 음성 향상 코드 (호환 경로 보존)
+datasets/                     녹음·학습 데이터 (로컬, Git 제외)
+artifacts/                    계수 파생 파일·환경 점검 결과 (Git 제외)
+runs/                         학습 결과·체크포인트 (Git 제외)
 ```
 
----
+## 이어서 작업할 때
 
-# Experimental Environment
+Jetson에서 “이어서 해줘”라고 요청하면 루트 [AGENTS.md](AGENTS.md)와 [JETSON_HANDOFF.md](docs/JETSON_HANDOFF.md)에 따라 환경 확인부터 시작한다. 현재 소스 기본값과 실측의 근거는 [HARDWARE_BASELINE.md](docs/HARDWARE_BASELINE.md)에 기록되어 있다. 기존 speech enhancement 실험은 [별도 문서](docs/LEGACY_SPEECH_ENHANCEMENT.md)에 보존했다.
 
-## Hardware
-
-* GPU: NVIDIA RTX 3080 Ti
-* RAM: 64 GB
-
-## Software
-
-* Ubuntu 22.04
-* Docker
-* CUDA 11.1
-* PyTorch 1.9.0
-
----
-
-# Dataset
-
-## Clean Speech
-
-### LibriSpeech
-
-Official Website:
-
-https://www.openslr.org/12
-
-Downloaded Dataset:
-
-```text
-train-clean-100
-```
-
-Number of files:
-
-```text
-28,539 FLAC files
-```
-
-Total duration:
-
-```text
-100 hours
-```
-
-Download:
-
-```bash
-mkdir -p ~/DeepANC/datasets/LibriSpeech
-cd ~/DeepANC/datasets/LibriSpeech
-
-wget https://www.openslr.org/resources/12/train-clean-100.tar.gz
-
-tar -xzf train-clean-100.tar.gz
-```
-
----
-
-## Noise Dataset
-
-### DNS-Challenge
-
-Repository:
-
-https://github.com/microsoft/DNS-Challenge
-
-Used Dataset:
-
-```text
-noise_fullband
-```
-
-Download:
-
-```bash
-mkdir -p ~/DeepANC/datasets
-cd ~/DeepANC/datasets
-
-git clone https://github.com/microsoft/DNS-Challenge.git
-
-cd DNS-Challenge
-
-curl -L "https://dnschallengepublic.blob.core.windows.net/dns5archive/V5_training_dataset/noise_fullband/datasets_fullband.noise_fullband.audioset_000.tar.bz2" \
-| tar -C "./" -f - -x -j
-```
-
----
-
-# Data Generation
-
-## Preprocessing
-
-* Convert to 16 kHz
-* Convert to Mono
-* RMS Normalization
-
-## Noisy-Clean Pair Generation
-
-```text
-Clean Speech
-+
-Noise
-↓
-Noisy Speech
-```
-
-Random SNR:
-
-```text
--5 dB ~ 15 dB
-```
-
-Generated Dataset:
-
-```text
-Total      : 10000 pairs
-Train Set  : 9000 pairs
-Valid Set  : 1000 pairs
-```
-
----
-
-# GCRN Data Format
-
-GCRN 학습 데이터는 HDF5 `.ex` 형식을 사용합니다.
-
-```text
-sample.ex
-├── mix
-└── sph
-```
-
-Description
-
-```text
-mix : Noisy Speech
-sph : Clean Speech
-```
-
----
-
-# Training Configuration
-
-```text
-batch_size      = 4
-buffer_size     = 8
-learning_rate   = 0.0005
-max_n_epochs    = 30
-clip_norm       = 5.0
-
-segment_size    = 4 sec
-segment_shift   = 1 sec
-```
-
----
-
-# Training
-
-```bash
-cd /workspace/DeepANC/scripts
-
-python -B ./train.py \
-  --gpu_ids=0 \
-  --tr_list=../filelists/tr_list_librispeech.txt \
-  --cv_file=../data/datasets/cv_librispeech/cv_librispeech.ex \
-  --ckpt_dir=exp_librispeech_dns \
-  --logging_period=100 \
-  --clip_norm=5.0 \
-  --lr=0.0005 \
-  --time_log=./time.log \
-  --unit=utt \
-  --batch_size=4 \
-  --buffer_size=8 \
-  --max_n_epochs=30
-```
-
----
-
-# Evaluation
-
-## Test
-
-```bash
-python -B ./test.py \
-  --gpu_ids=0 \
-  --tt_list=../filelists/tt_list_librispeech.txt \
-  --ckpt_dir=exp_librispeech_dns \
-  --model_file=./exp_librispeech_dns/models/latest.pt
-```
-
----
-
-## Metrics
-
-### SNR
-
-```bash
-python -B ./measure.py \
-  --metric=snr \
-  --tt_list=../filelists/tt_list_librispeech.txt \
-  --ckpt_dir=exp_librispeech_dns
-```
-
-### STOI
-
-```bash
-python -B ./measure.py \
-  --metric=stoi \
-  --tt_list=../filelists/tt_list_librispeech.txt \
-  --ckpt_dir=exp_librispeech_dns
-```
-
-### PESQ
-
-```bash
-python -B ./measure.py \
-  --metric=pesq \
-  --tt_list=../filelists/tt_list_librispeech.txt \
-  --ckpt_dir=exp_librispeech_dns
-```
-
----
-
-# Experimental Results
-
-## Dataset
-
-```text
-Clean Speech : LibriSpeech train-clean-100
-Noise        : DNS-Challenge noise_fullband
-```
-
-## Training
-
-```text
-Train Pairs      : 9000
-Validation Pairs : 1000
-
-Epoch            : 30
-Learning Rate    : 0.0005
-```
-
-## SNR Result
-
-Input SNR:
-
-```text
-6.0834 dB
-```
-
-Output SNR:
-
-```text
-8.9397 dB
-```
-
-Improvement:
-
-```text
-+2.8562 dB
-```
-
----
-
-# Output Files
-
-```text
-*_mix.wav
-```
-
-Noisy input
-
-```text
-*_sph.wav
-```
-
-Clean target
-
-```text
-*_sph_est.wav
-```
-
-Enhanced output
-
----
-
-# Project Structure
-
-```text
-DeepANC
-├── scripts
-│   ├── train.py
-│   ├── test.py
-│   ├── measure.py
-│   ├── run_train.sh
-│   ├── run_evaluate.sh
-│   └── utils
-│
-├── README.md
-└── .gitignore
-```
-
----
-
-# Notes
-
-본 저장소에는 대용량 데이터셋과 모델 파일(.pt)을 포함하지 않습니다.
-
-구성:
-
-```text
-DockerHub    : 실행 환경
-GitHub       : 코드 및 문서
-Datasets     : LibriSpeech / DNS-Challenge
-Checkpoints  : 학습된 모델(.pt)
-```
-
----
-
-# Future Work
-
-* DNS Full Dataset
-* LibriSpeech Full Dataset
-* Streaming Inference
-* Jetson AGX Orin Deployment
-* Deep ANC
-* End-to-End Noise Cancellation
+준비된 신경망은 인과적 시간영역 ANC의 **오프라인 출발점**이다. 합성 학습 점검은 실측 감쇠 성능을 의미하지 않는다. 실제 학습에는 ANC를 끈 상태에서 동시에 수집한 reference `x`와 오류 마이크 disturbance `d`가 필요하다. Jetson 오디오 장치나 전송 방식을 바꾸면 추가 지연과 경로를 측정해야 하며, 이 저장소는 아직 Jetson 실시간 출력·OMAP 통신을 구현하지 않는다.

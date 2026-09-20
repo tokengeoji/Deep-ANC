@@ -1,0 +1,10 @@
+* text=auto
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+# Keep the measured source byte-for-byte, including its original CRLF.
+rir.txt -text whitespace=cr-at-eol
+# Preserve the successful CCS project source as supplied.
+firmware/omap_l138/** -text -whitespace
