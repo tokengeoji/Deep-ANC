@@ -9,6 +9,8 @@
 
 - acoustic-ref 최우선. 외부 소리를 실제 REF 마이크로 받으며 소음 원본·미래 샘플을 사용하지 않는다.
 - ERR 한 점의 감쇠가 기준이며 고역은 1 kHz 이상이다. **Jetson 우선 대역은 1000–1600 Hz**다.
+- 최신 검토 구상은 **1 kHz를 경계로 저역은 OMAP FxNLMS, 고역은 Jetson Orin**이 맡는 구조다.
+  정확한 전이대역·출력 합산·입력 공유·장치 간 전송은 미정이다. 1600 Hz를 전체 목표의 상한으로 정하지 않는다.
 - 시스템 전체의 저역·고역 동시 감쇠와 음성·음악까지 제거하는 quiet zone 목표를 유지한다.
 - 현재 Jetson AGX Orin·덕트·마이크·USB DAC를 유지한다. 교체·구매를 해결책으로 가정하지 않는다.
 - Docker 내부에서만 코드·문서·Git·Python·테스트 작업을 한다. 호스트 `.venv`는 사용하지 않는다.
@@ -29,9 +31,9 @@
 통합 자체는 x86 CPU Docker에서 수행됐고 당시 결과는 1282 passed, 2 skipped,
 5 subtests passed였다. 아래 Jetson 검증은 그 이후 통합 코드를 실제 장치에서 실행한 결과다.
 
-최종 통합 Jetson 회귀: **1303 passed, 7 subtests passed, 실패·skip 없음 (182.62초)**.
+최종 통합 Jetson 회귀: **1303 passed, 7 subtests passed, 실패·skip 없음 (185.57초)**.
 `pytest -q -o addopts= -ra`로 두 Python 경로와 새 CUDA·원본 보호 회귀를 함께 실행했다.
-로그는 `results/pytest_jetson_merged_20260920_02.log`다. 스피커 출력은 하지 않았다.
+로그는 `results/pytest_jetson_merged_20260920_03.log`다. 스피커 출력은 하지 않았다.
 
 ### 통합 OMAP 16 kHz 경로
 
@@ -41,8 +43,8 @@
   PyTorch `2.5.0a0+872d972e41.nv24.08`, CUDA 12.6, cuDNN 9.3을 유지한다.
 - `artifacts/secondary_path/report.json`: 원본 `rir.txt` 500탭·SHA와 성공한 DSP `S_hat` 일치.
   탭·gain·부호·선행 지연은 변경하지 않았다.
-- `runs/smoke/run-AlOKhOVs/`: **CUDA 합성 학습 1 epoch** 및 검증, `last.pt`·`best.pt` 저장 완료.
-  유한 loss/gradient/output 검사 통과. 실행 로그는 `results/omap_prepare_jetson_20260920_01.log`다.
+- `runs/smoke/run-xk0EFZzv/`: **CUDA 합성 학습 1 epoch** 및 검증, `last.pt`·`best.pt` 저장 완료.
+  유한 loss/gradient/output 검사 통과. 실행 로그는 `results/omap_prepare_jetson_20260920_02.log`다.
   합성 데이터 검사이며 실제 ANC 감쇠나 실시간 지연 검증은 아니다.
 - `tests/test_omap_cuda.py`에 실제 CUDA의 FFT/direct FIR 출력·입력 gradient 등가,
   청크 state와 경계를 넘는 gradient, 합성 학습 1→2 epoch 재개/Adam 상태 복원 회귀를 추가했다.
@@ -117,6 +119,8 @@ FIR 이동량을 별도 저장 delay에서 빼지 않아 pre-roll만큼 추가 �
 음원·대역·REF/ERR 역할·구동 조건은 미확인이다. 현 Jetson과 직접 비교하지 않는다.
 **DSP/Jetson 출력 합산·스피커 공유·제어 스피커 수는 미정**이다.
 확정 전 듀얼 제어기·크로스오버·출력 라우팅을 임의 구현하지 않는다.
+현재 FxNLMS 원본의 stereo LINE IN은 REF/ERR 두 채널을 사용하므로 Jetson의 AUX 출력을
+그 입력에 꽂는 것만으로 기존 FxNLMS와 합산할 수 없다. 연결 구상은 [docs/13 §1.1](docs/13_acoustic_hybrid.md)을 따른다.
 
 ## 4. 자료의 실제 위치와 보존 상태
 
@@ -132,6 +136,16 @@ OMAP 계약의 manifest·`capture.json`·`preparation.json`도 발견되지 않�
 사용자 입회·볼륨 최소 상태에서 ANC OFF 녹음을 확보하는 것이다.
 기존 `rir.txt`는 이미 실측된 2차경로이며, 없다고 보고한 것은 학습용 REF/ERR 동기 녹음이다.
 실측 계획은 즉시 오디오 실행·펌웨어 변경을 승인한 것으로 해석하지 않는다.
+
+수집 준비 확인(2026-09-20): 사용자는 **Windows 컴퓨터에서 CCS를 운용**하고
+**TMDSEMU200-U XDS200 USB 디버그 프로브**를 사용한다고 확인했다.
+프로세서는 OMAP-L138이며, 실제 보드 모델/revision·현재 CCS 버전·가용 RAM/링커 배치는 미확인이다.
+저장된 프로젝트는 LCDKOMAPL138/CCS 9.3.0 설정이다. raw REF/ERR 모니터는 256샘플(16 ms)
+순환 버퍼뿐이며 연속 녹음·누락 검출·WAV 회수 경로는 미구현이다.
+다음은 기존 CCS `.ccxml`의 `Board or Device` 또는 실물 사진 확인과 수집 방식 결정이다.
+원본 FxNLMS를 보존하는 별도 녹음 전용 프로젝트 준비 여부를 사용자에게 질문했으며 아직 미승인이다.
+Windows에서 확보한 파일을 Jetson Docker에서 처리할 수 있지만, JTAG 접속 자체를 녹음 완료나
+실시간 Jetson–DSP 통신으로 간주하지 않는다. [수집 준비 안내](docs/DATASET.md)를 따른다.
 
 통합 전 Jetson에서는 과거 `runs/export*/` ONNX와 `results/` 실측 디렉터리의 존재를 확인했다.
 Git 통합은 이 로컬 대용량 산출물을 PC나 다른 Jetson으로 복사하지 않는다.

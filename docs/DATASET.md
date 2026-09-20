@@ -6,6 +6,50 @@
 
 이 문서는 이미 확보한 WAV를 준비하는 절차다. 제공 도구는 보드에서 녹음하거나 오디오 장치로 소리를 출력하지 않는다. 기존 OMAP-L138에서 동기화된 raw ADC를 보존하는 녹음 경로를 먼저 확보해야 한다. 별도의 USB 오디오 장치로 녹음하면 codec·gain·지연 조건이 달라질 수 있다.
 
+## 실측 전 수집 경로 확인
+
+현재 `FxNLMS0`의 `ref_mic_buf`·`err_mic_buf`는 256샘플 순환 모니터 버퍼다.
+16 kHz에서 16 ms마다 덮어쓰므로 CCS Graph 표시나 주기적인 메모리 덤프만으로
+손실 없는 연속 녹음을 확보했다고 볼 수 없다. `prepare_recordings.py`는 보드 수집기가 아니다.
+
+수집 경로를 정하기 전에 다음을 확인한다.
+
+1. 실물 보드 모델·revision, JTAG 디버거 모델, 현재 동작하는 CCS/컴파일러 버전.
+   저장된 `.ccsproject`는 LCDKOMAPL138 / CCS 9.3.0 / C6000 compiler 8.3.5 설정이지만
+   실제 보드나 현재 설치 버전을 증명하지 않는다. CCS의 기존 `.ccxml`을 열어
+   `Connection`과 `Board or Device`를 확인한다. 새 설정·연결 테스트·프로그램 로드는 하지 않는다.
+2. 같은 ADC clock의 raw REF/ERR 쌍과 샘플 순서, 누락·중복 검출 방법, 저장할 버퍼 범위.
+   두 PCM16 채널은 초당 64,000 byte(헤더 제외), 1분이면 3.84 MB다.
+   사용 가능한 RAM·링커 배치·전송 지속 속도는 실물 환경에서 확인하며 추정하지 않는다.
+3. 실제 채널·gain·배치와 ANC OFF/테스트 출력 OFF를 확인한다. 원본 DSP의 `anc_enable` 기본값은 1이며,
+   `test_tone_mode`는 ANC OFF여도 출력을 낼 수 있다. 사용자 입회·물리 볼륨 최소 조건을 지킨다.
+
+### JTAG 연결과 녹음을 구분
+
+CCS의 기본 연결은 **호스트 PC → 디버그 프로브 → 타깃 보드**다.
+Jetson과 OMAP의 JTAG 디버그 단자를 서로 직결하는 보드 간 통신 구조가 아니다.
+Jetson GPIO를 OMAP JTAG에 임의 배선하지 않는다.
+Jetson AGX Orin 개발 키트의 J502도 JTAG 디버그 커넥터로 문서화되어 있다.
+[TI CCS 연결 구조](https://software-dl.ti.com/ccs/esd/documents/users_guide_10.1.0/ccs_debug-main.html#the-basic-elements),
+[NVIDIA 커넥터 안내](https://docs.nvidia.com/jetson/agx-orin-devkit/user-guide/hardware_layout.html).
+
+CCS 21.0.1의 공식 호스트 CPU 조건은 x86_64다. Ubuntu 지원이라는 이유로
+ARM64 Jetson에서 동일한 CCS/프로브 드라이버를 그대로 쓸 수 있다고 가정하지 않는다.
+기존 Windows CCS 환경을 유지하고, 확보·검증한 녹음을 Jetson Docker로 가져와 처리할 수 있다.
+[TI 호스트 요구사항](https://software-dl.ti.com/ccs/esd/documents/users_guide_ccs_21.0.1/ccs_overview.html#hardware).
+
+사용 중인 XDS200(TMDSEMU200-U)은 호스트 쪽 USB와 타깃 쪽 디버그 커넥터를 구분한다.
+기존 Windows CCS → USB → XDS200 → OMAP JTAG 연결을 유지하며,
+이 연결을 Jetson과의 실시간 PCM 전송으로 해석하지 않는다.
+[TI XDS200 연결 설명](https://www.ti.com/tool/TMDSEMU200-U).
+
+CCS에는 메모리 저장 기능이 있으나, **먼저 연속 구간을 손실 없이 보관하는 캡처 기능**이 필요하다.
+녹음 완료 후 고정된 버퍼를 내보내는 방식과 실행 중 실시간 스트리밍은 다른 설계다.
+정지·재개를 반복해 얻은 조각을 연속 녹음처럼 이어 붙이지 않는다.
+[TI 메모리 저장 및 디버거 동작](https://software-dl.ti.com/ccs/esd/documents/users_guide_10.1.0/ccs_debug-main.html#load-and-save-memory).
+현재 어느 수집 방식도 구현·검증 완료로 선언하지 않는다. 방식 확정과 별도 승인 전에는
+원본 펌웨어·GEL·링커·Jetson 시스템을 변경하지 않는다.
+
 ## 녹음 조건과 폴더
 
 입력은 16,000 Hz, stereo, PCM16 WAV이며 Left는 기준 마이크, Right는 오류 마이크다. 마이크·스피커 배치와 codec 및 amplifier gain은 [2차경로 실측 기준](HARDWARE_BASELINE.md)과 맞춘다. 두 채널을 개별 정규화하거나, peak를 맞춰 이동하거나, resampling하지 않는다. clipping이 발생한 녹음은 gain 조건을 확인하고 다시 수집한다.
