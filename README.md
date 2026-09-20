@@ -11,12 +11,15 @@ Jetson AGX Orin에서 외부 소리를 REF 마이크로 받아 상쇄음을 생�
 
 - 저주파와 고주파를 **모두** 감쇠한다. 한쪽 대역만 좋아지면 전체 목표 달성이 아니다.
 - 환경소음·기계음뿐 아니라 **음성·음악도** 감쇠한다. 평균만으로 실패한 소스 종류를 가리지 않는다.
-- 현재 우선순위는 **acoustic-ref, Jetson 1000–1600 Hz 개선**이다. 시스템 전체 목표는 유지한다.
+- 핵심 연구 목표는 **acoustic-ref에서 1 kHz 이상 감쇠가 충분히 튜닝한 FxLMS/FxNLMS보다 좋은 딥러닝 ANC**다.
+  1000–1600 Hz는 첫 검증 구간이지 목표 상한이 아니다. 시스템 전체의 저역·음성·음악 목표도 유지한다.
 - 현재 Jetson·마이크·USB DAC·덕트를 유지한다. 외부 DSP와의 출력 연결은 미정이다.
 
 현재 작업·검증 결과·미완료 사항은 **[HANDOFF.md](HANDOFF.md)** 한 곳에서 관리한다.
 과거 digital-ref 감쇠나 합성 회귀를 현재 acoustic-ref 성능으로 인용하지 않는다.
 판정 기준은 [평가 프로토콜](docs/07_evaluation_protocol.md)을 따른다.
+현재 지시는 **새 학습을 시작하지 않고 학습 직전까지 준비**하는 것이다.
+동조건 비교·데이터 부족·필요 실측은 [고역 비교 준비](docs/19_high_frequency_comparison.md)를 따른다.
 
 ## 제어 구조
 
@@ -60,6 +63,9 @@ Docker 접근에 기존 sudo 인증이 필요한 경우 환경 관리 명령에�
 
 소리 출력 없는 검사:
 
+아래 전체 pytest에는 짧은 모델 학습 회귀가 포함된다. 학습 금지 단계에서는
+[무학습 사전 점검](docs/19_high_frequency_comparison.md)을 사용한다.
+
 ```bash
 bash scripts/docker/dev.sh exec .venv/bin/python -m pip check
 bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q
@@ -79,6 +85,9 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/bench/check_acoustic_re
 OMAP 경로를 선택했다고 Jetson USB 오디오 경로가 교정되는 것은 아니다.
 
 기존 개발 Docker를 시작한 뒤 오디오 출력 없이 준비한다.
+
+**주의:** `prepare_jetson.sh`는 CUDA 연산뿐 아니라 합성 학습 smoke도 실행한다.
+현재의 ‘학습 전까지’ 작업에서는 실행하지 않는다. 아래는 학습 재개가 허용된 뒤의 일반 절차다.
 
 ```bash
 bash scripts/docker/dev.sh exec bash tools/prepare_jetson.sh --allow-cpu  # x86 PC

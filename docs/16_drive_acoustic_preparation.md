@@ -1,5 +1,10 @@
 # 16. Drive 중심 acoustic 데이터·bootstrap 준비
 
+이 문서는 기존 **48 kHz acoustic 준비 도구와 Drive 보관/복원 계약**을 설명한다.
+최신 목표인 1 kHz 이상 FxLMS/FxNLMS 대비 DL 우위, 새 학습 보류, 2026-09-20 Drive 재확인과
+OMAP 16 kHz 실측 요구는 [docs/19](19_high_frequency_comparison.md)를 따른다.
+아래 bootstrap/학습 명령을 현재 무학습 준비 단계에서 자동 실행하지 않는다.
+
 > 2026-09-17: 비상업 학업 실험, acoustic REF, ERR 한 점. 시스템 전체는 저역·고역과 음성·음악 모두가 목표다.
 > Jetson의 우선 대역은 **1–1.6 kHz로 확정**됐다. 1000–1600 Hz 준비 설정·지표를 반영했고 800–1600 Hz 과거 실험은 보존한다.
 > **MIMII DG fan은 학습 보조 전용: machine train-only, validation/test 제외가 확정됐다.**

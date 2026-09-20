@@ -1,0 +1,16 @@
+{
+  "schema": "high_frequency_comparison_preparation.v1",
+  "stage": "prepare_only",
+  "reference_mode": "acoustic",
+  "sample_rate": 16000,
+  "secondary_path": "rir.txt",
+  "polarity": "e=d+S*u",
+  "primary_path_kind": null,
+  "additional_delay_samples": null,
+  "control_limit": null,
+  "minimum_high_band_advantage_db": null,
+  "maximum_low_band_degradation_db": null,
+  "candidate_selection": null,
+  "sfanc_manifest": "runs/sfanc/omap_20260920_02/speech_manifest.json",
+  "observed_run_directories": ["runs/sfanc/omap_20260920_02"]
+}

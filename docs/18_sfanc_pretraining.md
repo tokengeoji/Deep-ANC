@@ -1,7 +1,9 @@
 # 18. OMAP 원본 S 기반 SFANC 시뮬레이션 사전학습
 
-사용자가 확정한 기준은 **16 kHz OMAP 실측 `rir.txt` 500탭**이다. 지금은 필터 준비와
-선택기 학습을 우선하며, Jetson–OMAP 연결·오디오 출력은 보류한다. 저역·고역을 모두
+사용자가 확정한 기준은 **16 kHz OMAP 실측 `rir.txt` 500탭**이다. 이 문서는 이미 수행한
+필터 준비·선택기 학습의 계약과 결과다. 최신 지시는 **새 학습 전까지 준비**이며,
+1 kHz 이상에서 FxLMS/FxNLMS 대비 딥러닝 우위를 판정할 기준은 [docs/19](19_high_frequency_comparison.md)를 따른다.
+Jetson–OMAP 연결·오디오 출력은 보류한다. 저역·고역을 모두
 줄이고 음성·음악까지 다루는 목표는 유지하지만, 이 실험만으로 달성했다고 판단하지 않는다.
 
 사전 FIR bank와 과거 REF 기반 CNN 선택이라는 SFANC 구조를 구현했다.
@@ -83,7 +85,8 @@ loss = soft_cross_entropy(q, logits)
        + risk_weight * sum(softmax(logits)_k * (C_k - min(C)))
 ```
 
-목표 대역은 **[1000,1600) Hz**다. 추가 weight 3을 주되 전대역 잔차와 제어 에너지 항을
+이 기존 실험의 가중 대역은 **[1000,1600) Hz**다. 최신 목표인 1 kHz 이상 전체와 구분한다.
+추가 weight 3을 주되 전대역 잔차와 제어 에너지 항을
 유지한다. 이 목표 가중은 후보 채점/선택기 라벨에 적용되며, 위 FIR bank 해 계산은 각 준비
 음원의 전대역 ridge 목적함수를 사용한다. 현재 `temperature=0.05`, `risk_weight=1.0`이며
 `risk_weight=0`이면 CE 단독 기준 실험이다. 큰 후보 비용을 잘라서 숨기지 않는다.

@@ -8,10 +8,13 @@
 ## 1. 사용자 확정 사항
 
 - acoustic-ref 최우선. 외부 소리를 실제 REF 마이크로 받으며 소음 원본·미래 샘플을 사용하지 않는다.
-- ERR 한 점의 감쇠가 기준이며 고역은 1 kHz 이상이다. **Jetson 우선 대역은 1000–1600 Hz**다.
+- ERR 한 점의 감쇠가 기준이며, **1 kHz 이상에서 딥러닝 ANC가 충분히 튜닝한 비딥러닝
+  FxLMS/FxNLMS보다 좋은 성능**을 보이는 것이 핵심 연구 목표다. 우위는 아직 입증하지 못했다.
+  1000–1600 Hz는 첫 검증 구간이며 고역 전체 목표의 상한이 아니다.
 - 최신 검토 구상은 **1 kHz를 경계로 저역은 OMAP FxNLMS, 고역은 Jetson Orin**이 맡는 구조다.
   정확한 전이대역·출력 합산·입력 공유·장치 간 전송은 미정이다. 1600 Hz를 전체 목표의 상한으로 정하지 않는다.
-- 최신 작업 지시는 **연결은 나중에 하고 SFANC 필터 계산·학습부터 진행**하는 것이다.
+- 최신 작업 지시는 **연결은 나중에 하고 새 학습 전까지 준비**, 데이터가 부족하면 Drive 검색,
+  실측이 필요하면 보고하는 것이다. SFANC는 현재 준비 후보이지 우위가 보장된 최종 해법이 아니다.
   사전학습의 S는 사용자가 확정한 **OMAP 16 kHz 원본 실측 500탭**이다. 48 kHz 경로와 섞지 않는다.
 - 시스템 전체의 저역·고역 동시 감쇠와 음성·음악까지 제거하는 quiet zone 목표를 유지한다.
 - 현재 Jetson AGX Orin·덕트·마이크·USB DAC를 유지한다. 교체·구매를 해결책으로 가정하지 않는다.
@@ -24,6 +27,30 @@
   `tokengeoji/DeepANC`는 가져온 별도 원본 저장소이며 두 이름을 혼동하지 않는다.
   작성자는 `SEUNG JOON JEONG <155646237+tokengeoji@users.noreply.github.com>`을 사용한다. AI 표기는 넣지 않는다.
 
+### 최신 작업: 고역 비교의 무학습 준비
+
+- 비교 계약·자료·필요 실측의 단일 안내는 [docs/19](docs/19_high_frequency_comparison.md)다.
+- 비정규화 FxLMS와 FxNLMS를 `src/deep_anc/eval/classical_anc.py`로 명시적으로 분리했다.
+  기존 이름 `FxLMSController`의 정규화 동작은 그대로 보존했다. 새 기준선도 강튜닝·펌웨어 재현은 아니다.
+- `scripts/train/prepare_high_frequency.py`는 모델/optimizer/SVD fitting 없이 원본 S·정적 계약·
+  자료 경로·분할·과거 test 노출을 점검한다. 미확정 지연·한도·합격 기준은 null로 유지한다.
+  정적 감사일 뿐 학습 허가기가 아니며 `training_ready=false`, 정상 미완료 보고의 exit는 2다.
+- 실제 자료 점검: `results/high_frequency_readiness/omap_20260920_01/report.json`, 예상 exit 2.
+  원천 60/20/20파일 모두 존재·분할 누수 0, 과거 test→train/validation 유입 0.
+  이미 관찰한 test 20파일을 새 최종 test로 삼을 수 없음을 표시했다. 설계/자료/튜닝 미해결 11항목과
+  실측 성능 게이트 3항목을 별도로 남겼다.
+- 현재 SFANC 학습 진입점은 공통 고역 비교 계약에 맞춘 연결이 더 필요하다. HybridANCNet의
+  OMAP 16 kHz 하네스는 미구현인 선택적 비교 후보이며 기존 48 kHz 학습기를 대신 호출하지 않는다.
+- Drive 공개 원본 13개·192조각의 ID/이름/크기를 receipt와 재대조했다. 19.66 MB 메타데이터 ZIP과
+  내부 90파일 SHA를 검증했다. PCM 원본은 받지 않았으며 원격 음원 전체 복원은 여전히 미검증이다.
+  기록은 Git 제외 `results/drive_readiness/20260920_01/`에 보존한다.
+- **이번에는 새 모델 학습·bank fitting·튜닝·오디오 출력을 실행하지 않았다.**
+  `prepare_jetson.sh`와 전체 pytest에는 학습 smoke/회귀가 있으므로 최신 중단선에 따라 실행하지 않는다.
+  아래 CUDA 학습·전체 1640개 회귀는 이 지시 이전에 완료한 보존 기록이다.
+- 현재 변경의 **무학습 회귀 294 passed (12.13초), 실패·skip 없음**. 신규 plain/normalized 57개,
+  정적 준비 33개와 관련 기존 204개다. 로그 `results/pytest_high_frequency_prepare_20260920_01.log`.
+  전체 회귀를 다시 통과했다고 보고하지 않는다. 실행 파일 목록은 [docs/19](docs/19_high_frequency_comparison.md)에 있다.
+
 ## 2. 현재 Jetson 환경과 통합 후 검증
 
 현재 checkout은 `tokengeoji/Deep-ANC/main`의 통합 커밋 `4c8d267`을 fast-forward로 반영했다.
@@ -33,7 +60,7 @@
 통합 자체는 x86 CPU Docker에서 수행됐고 당시 결과는 1282 passed, 2 skipped,
 5 subtests passed였다. 아래 Jetson 검증은 그 이후 통합 코드를 실제 장치에서 실행한 결과다.
 
-최종 통합 Jetson 회귀: **1640 passed, 7 subtests passed, 실패·skip 없음 (209.06초)**.
+직전 전체 통합 Jetson 회귀: **1640 passed, 7 subtests passed, 실패·skip 없음 (209.06초)**.
 `pytest -q -o addopts= -ra`로 두 Python 경로와 SFANC·CUDA·원본 보호 회귀를 함께 실행했다.
 이번 연속 FIR·지연·계산 벤치·직접 CLI/보존 검사 188개를 포함한다.
 로그는 `results/pytest_sfanc_continuous_full_20260920_01.log`다. 스피커 출력은 하지 않았다.
@@ -171,11 +198,13 @@ FIR 이동량을 별도 저장 delay에서 빼지 않아 pre-roll만큼 추가 �
 
 ## 4. 자료의 실제 위치와 보존 상태
 
-통합 후 현재 Jetson의 `data/`, `datasets/`, `assets/`, `runs/`를 확인했으나
-**OMAP 16 kHz 동기 raw REF/ANC-OFF 실측 녹음은 없다.** `datasets/anc/` 자체가 없고,
+현재 Jetson의 `data/`, `datasets/`, `assets/`, `results/`, `runs/` 검사 범위에서
+**OMAP 16 kHz 동기 raw REF/ANC-OFF 실측 녹음은 확인되지 않았다.** `datasets/anc/` 자체가 없고,
 OMAP 계약의 manifest·`capture.json`·`preparation.json`도 발견되지 않았다.
 16 kHz 오디오 2,703개는 mono LibriSpeech FLAC이며 OMAP 녹음이 아니다.
-기존 WAV 103개는 44.1/48 kHz mono 음원이다. `recorded_train.jsonl`·`recorded_regrouped.jsonl`은
+WAV는 data 67 + results 91 + runs 36 = 194개를 확인했으며 44.1/48 kHz다.
+results에는 stereo 12개도 있다. 과거 '103개 모두 mono'는 data+runs 한정이었다.
+`recorded_train.jsonl`·`recorded_regrouped.jsonl`은
 각 82행의 48 kHz legacy 자료이며 현재 참조 세션 경로는 각 0/82개 존재한다.
 이 자료를 리샘플링하거나 ANC-OFF라고 추정해 OMAP 학습에 사용하지 않는다.
 현재 상태는 **로컬 미수집 / 기존 자료가 없으면 실측 예정**이다(사용자 확정).
@@ -189,7 +218,7 @@ OMAP 계약의 manifest·`capture.json`·`preparation.json`도 발견되지 않�
 프로세서는 OMAP-L138이며, 실제 보드 모델/revision·현재 CCS 버전·가용 RAM/링커 배치는 미확인이다.
 저장된 프로젝트는 LCDKOMAPL138/CCS 9.3.0 설정이다. raw REF/ERR 모니터는 256샘플(16 ms)
 순환 버퍼뿐이며 연속 녹음·누락 검출·WAV 회수 경로는 미구현이다.
-사용자는 연결 작업을 뒤로 미루고 SFANC 학습을 먼저 진행하도록 지시했다. 보드 식별·수집 방식은
+사용자는 연결 작업을 뒤로 미뤘고 현재는 새 학습 전 준비를 지시했다. 보드 식별·수집 방식은
 실측 단계에서 확인한다. 별도 녹음 전용 프로젝트는 아직 승인·구현하지 않았으며 현재 보류한다.
 Windows에서 확보한 파일을 Jetson Docker에서 처리할 수 있지만, JTAG 접속 자체를 녹음 완료나
 실시간 Jetson–DSP 통신으로 간주하지 않는다. [수집 준비 안내](docs/DATASET.md)를 따른다.
@@ -199,18 +228,24 @@ Git 통합은 이 로컬 대용량 산출물을 PC나 다른 Jetson으로 복사
 파일 존재만으로 현재 acoustic 모델이나 새 성능이 검증된 것은 아니다.
 반면 2026-09-15 x86 PC에서 생성한 `results/drive_preparation/20260915_01/`,
 `results/drive_transfer_receipts/20260915_01/`, `results/prepared_fir/pc_20260915_linear_01/`는
-당시 Jetson에 회수되지 않았다. 과거 PC 경로를 현재 호스트에 있다고 가정하지 않는다.
+당시 Jetson에 회수되지 않았다. 이번에는 그 기록을 포함한 메타데이터 ZIP만 별도 results에 회수했다.
+옛 경로로 압축 해제하거나 현재 문서/설정/48 kHz 자산을 덮어쓰지 않았다.
 기존 `data/manifests`에는 호스트 절대경로를 담은 legacy 자료가 있다. Docker의 strict 준비
 완료로 간주하지 않는다. 합성 단위테스트는 이 로컬 자료에 의존하지 않도록 고립했다.
 
-Drive 데이터의 마지막 확인 기록:
+Drive 데이터의 2026-09-20 확인:
 
 - 공개 원본 13개(18,599,035,802 byte)를 192조각+13 manifest로 업로드 확인한 뒤 PC 임시 원본을 정리했다.
-  재개 시 **receipt와 Drive 목록부터 대조**하고 중복 다운로드·업로드하지 않는다.
-- 원격 전체 복원 checksum은 미검증이다. 복원 후 다시 검증해야 한다.
+  이번에 13개 원격 source 폴더를 열어 모든 조각의 ID·이름·크기를 기존 receipt와 대조했다.
+- 메타데이터 ZIP SHA와 내부 90파일 SHA는 검증했다. 원격 PCM 조각/전체 원본 checksum은
+  미검증이며 단계적 복원 후 다시 검증해야 한다. 여유 공간 약 4.5 GiB에 전체 자료를 받지 않는다.
 - FMA 8000개 중 7개 수치 QA 실패가 있었으며 strict 학습 준비 완료로 승격하지 않았다.
 - MIMII 공식 split은 메타데이터로 보존하되 ANC train-only다. section은 독립 원녹음 ID가 아니다.
 - 기존 Drive 분할 백업의 part5는 당시 미확인 상태였다. 분실·삭제로 단정하거나 옛 백업을 정리하지 않는다.
+- 프로젝트 폴더·OMAP/L138/capture 이름 검색·대표 legacy session 메타에서는 적합한 OMAP 동기
+  녹음을 찾지 못했다. 대표 session은 48 kHz다. 모든 Drive/압축파일의 전수 부재를 뜻하지 않는다.
+- 로컬 SFANC 분할에는 중복이 없지만 test 40crop과 그 화자·책 그룹은 이미 관찰했다.
+  옛 speech.jsonl의 화자 누수·FMA raw 부재·ESC/DEMAND 일부만 보유한 상태는 docs/19를 따른다.
 
 복원·라이선스·QA·정리 receipt 절차는 [docs/16](docs/16_drive_acoustic_preparation.md)를 따른다.
 Drive 보관 완료와 로컬 strict 데이터 준비·실제 학습 완료는 별개다.
@@ -221,16 +256,19 @@ Drive 보관 완료와 로컬 strict 데이터 준비·실제 학습 완료는 �
 
 ## 5. 다음 순서
 
-1. 기존 Docker를 재사용한다. 코드 변경 시 관련 회귀와 전체 검사를 수행한다.
-2. **우선 SFANC:** OMAP 원본 S를 보존한 오프라인 필터·선택기 학습을 발전시킨다.
-   연속 진단에서 드러난 경로/지연 불일치를 반영한 bank 재설계·적응 결합을 검토하고,
-   출력 한도·전이 구간·고역/저역 증폭을 독립 자료로 재검증한다. 합성 P 3/8 ms를 실측값으로 쓰지 않는다.
-   HybridANCNet 감쇠 비교에는 동일 OMAP 경로·출력 제한·인과 지연의 별도 학습본이 필요하다.
-   마지막 test를 다시 튜닝 자료로 쓰지 않는다. 연결 질문이나 녹음 부재로 가능한 오프라인 작업을 멈추지 않는다.
+1. 기존 Docker를 재사용한다. **현재는 새 학습 금지**이므로 학습이 없는 명시적 회귀만 수행한다.
+   `prepare_jetson.sh`나 전체 pytest를 자동 실행하지 않는다. 학습 재개 시 전체 검사를 다시 수행한다.
+2. **고역 비교 학습 전 준비:** docs/19의 공통 계약·baseline validation 탐색 정책·새 독립 test·
+   출력/지연 조건을 확정한다. Drive의 기존 source 자료를 필요한 분할부터 복원·PCM/라이선스/그룹 QA한다.
+   현재 SFANC의 1–1.6 kHz 비용을 1 kHz 이상 전체 우위로 이름만 바꾸지 않는다.
+   경로/지연 불일치를 반영할 bank 재설계와 공통 학습 하네스는 그 계약을 바탕으로 준비한다.
+   합성 P 3/8 ms를 실측값으로 쓰지 않고, 이미 관찰한 test를 재튜닝에 사용하지 않는다.
+   HybridANCNet은 선택적 비교 후보다. 기존 48 kHz 체크포인트를 16 kHz 학습본으로 바꾸어 부르지 않는다.
 3. **실측 후속:** 기존 동기 녹음이 없으면 사용자 계획대로 실측한다.
    먼저 OMAP 수집 경로·gain·배선·공통 clock을 확인하고, 사용자 입회·볼륨 최소 상태에서
    [DATASET.md](docs/DATASET.md)의 16 kHz raw REF/ANC-OFF 녹음을 확보한다.
-   독립 train/valid 세션과 raw 단위를 검증한 뒤 CUDA 1 epoch부터 진행한다.
+   독립 train/valid/최종 test 세션과 raw 단위를 검증한다. **학습 재개 지시를 받은 뒤에만**
+   작은 CUDA 학습으로 확장하며 지금은 실행하지 않는다.
    합성 결과를 실제 데이터 학습으로 대체하거나 녹음 경로를 임의로 정하지 않는다.
 4. **별도 48 kHz 후속:** interleaved 저장모델의 pre-roll 회귀를 수정·재검증하고,
    실제 acoustic artifact의 출처·독립 학습/평가 자격, Drive receipt/자료 회수 상태와
