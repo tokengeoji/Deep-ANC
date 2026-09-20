@@ -237,6 +237,9 @@ def channel_impulse_response(
 
     ``pre_roll`` 만큼 순환 이동시켜 대역제한 IR 의 **선행 링잉을 온셋 앞쪽에 남긴다**.
     이 여유가 없으면 링잉이 주기 끝으로 감겨 들어가 onset 탐색이 앞당겨 잡힌다.
+    이동은 반드시 전체 FFT 주기에서 한 뒤 compact 구간을 자른다. 특히 홀수 빈
+    채널은 반 주기 뒤 부호가 뒤집히므로, 잘라낸 반 주기를 roll하면 선행 링잉의
+    부호를 잘못 복제한다. 호출자는 저장할 별도 delay에서 pre_roll을 빼야 한다.
     """
 
     selected = probe.bins_for(drive)
@@ -246,8 +249,8 @@ def channel_impulse_response(
         raise ValueError(
             f"전달함수 길이가 톤 개수와 다릅니다: {values.size} != {selected.size}"
         )
-    if pre_roll < 0:
-        raise ValueError("pre_roll 은 음수일 수 없습니다")
+    if type(pre_roll) is not int or pre_roll < 0:
+        raise ValueError("pre_roll 은 비음수 정수여야 합니다")
 
     spectrum = np.zeros(probe.period_samples // 2 + 1, dtype=np.complex128)
     spectrum[selected] = values
@@ -255,7 +258,7 @@ def channel_impulse_response(
     period = probe.period_samples // step
     if pre_roll >= period:
         raise ValueError(f"pre_roll 이 복원 주기({period})보다 큽니다")
-    return np.roll(full[:period], int(pre_roll))
+    return np.roll(full, pre_roll)[:period]
 
 
 def tone_snr_db(

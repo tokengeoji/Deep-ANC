@@ -257,6 +257,18 @@ def analyse_channel(
         max_delay_samples=min(int(max_delay_samples), unambiguous - 1),
     )
     integer_delay = int(round(delay))
+    if type(pre_roll) is not int or pre_roll < 0:
+        raise ValueError("pre_roll은 비음수 정수여야 합니다")
+    # pre-roll은 compact FIR의 시간 원점을 뒤로 옮긴다. 이를 별도
+    # delay에서도 유지하면 같은 여유를 두 번 더하게 된다.
+    # 음수 delay로 선행 샘플을 요구하는 모델은 저장하지 않는다.
+    if pre_roll > integer_delay:
+        raise ValueError(
+            f"pre_roll {pre_roll} > 벌크 지연 {integer_delay}: "
+            "비인과 compact 모델이 됩니다. 더 작은 pre-roll로 다시 분석하세요"
+        )
+    if type(fir_length) is not int or fir_length <= pre_roll:
+        raise ValueError("fir_length는 pre_roll보다 큰 정수여야 합니다")
     # 벌크 지연을 빼면 남는 IR 이 짧아져 복원 주기 안에 안전하게 들어간다.
     residual = mean_transfer * np.exp(
         2j * np.pi * frequencies * integer_delay / probe.sample_rate
@@ -285,8 +297,10 @@ def analyse_channel(
         ),
         "raw_consistency": complex_consistency(stack),
         "absolute_tau_spread": float(np.max(taus_kept) - np.min(taus_kept)),
-        "delay_samples": integer_delay,
+        "delay_samples": integer_delay - pre_roll,
+        "bulk_delay_samples": integer_delay,
         "delay_fractional": delay,
+        "time_origin_convention": "bulk_delay_minus_pre_roll_v1",
         "fir": fir,
         "ir": ir,
         "pre_roll": int(pre_roll),
@@ -335,6 +349,9 @@ def _official_arrays(
     return {
         "fir": np.asarray(model["fir"], dtype=np.float32),
         "delay_samples": np.int64(model["delay_samples"]),
+        "bulk_delay_samples": np.int64(model["bulk_delay_samples"]),
+        "pre_roll_samples": np.int64(model["pre_roll"]),
+        "time_origin_convention": np.str_(model["time_origin_convention"]),
         "sample_rate": np.int64(fs),
         "coherence_median": np.float64(consistency),
         "consistency_band_hz": np.asarray(
@@ -611,8 +628,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             f"\n=== {label} ===\n"
-            f"  순수지연 {model['delay_samples']} 샘플 "
-            f"({model['delay_fractional']:.2f}) · "
+            f"  분리 delay {model['delay_samples']} 샘플 "
+            f"(벌크 {model['delay_fractional']:.2f}, pre-roll {model['pre_roll']}) · "
             f"{model['consistency_band_hz'][0]:.0f}-"
             f"{model['consistency_band_hz'][1]:.0f}Hz 일관성 "
             f"**{model['consistency']:.4f}** (전대역 {model['fullband_consistency']:.4f})\n"
@@ -663,6 +680,9 @@ def main(argv: list[str] | None = None) -> int:
                 "consistency_band_hz": list(item["model"]["consistency_band_hz"]),
                 "raw_consistency": item["model"]["raw_consistency"],
                 "delay_samples": item["model"]["delay_samples"],
+                "bulk_delay_samples": item["model"]["bulk_delay_samples"],
+                "pre_roll_samples": item["model"]["pre_roll"],
+                "time_origin_convention": item["model"]["time_origin_convention"],
                 "delay_fractional": item["model"]["delay_fractional"],
                 "repeat_tau_samples": [float(v) for v in item["model"]["taus"]],
                 "absolute_tau_spread_samples": item["model"]["absolute_tau_spread"],

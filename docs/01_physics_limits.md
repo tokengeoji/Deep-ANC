@@ -26,8 +26,10 @@ P/S는 같은 capture에서 얻은 내부 스피커 경로다. 이 P를 외부 �
 CS→REF 피드백 경로 F로 취급하지 않는다. acoustic 제어에서 S와 F의 역할은
 [docs/13](13_acoustic_hybrid.md)을 따른다.
 
-위 표는 기존 NPZ 메타데이터 기준이다. interleaved 측정 도구의 합성 round-trip에서
-pre-roll만큼 추가 지연되는 미해결 문제가 확인됐다([HANDOFF §3](../HANDOFF.md)).
+위 표는 기존 NPZ 메타데이터 기준이다. interleaved 측정 도구에서 pre-roll을 delay와
+중복 계산한 문제와 홀수 빈의 반주기 부호 문제를 수정했다. 새 도구는 전체 주기의 FIR을
+이동한 뒤 자르고 `delay = bulk_delay - pre_roll`을 저장한다. 두 채널·빈 parity·분수 지연의
+복소 주파수 응답 round-trip을 합성 회귀로 검사했다([HANDOFF §3](../HANDOFF.md)).
 원시 capture와 저장 규약을 재검증하기 전까지 이 표를 새로 확정한 실측 지연으로 인용하거나,
 기존 NPZ에서 pre-roll을 임의로 빼서 보정하지 않는다. OMAP 16 kHz `rir.txt`는 별도 경로다.
 

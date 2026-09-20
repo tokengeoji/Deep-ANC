@@ -1,0 +1,33 @@
+{
+  "schema": "sfanc_paired_recipe.v1",
+  "sample_rate": 16000,
+  "secondary_source_sha256": "9ece235a68a78a7f7c702d49d75525974df2ac2a8a9ca42ced155af901bcf9e3",
+  "selector_architecture": "ref_spectrum_v1",
+  "label_policy": "past_ref_next_window_zero_start_hard_clip",
+  "window_samples": null,
+  "stride_samples": null,
+  "n_fft": null,
+  "control_length": null,
+  "additional_delay_samples": null,
+  "control_limit": null,
+  "maximum_windows_per_split": null,
+  "cost": {
+    "band_weights": {"low": null, "priority_high": null, "remaining_high": null},
+    "effort_penalty": null,
+    "clipping_penalty": null,
+    "power_floor": null
+  },
+  "bank": {
+    "regularization": null,
+    "effort_penalty": null,
+    "candidates": [{"name": null, "reference": null, "start_sample": null, "sample_count": null}]
+  },
+  "training": {
+    "epochs": null,
+    "batch_size": null,
+    "learning_rate": null,
+    "seed": null,
+    "temperature": null,
+    "risk_weight": null
+  }
+}

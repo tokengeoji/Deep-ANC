@@ -10,6 +10,10 @@
 대신하지 않는다. train/valid 외에 새로운 **독립 최종 test 세션**도 수집 계획에서 분리한다.
 기존 도구의 train/valid manifest에 test를 임의로 편입하지 말고 최종 평가 자료로 따로 잠근다.
 확인한 자료 범위와 실측 목록은 [고역 비교 준비](19_high_frequency_comparison.md)를 따른다.
+새 실측의 정식 진입은 [수집 패킷·QA 실행 안내](20_measurement_runbook.md)다.
+이 문서 아래의 `prepare_recordings.py`는 그 QA가 호출하는 하위 train/valid 분리 도구다.
+하위 도구의 선택적 sidecar 규약과 달리 **새 고역 비교 packet은 capture 메타·출처 그룹·test 잠금이 필수**다.
+보드 식별 정보는 사용자가 나중에 제공하기로 했으며 녹음 펌웨어/메모리 구현은 보류한다.
 
 ## 실측 전 수집 경로 확인
 

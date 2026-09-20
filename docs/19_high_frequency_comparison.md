@@ -35,12 +35,14 @@
 아직 확정하지 않았다. [준비 계약](../configs/high_frequency_comparison.json)의 `null`을
 0이나 과거 기본값으로 채우지 않는다. 합격 기준을 사후에 유리하게 바꾸지 않는다.
 
-## 구현한 준비와 남은 학습 코드
+## 구현한 준비와 남은 검증
 
 | 항목 | 현재 준비 | 아직 아닌 것 |
 |---|---|---|
-| 비딥러닝 기준선 | `eval/classical_anc.py`에서 plain FxLMS와 FxNLMS를 실제 다른 갱신식으로 제공 | 강튜닝 완료·원본 펌웨어 재현 |
-| SFANC | 16 kHz FIR bank·REF-only CNN의 기존 학습 경로와 연속 수치 코어 존재 | 새 공통 자료/목표/지연 분포에 맞춘 학습 준비 완료 |
+| 비딥러닝 기준선 | plain FxLMS/FxNLMS와 validation 전용 후보 탐색·실패 기록·선택 동결 코드 | 실제 탐색 실행·강튜닝 완료·원본 펌웨어 재현 |
+| SFANC | 실측 QA packet → raw REF/d → 준비 계획 → 별도 승인 후 bank/선택기 학습 연결 | 실측 자료·명시 recipe·새 학습 실행·연속 실시간 검증 |
+| 공통 지표 | 고/저/세부대역·초기/전이/정상 구간, clip·증폭·세션 단위 paired bootstrap | 실측 감쇠·독립성·최소 실용 우위 인증 |
+| 수집 후 QA | 채널/PCM/출처/세션/gain 선언 검사, train/valid 분리, 최종 test 잠금 | 보드 녹음 구현·물리 동기/ANC OFF 자동 인증 |
 | HybridANCNet | 기존 48 kHz 구조·스트리밍 구현 보존, 선택적 비교 후보 | OMAP 16 kHz 동조건 학습 하네스·학습본 |
 | `deepanc.CausalController` | 원본 S용 별도 작은 인과 신경망 | HybridANCNet이나 SFANC와 같은 모델 |
 | 정적 준비 CLI | 계약·원본 S·원천 경로·분할/이전 test 노출·미확정 사항 검사 | PCM/라이선스/수집 동기성 인증·자동 학습 허가 |
@@ -66,10 +68,20 @@ bash scripts/docker/dev.sh exec .venv/bin/python scripts/train/prepare_high_freq
 `training_executed/optimizer_created/model_instantiated/forward_backward_executed/bank_fitting_executed`는 모두 false다.
 미확정 사항을 채웠다는 이유만으로 실제 데이터 QA·학습 하네스 검증이 끝났다고 하지 않는다.
 
-이번 확인 결과: 실제 점검 `results/high_frequency_readiness/omap_20260920_01/report.json`은
-exit 2, 설계/자료/튜닝 미해결 11항목과 실측 성능 게이트 3항목을 남겼다.
-무학습 회귀는 **294 passed**이며 로그는 `results/pytest_high_frequency_prepare_20260920_01.log`다.
-실행 목록은 아래와 같다. 모델 학습·SVD fitting을 포함한 전체 pytest는 재실행하지 않았다.
+실측 전 준비 패킷과 이후 파일 흐름의 단일 실행 안내는 [docs/20](20_measurement_runbook.md)다.
+SFANC 라벨은 과거 REF만 특징으로 보고, 다음 창의 실제 `d`와 hard clip 후 `S*u`로 비용을 만든다.
+저역·[1,1.6) kHz·[1.6,8] kHz 가중치는 명시 설정이며 과거 가중치 3을 자동 사용하지 않는다.
+FIR bank 후보 계산은 기존 **전대역 선형 ridge 제안**을 재사용한다. 라벨의 대역 가중/clip 평가와
+구분하며 bank 자체가 고역·비선형 제한에 최적화됐다고 하지 않는다. 라벨은 zero-start 창 진단이며
+연속 필터 교체 성능을 대신하지 않는다. 미래 승인 학습 연결은 현재 mock 회귀만 검증했다.
+
+기준선 선택 코드는 정상상태 [1,8] kHz 감쇠의 세션별 평균을 최대화하고 정확한 동점은 후보 ID로
+결정한다. 탐색 예산·clip·저역 악화 문턱·실제 추가 지연은 명시값이 필요하다. 후보 전부 실패하면
+선택을 발급받았다고 간주하지 않는다. 실패/미평가/수치 floor 결과를 보고서에서 제거하지 않는다.
+이 목적·구간이 최종 비교에 적합한지 사전 확정해야 하며 실제 탐색은 아직 하지 않았다.
+
+최신 검사 수와 로그는 [HANDOFF](../HANDOFF.md)에만 유지한다. 무학습 실행 목록은 아래와 같다.
+모델 학습·SVD fitting을 포함한 전체 pytest는 재실행하지 않는다.
 
 ```bash
 bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q -o addopts= -ra \
@@ -77,6 +89,10 @@ bash scripts/docker/dev.sh exec .venv/bin/python -m pytest -q -o addopts= -ra \
   tests/test_sfanc_stream.py tests/test_sfanc_fxnlms.py tests/test_sfanc_sources.py \
   tests/test_recordings.py tests/test_omap_prepare_secondary_path.py \
   tests/test_metrics.py tests/test_acoustic_readiness.py \
+  tests/test_measurement_ready.py tests/test_pre_measurement_packet.py \
+  tests/test_sfanc_paired.py tests/test_high_frequency_metrics.py \
+  tests/test_baseline_selection.py tests/test_baseline_selection_cli.py \
+  tests/test_interleaved_probe.py tests/test_interleaved_time_origin.py \
   tests/test_omap_secondary_path.py::test_authoritative_measurement_matches_successful_controller
 ```
 
@@ -100,7 +116,7 @@ ESC-50, DEMAND 6환경, MIMII DG fan이 대상이다.
 - FMA의 과거 7개 QA 실패·디코더 경고와 개별 라이선스/artist 분할 검토가 남아 있다.
 - MIMII DG는 사용자 확정대로 **학습 보조 전용, val/test 제외**다. 원래 공식 split 메타는 보존한다.
 - speech는 화자·책, music은 artist·작품, ESC는 원녹음, DEMAND 동시 16채널은 같은 그룹으로 묶는다.
-- 현재 여유 공간 약 4.5 GiB에 전체 18.6 GB 원본을 무작정 복원하지 않는다.
+- 여유 공간은 시점마다 다르므로 복원 전에 확인하며 전체 18.6 GB 원본을 무작정 복원하지 않는다.
   필요한 학습 분할을 확정한 뒤 기존 Drive 자료를 검증하며 단계적으로 회수한다.
 
 개인 Drive ID·receipt·검사 산출물은 Git 제외

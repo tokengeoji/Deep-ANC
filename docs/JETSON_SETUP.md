@@ -4,6 +4,11 @@
 
 OMAP 경로와 기존 Jetson USB 오디오의 48 kHz NPZ 경로는 별도다. `configs/duct.yaml`이나 `assets/measured/`를 이 RIR로 교체하지 않는다. 데이터·입출력 gain·지연·체크포인트 역시 서로 자동 호환되지 않는다.
 
+**현재는 실측 전·새 학습 전 준비 단계다.** 아래 `prepare_jetson.sh`·전체 pytest·학습 명령은
+실제 학습/역전파를 포함하므로 현재 실행하지 않는다. 무학습 절차는
+[실측 전 실행 안내](20_measurement_runbook.md), 허용 회귀 목록은 [docs/19](19_high_frequency_comparison.md)를 따른다.
+아래 절차는 별도 학습 재개 승인 이후의 일반 `deepanc` 환경 검사이며 SFANC 준비 CLI가 아니다.
+
 ## 1. 기존 Docker 환경 사용
 
 코드·Git·Python·테스트는 Docker 내부에서 수행한다. 호스트 `.venv`를 만들거나 호스트 패키지를 설치하지 않는다. 아래 명령은 저장소 루트에서 Docker 관리 스크립트를 호출한다.

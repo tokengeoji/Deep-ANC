@@ -20,6 +20,7 @@ Jetson AGX Orin에서 외부 소리를 REF 마이크로 받아 상쇄음을 생�
 판정 기준은 [평가 프로토콜](docs/07_evaluation_protocol.md)을 따른다.
 현재 지시는 **새 학습을 시작하지 않고 학습 직전까지 준비**하는 것이다.
 동조건 비교·데이터 부족·필요 실측은 [고역 비교 준비](docs/19_high_frequency_comparison.md)를 따른다.
+수집 양식·파일 검수·SFANC/기준선 준비 명령은 [실측 전 실행 안내](docs/20_measurement_runbook.md)에 있다.
 
 ## 제어 구조
 

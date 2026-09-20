@@ -27,19 +27,35 @@
   `tokengeoji/DeepANC`는 가져온 별도 원본 저장소이며 두 이름을 혼동하지 않는다.
   작성자는 `SEUNG JOON JEONG <155646237+tokengeoji@users.noreply.github.com>`을 사용한다. AI 표기는 넣지 않는다.
 
-### 최신 작업: 고역 비교의 무학습 준비
+### 최신 작업: 실측 전 무학습 준비
 
-- 비교 계약·자료·필요 실측의 단일 안내는 [docs/19](docs/19_high_frequency_comparison.md)다.
+- 비교 계약·자료·필요 실측은 [docs/19](docs/19_high_frequency_comparison.md),
+  **수집·검수·학습 전 준비 명령은 [docs/20](docs/20_measurement_runbook.md)**를 따른다.
+- `tools/prepare_before_measurement.py`가 수집 양식·SFANC recipe·기준선 탐색 계획·후속 수동 명령을
+  한 패킷으로 만든다. null/unknown은 유지하며 `capture_ready/training_ready=false`다.
+- `tools/prepare_measurement_session.py`는 raw stereo PCM16/16 kHz·누락/clip·메타·gain·
+  세션/원녹음/화자·작품 그룹 분리를 검사한다. 통과 시 train/valid 채널을 원 PCM 그대로 분리하고
+  final test lock을 남긴다. 물리 동기·ANC OFF·gain 선언을 자동 인증하는 도구가 아니다.
+- `scripts/train/prepare_sfanc_paired.py`가 검수 packet의 실측 REF/d를 원본 S와 연결한다.
+  과거 REF 특징·다음 창의 실제 제한 명령/잔차 비용, 명시 대역 가중, train-only bank 후보를 지원한다.
+  기본 준비는 모델·라벨·fit을 실행하지 않는다. 미래 승인 학습 연결은 mock 회귀로만 검사했다.
+  bank는 기존 전대역 선형 ridge 제안이며 고역 hard-limit 최적화·연속 실시간 학습 완료가 아니다.
 - 비정규화 FxLMS와 FxNLMS를 `src/deep_anc/eval/classical_anc.py`로 명시적으로 분리했다.
   기존 이름 `FxLMSController`의 정규화 동작은 그대로 보존했다. 새 기준선도 강튜닝·펌웨어 재현은 아니다.
+- `scripts/eval/tune_classical_baselines.py`는 기본 무실행 계획 검사다. 향후 validation-only
+  후보 탐색·실패 보존·정상 고역 세션 평균 선택·동결 SHA를 지원한다. 실제 튜닝은 미실행이다.
+  `high_frequency_metrics.py`는 대역/구간·clip·증폭·세션 paired bootstrap을 제공한다.
 - `scripts/train/prepare_high_frequency.py`는 모델/optimizer/SVD fitting 없이 원본 S·정적 계약·
   자료 경로·분할·과거 test 노출을 점검한다. 미확정 지연·한도·합격 기준은 null로 유지한다.
   정적 감사일 뿐 학습 허가기가 아니며 `training_ready=false`, 정상 미완료 보고의 exit는 2다.
-- 실제 자료 점검: `results/high_frequency_readiness/omap_20260920_01/report.json`, 예상 exit 2.
+- 최신 정적 점검: `results/high_frequency_readiness/omap_20260920_02/report.json`, 예상 exit 2.
   원천 60/20/20파일 모두 존재·분할 누수 0, 과거 test→train/validation 유입 0.
   이미 관찰한 test 20파일을 새 최종 test로 삼을 수 없음을 표시했다. 설계/자료/튜닝 미해결 11항목과
   실측 성능 게이트 3항목을 별도로 남겼다.
-- 현재 SFANC 학습 진입점은 공통 고역 비교 계약에 맞춘 연결이 더 필요하다. HybridANCNet의
+- 빈 준비 패킷: `results/pre_measurement/omap_20260920_01/`. JSON 양식 9개와 report를 만들었다.
+  내부 `baseline_plan_check`는 미정 20항목으로 exit 2, `empty_intake_check`는 녹음/확인값이 없는
+  상태를 exit 2로 거부했다. 가짜 녹음이나 모델을 넣지 않았으며 모든 실행 플래그는 false다.
+- 실측 SFANC 준비 연결은 구현했지만 자료·recipe·실제 학습·동조건 최종 비교는 남았다. HybridANCNet의
   OMAP 16 kHz 하네스는 미구현인 선택적 비교 후보이며 기존 48 kHz 학습기를 대신 호출하지 않는다.
 - Drive 공개 원본 13개·192조각의 ID/이름/크기를 receipt와 재대조했다. 19.66 MB 메타데이터 ZIP과
   내부 90파일 SHA를 검증했다. PCM 원본은 받지 않았으며 원격 음원 전체 복원은 여전히 미검증이다.
@@ -47,13 +63,16 @@
 - **이번에는 새 모델 학습·bank fitting·튜닝·오디오 출력을 실행하지 않았다.**
   `prepare_jetson.sh`와 전체 pytest에는 학습 smoke/회귀가 있으므로 최신 중단선에 따라 실행하지 않는다.
   아래 CUDA 학습·전체 1640개 회귀는 이 지시 이전에 완료한 보존 기록이다.
-- 현재 변경의 **무학습 회귀 294 passed (12.13초), 실패·skip 없음**. 신규 plain/normalized 57개,
-  정적 준비 33개와 관련 기존 204개다. 로그 `results/pytest_high_frequency_prepare_20260920_01.log`.
-  전체 회귀를 다시 통과했다고 보고하지 않는다. 실행 파일 목록은 [docs/19](docs/19_high_frequency_comparison.md)에 있다.
+- 최종 통합 **무학습 회귀 566 passed (23.18초), 실패·skip 없음**.
+  로그 `results/pytest_pre_measurement_20260920_02.log`; 1차 554개 통과 로그도 보존했다.
+  소형 수치/고정 bank 라벨·mock 학습 연결 검사이며 실제 새 학습·SVD fitting·실음원 튜닝은 없다.
+  전체 회귀를 다시 통과했다고 보고하지 않는다. 실행 목록은 [docs/19](docs/19_high_frequency_comparison.md)에 있다.
+- **사용자가 보드/CCS 식별 정보는 나중에 제공하기로 했다.** 메모리 배치·연속 raw 수집 구현과
+  녹음 전용 보드 프로젝트는 보류한다. 파일 기반 패킷 완성과 보드 녹음 준비 완료를 혼동하지 않는다.
 
 ## 2. 현재 Jetson 환경과 통합 후 검증
 
-현재 checkout은 `tokengeoji/Deep-ANC/main`의 통합 커밋 `4c8d267`을 fast-forward로 반영했다.
+`tokengeoji/Deep-ANC/main`의 통합 기준 커밋은 `4c8d267`이며 이후 같은 main에서 준비 작업을 진행했다.
 접속 장치는 **실제 ARM64 Jetson AGX Orin / L4T R36.4.4**다. 기존 Docker·NVIDIA PyTorch를
 그대로 재사용했으며 호스트 시스템·오디오 설정·측정 원본은 변경하지 않았다.
 
@@ -182,12 +201,13 @@ REF 기하 선행은 약 2.915 ms다. S의 기존 반복 검증 대역은 **150�
 `--require-band 1000 1600 --require-broadband` 결과를 숨기거나 게이트를 낮추지 않는다.
 자세한 digital/acoustic 구분은 [docs/01](docs/01_physics_limits.md)을 따른다.
 
-**48 kHz 측정 도구의 미해결 주의점:** `measure_paths_interleaved.py`의 저장모델을
-합성 순수지연 1400샘플로 재구성하면 `pre_roll=0/128/256`에서 각각 1400/1528/1656샘플이 된다.
-FIR 이동량을 별도 저장 delay에서 빼지 않아 pre-roll만큼 추가 지연되는 문제를 통합본에서도 재현했다.
-반복 consistency가 1이어도 시간 정렬을 보장하지 않는다. OMAP `rir.txt`와는 별도 문제이며,
-기존 실측 NPZ·1465/1608·handoff256은 자동 보정하지 않았다. 원시 capture와 저장 규약을 대조해
-수정·재검증하기 전에는 위 저장값 기반 예산을 확정 실측값으로 재해석하지 않는다.
+**48 kHz 측정 시간축: 코드 수정, 기존 실측은 미재검증.** 이전 도구는 합성 순수지연
+1400샘플을 pre-roll 128/256일 때 1528/1656샘플로 저장했다. 새 도구는
+`delay=bulk_delay-pre_roll` 및 시간 원점 메타를 저장하고, 전체 주기에서 FIR을 이동한 뒤
+자르도록 홀수 빈의 반주기 부호도 수정했다. 두 채널·빈 parity·정수/분수 지연·gain/극성의
+복소 응답 round-trip 등 관련 회귀 64개가 통과했다. 반복 consistency만으로 정렬을 인증하지 않는다.
+OMAP `rir.txt`와 별도 문제다. **기존 NPZ·1465/1608·handoff256은 변경하지 않았다.**
+원시 capture와 저장 규약을 재검증하기 전에는 위 기존 예산을 확정 실측값으로 재해석하지 않는다.
 
 외부 DSP의 FxNLMS 10 dB 이상 감쇠는 사용자 보고다. 같은 덕트·스피커지만 마이크가 달랐고,
 음원·대역·REF/ERR 역할·구동 조건은 미확인이다. 현 Jetson과 직접 비교하지 않는다.
@@ -218,8 +238,9 @@ results에는 stereo 12개도 있다. 과거 '103개 모두 mono'는 data+runs �
 프로세서는 OMAP-L138이며, 실제 보드 모델/revision·현재 CCS 버전·가용 RAM/링커 배치는 미확인이다.
 저장된 프로젝트는 LCDKOMAPL138/CCS 9.3.0 설정이다. raw REF/ERR 모니터는 256샘플(16 ms)
 순환 버퍼뿐이며 연속 녹음·누락 검출·WAV 회수 경로는 미구현이다.
-사용자는 연결 작업을 뒤로 미뤘고 현재는 새 학습 전 준비를 지시했다. 보드 식별·수집 방식은
-실측 단계에서 확인한다. 별도 녹음 전용 프로젝트는 아직 승인·구현하지 않았으며 현재 보류한다.
+사용자는 연결 작업을 뒤로 미뤘고 현재는 실측 전/새 학습 전 준비를 지시했다. 보드 식별은
+나중에 제공하기로 했다. 별도 녹음 프로젝트의 메모리/수집 구현·로드는 보류한다.
+수집 양식·파일 QA·학습 전 연결은 구현했으며 [docs/20](docs/20_measurement_runbook.md)를 따른다.
 Windows에서 확보한 파일을 Jetson Docker에서 처리할 수 있지만, JTAG 접속 자체를 녹음 완료나
 실시간 Jetson–DSP 통신으로 간주하지 않는다. [수집 준비 안내](docs/DATASET.md)를 따른다.
 

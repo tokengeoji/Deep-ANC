@@ -80,6 +80,11 @@ def test_static_report_never_runs_training_and_preserves_inputs(inputs, tmp_path
     assert result["candidates"]["hybrid_ancnet"]["legacy_training_sample_rate"] == 48000
     assert not result["candidates"]["causal_controller"]["is_hybrid_ancnet"]
     assert not result["candidates"]["hybrid_ancnet"]["required_for_sfanc_training"]
+    assert result["candidates"]["sfanc"]["paired_training_bridge_exists"]
+    assert not result["candidates"]["sfanc"]["comparison_contract_adapter_required"]
+    assert result["classical_baselines"]["validation_search_runner_exists"]
+    assert result["classical_baselines"]["band_and_session_metrics_exists"]
+    assert not result["classical_baselines"]["strong_tuning_ready"]
     assert result["protocol"]["mimii_usage"].startswith("train_only")
     assert "measured_ref_err_not_verified" in {row["code"] for row in result["physical_claim_blockers"]}
     assert result == json.loads((tmp_path / "out/report.json").read_text())
@@ -105,6 +110,9 @@ def test_missing_manifest_and_prior_history_are_not_pass(config, tmp_path):
     result = readiness.prepare_high_frequency(path, tmp_path / "out", repository_root=tmp_path)
     assert {"source_manifest_missing", "prior_test_history_incomplete"} <= {r["code"] for r in result["blockers"]}
     assert not result["classical_baselines"]["plain_and_normalized_module_exists"]
+    assert not result["classical_baselines"]["validation_search_runner_exists"]
+    assert not result["candidates"]["sfanc"]["paired_training_bridge_exists"]
+    assert result["candidates"]["sfanc"]["comparison_contract_adapter_required"]
 
 
 def test_existing_output_rejected_before_config_load(tmp_path, monkeypatch):

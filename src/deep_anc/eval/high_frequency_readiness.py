@@ -221,9 +221,10 @@ def prepare_high_frequency(config_path, out, *, sfanc_manifest=None, capture=Non
         blockers.append({"code": "prior_test_history_incomplete"})
     blockers.extend({"code": code} for code in (
         "source_pcm_license_and_coverage_qa_pending", "new_independent_test_not_verified",
-        "comparison_information_and_validation_policy_pending", "strong_baseline_tuning_not_prepared"))
+        "comparison_information_and_validation_policy_pending", "baseline_search_policy_and_execution_pending"))
     paths = {
-        "sfanc": ["scripts/train/train_sfanc.py", "src/deep_anc/train/sfanc_experiment.py"],
+        "sfanc": ["scripts/train/train_sfanc.py", "src/deep_anc/train/sfanc_experiment.py",
+                  "scripts/train/prepare_sfanc_paired.py", "src/deep_anc/train/sfanc_paired.py"],
         "hybrid_ancnet": ["src/deep_anc/models/hybrid_anc.py", "src/deep_anc/train/trainer.py"],
         "causal_controller": ["deepanc/model.py", "deepanc/train.py"],
     }
@@ -231,11 +232,14 @@ def prepare_high_frequency(config_path, out, *, sfanc_manifest=None, capture=Non
                         "training_entrypoint_ready_for_this_comparison": False,
                         "architecture_selected": False, "optimizer_settings_selected": False}
                   for name, files in paths.items()}
-    candidates["sfanc"].update(adapter_required=False, comparison_contract_adapter_required=True,
+    paired_bridge = all((root / path).is_file() for path in (
+        "scripts/train/prepare_sfanc_paired.py", "src/deep_anc/train/sfanc_paired.py"))
+    candidates["sfanc"].update(adapter_required=False, comparison_contract_adapter_required=not paired_bridge,
+        paired_training_bridge_exists=paired_bridge,
         role="current_research_candidate_not_final_selection", existing_training_entrypoint_available=True,
         native_sample_rate=16000,
         existing_entrypoint="직접 실행 시 FIR fitting과 CNN 학습을 시작하므로 준비 CLI에서 호출 금지",
-        pending="공통 데이터/플랜트/평가 계약과 prepare/train 분리; 기존 P=8 ms·가중치3을 새 설계로 자동 확정하지 않음")
+        pending="실측 QA packet·명시 recipe·공통 비교/지연 정책·승인 후 실제 학습 검증 필요; 기존 P=8 ms·가중치3 자동 승계 금지")
     candidates["hybrid_ancnet"].update(adapter_required=True, legacy_training_sample_rate=48000,
         role="optional_unimplemented_omap_comparison_candidate", required_for_sfanc_training=False,
         omap_16khz_training_harness_exists=False,
@@ -279,6 +283,9 @@ def prepare_high_frequency(config_path, out, *, sfanc_manifest=None, capture=Non
         "inventory_file_check": inventory_check,
         "candidates": candidates,
         "classical_baselines": {"plain_and_normalized_module_exists": (root / "src/deep_anc/eval/classical_anc.py").is_file(),
+            "validation_search_runner_exists": all((root / path).is_file() for path in (
+                "src/deep_anc/eval/baseline_selection.py", "scripts/eval/tune_classical_baselines.py")),
+            "band_and_session_metrics_exists": (root / "src/deep_anc/eval/high_frequency_metrics.py").is_file(),
             "existing_cold_fxnlms_exists": (root / "src/deep_anc/eval/sfanc_fxnlms.py").is_file(),
             "module_execution_performed": False, "strong_tuning_ready": False,
             "scope": "파일 존재만 확인; 구현 정확성·수렴·최적 baseline 검증이 아님"},

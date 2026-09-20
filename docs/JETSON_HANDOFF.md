@@ -22,6 +22,7 @@
 **현재 지시(2026-09-20)는 새 학습 전까지 준비하는 것이다.** 아래 `prepare_jetson.sh`와
 전체 pytest에는 합성 모델 학습이 포함되므로 이 단계에서는 실행하지 않는다.
 학습을 호출하지 않는 점검과 실제 부족 자료는 [고역 비교 준비](19_high_frequency_comparison.md)를 따른다.
+수집 양식·QA·실측 SFANC 연결의 최신 실행 순서는 [docs/20](20_measurement_runbook.md)다.
 아래 학습/smoke 명령은 학습 재개가 허용된 뒤의 일반 절차로 보존한다.
 
 기존 Docker 환경에서 Git 상태와 실제 실행 장치를 먼저 확인한다. 원격이 하이픈이 있는 `tokengeoji/Deep-ANC`인지 확인하고 기존 작업을 보존한다.
